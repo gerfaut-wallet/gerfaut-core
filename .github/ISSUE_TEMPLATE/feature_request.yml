@@ -13,6 +13,6 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: How you imagine it working. Keep in mind Gerfaut is strictly watch-only — no signing features.
+      description: How you imagine it working. Keep in mind Gerfaut is strictly watch-only, so it will never sign anything.
     validations:
       required: true
