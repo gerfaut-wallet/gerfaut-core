@@ -1,6 +1,6 @@
 # Security Policy
 
-Gerfaut is a watch-only Bitcoin wallet. It never generates, stores, or handles private keys, and it never signs transactions. Even so, wallet software carries real risk: extended public keys, descriptors, addresses, and balances are sensitive data, and a display or alerting flaw can be leveraged to misdirect funds. Security reports are taken seriously and handled with priority.
+Gerfaut is a watch-only Bitcoin wallet. It never generates, stores, or handles private keys, and it never signs transactions. Even so, wallet software carries real risk: extended public keys, descriptors, addresses, and balances are sensitive data, and a display or alerting flaw can be leveraged to misdirect funds. Security reports are taken seriously and handled as a priority.
 
 ## Reporting a vulnerability
 
