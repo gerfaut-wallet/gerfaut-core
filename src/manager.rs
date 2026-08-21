@@ -389,7 +389,7 @@ impl WalletManager {
         started: Instant,
     ) -> CoreResult<SyncReport> {
         let full = meta.last_sync.is_none();
-        let mut last_error = String::from("no backend available");
+        let mut attempts: Vec<String> = Vec::new();
 
         for endpoint in endpoints {
             // Build a fresh request under the lock (requests are consumed
@@ -406,7 +406,7 @@ impl WalletManager {
             };
 
             match chain::sync_engine(endpoint, request, meta.gap_limit).await {
-                Err(detail) => last_error = format!("{}: {detail}", endpoint.label()),
+                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(response) => {
                     let mut state = self.state.lock().await;
                     let engine = ensure_engine(&mut state, &meta.id)?;
@@ -441,10 +441,7 @@ impl WalletManager {
             }
         }
 
-        Err(CoreError::Sync {
-            backend: config_label(endpoints),
-            detail: last_error,
-        })
+        Err(sync_failure(endpoints, attempts))
     }
 
     async fn sync_address_wallet(
@@ -454,10 +451,10 @@ impl WalletManager {
         endpoints: &[Endpoint],
         started: Instant,
     ) -> CoreResult<SyncReport> {
-        let mut last_error = String::from("no backend available");
+        let mut attempts: Vec<String> = Vec::new();
         for endpoint in endpoints {
             match chain::fetch_address_state(endpoint, address, meta.network).await {
-                Err(detail) => last_error = format!("{}: {detail}", endpoint.label()),
+                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(watch) => {
                     let mut state = self.state.lock().await;
                     let tx_count_before = {
@@ -482,10 +479,7 @@ impl WalletManager {
                 }
             }
         }
-        Err(CoreError::Sync {
-            backend: config_label(endpoints),
-            detail: last_error,
-        })
+        Err(sync_failure(endpoints, attempts))
     }
 
     /// Syncs every wallet of a network (or all of them), sequentially:
@@ -511,6 +505,19 @@ impl WalletManager {
 }
 
 // --- helpers -----------------------------------------------------------
+
+/// One error covering every endpoint tried, so the user sees each
+/// backend's outcome instead of only the last one.
+fn sync_failure(endpoints: &[Endpoint], attempts: Vec<String>) -> CoreError {
+    CoreError::Sync {
+        backend: config_label(endpoints),
+        detail: if attempts.is_empty() {
+            "no backend available".to_owned()
+        } else {
+            attempts.join("; ")
+        },
+    }
+}
 
 fn config_label(endpoints: &[Endpoint]) -> String {
     endpoints
