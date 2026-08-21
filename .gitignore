@@ -10,3 +10,8 @@ Desktop.ini
 
 # Local files
 *.local
+
+
+# Added by cargo
+
+/target

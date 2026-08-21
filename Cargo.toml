@@ -1,0 +1,28 @@
+[package]
+name = "gerfaut-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Core library of Gerfaut, a Bitcoin watch-only wallet"
+repository = "https://github.com/gerfaut-wallet/gerfaut-core"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+bdk_wallet = "3.1"
+bdk_esplora = { version = "0.22", default-features = false, features = ["async-https-rustls", "tokio"] }
+bdk_electrum = { version = "0.24", default-features = false, features = ["use-rustls-ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+rand = "0.9"
+zeroize = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
