@@ -15,8 +15,13 @@ const PARALLEL_REQUESTS: usize = 4;
 /// Hard cap on fetched address history pages (25 confirmed txs each).
 const MAX_HISTORY_PAGES: usize = 20;
 
+/// Socket timeout, seconds. Bounded so that an unreachable instance
+/// fails fast and the caller's fallback to the next endpoint actually
+/// happens within a tolerable delay.
+const TIMEOUT_SECS: u64 = 20;
+
 pub(crate) fn client(url: &str) -> Result<AsyncClient, esplora_client::Error> {
-    Builder::new(url).build_async()
+    Builder::new(url).timeout(TIMEOUT_SECS).build_async()
 }
 
 pub(crate) async fn full_scan(
