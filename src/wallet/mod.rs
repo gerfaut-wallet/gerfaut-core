@@ -3,6 +3,7 @@
 
 pub mod meta;
 pub mod snapshot;
+pub mod views;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,12 +16,21 @@ use crate::wallet::snapshot::TxIo;
 pub struct AddressWatchState {
     /// Transactions touching the address, newest first.
     pub txs: Vec<AddressTx>,
+    /// Unspent outputs of the address, as reported by the backend.
+    #[serde(default)]
+    pub utxos: Vec<AddressUtxo>,
     /// Chain tip height at the last sync.
     pub tip_height: u32,
-    /// Sum of outputs funding the address, in satoshis.
+    /// Sum of outputs funding the address, in satoshis (confirmed and
+    /// mempool combined).
     pub funded_sats: u64,
-    /// Sum of inputs spending from the address, in satoshis.
+    /// Sum of inputs spending from the address, in satoshis (confirmed
+    /// and mempool combined).
     pub spent_sats: u64,
+    /// True when the address has more history than the sync fetched;
+    /// the totals above remain exact (they come from backend stats).
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// One transaction as seen from a watched address.
@@ -36,4 +46,14 @@ pub struct AddressTx {
     pub vsize: u64,
     pub inputs: Vec<TxIo>,
     pub outputs: Vec<TxIo>,
+}
+
+/// One unspent output of a watched address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddressUtxo {
+    pub txid: String,
+    pub vout: u32,
+    pub value_sats: u64,
+    pub height: Option<u32>,
+    pub timestamp: Option<u64>,
 }

@@ -1,8 +1,15 @@
 //! Chain data sources: backend configuration and synchronization.
 
+pub(crate) mod electrum;
+pub(crate) mod esplora;
+
+use bdk_wallet::KeychainKind;
+use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
 use serde::{Deserialize, Serialize};
 
+use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
+use crate::wallet::AddressWatchState;
 
 /// Where a wallet's chain data comes from.
 ///
@@ -47,6 +54,119 @@ fn host_of(url: &str) -> Option<String> {
     let host = host_port.rsplit_once('@').map_or(host_port, |(_, h)| h);
     let host = host.split(':').next()?;
     (!host.is_empty()).then(|| host.to_owned())
+}
+
+/// One concrete server to talk to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Endpoint {
+    Esplora(String),
+    Electrum(String),
+}
+
+impl Endpoint {
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Endpoint::Esplora(url) | Endpoint::Electrum(url) => {
+                host_of(url).unwrap_or_else(|| "backend".to_owned())
+            }
+        }
+    }
+}
+
+/// Resolves a backend configuration into concrete endpoints, in the
+/// order they should be tried.
+pub(crate) fn endpoints(config: &BackendConfig, network: Network) -> CoreResult<Vec<Endpoint>> {
+    match config {
+        BackendConfig::PublicEsplora => {
+            let urls = network.default_esplora_urls();
+            if urls.is_empty() {
+                return Err(CoreError::BackendUnavailable(format!(
+                    "no public backend exists for {network}; configure your own node"
+                )));
+            }
+            Ok(urls
+                .iter()
+                .map(|url| Endpoint::Esplora((*url).to_owned()))
+                .collect())
+        }
+        BackendConfig::CustomEsplora { url } => Ok(vec![Endpoint::Esplora(url.clone())]),
+        BackendConfig::CustomElectrum { url } => Ok(vec![Endpoint::Electrum(url.clone())]),
+    }
+}
+
+/// A prepared sync request for a descriptor wallet.
+pub(crate) enum EngineRequest {
+    Full(FullScanRequest<KeychainKind>),
+    Incremental(SyncRequest<(KeychainKind, u32)>),
+}
+
+/// The matching response, to apply back onto the wallet.
+pub(crate) enum EngineResponse {
+    Full(FullScanResponse<KeychainKind>),
+    Incremental(SyncResponse),
+}
+
+/// Runs one sync attempt against one endpoint. The error is a plain
+/// string: the caller owns retry logic and error wrapping.
+pub(crate) async fn sync_engine(
+    endpoint: &Endpoint,
+    request: EngineRequest,
+    stop_gap: u32,
+) -> Result<EngineResponse, String> {
+    match (endpoint, request) {
+        (Endpoint::Esplora(url), EngineRequest::Full(request)) => {
+            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            esplora::full_scan(&client, request, stop_gap)
+                .await
+                .map(EngineResponse::Full)
+                .map_err(|e| e.to_string())
+        }
+        (Endpoint::Esplora(url), EngineRequest::Incremental(request)) => {
+            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            esplora::sync(&client, request)
+                .await
+                .map(EngineResponse::Incremental)
+                .map_err(|e| e.to_string())
+        }
+        (Endpoint::Electrum(url), EngineRequest::Full(request)) => {
+            let url = url.clone();
+            tokio::task::spawn_blocking(move || {
+                electrum::full_scan_blocking(&url, request, stop_gap)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map(EngineResponse::Full)
+            .map_err(|e| e.to_string())
+        }
+        (Endpoint::Electrum(url), EngineRequest::Incremental(request)) => {
+            let url = url.clone();
+            tokio::task::spawn_blocking(move || electrum::sync_blocking(&url, request))
+                .await
+                .map_err(|e| e.to_string())?
+                .map(EngineResponse::Incremental)
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// Fetches the state of a single watched address from one endpoint.
+///
+/// Only Esplora backends can serve this today; an Electrum endpoint is
+/// reported as unavailable with an actionable message.
+pub(crate) async fn fetch_address_state(
+    endpoint: &Endpoint,
+    address: &str,
+    network: Network,
+) -> Result<AddressWatchState, String> {
+    match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            esplora::fetch_address_state(&client, address, network).await
+        }
+        Endpoint::Electrum(_) => Err("single-address wallets need an Esplora backend for now; \
+             switch the backend or import a descriptor"
+            .to_owned()),
+    }
 }
 
 #[cfg(test)]

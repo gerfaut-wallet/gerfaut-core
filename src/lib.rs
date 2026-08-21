@@ -12,9 +12,11 @@ pub mod chain;
 pub mod error;
 pub mod format;
 pub mod input;
+pub mod manager;
 pub mod network;
 pub mod store;
 pub mod wallet;
 
 pub use error::{CoreError, CoreResult};
+pub use manager::WalletManager;
 pub use network::Network;
