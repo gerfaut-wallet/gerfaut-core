@@ -4,7 +4,7 @@
 //! `spawn_blocking`.
 
 use bdk_electrum::BdkElectrumClient;
-use bdk_electrum::electrum_client::{self, Client, Config};
+use bdk_electrum::electrum_client::{self, Client, Config, Socks5Config};
 use bdk_wallet::KeychainKind;
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
 
@@ -13,10 +13,22 @@ const BATCH_SIZE: usize = 10;
 /// Socket timeout. Without it a stalled server blocks the sync forever
 /// inside `spawn_blocking`, with no way to cancel.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Onion endpoints get more room: Tor circuits are slow to build.
+const TOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn client(url: &str) -> Result<BdkElectrumClient<Client>, electrum_client::Error> {
-    let config = Config::builder().timeout(Some(TIMEOUT)).build();
-    Ok(BdkElectrumClient::new(Client::from_config(url, config)?))
+    let mut builder = Config::builder();
+    if crate::chain::is_onion(url) {
+        builder = builder
+            .socks5(Some(Socks5Config::new(crate::chain::TOR_SOCKS_PROXY)))
+            .timeout(Some(TOR_TIMEOUT));
+    } else {
+        builder = builder.timeout(Some(TIMEOUT));
+    }
+    Ok(BdkElectrumClient::new(Client::from_config(
+        url,
+        builder.build(),
+    )?))
 }
 
 pub(crate) fn full_scan_blocking(

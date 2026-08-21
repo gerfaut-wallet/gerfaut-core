@@ -19,9 +19,18 @@ const MAX_HISTORY_PAGES: usize = 20;
 /// fails fast and the caller's fallback to the next endpoint actually
 /// happens within a tolerable delay.
 const TIMEOUT_SECS: u64 = 20;
+/// Onion endpoints get more room: Tor circuits are slow to build.
+const TOR_TIMEOUT_SECS: u64 = 60;
 
 pub(crate) fn client(url: &str) -> Result<AsyncClient, esplora_client::Error> {
-    Builder::new(url).timeout(TIMEOUT_SECS).build_async()
+    let mut builder = Builder::new(url).timeout(TIMEOUT_SECS);
+    if crate::chain::is_onion(url) {
+        // socks5h: the proxy resolves the name; .onion never touches DNS.
+        builder = builder
+            .proxy(&format!("socks5h://{}", crate::chain::TOR_SOCKS_PROXY))
+            .timeout(TOR_TIMEOUT_SECS);
+    }
+    builder.build_async()
 }
 
 pub(crate) async fn full_scan(

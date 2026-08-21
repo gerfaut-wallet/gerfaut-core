@@ -14,7 +14,9 @@ pub mod format;
 pub mod input;
 pub mod manager;
 pub mod network;
+pub mod price;
 pub mod store;
+pub mod updates;
 pub mod wallet;
 
 pub use error::{CoreError, CoreResult};

@@ -47,6 +47,16 @@ impl BackendConfig {
     }
 }
 
+/// Local Tor SOCKS proxy, the default of both the Tor daemon and the
+/// Tor Browser bundle's expert bundle.
+pub const TOR_SOCKS_PROXY: &str = "127.0.0.1:9050";
+
+/// Whether a backend URL points at a Tor hidden service. Onion hosts
+/// are routed through the local Tor proxy automatically.
+pub(crate) fn is_onion(url: &str) -> bool {
+    host_of(url).is_some_and(|host| host.ends_with(".onion"))
+}
+
 /// Extracts the host part of a URL-ish string, without any userinfo.
 fn host_of(url: &str) -> Option<String> {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
