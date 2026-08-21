@@ -8,10 +8,13 @@
 //! seeds, or sign transactions, and there never will be. Inputs containing
 //! private key material are rejected at the parsing boundary.
 
+pub mod chain;
 pub mod error;
 pub mod format;
 pub mod input;
 pub mod network;
+pub mod store;
+pub mod wallet;
 
 pub use error::{CoreError, CoreResult};
 pub use network::Network;

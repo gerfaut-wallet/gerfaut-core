@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Testnet v3 is intentionally absent: it is being sunset in favor of
 /// Testnet 4, and inputs carrying v3 version bytes are treated as Testnet 4
 /// material (the encodings are identical).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Network {
     Mainnet,
