@@ -356,7 +356,19 @@ impl WalletManager {
                 state.payload.settings.backend_for(record.meta.network),
             )
         };
-        let endpoints = chain::endpoints(&config, meta.network)?;
+        let mut endpoints = chain::endpoints(&config, meta.network)?;
+        // Try the backend that answered last time first: on networks
+        // where one public instance is blocked, this skips a dead
+        // 20-second timeout on every sync.
+        if let Some(stamp) = &meta.last_sync
+            && let Some(position) = endpoints
+                .iter()
+                .position(|endpoint| endpoint.label() == stamp.backend)
+            && position > 0
+        {
+            let preferred = endpoints.remove(position);
+            endpoints.insert(0, preferred);
+        }
 
         match &meta.kind {
             WalletKind::Descriptors { .. } => {
