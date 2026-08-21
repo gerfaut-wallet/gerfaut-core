@@ -114,6 +114,11 @@ pub struct WalletSnapshot {
     pub txs: Vec<TxSummary>,
     /// Chain tip height at the last sync; 0 before the first sync.
     pub tip_height: u32,
+    /// True when the transaction list is incomplete (a watched address
+    /// with more history than one sync fetches). The balance stays
+    /// exact; the UI must say the list is partial.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// Outcome of one sync run.

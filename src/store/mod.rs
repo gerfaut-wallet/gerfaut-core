@@ -139,15 +139,28 @@ impl Vault {
     }
 
     /// Encrypts and writes the whole payload, atomically: the new file
-    /// is written next to the old one and swapped in with a rename, so
-    /// a crash mid-write never leaves a truncated vault.
+    /// is written and flushed to disk next to the old one, then swapped
+    /// in with a rename, so neither a crash mid-write nor a power loss
+    /// right after the rename can leave a truncated vault.
     pub fn save(&self, payload: &VaultPayload) -> Result<(), VaultError> {
         let plaintext =
             serde_json::to_vec(payload).map_err(|e| VaultError::CorruptedPayload(e.to_string()))?;
         let sealed = cipher::seal(&plaintext, &self.key)?;
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &sealed)?;
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(&sealed)?;
+            file.sync_all()?;
+        }
         std::fs::rename(&tmp, &self.path)?;
+        // Persist the rename itself where the platform allows it.
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 

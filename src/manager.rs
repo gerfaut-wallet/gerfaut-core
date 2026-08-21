@@ -257,6 +257,7 @@ impl WalletManager {
                     balance: views::balance(engine),
                     txs: views::tx_summaries(engine),
                     tip_height: views::tip_height(engine),
+                    truncated: false,
                     meta: record.meta,
                 })
             }
@@ -266,6 +267,7 @@ impl WalletManager {
                     balance: views::address_balance(&watch),
                     txs: views::address_tx_summaries(&watch),
                     tip_height: watch.tip_height,
+                    truncated: watch.truncated,
                     meta: record.meta,
                 })
             }
@@ -421,7 +423,7 @@ impl WalletManager {
                         took_ms: started.elapsed().as_millis() as u64,
                         backend: endpoint.label(),
                     };
-                    finish_sync(&mut state, &meta.id, &report)?;
+                    finish_sync(&mut state, &meta.id, &report, tx_count_after)?;
                     return Ok(report);
                 }
             }
@@ -453,16 +455,17 @@ impl WalletManager {
                             .as_ref()
                             .map_or(0, |s| s.txs.len() as u32)
                     };
+                    let tx_count_after = watch.txs.len() as u32;
                     let report = SyncReport {
                         wallet_id: meta.id.clone(),
-                        new_tx_count: (watch.txs.len() as u32).saturating_sub(tx_count_before),
+                        new_tx_count: tx_count_after.saturating_sub(tx_count_before),
                         balance: views::address_balance(&watch),
                         tip_height: watch.tip_height,
                         took_ms: started.elapsed().as_millis() as u64,
                         backend: endpoint.label(),
                     };
                     find_record_mut(&mut state.payload, &meta.id)?.address_state = Some(watch);
-                    finish_sync(&mut state, &meta.id, &report)?;
+                    finish_sync(&mut state, &meta.id, &report, tx_count_after)?;
                     return Ok(report);
                 }
             }
@@ -585,16 +588,21 @@ fn merge_changeset(
 }
 
 /// Updates cached totals and the sync stamp, then persists the vault.
-fn finish_sync(state: &mut ManagerState, id: &str, report: &SyncReport) -> CoreResult<()> {
+///
+/// `tx_count` is the absolute engine count after the sync, never an
+/// accumulated delta: replacements, evictions, and interleaved syncs
+/// must not make the cached figure drift.
+fn finish_sync(
+    state: &mut ManagerState,
+    id: &str,
+    report: &SyncReport,
+    tx_count: u32,
+) -> CoreResult<()> {
     {
         let record = find_record_mut(&mut state.payload, id)?;
         record.meta.cached = CachedTotals {
             balance: report.balance,
-            tx_count: record
-                .meta
-                .cached
-                .tx_count
-                .saturating_add(report.new_tx_count),
+            tx_count,
         };
         record.meta.last_sync = Some(SyncStamp {
             at: now_secs(),

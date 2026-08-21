@@ -6,13 +6,14 @@
 //! magic "GFVAULT1" (8) | version (1) | kdf (1) | salt (16) | nonce (24) | ciphertext
 //! ```
 //!
-//! XChaCha20-Poly1305 with a random 24-byte nonce per write. The key is
+//! XChaCha20-Poly1305 with a random 24-byte nonce per write; the whole
+//! header is bound as associated data (since version 2). The key is
 //! either provided raw by the platform (32 bytes out of the OS keystore)
-//! or derived from a password with Argon2id. A fresh salt and nonce are
-//! drawn on every save.
+//! or derived from a password with Argon2id (pinned parameters). A fresh
+//! salt and nonce are drawn on every save.
 
 use argon2::Argon2;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use rand::RngCore;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -20,7 +21,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::error::VaultError;
 
 const MAGIC: &[u8; 8] = b"GFVAULT1";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const HEADER_LEN: usize = 8 + 1 + 1 + SALT_LEN + NONCE_LEN;
@@ -47,12 +48,20 @@ impl VaultKey {
     }
 
     /// Derives the 32-byte encryption key for a given salt.
+    ///
+    /// Argon2id parameters are pinned explicitly (OWASP profile:
+    /// m=19456 KiB, t=2, p=1): a dependency bump changing library
+    /// defaults must never lock existing vaults out.
     fn derive(&self, salt: &[u8]) -> Result<[u8; 32], VaultError> {
         match self {
             VaultKey::Raw(key) => Ok(*key),
             VaultKey::Password(password) => {
+                let params = argon2::Params::new(19_456, 2, 1, Some(32))
+                    .map_err(|e| VaultError::Kdf(e.to_string()))?;
+                let argon =
+                    Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
                 let mut out = [0u8; 32];
-                Argon2::default()
+                argon
                     .hash_password_into(password.as_bytes(), salt, &mut out)
                     .map_err(|e| VaultError::Kdf(e.to_string()))?;
                 Ok(out)
@@ -62,25 +71,36 @@ impl VaultKey {
 }
 
 /// Encrypts a serialized payload into the vault file format.
+///
+/// The whole header (magic, version, KDF id, salt, nonce) is bound as
+/// associated data: flipping any header byte fails authentication.
 pub fn seal(plaintext: &[u8], key: &VaultKey) -> Result<Vec<u8>, VaultError> {
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     rand::rng().fill_bytes(&mut salt);
     rand::rng().fill_bytes(&mut nonce);
 
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    header.extend_from_slice(MAGIC);
+    header.push(VERSION);
+    header.push(key.kdf_id());
+    header.extend_from_slice(&salt);
+    header.extend_from_slice(&nonce);
+
     let mut derived = key.derive(&salt)?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), plaintext)
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &header,
+            },
+        )
         .map_err(|_| VaultError::Kdf("encryption failure".to_owned()))?;
     derived.zeroize();
 
-    let mut out = Vec::with_capacity(HEADER_LEN + ciphertext.len());
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION);
-    out.push(key.kdf_id());
-    out.extend_from_slice(&salt);
-    out.extend_from_slice(&nonce);
+    let mut out = header;
     out.extend_from_slice(&ciphertext);
     Ok(out)
 }
@@ -89,13 +109,14 @@ pub fn seal(plaintext: &[u8], key: &VaultKey) -> Result<Vec<u8>, VaultError> {
 ///
 /// Fails with [`VaultError::WrongKeyOrCorrupted`] when authentication
 /// fails — a wrong key and a tampered file are indistinguishable by
-/// design.
+/// design. Version 1 files (no header binding) are still readable; they
+/// are rewritten as version 2 at the next save.
 pub fn unseal(file: &[u8], key: &VaultKey) -> Result<Vec<u8>, VaultError> {
     if file.len() < HEADER_LEN || &file[..8] != MAGIC {
         return Err(VaultError::NotAVault);
     }
     let version = file[8];
-    if version != VERSION {
+    if version != 1 && version != VERSION {
         return Err(VaultError::UnsupportedVersion(version));
     }
     // The KDF byte is informative (it lets an app prompt for the right
@@ -106,8 +127,17 @@ pub fn unseal(file: &[u8], key: &VaultKey) -> Result<Vec<u8>, VaultError> {
 
     let mut derived = key.derive(salt)?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
+    let payload = Payload {
+        msg: ciphertext,
+        // Version 1 sealed without associated data.
+        aad: if version == 1 {
+            &[]
+        } else {
+            &file[..HEADER_LEN]
+        },
+    };
     let plaintext = cipher
-        .decrypt(XNonce::from_slice(nonce), ciphertext)
+        .decrypt(XNonce::from_slice(nonce), payload)
         .map_err(|_| VaultError::WrongKeyOrCorrupted);
     derived.zeroize();
     plaintext
@@ -122,7 +152,9 @@ pub fn kdf_kind(file: &[u8]) -> Result<VaultKdf, VaultError> {
     match file[9] {
         KDF_RAW => Ok(VaultKdf::PlatformKey),
         KDF_ARGON2ID => Ok(VaultKdf::Password),
-        _ => Err(VaultError::UnsupportedVersion(file[8])),
+        other => Err(VaultError::CorruptedPayload(format!(
+            "unknown kdf id {other}"
+        ))),
     }
 }
 
@@ -177,6 +209,42 @@ mod tests {
             unseal(&sealed, &raw_key(7)),
             Err(VaultError::WrongKeyOrCorrupted)
         ));
+    }
+
+    #[test]
+    fn header_tampering_is_detected() {
+        let mut sealed = seal(b"payload", &raw_key(7)).unwrap();
+        // Flip the KDF id byte: the header is bound as associated data.
+        sealed[9] ^= 0x01;
+        assert!(matches!(
+            unseal(&sealed, &raw_key(7)),
+            Err(VaultError::WrongKeyOrCorrupted)
+        ));
+    }
+
+    #[test]
+    fn version_1_files_stay_readable() {
+        // Reproduce the version 1 layout: same header, no associated data.
+        let key = raw_key(7);
+        let mut salt = [0u8; SALT_LEN];
+        let mut nonce = [0u8; NONCE_LEN];
+        rand::rng().fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut nonce);
+        let mut derived = key.derive(&salt).unwrap();
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
+        let ciphertext = cipher
+            .encrypt(XNonce::from_slice(&nonce), b"legacy payload".as_slice())
+            .unwrap();
+        derived.zeroize();
+        let mut file = Vec::new();
+        file.extend_from_slice(MAGIC);
+        file.push(1);
+        file.push(KDF_RAW);
+        file.extend_from_slice(&salt);
+        file.extend_from_slice(&nonce);
+        file.extend_from_slice(&ciphertext);
+
+        assert_eq!(unseal(&file, &key).unwrap(), b"legacy payload");
     }
 
     #[test]

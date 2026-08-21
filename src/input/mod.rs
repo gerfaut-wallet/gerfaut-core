@@ -234,21 +234,29 @@ fn script_kind_of(descriptor: &Descriptor<DescriptorPublicKey>) -> ScriptKind {
 
 /// Candidate networks of a descriptor, from the version bytes of the
 /// extended keys it contains. A descriptor without extended keys is
-/// network-agnostic.
-fn descriptor_networks(descriptor: &Descriptor<DescriptorPublicKey>) -> Vec<Network> {
-    let mut kind: Option<NetworkKind> = None;
+/// network-agnostic; one mixing mainnet and test keys is rejected.
+fn descriptor_networks(descriptor: &Descriptor<DescriptorPublicKey>) -> CoreResult<Vec<Network>> {
+    let mut kinds: Vec<NetworkKind> = Vec::new();
     descriptor.for_each_key(|key| {
         let key_kind = match key {
             DescriptorPublicKey::XPub(xkey) => Some(xkey.xkey.network),
             DescriptorPublicKey::MultiXPub(xkey) => Some(xkey.xkey.network),
             DescriptorPublicKey::Single(_) => None,
         };
-        if kind.is_none() {
-            kind = key_kind;
+        if let Some(key_kind) = key_kind
+            && !kinds.contains(&key_kind)
+        {
+            kinds.push(key_kind);
         }
         true
     });
-    networks_for_kind(kind)
+    if kinds.len() > 1 {
+        return Err(CoreError::InvalidInput {
+            kind: "descriptor",
+            detail: "the descriptor mixes mainnet and test network keys".to_owned(),
+        });
+    }
+    Ok(networks_for_kind(kinds.first().copied()))
 }
 
 fn networks_for_kind(kind: Option<NetworkKind>) -> Vec<Network> {
@@ -282,7 +290,7 @@ fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
         }
         return Ok(ParsedInput {
             kind: RecognizedKind::MultipathDescriptor,
-            networks: descriptor_networks(&parts[0]),
+            networks: descriptor_networks(&parts[0])?,
             payload: ParsedPayload::Descriptors {
                 external: parts[0].to_string(),
                 internal: Some(parts[1].to_string()),
@@ -298,7 +306,7 @@ fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
     }
     Ok(ParsedInput {
         kind: RecognizedKind::Descriptor,
-        networks: descriptor_networks(&descriptor),
+        networks: descriptor_networks(&descriptor)?,
         payload: ParsedPayload::Descriptors {
             external: descriptor.to_string(),
             internal: None,
@@ -317,8 +325,8 @@ fn parse_descriptor_pair(first: &str, second: &str) -> CoreResult<ParsedInput> {
             detail: "cannot combine a multipath descriptor with a second descriptor".to_owned(),
         });
     }
-    let external_networks = descriptor_networks(&external);
-    if external_networks != descriptor_networks(&internal) {
+    let external_networks = descriptor_networks(&external)?;
+    if external_networks != descriptor_networks(&internal)? {
         return Err(CoreError::InvalidInput {
             kind: "descriptor",
             detail: "the two descriptors belong to different networks".to_owned(),
