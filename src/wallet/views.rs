@@ -166,7 +166,7 @@ pub(crate) fn utxos(wallet: &bdk_wallet::Wallet, network: Network) -> Vec<UtxoIn
         })
         .collect();
     let _ = tip; // confirmations live in `status`; tip kept for future use
-    utxos.sort_by(|a, b| b.value_sats.cmp(&a.value_sats));
+    utxos.sort_by_key(|utxo| std::cmp::Reverse(utxo.value_sats));
     utxos
 }
 
@@ -298,7 +298,7 @@ pub(crate) fn address_utxos(state: &AddressWatchState, address: &str) -> Vec<Utx
             derivation_index: None,
         })
         .collect();
-    utxos.sort_by(|a, b| b.value_sats.cmp(&a.value_sats));
+    utxos.sort_by_key(|utxo| std::cmp::Reverse(utxo.value_sats));
     utxos
 }
 
