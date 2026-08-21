@@ -148,10 +148,12 @@ pub(crate) async fn fetch_address_state(
                     is_mine: vout.scriptpubkey == our_script,
                 })
                 .collect();
+            // A coinbase transaction has no fee; Esplora reports 0.
+            let is_coinbase = tx.vin.first().is_some_and(|vin| vin.is_coinbase);
             AddressTx {
                 txid: tx.txid.to_string(),
                 net_sats: received as i64 - spent as i64,
-                fee_sats: Some(tx.fee),
+                fee_sats: (!is_coinbase).then_some(tx.fee),
                 height: tx.status.block_height,
                 timestamp: tx.status.block_time,
                 vsize: tx.weight.div_ceil(4),
