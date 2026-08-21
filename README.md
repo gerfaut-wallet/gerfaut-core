@@ -26,7 +26,7 @@ Gerfaut never touches private keys. This library contains no code to generate ke
 | Repository | Role |
 |---|---|
 | `gerfaut-core` | Core Rust library, this repository |
-| [`gerfaut-mobile`](https://github.com/gerfaut-wallet/gerfaut-mobile) | Mobile app (Flutter, Android and iOS) |
+| [`gerfaut-mobile`](https://github.com/gerfaut-wallet/gerfaut-mobile) | Mobile app (Flutter, Android first) |
 | [`gerfaut-desktop`](https://github.com/gerfaut-wallet/gerfaut-desktop) | Desktop app (Tauri v2, for Windows, macOS, and Linux) |
 | [`gerfaut-web`](https://github.com/gerfaut-wallet/gerfaut-web) | Website, documentation, downloads |
 
