@@ -3,11 +3,13 @@
 
 pub mod meta;
 pub mod snapshot;
+pub mod tx_extras;
 pub mod views;
 
 use serde::{Deserialize, Serialize};
 
 use crate::wallet::snapshot::TxIo;
+use crate::wallet::tx_extras::TxExtras;
 
 /// Chain state of a single watched address, tracked without the BDK
 /// engine (a lone address has no descriptor to derive from). Rebuilt
@@ -46,6 +48,10 @@ pub struct AddressTx {
     pub vsize: u64,
     pub inputs: Vec<TxIo>,
     pub outputs: Vec<TxIo>,
+    /// Deep facts captured at sync time; absent on entries synced by
+    /// older versions until the next refresh.
+    #[serde(default)]
+    pub extras: Option<TxExtras>,
 }
 
 /// One unspent output of a watched address.

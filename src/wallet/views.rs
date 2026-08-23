@@ -11,7 +11,7 @@ use crate::network::Network;
 use crate::wallet::snapshot::{
     AddressEntry, BalanceSnapshot, Keychain, TxDetail, TxIo, TxStatus, TxSummary, UtxoInfo,
 };
-use crate::wallet::{AddressTx, AddressWatchState};
+use crate::wallet::{AddressTx, AddressWatchState, tx_extras};
 
 /// Confirmations of a block at `height` when the tip is `tip`.
 fn confirmations(height: u32, tip: u32) -> u32 {
@@ -114,6 +114,7 @@ pub(crate) fn tx_detail(
                 address: previous.and_then(|p| address_of(&p.script_pubkey, network)),
                 value_sats: previous.map(|p| p.value.to_sat()),
                 is_mine: previous.is_some_and(|p| wallet.is_mine(p.script_pubkey.clone())),
+                ..TxIo::default()
             }
         })
         .collect();
@@ -124,12 +125,20 @@ pub(crate) fn tx_detail(
             address: address_of(&txout.script_pubkey, network),
             value_sats: Some(txout.value.to_sat()),
             is_mine: wallet.is_mine(txout.script_pubkey.clone()),
+            change: matches!(
+                wallet.derivation_of_spk(txout.script_pubkey.clone()),
+                Some((KeychainKind::Internal, _))
+            ),
+            op_return: tx_extras::op_return_of(&txout.script_pubkey),
         })
         .collect();
 
     let (sent, received) = wallet.sent_and_received(&tx);
     let fee_sats = wallet.calculate_fee(&tx).ok().map(|f| f.to_sat());
     let vsize = tx.vsize() as u64;
+    let extras = tx_extras::analyze(&tx, |outpoint| {
+        wallet.tx_graph().get_txout(*outpoint).cloned()
+    });
     Ok(TxDetail {
         summary: TxSummary {
             txid: txid.to_string(),
@@ -145,6 +154,7 @@ pub(crate) fn tx_detail(
         outputs,
         vsize,
         fee_rate_sat_vb: fee_sats.map(|fee| fee as f64 / vsize as f64),
+        extras: Some(extras),
     })
 }
 
@@ -275,6 +285,7 @@ pub(crate) fn address_tx_detail(state: &AddressWatchState, txid: &str) -> CoreRe
             .fee_sats
             .filter(|_| tx.vsize > 0)
             .map(|fee| fee as f64 / tx.vsize as f64),
+        extras: tx.extras.clone(),
     })
 }
 

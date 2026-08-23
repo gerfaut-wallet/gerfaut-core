@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::wallet::meta::WalletMeta;
+use crate::wallet::tx_extras::{OpReturnData, TxExtras};
 
 /// Balance breakdown, in satoshis.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,7 +52,7 @@ pub struct TxSummary {
 }
 
 /// One side entry (input or output) of a transaction detail view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxIo {
     /// Address, when the script has one.
     pub address: Option<String>,
@@ -60,6 +61,12 @@ pub struct TxIo {
     pub value_sats: Option<u64>,
     /// Whether this side belongs to the wallet.
     pub is_mine: bool,
+    /// Output on the wallet's change keychain (descriptor wallets only).
+    #[serde(default)]
+    pub change: bool,
+    /// Decoded OP_RETURN payload, for data-carrying outputs.
+    #[serde(default)]
+    pub op_return: Option<OpReturnData>,
 }
 
 /// Full transaction detail.
@@ -72,6 +79,10 @@ pub struct TxDetail {
     pub vsize: u64,
     /// Fee rate in sat/vB, when the fee is known.
     pub fee_rate_sat_vb: Option<f64>,
+    /// Deep transaction facts; absent only for watched-address entries
+    /// synced by older versions.
+    #[serde(default)]
+    pub extras: Option<TxExtras>,
 }
 
 /// Which derivation chain an address or UTXO belongs to.

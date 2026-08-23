@@ -6,9 +6,11 @@ use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::address::Address;
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
 
+use bdk_wallet::bitcoin::{Amount, OutPoint, TxOut};
+
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
-use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState};
+use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
 
 /// Concurrent requests during scans.
 const PARALLEL_REQUESTS: usize = 4;
@@ -140,12 +142,9 @@ pub(crate) async fn fetch_address_state(
                         address: script_address(&prevout.scriptpubkey, network),
                         value_sats: Some(prevout.value),
                         is_mine: prevout.scriptpubkey == our_script,
+                        ..TxIo::default()
                     },
-                    None => TxIo {
-                        address: None,
-                        value_sats: None,
-                        is_mine: false,
-                    },
+                    None => TxIo::default(),
                 })
                 .collect();
             let outputs = tx
@@ -155,10 +154,30 @@ pub(crate) async fn fetch_address_state(
                     address: script_address(&vout.scriptpubkey, network),
                     value_sats: Some(vout.value),
                     is_mine: vout.scriptpubkey == our_script,
+                    change: false,
+                    op_return: tx_extras::op_return_of(&vout.scriptpubkey),
                 })
                 .collect();
             // A coinbase transaction has no fee; Esplora reports 0.
             let is_coinbase = tx.vin.first().is_some_and(|vin| vin.is_coinbase);
+            // The prevouts Esplora attaches to each input make the deep
+            // analysis (taproot spend, sigops) as accurate as the API is.
+            let prevouts: std::collections::HashMap<OutPoint, TxOut> = tx
+                .vin
+                .iter()
+                .filter_map(|vin| {
+                    vin.prevout.as_ref().map(|p| {
+                        (
+                            OutPoint::new(vin.txid, vin.vout),
+                            TxOut {
+                                value: Amount::from_sat(p.value),
+                                script_pubkey: p.scriptpubkey.clone(),
+                            },
+                        )
+                    })
+                })
+                .collect();
+            let extras = tx_extras::analyze(&tx.to_tx(), |op| prevouts.get(op).cloned());
             AddressTx {
                 txid: tx.txid.to_string(),
                 net_sats: received as i64 - spent as i64,
@@ -168,6 +187,7 @@ pub(crate) async fn fetch_address_state(
                 vsize: tx.weight.div_ceil(4),
                 inputs,
                 outputs,
+                extras: Some(extras),
             }
         })
         .collect();
