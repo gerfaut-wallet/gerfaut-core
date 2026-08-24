@@ -482,6 +482,68 @@ impl WalletManager {
         Err(sync_failure(endpoints, attempts))
     }
 
+    /// Fetches an older round of history for a watched address and
+    /// appends it to the stored list. The balance and the UTXO set
+    /// already cover the whole chain, so only the list grows.
+    ///
+    /// Returns how many transactions were added. Zero means the history
+    /// is exhausted.
+    pub async fn load_more_history(&self, id: &str) -> CoreResult<u32> {
+        let (meta, config, cursor) = {
+            let state = self.state.lock().await;
+            let record = find_record(&state.payload, id)?;
+            let cursor = record
+                .address_state
+                .as_ref()
+                .and_then(|watch| watch.history_cursor.clone());
+            (
+                record.meta.clone(),
+                state.payload.settings.backend_for(record.meta.network),
+                cursor,
+            )
+        };
+        let WalletKind::SingleAddress { address } = &meta.kind else {
+            return Err(CoreError::InvalidInput {
+                kind: "wallet_kind",
+                detail: "descriptor wallets already carry their full history".to_owned(),
+            });
+        };
+        let Some(cursor) = cursor else {
+            return Ok(0);
+        };
+        let endpoints = chain::endpoints(&config, meta.network)?;
+
+        let mut attempts: Vec<String> = Vec::new();
+        for endpoint in &endpoints {
+            match chain::fetch_address_history(endpoint, address, meta.network, &cursor).await {
+                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
+                Ok(round) => {
+                    let mut state = self.state.lock().await;
+                    let record = find_record_mut(&mut state.payload, id)?;
+                    let Some(watch) = record.address_state.as_mut() else {
+                        return Ok(0);
+                    };
+                    let known: std::collections::HashSet<String> =
+                        watch.txs.iter().map(|tx| tx.txid.clone()).collect();
+                    let fresh: Vec<_> = round
+                        .txs
+                        .into_iter()
+                        .filter(|tx| !known.contains(&tx.txid))
+                        .collect();
+                    let added = fresh.len() as u32;
+                    watch.txs.extend(fresh);
+                    watch.history_cursor = round.cursor;
+                    watch.truncated = watch.history_cursor.is_some();
+                    let tx_count = watch.txs.len() as u32;
+                    record.meta.cached.tx_count = tx_count;
+                    state.vault.save(&state.payload)?;
+                    return Ok(added);
+                }
+            }
+        }
+        Err(sync_failure(&endpoints, attempts))
+    }
+
     /// Syncs every wallet of a network (or all of them), sequentially:
     /// public backends are shared infrastructure, not something to
     /// hammer in parallel. One failure does not stop the others.
@@ -788,6 +850,34 @@ mod tests {
             }
         );
         assert_eq!(settings.app_prefs.get("theme").unwrap(), "dark");
+    }
+
+    #[tokio::test]
+    async fn load_more_history_refuses_descriptor_wallets() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input(MULTIPATH).unwrap();
+        let meta = manager
+            .add_wallet("Cold", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        let error = manager.load_more_history(&meta.id).await.unwrap_err();
+        assert!(
+            error.to_string().contains("full history"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_more_history_is_a_no_op_without_a_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx").unwrap();
+        let meta = manager
+            .add_wallet("Watch", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        assert_eq!(manager.load_more_history(&meta.id).await.unwrap(), 0);
     }
 
     #[tokio::test]

@@ -30,6 +30,10 @@ pub struct TxExtras {
     pub is_coinbase: bool,
     /// Mining pool recognized from the coinbase signature script.
     pub coinbase_pool: Option<String>,
+    /// Block height committed in the coinbase input (BIP-34).
+    pub coinbase_height: Option<u32>,
+    /// Printable text left in the coinbase signature script.
+    pub coinbase_tag: Option<String>,
     /// Sigop cost as consensus counts it. Inputs whose previous output
     /// is unknown cannot contribute their P2SH sigops.
     pub sigops: u64,
@@ -44,7 +48,17 @@ pub struct OpReturnData {
     pub hex: String,
     /// The payload as text, when it is printable UTF-8.
     pub text: Option<String>,
+    /// Name of a recognized protocol payload, when the prefix says so.
+    pub label: Option<String>,
 }
+
+/// Recognized OP_RETURN payload prefixes, matched on the hex payload.
+const OP_RETURN_TAGS: &[(&str, &str)] = &[
+    ("aa21a9ed", "Witness commitment"),
+    ("52534b424c4f434b3a", "RSK merge mining"),
+    ("6f6d6e69", "Omni Layer"),
+    ("444f4350524f4f46", "Proof of existence"),
+];
 
 /// Recognizable coinbase tags of the major pools, matched
 /// case-insensitively against the coinbase signature script.
@@ -73,13 +87,12 @@ const POOL_TAGS: &[(&str, &str)] = &[
 /// with the spent output when the wallet knows it.
 pub fn analyze(tx: &Transaction, mut prevout: impl FnMut(&OutPoint) -> Option<TxOut>) -> TxExtras {
     let is_coinbase = tx.is_coinbase();
-    let coinbase_pool = if is_coinbase {
-        tx.input
-            .first()
-            .and_then(|vin| pool_of(vin.script_sig.as_bytes()))
-    } else {
-        None
-    };
+    let coinbase_sig = is_coinbase
+        .then(|| tx.input.first().map(|vin| vin.script_sig.as_bytes()))
+        .flatten();
+    let coinbase_pool = coinbase_sig.and_then(pool_of);
+    let coinbase_height = coinbase_sig.and_then(bip34_height);
+    let coinbase_tag = coinbase_sig.and_then(printable_run);
     let taproot = tx
         .input
         .iter()
@@ -95,6 +108,8 @@ pub fn analyze(tx: &Transaction, mut prevout: impl FnMut(&OutPoint) -> Option<Tx
         taproot,
         is_coinbase,
         coinbase_pool,
+        coinbase_height,
+        coinbase_tag,
         sigops: tx.total_sigop_cost(|outpoint: &OutPoint| prevout(outpoint)) as u64,
         raw_hex: serialize_hex(tx),
     }
@@ -105,19 +120,70 @@ pub fn op_return_of(script: &Script) -> Option<OpReturnData> {
     if !script.is_op_return() {
         return None;
     }
+    // Concatenate the data pushes. A payload that does not parse as
+    // script (arbitrary bytes happen) falls back to everything after
+    // the OP_RETURN opcode, which is what explorers show.
     let mut bytes: Vec<u8> = Vec::new();
-    for instruction in script.instructions().flatten() {
-        if let Instruction::PushBytes(push) = instruction {
-            bytes.extend_from_slice(push.as_bytes());
+    let mut parsed = true;
+    for instruction in script.instructions() {
+        match instruction {
+            Ok(Instruction::PushBytes(push)) => bytes.extend_from_slice(push.as_bytes()),
+            Ok(Instruction::Op(_)) => {}
+            Err(_) => {
+                parsed = false;
+                break;
+            }
         }
     }
-    let text = String::from_utf8(bytes.clone())
-        .ok()
-        .filter(|s| !s.is_empty() && s.chars().all(|c| !c.is_control()));
-    Some(OpReturnData {
-        hex: bytes.to_lower_hex_string(),
-        text,
-    })
+    if !parsed || bytes.is_empty() {
+        bytes = script.as_bytes().get(1..).unwrap_or_default().to_vec();
+    }
+    let hex = bytes.to_lower_hex_string();
+    let label = OP_RETURN_TAGS
+        .iter()
+        .find(|(prefix, _)| hex.starts_with(prefix))
+        .map(|(_, name)| (*name).to_owned());
+    let text = String::from_utf8(bytes.clone()).ok().filter(|s| {
+        s.chars().count() >= 2
+            && s.chars().all(|c| !c.is_control())
+            && s.chars().any(|c| c.is_alphanumeric())
+    });
+    Some(OpReturnData { hex, text, label })
+}
+
+/// Block height committed at the start of a coinbase script (BIP-34).
+fn bip34_height(script_sig: &[u8]) -> Option<u32> {
+    let len = *script_sig.first()? as usize;
+    if len == 0 || len > 4 || script_sig.len() < 1 + len {
+        return None;
+    }
+    let mut height = 0u32;
+    for (index, byte) in script_sig[1..=len].iter().enumerate() {
+        height |= u32::from(*byte) << (8 * index);
+    }
+    Some(height)
+}
+
+/// Longest printable run left in a coinbase script: the miner's tag.
+fn printable_run(script_sig: &[u8]) -> Option<String> {
+    let mut best = String::new();
+    let mut current = String::new();
+    for &byte in script_sig {
+        if byte.is_ascii_graphic() || byte == b' ' {
+            current.push(byte as char);
+        } else {
+            if current.chars().count() > best.chars().count() {
+                best = current.clone();
+            }
+            current.clear();
+        }
+    }
+    if current.chars().count() > best.chars().count() {
+        best = current;
+    }
+    let trimmed = best.trim();
+    (trimmed.chars().count() >= 4 && trimmed.chars().any(|c| c.is_alphanumeric()))
+        .then(|| trimmed.to_owned())
 }
 
 /// Pool name recognized in a coinbase signature script, if any.
@@ -231,11 +297,61 @@ mod tests {
     }
 
     #[test]
-    fn pool_recognition_from_coinbase_tag() {
+    fn coinbase_height_and_tag_are_decoded() {
+        // Push of 3 bytes: 0x02446d little endian, then a miner tag.
+        let mut script_sig = vec![0x03, 0x6d, 0x44, 0x02];
+        script_sig.push(0);
+        script_sig.extend_from_slice(b"/Foundry USA Pool #dropgold/");
+        script_sig.push(255);
+        let mut coinbase = plain_input(0);
+        coinbase.previous_output = OutPoint::null();
+        coinbase.script_sig = ScriptBuf::from_bytes(script_sig);
+        let extras = analyze(&tx_with(vec![coinbase], vec![]), |_| None);
+        assert_eq!(extras.coinbase_height, Some(148_589));
         assert_eq!(
-            pool_of(b"\x03\x89\xa2\x0c/Foundry USA Pool #dropgold/"),
-            Some("Foundry USA".to_owned()),
+            extras.coinbase_tag.as_deref(),
+            Some("/Foundry USA Pool #dropgold/")
         );
+        assert_eq!(extras.coinbase_pool.as_deref(), Some("Foundry USA"));
+    }
+
+    #[test]
+    fn non_coinbase_has_no_coinbase_fields() {
+        let extras = analyze(&tx_with(vec![plain_input(0xFFFF_FFFF)], vec![]), |_| None);
+        assert_eq!(extras.coinbase_height, None);
+        assert_eq!(extras.coinbase_tag, None);
+        assert_eq!(extras.coinbase_pool, None);
+    }
+
+    #[test]
+    fn witness_commitment_is_labeled() {
+        let mut payload = vec![0xaa, 0x21, 0xa9, 0xed];
+        payload.extend_from_slice(&[9u8; 32]);
+        let script = Builder::new()
+            .push_opcode(OP_RETURN)
+            .push_slice::<&bdk_wallet::bitcoin::script::PushBytes>(
+                payload.as_slice().try_into().expect("push"),
+            )
+            .into_script();
+        let data = op_return_of(&script).expect("op_return");
+        assert_eq!(data.label.as_deref(), Some("Witness commitment"));
+        assert_eq!(data.text, None, "binary commitment is not text");
+    }
+
+    #[test]
+    fn bare_op_return_yields_an_empty_payload() {
+        let script = Builder::new().push_opcode(OP_RETURN).into_script();
+        let data = op_return_of(&script).expect("op_return");
+        assert_eq!(data.hex, "");
+        assert_eq!(data.text, None);
+        assert_eq!(data.label, None);
+    }
+
+    #[test]
+    fn pool_recognition_from_coinbase_tag() {
+        let mut sig = vec![0x03u8, 0x89, 0xa2, 0x0c];
+        sig.extend_from_slice(b"/Foundry USA Pool #dropgold/");
+        assert_eq!(pool_of(&sig), Some("Foundry USA".to_owned()));
         assert_eq!(pool_of(b"/F2Pool/mined"), Some("F2Pool".to_owned()));
         assert_eq!(pool_of(b"nothing recognizable"), None);
     }

@@ -6,7 +6,7 @@ use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::address::Address;
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
 
-use bdk_wallet::bitcoin::{Amount, OutPoint, TxOut};
+use bdk_wallet::bitcoin::{Amount, OutPoint, TxOut, Txid};
 
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
@@ -14,8 +14,10 @@ use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
 
 /// Concurrent requests during scans.
 const PARALLEL_REQUESTS: usize = 4;
-/// Hard cap on fetched address history pages (25 confirmed txs each).
-const MAX_HISTORY_PAGES: usize = 20;
+/// Address history pages fetched per request round (25 confirmed txs
+/// each). A sync stays fast; anything older is fetched on demand by
+/// [`fetch_address_history`], so nothing stays out of reach.
+pub(crate) const HISTORY_PAGES_PER_ROUND: usize = 40;
 
 /// Socket timeout, seconds. Bounded so that an unreachable instance
 /// fails fast and the caller's fallback to the next endpoint actually
@@ -52,17 +54,22 @@ pub(crate) async fn sync(
     client.sync(request, PARALLEL_REQUESTS).await
 }
 
+/// One round of address history: the transactions fetched and, when
+/// older ones remain, the cursor to continue from.
+pub(crate) struct HistoryRound {
+    pub txs: Vec<AddressTx>,
+    /// Txid to pass as `from` to fetch the next round; `None` when the
+    /// history is exhausted.
+    pub cursor: Option<String>,
+}
+
 /// Fetches the complete state of a single watched address.
 pub(crate) async fn fetch_address_state(
     client: &AsyncClient,
     address: &str,
     network: Network,
 ) -> Result<AddressWatchState, String> {
-    let address: Address = address
-        .parse::<Address<_>>()
-        .map_err(|e| format!("invalid address: {e}"))?
-        .require_network(network.to_bitcoin())
-        .map_err(|e| format!("address/network mismatch: {e}"))?;
+    let address = parse_address(address, network)?;
     let our_script = address.script_pubkey();
 
     let tip_height = client.get_height().await.map_err(|e| e.to_string())?;
@@ -71,38 +78,15 @@ pub(crate) async fn fetch_address_state(
         .await
         .map_err(|e| e.to_string())?;
 
-    // First page: mempool transactions plus the newest confirmed ones.
-    let mut raw_txs = client
-        .get_address_txs(&address, None)
-        .await
-        .map_err(|e| e.to_string())?;
-    let confirmed_total = stats.chain_stats.tx_count as usize;
-    let mut truncated = false;
-    for _ in 0..MAX_HISTORY_PAGES {
-        let confirmed_fetched = raw_txs.iter().filter(|t| t.status.confirmed).count();
-        if confirmed_fetched >= confirmed_total {
-            break;
-        }
-        let Some(last_seen) = raw_txs
-            .iter()
-            .rev()
-            .find(|t| t.status.confirmed)
-            .map(|t| t.txid)
-        else {
-            break;
-        };
-        let page = client
-            .get_address_txs(&address, Some(last_seen))
-            .await
-            .map_err(|e| e.to_string())?;
-        if page.is_empty() {
-            break;
-        }
-        raw_txs.extend(page);
-    }
-    if raw_txs.iter().filter(|t| t.status.confirmed).count() < confirmed_total {
-        truncated = true;
-    }
+    let round = history_round(
+        client,
+        &address,
+        &our_script,
+        network,
+        None,
+        Some(stats.chain_stats.tx_count as usize),
+    )
+    .await?;
 
     let utxos = client
         .get_address_utxos(&address)
@@ -118,88 +102,170 @@ pub(crate) async fn fetch_address_state(
         })
         .collect();
 
-    let txs = raw_txs
-        .into_iter()
-        .map(|tx| {
-            let received: u64 = tx
-                .vout
-                .iter()
-                .filter(|v| v.scriptpubkey == our_script)
-                .map(|v| v.value)
-                .sum();
-            let spent: u64 = tx
-                .vin
-                .iter()
-                .filter_map(|v| v.prevout.as_ref())
-                .filter(|p| p.scriptpubkey == our_script)
-                .map(|p| p.value)
-                .sum();
-            let inputs = tx
-                .vin
-                .iter()
-                .map(|vin| match &vin.prevout {
-                    Some(prevout) => TxIo {
-                        address: script_address(&prevout.scriptpubkey, network),
-                        value_sats: Some(prevout.value),
-                        is_mine: prevout.scriptpubkey == our_script,
-                        ..TxIo::default()
-                    },
-                    None => TxIo::default(),
-                })
-                .collect();
-            let outputs = tx
-                .vout
-                .iter()
-                .map(|vout| TxIo {
-                    address: script_address(&vout.scriptpubkey, network),
-                    value_sats: Some(vout.value),
-                    is_mine: vout.scriptpubkey == our_script,
-                    change: false,
-                    op_return: tx_extras::op_return_of(&vout.scriptpubkey),
-                })
-                .collect();
-            // A coinbase transaction has no fee; Esplora reports 0.
-            let is_coinbase = tx.vin.first().is_some_and(|vin| vin.is_coinbase);
-            // The prevouts Esplora attaches to each input make the deep
-            // analysis (taproot spend, sigops) as accurate as the API is.
-            let prevouts: std::collections::HashMap<OutPoint, TxOut> = tx
-                .vin
-                .iter()
-                .filter_map(|vin| {
-                    vin.prevout.as_ref().map(|p| {
-                        (
-                            OutPoint::new(vin.txid, vin.vout),
-                            TxOut {
-                                value: Amount::from_sat(p.value),
-                                script_pubkey: p.scriptpubkey.clone(),
-                            },
-                        )
-                    })
-                })
-                .collect();
-            let extras = tx_extras::analyze(&tx.to_tx(), |op| prevouts.get(op).cloned());
-            AddressTx {
-                txid: tx.txid.to_string(),
-                net_sats: received as i64 - spent as i64,
-                fee_sats: (!is_coinbase).then_some(tx.fee),
-                height: tx.status.block_height,
-                timestamp: tx.status.block_time,
-                vsize: tx.weight.div_ceil(4),
-                inputs,
-                outputs,
-                extras: Some(extras),
-            }
-        })
-        .collect();
-
     Ok(AddressWatchState {
-        txs,
+        txs: round.txs,
         utxos,
         tip_height,
         funded_sats: stats.chain_stats.funded_txo_sum + stats.mempool_stats.funded_txo_sum,
         spent_sats: stats.chain_stats.spent_txo_sum + stats.mempool_stats.spent_txo_sum,
-        truncated,
+        truncated: round.cursor.is_some(),
+        history_cursor: round.cursor,
     })
+}
+
+/// Fetches the next round of older transactions, continuing after
+/// `from`. Used by "load older transactions": the balance and the UTXO
+/// set already cover the full history, only the list grows.
+pub(crate) async fn fetch_address_history(
+    client: &AsyncClient,
+    address: &str,
+    network: Network,
+    from: &str,
+) -> Result<HistoryRound, String> {
+    let address = parse_address(address, network)?;
+    let our_script = address.script_pubkey();
+    let from: Txid = from
+        .parse()
+        .map_err(|_| format!("invalid history cursor: {from}"))?;
+    history_round(client, &address, &our_script, network, Some(from), None).await
+}
+
+fn parse_address(address: &str, network: Network) -> Result<Address, String> {
+    address
+        .parse::<Address<_>>()
+        .map_err(|e| format!("invalid address: {e}"))?
+        .require_network(network.to_bitcoin())
+        .map_err(|e| format!("address/network mismatch: {e}"))
+}
+
+/// Pages through the address history from `from` (newest first when
+/// `None`), at most [`HISTORY_PAGES_PER_ROUND`] pages.
+async fn history_round(
+    client: &AsyncClient,
+    address: &Address,
+    our_script: &bdk_wallet::bitcoin::ScriptBuf,
+    network: Network,
+    from: Option<Txid>,
+    confirmed_total: Option<usize>,
+) -> Result<HistoryRound, String> {
+    let mut raw_txs = client
+        .get_address_txs(address, from)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut cursor: Option<String> = None;
+    let mut pages = 1usize;
+    loop {
+        // The whole history is in hand: `confirmed_total` counts it from
+        // the address stats, so no probing request is needed.
+        if let Some(total) = confirmed_total
+            && raw_txs.iter().filter(|t| t.status.confirmed).count() >= total
+        {
+            break;
+        }
+        let Some(last_seen) = raw_txs
+            .iter()
+            .rev()
+            .find(|t| t.status.confirmed)
+            .map(|t| t.txid)
+        else {
+            break;
+        };
+        if pages >= HISTORY_PAGES_PER_ROUND {
+            cursor = Some(last_seen.to_string());
+            break;
+        }
+        let page = client
+            .get_address_txs(address, Some(last_seen))
+            .await
+            .map_err(|e| e.to_string())?;
+        pages += 1;
+        if page.is_empty() {
+            break;
+        }
+        raw_txs.extend(page);
+    }
+
+    let txs = raw_txs
+        .into_iter()
+        .map(|tx| to_address_tx(tx, our_script, network))
+        .collect();
+    Ok(HistoryRound { txs, cursor })
+}
+
+/// One esplora transaction as seen from the watched address.
+fn to_address_tx(
+    tx: esplora_client::api::Tx,
+    our_script: &bdk_wallet::bitcoin::ScriptBuf,
+    network: Network,
+) -> AddressTx {
+    let received: u64 = tx
+        .vout
+        .iter()
+        .filter(|v| v.scriptpubkey == *our_script)
+        .map(|v| v.value)
+        .sum();
+    let spent: u64 = tx
+        .vin
+        .iter()
+        .filter_map(|v| v.prevout.as_ref())
+        .filter(|p| p.scriptpubkey == *our_script)
+        .map(|p| p.value)
+        .sum();
+    let inputs = tx
+        .vin
+        .iter()
+        .map(|vin| match &vin.prevout {
+            Some(prevout) => TxIo {
+                address: script_address(&prevout.scriptpubkey, network),
+                value_sats: Some(prevout.value),
+                is_mine: prevout.scriptpubkey == *our_script,
+                ..TxIo::default()
+            },
+            None => TxIo::default(),
+        })
+        .collect();
+    let outputs = tx
+        .vout
+        .iter()
+        .map(|vout| TxIo {
+            address: script_address(&vout.scriptpubkey, network),
+            value_sats: Some(vout.value),
+            is_mine: vout.scriptpubkey == *our_script,
+            change: false,
+            op_return: tx_extras::op_return_of(&vout.scriptpubkey),
+        })
+        .collect();
+    // A coinbase transaction has no fee; Esplora reports 0.
+    let is_coinbase = tx.vin.first().is_some_and(|vin| vin.is_coinbase);
+    // The prevouts Esplora attaches to each input make the deep
+    // analysis (taproot spend, sigops) as accurate as the API is.
+    let prevouts: std::collections::HashMap<OutPoint, TxOut> = tx
+        .vin
+        .iter()
+        .filter_map(|vin| {
+            vin.prevout.as_ref().map(|p| {
+                (
+                    OutPoint::new(vin.txid, vin.vout),
+                    TxOut {
+                        value: Amount::from_sat(p.value),
+                        script_pubkey: p.scriptpubkey.clone(),
+                    },
+                )
+            })
+        })
+        .collect();
+    let extras = tx_extras::analyze(&tx.to_tx(), |op| prevouts.get(op).cloned());
+    AddressTx {
+        txid: tx.txid.to_string(),
+        net_sats: received as i64 - spent as i64,
+        fee_sats: (!is_coinbase).then_some(tx.fee),
+        height: tx.status.block_height,
+        timestamp: tx.status.block_time,
+        vsize: tx.weight.div_ceil(4),
+        inputs,
+        outputs,
+        extras: Some(extras),
+    }
 }
 
 fn script_address(script: &bdk_wallet::bitcoin::ScriptBuf, network: Network) -> Option<String> {

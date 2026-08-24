@@ -179,6 +179,23 @@ pub(crate) async fn fetch_address_state(
     }
 }
 
+/// Fetches an older round of address history from one endpoint.
+pub(crate) async fn fetch_address_history(
+    endpoint: &Endpoint,
+    address: &str,
+    network: Network,
+    from: &str,
+) -> Result<esplora::HistoryRound, String> {
+    match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            esplora::fetch_address_history(&client, address, network, from).await
+        }
+        Endpoint::Electrum(_) => Err("single-address wallets need an Esplora backend for now;              switch the backend or import a descriptor"
+            .to_owned()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

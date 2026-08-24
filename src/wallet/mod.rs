@@ -33,6 +33,10 @@ pub struct AddressWatchState {
     /// the totals above remain exact (they come from backend stats).
     #[serde(default)]
     pub truncated: bool,
+    /// Txid to continue the history from, when older transactions
+    /// remain to be fetched on demand.
+    #[serde(default)]
+    pub history_cursor: Option<String>,
 }
 
 /// One transaction as seen from a watched address.

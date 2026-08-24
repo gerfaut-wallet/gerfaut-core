@@ -125,9 +125,10 @@ pub struct WalletSnapshot {
     pub txs: Vec<TxSummary>,
     /// Chain tip height at the last sync; 0 before the first sync.
     pub tip_height: u32,
-    /// True when the transaction list is incomplete (a watched address
-    /// with more history than one sync fetches). The balance stays
-    /// exact; the UI must say the list is partial.
+    /// True when older transactions remain to be fetched (a watched
+    /// address with more history than one sync round covers). The
+    /// balance stays exact; the UI offers to load the rest, which calls
+    /// [`crate::manager::WalletManager::load_more_history`].
     #[serde(default)]
     pub truncated: bool,
 }
