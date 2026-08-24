@@ -21,6 +21,7 @@ use crate::store::{Settings, Vault, VaultKey, VaultPayload, WalletRecord};
 use crate::wallet::meta::{CachedTotals, DEFAULT_GAP_LIMIT, SyncStamp, WalletKind, WalletMeta};
 use crate::wallet::snapshot::{AddressEntry, SyncReport, TxDetail, UtxoInfo, WalletSnapshot};
 use crate::wallet::views;
+use crate::wallet::{AddressTx, AddressWatchState};
 
 /// Vault file name inside the data directory.
 const VAULT_FILE: &str = "gerfaut.vault";
@@ -455,7 +456,7 @@ impl WalletManager {
         for endpoint in endpoints {
             match chain::fetch_address_state(endpoint, address, meta.network).await {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
-                Ok(watch) => {
+                Ok(mut watch) => {
                     let mut state = self.state.lock().await;
                     let tx_count_before = {
                         let record = find_record(&state.payload, &meta.id)?;
@@ -464,6 +465,15 @@ impl WalletManager {
                             .as_ref()
                             .map_or(0, |s| s.txs.len() as u32)
                     };
+                    // A sync fetches the newest round only. Keep the older
+                    // rounds the user already loaded, otherwise every sync
+                    // would silently undo "load older transactions".
+                    if let Some(previous) = find_record(&state.payload, &meta.id)?
+                        .address_state
+                        .as_ref()
+                    {
+                        keep_older_history(&mut watch, previous);
+                    }
                     let tx_count_after = watch.txs.len() as u32;
                     let report = SyncReport {
                         wallet_id: meta.id.clone(),
@@ -586,6 +596,35 @@ fn config_label(endpoints: &[Endpoint]) -> String {
         .first()
         .map(|e| e.label())
         .unwrap_or_else(|| "backend".to_owned())
+}
+
+/// Carries the deep history of `previous` over to a freshly synced
+/// `watch`, which only holds the newest round.
+///
+/// Only transactions confirmed strictly below the fresh round's oldest
+/// block are kept: that part of the chain is settled, while anything
+/// inside the fresh window is authoritative in `watch` (a replacement or
+/// a reorg must not be resurrected).
+fn keep_older_history(watch: &mut AddressWatchState, previous: &AddressWatchState) {
+    let Some(oldest_fresh) = watch.txs.iter().filter_map(|tx| tx.height).min() else {
+        return;
+    };
+    let known: std::collections::HashSet<&str> =
+        watch.txs.iter().map(|tx| tx.txid.as_str()).collect();
+    let older: Vec<AddressTx> = previous
+        .txs
+        .iter()
+        .filter(|tx| tx.height.is_some_and(|height| height < oldest_fresh))
+        .filter(|tx| !known.contains(tx.txid.as_str()))
+        .cloned()
+        .collect();
+    if older.is_empty() {
+        return;
+    }
+    watch.txs.extend(older);
+    // The deeper cursor wins: the list now reaches at least that far.
+    watch.history_cursor = previous.history_cursor.clone();
+    watch.truncated = watch.history_cursor.is_some();
 }
 
 fn find_record<'a>(payload: &'a VaultPayload, id: &str) -> CoreResult<&'a WalletRecord> {
@@ -850,6 +889,77 @@ mod tests {
             }
         );
         assert_eq!(settings.app_prefs.get("theme").unwrap(), "dark");
+    }
+
+    #[test]
+    fn deep_history_survives_a_sync() {
+        let tx = |txid: &str, height: Option<u32>| AddressTx {
+            txid: txid.to_owned(),
+            net_sats: 0,
+            fee_sats: None,
+            height,
+            timestamp: None,
+            vsize: 100,
+            inputs: vec![],
+            outputs: vec![],
+            extras: None,
+        };
+        // The user had loaded two rounds; a sync only refetches the newest.
+        let previous = AddressWatchState {
+            txs: vec![
+                tx("aa", Some(900)),
+                tx("bb", Some(500)),
+                tx("cc", Some(100)),
+            ],
+            history_cursor: Some("cc".to_owned()),
+            truncated: true,
+            ..Default::default()
+        };
+        let mut fresh = AddressWatchState {
+            txs: vec![tx("new", None), tx("aa", Some(900))],
+            history_cursor: Some("aa".to_owned()),
+            truncated: true,
+            ..Default::default()
+        };
+        keep_older_history(&mut fresh, &previous);
+        let ids: Vec<&str> = fresh.txs.iter().map(|t| t.txid.as_str()).collect();
+        assert_eq!(ids, vec!["new", "aa", "bb", "cc"], "older rounds are kept");
+        assert_eq!(
+            fresh.history_cursor.as_deref(),
+            Some("cc"),
+            "the deeper cursor wins"
+        );
+    }
+
+    #[test]
+    fn a_replaced_transaction_is_not_resurrected() {
+        let tx = |txid: &str, height: Option<u32>| AddressTx {
+            txid: txid.to_owned(),
+            net_sats: 0,
+            fee_sats: None,
+            height,
+            timestamp: None,
+            vsize: 100,
+            inputs: vec![],
+            outputs: vec![],
+            extras: None,
+        };
+        // "gone" sat inside the fresh window and vanished from the chain.
+        let previous = AddressWatchState {
+            txs: vec![tx("gone", Some(950)), tx("old", Some(10))],
+            ..Default::default()
+        };
+        let mut fresh = AddressWatchState {
+            txs: vec![tx("kept", Some(900))],
+            ..Default::default()
+        };
+        keep_older_history(&mut fresh, &previous);
+        let ids: Vec<&str> = fresh.txs.iter().map(|t| t.txid.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["kept", "old"],
+            "only settled history is carried over"
+        );
     }
 
     #[tokio::test]
