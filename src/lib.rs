@@ -10,6 +10,8 @@
 
 pub mod chain;
 pub mod error;
+pub mod export;
+pub mod fees;
 pub mod format;
 pub mod input;
 pub mod manager;

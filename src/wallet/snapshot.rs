@@ -106,6 +106,28 @@ pub struct UtxoInfo {
     pub derivation_index: Option<u32>,
 }
 
+/// One row of the address audit list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddressRow {
+    pub index: u32,
+    pub address: String,
+    /// Whether the chain has seen this address used.
+    pub used: bool,
+    /// Sum of the unspent outputs currently on this address.
+    pub balance_sats: u64,
+}
+
+/// Revealed addresses of a wallet, by keychain, capped in size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddressList {
+    pub external: Vec<AddressRow>,
+    /// Change addresses; empty when none were revealed (or for wallets
+    /// without a change descriptor).
+    pub internal: Vec<AddressRow>,
+    /// True when a keychain had more rows than the cap.
+    pub truncated: bool,
+}
+
 /// One receive address row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddressEntry {

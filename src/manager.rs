@@ -15,11 +15,14 @@ use tokio::sync::Mutex;
 
 use crate::chain::{self, BackendConfig, Endpoint, EngineRequest, EngineResponse};
 use crate::error::{CoreError, CoreResult};
+use crate::export::{ExportOptions, ExportResult};
 use crate::input::{ParsedInput, ParsedPayload};
 use crate::network::Network;
 use crate::store::{Settings, Vault, VaultKey, VaultPayload, WalletRecord};
 use crate::wallet::meta::{CachedTotals, SyncStamp, WalletKind, WalletMeta};
-use crate::wallet::snapshot::{AddressEntry, SyncReport, TxDetail, UtxoInfo, WalletSnapshot};
+use crate::wallet::snapshot::{
+    AddressEntry, AddressList, SyncReport, TxDetail, UtxoInfo, WalletSnapshot,
+};
 use crate::wallet::views;
 use crate::wallet::{AddressTx, AddressWatchState};
 
@@ -364,6 +367,60 @@ impl WalletManager {
                 derivation: None,
             }]),
         }
+    }
+
+    /// Revealed addresses of a wallet, by keychain, with usage and the
+    /// balance on each. Capped: an audit view, not an infinite scroll.
+    pub async fn address_list(&self, id: &str) -> CoreResult<AddressList> {
+        let mut state = self.state.lock().await;
+        let record = find_record(&state.payload, id)?.clone();
+        match &record.meta.kind {
+            WalletKind::Descriptors { .. } => {
+                let engine = ensure_engine(&mut state, id)?;
+                let list = views::address_list(engine);
+                // Revealing may stage a change set; persist it.
+                let staged = engine.take_staged();
+                if let Some(staged) = staged {
+                    merge_changeset(&mut state, id, staged)?;
+                    let state = &mut *state;
+                    state.vault.save(&state.payload)?;
+                }
+                Ok(list)
+            }
+            WalletKind::SingleAddress { address } => {
+                let (used, balance_sats) = record
+                    .address_state
+                    .as_ref()
+                    .map(|s| {
+                        (
+                            !s.txs.is_empty(),
+                            s.utxos.iter().map(|u| u.value_sats).sum(),
+                        )
+                    })
+                    .unwrap_or((false, 0));
+                Ok(AddressList {
+                    external: vec![crate::wallet::snapshot::AddressRow {
+                        index: 0,
+                        address: address.clone(),
+                        used,
+                        balance_sats,
+                    }],
+                    internal: Vec::new(),
+                    truncated: false,
+                })
+            }
+        }
+    }
+
+    /// Builds a CSV export of one wallet's transactions: exactly the
+    /// rows the screens show, filtered. Everything stays local.
+    pub async fn export_transactions(
+        &self,
+        id: &str,
+        options: &ExportOptions,
+    ) -> CoreResult<ExportResult> {
+        let snapshot = self.wallet_snapshot(id).await?;
+        Ok(crate::export::transactions_csv(&snapshot.txs, options))
     }
 
     // --- sync ----------------------------------------------------------
@@ -829,6 +886,41 @@ mod tests {
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         let again = manager.receive_addresses(&meta.id, 2).await.unwrap();
         assert_eq!(again[0].address, entries[0].address);
+    }
+
+    #[tokio::test]
+    async fn address_list_and_export_read_the_same_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input(MULTIPATH).unwrap();
+        let meta = manager
+            .add_wallet("Signet cold", &parsed, Network::Signet)
+            .await
+            .unwrap();
+
+        // Fresh wallet: one revealed external address, no change yet.
+        let list = manager.address_list(&meta.id).await.unwrap();
+        assert_eq!(list.external.len(), 1);
+        assert_eq!(list.external[0].index, 0);
+        assert!(!list.external[0].used);
+        assert_eq!(list.external[0].balance_sats, 0);
+        assert!(list.internal.is_empty());
+        assert!(!list.truncated);
+
+        // Peeking receive addresses reveals further external rows.
+        let _ = manager.receive_addresses(&meta.id, 0).await.unwrap();
+        let again = manager.address_list(&meta.id).await.unwrap();
+        assert!(!again.external.is_empty());
+        assert_eq!(again.external[0].address, list.external[0].address);
+
+        // An empty wallet exports a header and nothing else.
+        let export = manager
+            .export_transactions(&meta.id, &crate::export::ExportOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(export.rows, 0);
+        assert!(export.csv.starts_with("txid,date_utc,"));
+        assert_eq!(export.csv.lines().count(), 1);
     }
 
     #[tokio::test]

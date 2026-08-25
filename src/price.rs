@@ -122,7 +122,7 @@ pub struct PriceQuote {
     pub at: u64,
 }
 
-fn http_client() -> CoreResult<reqwest::Client> {
+pub(crate) fn http_client() -> CoreResult<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .user_agent("gerfaut")
@@ -130,7 +130,7 @@ fn http_client() -> CoreResult<reqwest::Client> {
         .map_err(|e| CoreError::Internal(format!("http client: {e}")))
 }
 
-async fn get_json(url: &str) -> CoreResult<serde_json::Value> {
+pub(crate) async fn get_json(url: &str) -> CoreResult<serde_json::Value> {
     let response = http_client()?
         .get(url)
         .send()

@@ -9,7 +9,8 @@ use bdk_wallet::chain::ChainPosition;
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
 use crate::wallet::snapshot::{
-    AddressEntry, BalanceSnapshot, Keychain, TxDetail, TxIo, TxStatus, TxSummary, UtxoInfo,
+    AddressEntry, AddressList, AddressRow, BalanceSnapshot, Keychain, TxDetail, TxIo, TxStatus,
+    TxSummary, UtxoInfo,
 };
 use crate::wallet::{AddressTx, AddressWatchState, tx_extras};
 
@@ -178,6 +179,54 @@ pub(crate) fn utxos(wallet: &bdk_wallet::Wallet, network: Network) -> Vec<UtxoIn
     let _ = tip; // confirmations live in `status`; tip kept for future use
     utxos.sort_by_key(|utxo| std::cmp::Reverse(utxo.value_sats));
     utxos
+}
+
+/// Rows shown per keychain on the address page before truncation: an
+/// audit view, not an infinite scroll.
+pub(crate) const ADDRESS_LIST_CAP: usize = 200;
+
+/// Revealed addresses of both keychains, ascending, with usage and the
+/// balance currently sitting on each. Reveals the first external
+/// address if nothing is revealed yet: the caller must persist the
+/// staged change set afterwards.
+pub(crate) fn address_list(wallet: &mut bdk_wallet::Wallet) -> AddressList {
+    // Balance per (keychain, index) from the unspent set.
+    let mut balances: std::collections::HashMap<(KeychainKind, u32), u64> =
+        std::collections::HashMap::new();
+    for output in wallet.list_unspent() {
+        *balances
+            .entry((output.keychain, output.derivation_index))
+            .or_default() += output.txout.value.to_sat();
+    }
+
+    // Guarantee at least one visible external address.
+    let _ = wallet.next_unused_address(KeychainKind::External);
+
+    let mut truncated = false;
+    let mut rows = |keychain: KeychainKind| -> Vec<AddressRow> {
+        let Some(last) = wallet.derivation_index(keychain) else {
+            return Vec::new();
+        };
+        let count = last as usize + 1;
+        if count > ADDRESS_LIST_CAP {
+            truncated = true;
+        }
+        (0..count.min(ADDRESS_LIST_CAP) as u32)
+            .map(|index| AddressRow {
+                index,
+                address: wallet.peek_address(keychain, index).address.to_string(),
+                used: wallet.spk_index().is_used(keychain, index),
+                balance_sats: balances.get(&(keychain, index)).copied().unwrap_or(0),
+            })
+            .collect()
+    };
+    let external = rows(KeychainKind::External);
+    let internal = rows(KeychainKind::Internal);
+    AddressList {
+        external,
+        internal,
+        truncated,
+    }
 }
 
 /// The next unused receive address plus `lookahead` upcoming ones.
