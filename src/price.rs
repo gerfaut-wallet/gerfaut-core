@@ -41,7 +41,10 @@ impl PriceSource {
             PriceSource::Kraken => true,
             PriceSource::Coingecko => range != PriceRange::Max,
             PriceSource::MempoolSpace => {
-                matches!(range, PriceRange::Month | PriceRange::Year | PriceRange::Max)
+                matches!(
+                    range,
+                    PriceRange::Month | PriceRange::Year | PriceRange::Max
+                )
             }
         }
     }
@@ -360,9 +363,7 @@ fn thin_series(points: Vec<PricePoint>, max: usize) -> Vec<PricePoint> {
         return points;
     }
     let last = points.len() - 1;
-    let mut thinned: Vec<PricePoint> = (0..max - 1)
-        .map(|i| points[i * last / (max - 1)])
-        .collect();
+    let mut thinned: Vec<PricePoint> = (0..max - 1).map(|i| points[i * last / (max - 1)]).collect();
     thinned.push(points[last]);
     thinned
 }

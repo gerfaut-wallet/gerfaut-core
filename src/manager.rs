@@ -380,7 +380,10 @@ impl WalletManager {
             let mut meta = record.meta.clone();
             // The effective gap limit is the global setting.
             meta.gap_limit = state.payload.settings.gap_limit;
-            (meta, state.payload.settings.backend_for(record.meta.network))
+            (
+                meta,
+                state.payload.settings.backend_for(record.meta.network),
+            )
         };
         let mut endpoints = chain::endpoints(&config, meta.network)?;
         // Try the backend that answered last time first: on networks
@@ -845,7 +848,12 @@ mod tests {
         assert_eq!(manager.settings().await.gap_limit, 50);
         assert_eq!(manager.list_wallets(None).await[0].gap_limit, 50);
         assert_eq!(
-            manager.wallet_snapshot(&meta.id).await.unwrap().meta.gap_limit,
+            manager
+                .wallet_snapshot(&meta.id)
+                .await
+                .unwrap()
+                .meta
+                .gap_limit,
             50
         );
         // Bounds are enforced.
