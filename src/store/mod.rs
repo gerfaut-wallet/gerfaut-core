@@ -48,6 +48,10 @@ pub struct Settings {
     /// Backend configuration, per network.
     #[serde(default)]
     pub backends: BTreeMap<Network, BackendConfig>,
+    /// Gap limit shared by every wallet: how far past the last used
+    /// address syncs scan, and where the apps warn on Receive.
+    #[serde(default = "default_gap_limit")]
+    pub gap_limit: u32,
     /// Small app-side preferences (theme, hidden balances, ...) kept in
     /// the same encrypted file so nothing leaks in plain preference
     /// stores. Keys are namespaced by the apps.
@@ -55,11 +59,16 @@ pub struct Settings {
     pub app_prefs: BTreeMap<String, String>,
 }
 
+fn default_gap_limit() -> u32 {
+    crate::wallet::meta::DEFAULT_GAP_LIMIT
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             active_network: Network::Mainnet,
             backends: BTreeMap::new(),
+            gap_limit: default_gap_limit(),
             app_prefs: BTreeMap::new(),
         }
     }

@@ -113,6 +113,11 @@ pub struct AddressEntry {
     pub address: String,
     /// Whether the chain has seen this address used.
     pub used: bool,
+    /// Derivation path for descriptor wallets: absolute
+    /// (`m/84'/1'/0'/0/5`) when the origin is unambiguous, else
+    /// keychain-relative (`0/5`). None for watched single addresses.
+    #[serde(default)]
+    pub derivation: Option<String>,
 }
 
 /// Home view of a wallet: metadata, balance, transaction list.

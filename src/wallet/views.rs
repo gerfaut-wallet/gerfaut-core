@@ -193,6 +193,7 @@ pub(crate) fn receive_addresses(
         index: next.index,
         address: next.address.to_string(),
         used: false,
+        derivation: derivation_path(wallet, next.index),
     }];
     for offset in 1..=lookahead {
         let peeked = wallet.peek_address(KeychainKind::External, next.index + offset);
@@ -200,9 +201,34 @@ pub(crate) fn receive_addresses(
             index: peeked.index,
             address: peeked.address.to_string(),
             used: false,
+            derivation: derivation_path(wallet, peeked.index),
         });
     }
     entries
+}
+
+/// Absolute derivation path of one external address, when the
+/// descriptor carries a single unambiguous origin (`m/84'/1'/0'/0/5`).
+/// Multi-key descriptors with diverging origins fall back to the
+/// keychain-relative path (`0/5`).
+fn derivation_path(wallet: &bdk_wallet::Wallet, index: u32) -> Option<String> {
+    use bdk_wallet::miniscript::ForEachKey;
+    let descriptor = wallet.public_descriptor(KeychainKind::External);
+    let definite = descriptor.at_derivation_index(index).ok()?;
+    let mut paths: Vec<String> = Vec::new();
+    definite.for_each_key(|key| {
+        if let Some(path) = key.full_derivation_path() {
+            let text = path.to_string();
+            paths.push(text.strip_prefix("m/").unwrap_or(&text).to_owned());
+        }
+        true
+    });
+    paths.sort();
+    paths.dedup();
+    match paths.as_slice() {
+        [only] => Some(format!("m/{only}")),
+        _ => Some(format!("0/{index}")),
+    }
 }
 
 // --- single-address wallets --------------------------------------------

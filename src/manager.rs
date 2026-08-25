@@ -18,7 +18,7 @@ use crate::error::{CoreError, CoreResult};
 use crate::input::{ParsedInput, ParsedPayload};
 use crate::network::Network;
 use crate::store::{Settings, Vault, VaultKey, VaultPayload, WalletRecord};
-use crate::wallet::meta::{CachedTotals, DEFAULT_GAP_LIMIT, SyncStamp, WalletKind, WalletMeta};
+use crate::wallet::meta::{CachedTotals, SyncStamp, WalletKind, WalletMeta};
 use crate::wallet::snapshot::{AddressEntry, SyncReport, TxDetail, UtxoInfo, WalletSnapshot};
 use crate::wallet::views;
 use crate::wallet::{AddressTx, AddressWatchState};
@@ -93,6 +93,22 @@ impl WalletManager {
         Ok(())
     }
 
+    /// Sets the gap limit shared by every wallet. Takes effect on the
+    /// next sync; a raised limit widens the scan, a lowered one only
+    /// narrows future scans (revealed addresses stay watched).
+    pub async fn set_gap_limit(&self, gap_limit: u32) -> CoreResult<()> {
+        if !(1..=500).contains(&gap_limit) {
+            return Err(CoreError::InvalidInput {
+                kind: "gap limit",
+                detail: "must be between 1 and 500".to_owned(),
+            });
+        }
+        let mut state = self.state.lock().await;
+        state.payload.settings.gap_limit = gap_limit;
+        state.vault.save(&state.payload)?;
+        Ok(())
+    }
+
     /// Stores one small app preference (theme, hidden balances, ...) in
     /// the encrypted vault.
     pub async fn set_app_pref(&self, key: String, value: String) -> CoreResult<()> {
@@ -107,11 +123,17 @@ impl WalletManager {
     /// Lists wallet metadata, optionally restricted to one network.
     pub async fn list_wallets(&self, network: Option<Network>) -> Vec<WalletMeta> {
         let state = self.state.lock().await;
+        let gap_limit = state.payload.settings.gap_limit;
         state
             .payload
             .wallets
             .iter()
-            .map(|record| record.meta.clone())
+            .map(|record| {
+                let mut meta = record.meta.clone();
+                // Present the effective, global gap limit.
+                meta.gap_limit = gap_limit;
+                meta
+            })
             .filter(|meta| network.is_none_or(|n| meta.network == n))
             .collect()
     }
@@ -172,7 +194,7 @@ impl WalletManager {
             kind: kind.clone(),
             recognized_as: parsed.kind,
             created_at: now_secs(),
-            gap_limit: DEFAULT_GAP_LIMIT,
+            gap_limit: state.payload.settings.gap_limit,
             labels: Default::default(),
             last_sync: None,
             cached: CachedTotals::default(),
@@ -250,7 +272,9 @@ impl WalletManager {
 
     pub async fn wallet_snapshot(&self, id: &str) -> CoreResult<WalletSnapshot> {
         let mut state = self.state.lock().await;
-        let record = find_record(&state.payload, id)?.clone();
+        let mut record = find_record(&state.payload, id)?.clone();
+        // Present the effective, global gap limit.
+        record.meta.gap_limit = state.payload.settings.gap_limit;
         match &record.meta.kind {
             WalletKind::Descriptors { .. } => {
                 let engine = ensure_engine(&mut state, id)?;
@@ -337,6 +361,7 @@ impl WalletManager {
                     .address_state
                     .as_ref()
                     .is_some_and(|s| !s.txs.is_empty()),
+                derivation: None,
             }]),
         }
     }
@@ -352,10 +377,10 @@ impl WalletManager {
         let (meta, config) = {
             let state = self.state.lock().await;
             let record = find_record(&state.payload, id)?;
-            (
-                record.meta.clone(),
-                state.payload.settings.backend_for(record.meta.network),
-            )
+            let mut meta = record.meta.clone();
+            // The effective gap limit is the global setting.
+            meta.gap_limit = state.payload.settings.gap_limit;
+            (meta, state.payload.settings.backend_for(record.meta.network))
         };
         let mut endpoints = chain::endpoints(&config, meta.network)?;
         // Try the backend that answered last time first: on networks
@@ -791,6 +816,9 @@ mod tests {
         assert!(entries[0].address.starts_with("tb1"));
         assert_eq!(entries[0].index, 0);
         assert_eq!(entries[2].index, 2);
+        // Single-origin descriptor: the absolute path is unambiguous.
+        assert_eq!(entries[0].derivation.as_deref(), Some("m/84'/1'/0'/0/0"));
+        assert_eq!(entries[2].derivation.as_deref(), Some("m/84'/1'/0'/0/2"));
 
         // A fresh manager reloads the engine from the vault and derives
         // the same addresses.
@@ -798,6 +826,36 @@ mod tests {
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         let again = manager.receive_addresses(&meta.id, 2).await.unwrap();
         assert_eq!(again[0].address, entries[0].address);
+    }
+
+    #[tokio::test]
+    async fn gap_limit_is_global_and_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input(MULTIPATH).unwrap();
+        let meta = manager
+            .add_wallet("Signet cold", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        assert_eq!(meta.gap_limit, 20, "default follows the setting");
+        assert_eq!(manager.settings().await.gap_limit, 20);
+
+        manager.set_gap_limit(50).await.unwrap();
+        // Every surface presents the new effective value.
+        assert_eq!(manager.settings().await.gap_limit, 50);
+        assert_eq!(manager.list_wallets(None).await[0].gap_limit, 50);
+        assert_eq!(
+            manager.wallet_snapshot(&meta.id).await.unwrap().meta.gap_limit,
+            50
+        );
+        // Bounds are enforced.
+        assert!(manager.set_gap_limit(0).await.is_err());
+        assert!(manager.set_gap_limit(501).await.is_err());
+
+        // A fresh manager reloads the value from the vault.
+        drop(manager);
+        let manager = WalletManager::open(dir.path(), key()).unwrap();
+        assert_eq!(manager.settings().await.gap_limit, 50);
     }
 
     #[tokio::test]
