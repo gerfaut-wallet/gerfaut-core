@@ -69,7 +69,7 @@ pub enum RecognizedKind {
 #[serde(rename_all = "snake_case")]
 pub enum InputWarning {
     /// A bare `xpub`/`tpub` carries no script type; BIP84 (`wpkh`) was
-    /// assumed. The user should be offered the alternatives.
+    /// assumed. The alternatives are listed in `script_options`.
     AssumedSegwit,
     /// The key used a SLIP-132 prefix and was normalized to `xpub`/`tpub`.
     Slip132Converted,
@@ -105,7 +105,27 @@ pub struct ParsedInput {
     pub networks: Vec<Network>,
     pub payload: ParsedPayload,
     pub warnings: Vec<InputWarning>,
+    /// Script types the user may pick instead of the one in `payload`.
+    /// Non-empty only when the input does not fix the script type by
+    /// itself (a lone extended key). Re-run [`parse_input_with`] with
+    /// the choice to rebuild the descriptors.
+    #[serde(default)]
+    pub script_options: Vec<ScriptKind>,
+    /// First receive address, derived for the first candidate network,
+    /// so the user can compare it with the wallet they are importing.
+    /// `None` for single addresses and for descriptors that cannot
+    /// derive one.
+    #[serde(default)]
+    pub preview_address: Option<String>,
 }
+
+/// Script types a lone extended key can be imported as.
+pub const SINGLE_KEY_SCRIPTS: [ScriptKind; 4] = [
+    ScriptKind::Legacy,
+    ScriptKind::NestedSegwit,
+    ScriptKind::Segwit,
+    ScriptKind::Taproot,
+];
 
 /// Classifies raw user input into wallet material.
 ///
@@ -114,6 +134,22 @@ pub struct ParsedInput {
 /// but invalid format are reported as such; only inputs matching nothing
 /// at all yield [`CoreError::UnrecognizedInput`].
 pub fn parse_input(input: &str) -> CoreResult<ParsedInput> {
+    parse_input_with(input, None)
+}
+
+/// Same as [`parse_input`], with the script type the user picked for a
+/// lone extended key. The choice only applies to inputs that leave the
+/// script type open (`script_options` non-empty); everything else fixes
+/// its own script type and ignores it.
+pub fn parse_input_with(input: &str, script: Option<ScriptKind>) -> CoreResult<ParsedInput> {
+    let mut parsed = classify(input, script)?;
+    if parsed.preview_address.is_none() {
+        parsed.preview_address = preview_address(&parsed);
+    }
+    Ok(parsed)
+}
+
+fn classify(input: &str, script: Option<ScriptKind>) -> CoreResult<ParsedInput> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(CoreError::UnrecognizedInput("empty input".to_owned()));
@@ -147,8 +183,11 @@ pub fn parse_input(input: &str) -> CoreResult<ParsedInput> {
     if token.contains('(') {
         return parse_single_descriptor(token);
     }
+    if let Some((origin, key)) = split_key_origin(token) {
+        return parse_extended_key(key, Some(origin), script);
+    }
     if xpub::looks_like_extended_key(token) {
-        return parse_extended_key(token);
+        return parse_extended_key(token, None, script);
     }
     if let Ok(address) = token.parse::<Address<_>>() {
         return classify_address(address);
@@ -297,6 +336,8 @@ fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
                 script: script_kind_of(&parts[0]),
             },
             warnings: vec![],
+            script_options: vec![],
+            preview_address: None,
         });
     }
 
@@ -313,6 +354,8 @@ fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
             script: script_kind_of(&descriptor),
         },
         warnings,
+        script_options: vec![],
+        preview_address: None,
     })
 }
 
@@ -341,6 +384,8 @@ fn parse_descriptor_pair(first: &str, second: &str) -> CoreResult<ParsedInput> {
             script: script_kind_of(&external),
         },
         warnings: vec![],
+        script_options: vec![],
+        preview_address: None,
     })
 }
 
@@ -383,7 +428,43 @@ fn descriptors_for_xpub(
     ))
 }
 
-fn parse_extended_key(token: &str) -> CoreResult<ParsedInput> {
+/// Splits a key-origin prefixed extended key, `[fingerprint/path]xpub…`,
+/// into its origin (brackets included) and the key. Returns `None` for
+/// anything else.
+fn split_key_origin(token: &str) -> Option<(&str, &str)> {
+    let rest = token.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let origin = &token[..close + 2];
+    let key = &rest[close + 1..];
+    (key.len() > 20 && xpub::looks_like_extended_key(key)).then_some((origin, key))
+}
+
+/// Script type implied by the purpose level of a key origin path
+/// (`[fp/84'/0'/0']`): BIP44, BIP49, BIP84, BIP86. `None` when the path
+/// starts elsewhere.
+fn script_from_origin(origin: &str) -> Option<ScriptKind> {
+    let path = origin.trim_start_matches('[').trim_end_matches(']');
+    let purpose = path.split('/').nth(1)?;
+    match purpose.trim_end_matches(['\'', 'h', 'H']) {
+        "44" => Some(ScriptKind::Legacy),
+        "49" => Some(ScriptKind::NestedSegwit),
+        "84" => Some(ScriptKind::Segwit),
+        "86" => Some(ScriptKind::Taproot),
+        _ => None,
+    }
+}
+
+/// A lone extended key, with or without a key origin.
+///
+/// The script type comes, in order, from the user's explicit choice,
+/// the SLIP-132 prefix (`ypub`, `zpub`, …), the purpose of the origin
+/// path, and finally the BIP84 default with a warning. In every case the
+/// user may still switch: `script_options` lists the alternatives.
+fn parse_extended_key(
+    token: &str,
+    origin: Option<&str>,
+    choice: Option<ScriptKind>,
+) -> CoreResult<ParsedInput> {
     let decoded = xpub::decode_extended_key(token)?;
     if decoded.multisig_only {
         return Err(CoreError::InvalidInput {
@@ -393,19 +474,32 @@ fn parse_extended_key(token: &str) -> CoreResult<ParsedInput> {
                 .to_owned(),
         });
     }
+    if let Some(choice) = choice
+        && !SINGLE_KEY_SCRIPTS.contains(&choice)
+    {
+        return Err(CoreError::InvalidInput {
+            kind: "script type",
+            detail: format!("{choice:?} cannot be built from a single key"),
+        });
+    }
 
     let mut warnings = vec![];
     if decoded.converted {
         warnings.push(InputWarning::Slip132Converted);
     }
-    let script = match decoded.script_hint {
-        Some(script) => script,
-        None => {
+    let script = match (
+        choice,
+        decoded.script_hint,
+        origin.and_then(script_from_origin),
+    ) {
+        (Some(choice), ..) => choice,
+        (None, Some(hint), _) | (None, None, Some(hint)) => hint,
+        (None, None, None) => {
             warnings.push(InputWarning::AssumedSegwit);
             ScriptKind::Segwit
         }
     };
-    let (external, internal) = descriptors_for_xpub(&decoded.normalized, None, script)?;
+    let (external, internal) = descriptors_for_xpub(&decoded.normalized, origin, script)?;
 
     Ok(ParsedInput {
         kind: RecognizedKind::ExtendedKey,
@@ -416,7 +510,23 @@ fn parse_extended_key(token: &str) -> CoreResult<ParsedInput> {
             script,
         },
         warnings,
+        script_options: SINGLE_KEY_SCRIPTS.to_vec(),
+        preview_address: None,
     })
+}
+
+/// First receive address of a descriptor payload, on the first
+/// candidate network. Best effort: a descriptor that cannot derive
+/// (bare miniscript, no wildcard on a script we cannot address) yields
+/// `None` rather than an error, the import itself is unaffected.
+fn preview_address(parsed: &ParsedInput) -> Option<String> {
+    let ParsedPayload::Descriptors { external, .. } = &parsed.payload else {
+        return None;
+    };
+    let network = parsed.networks.first()?.to_bitcoin();
+    let descriptor = external.parse::<Descriptor<DescriptorPublicKey>>().ok()?;
+    let definite = descriptor.at_derivation_index(0).ok()?;
+    definite.address(network).ok().map(|a| a.to_string())
 }
 
 // --- addresses ---------------------------------------------------------
@@ -442,6 +552,8 @@ fn classify_address(
         networks,
         payload: ParsedPayload::Address { address: canonical },
         warnings: vec![],
+        script_options: vec![],
+        preview_address: None,
     })
 }
 
@@ -522,6 +634,8 @@ fn parse_json_export(input: &str) -> CoreResult<ParsedInput> {
                 script: *script,
             },
             warnings,
+            script_options: vec![],
+            preview_address: None,
         });
     }
 
@@ -592,6 +706,79 @@ mod tests {
         assert!(external.starts_with("wpkh("));
         assert!(external.contains("/0/*"));
         assert!(internal.unwrap().contains("/1/*"));
+        assert_eq!(parsed.script_options, SINGLE_KEY_SCRIPTS.to_vec());
+        let preview = parsed.preview_address.as_deref().unwrap();
+        assert!(preview.starts_with("tb1q"), "{preview}");
+    }
+
+    #[test]
+    fn chosen_script_rebuilds_the_descriptors() {
+        let taproot = parse_input_with(TPUB, Some(ScriptKind::Taproot)).unwrap();
+        let (external, _, script) = descriptors(&taproot);
+        assert_eq!(script, ScriptKind::Taproot);
+        assert!(external.starts_with("tr("));
+        assert!(!taproot.warnings.contains(&InputWarning::AssumedSegwit));
+        assert!(taproot.preview_address.unwrap().starts_with("tb1p"));
+
+        let legacy = parse_input_with(TPUB, Some(ScriptKind::Legacy)).unwrap();
+        let (external, _, _) = descriptors(&legacy);
+        assert!(external.starts_with("pkh("));
+        let preview = legacy.preview_address.unwrap();
+        assert!(
+            preview.starts_with('m') || preview.starts_with('n'),
+            "{preview}"
+        );
+
+        let nested = parse_input_with(TPUB, Some(ScriptKind::NestedSegwit)).unwrap();
+        assert!(nested.preview_address.unwrap().starts_with('2'));
+    }
+
+    #[test]
+    fn choice_is_ignored_for_fixed_inputs() {
+        let single = format!("wpkh({TPUB}/0/*)");
+        let parsed = parse_input_with(&single, Some(ScriptKind::Taproot)).unwrap();
+        let (_, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(parsed.script_options.is_empty());
+        assert!(parsed.preview_address.unwrap().starts_with("tb1q"));
+    }
+
+    #[test]
+    fn multisig_scripts_cannot_be_chosen_for_a_key() {
+        assert!(matches!(
+            parse_input_with(TPUB, Some(ScriptKind::WitnessScript)),
+            Err(CoreError::InvalidInput {
+                kind: "script type",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn key_origin_sets_the_script_type() {
+        let input = format!("[9a6a2580/86'/1'/0']{TPUB}");
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::ExtendedKey);
+        assert!(parsed.warnings.is_empty());
+        let (external, internal, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Taproot);
+        assert!(external.starts_with("tr([9a6a2580/86'/1'/0']"));
+        assert!(internal.unwrap().contains("/1/*"));
+
+        let hardened_h = format!("[9a6a2580/49h/1h/0h]{TPUB}");
+        let (_, _, script) = descriptors(&parse_input(&hardened_h).unwrap());
+        assert_eq!(script, ScriptKind::NestedSegwit);
+
+        let unknown_purpose = format!("[9a6a2580/0'/1'/0']{TPUB}");
+        let parsed = parse_input(&unknown_purpose).unwrap();
+        assert!(parsed.warnings.contains(&InputWarning::AssumedSegwit));
+    }
+
+    #[test]
+    fn address_has_no_preview() {
+        let parsed = parse_input("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+        assert!(parsed.preview_address.is_none());
+        assert!(parsed.script_options.is_empty());
     }
 
     #[test]
