@@ -34,19 +34,28 @@ fn fee_error(detail: String) -> CoreError {
     }
 }
 
-/// The mempool.space API base for a network, when it has a fee market.
-fn api_base(network: Network) -> Option<&'static str> {
+/// mempool-compatible API bases for a network, in priority order: the
+/// same two operators as the chain backends, so that an instance blocked
+/// from the user's network does not leave the card empty. Empty for
+/// regtest, which has no fee market.
+fn api_bases(network: Network) -> &'static [&'static str] {
     match network {
-        Network::Mainnet => Some("https://mempool.space/api"),
-        Network::Signet => Some("https://mempool.space/signet/api"),
-        Network::Testnet4 => Some("https://mempool.space/testnet4/api"),
-        Network::Regtest => None,
+        Network::Mainnet => &["https://mempool.space/api", "https://mempool.emzy.de/api"],
+        Network::Signet => &[
+            "https://mempool.space/signet/api",
+            "https://mempool.emzy.de/signet/api",
+        ],
+        Network::Testnet4 => &[
+            "https://mempool.space/testnet4/api",
+            "https://mempool.emzy.de/testnet4/api",
+        ],
+        Network::Regtest => &[],
     }
 }
 
 /// Whether fee estimates exist for this network at all.
 pub fn supports(network: Network) -> bool {
-    api_base(network).is_some()
+    !api_bases(network).is_empty()
 }
 
 fn now_secs() -> u64 {
@@ -58,10 +67,18 @@ fn now_secs() -> u64 {
 
 /// Fetches the recommended fee rates for a network.
 pub async fn fetch_fees(network: Network) -> CoreResult<FeeEstimates> {
-    let base =
-        api_base(network).ok_or_else(|| fee_error(format!("no fee estimates on {network}")))?;
-    let value = get_json(&format!("{base}/v1/fees/recommended")).await?;
-    parse_fees(&value)
+    let bases = api_bases(network);
+    if bases.is_empty() {
+        return Err(fee_error(format!("no fee estimates on {network}")));
+    }
+    let mut last_error = None;
+    for base in bases {
+        match get_json(&format!("{base}/v1/fees/recommended")).await {
+            Ok(value) => return parse_fees(&value),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("at least one base was tried"))
 }
 
 /// mempool.space shape: `{"fastestFee": n, "halfHourFee": n, ...}`.
