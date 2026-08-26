@@ -53,15 +53,26 @@ impl Network {
 
     /// Default public Esplora endpoints for this network, in priority order.
     ///
-    /// Empty for regtest: a local backend must be configured explicitly.
+    /// Every network gets at least two independent operators: a single
+    /// instance that is blocked or down from the user's network would
+    /// otherwise look like an empty wallet. Empty for regtest: a local
+    /// backend must be configured explicitly.
     pub fn default_esplora_urls(self) -> &'static [&'static str] {
         match self {
-            Network::Mainnet => &["https://mempool.space/api", "https://blockstream.info/api"],
+            Network::Mainnet => &[
+                "https://mempool.space/api",
+                "https://blockstream.info/api",
+                "https://mempool.emzy.de/api",
+            ],
             Network::Signet => &[
                 "https://mempool.space/signet/api",
                 "https://blockstream.info/signet/api",
+                "https://mempool.emzy.de/signet/api",
             ],
-            Network::Testnet4 => &["https://mempool.space/testnet4/api"],
+            Network::Testnet4 => &[
+                "https://mempool.space/testnet4/api",
+                "https://mempool.emzy.de/testnet4/api",
+            ],
             Network::Regtest => &[],
         }
     }
@@ -128,12 +139,18 @@ mod tests {
     }
 
     #[test]
-    fn every_network_but_regtest_has_public_backends() {
+    fn every_network_but_regtest_has_a_fallback_backend() {
         for network in Network::ALL {
+            let urls = network.default_esplora_urls();
             if network == Network::Regtest {
-                assert!(network.default_esplora_urls().is_empty());
+                assert!(urls.is_empty());
             } else {
-                assert!(!network.default_esplora_urls().is_empty());
+                assert!(urls.len() >= 2, "{network} needs a second operator");
+                let hosts: std::collections::BTreeSet<&str> = urls
+                    .iter()
+                    .map(|url| url.split('/').nth(2).unwrap())
+                    .collect();
+                assert_eq!(hosts.len(), urls.len(), "{network} repeats an operator");
             }
         }
     }
