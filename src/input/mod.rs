@@ -10,6 +10,7 @@
 //! WIF keys, seed phrases — is rejected before any other processing and
 //! is never stored or logged.
 
+pub mod qr;
 pub mod xpub;
 
 use bdk_wallet::bitcoin::NetworkKind;
@@ -160,6 +161,22 @@ fn classify(input: &str, script: Option<ScriptKind>) -> CoreResult<ParsedInput> 
 
     reject_private_material(trimmed)?;
 
+    // A pasted QR payload (UR, BBQr) is opened first; a multi-part one
+    // cannot be typed in, it has to be scanned frame by frame.
+    if qr::is_envelope(trimmed) {
+        let progress = qr::assemble(&[trimmed.to_owned()])?;
+        return match progress.text {
+            Some(text) => classify(&text, script),
+            None => Err(CoreError::InvalidInput {
+                kind: "qr",
+                detail: format!(
+                    "this is part 1 of a {}-part QR code: scan it with the camera",
+                    progress.total
+                ),
+            }),
+        };
+    }
+
     if trimmed.starts_with('{') {
         return parse_json_export(trimmed);
     }
@@ -263,9 +280,10 @@ fn script_kind_of(descriptor: &Descriptor<DescriptorPublicKey>) -> ScriptKind {
         DescriptorType::Wpkh => ScriptKind::Segwit,
         DescriptorType::ShWpkh => ScriptKind::NestedSegwit,
         DescriptorType::Tr => ScriptKind::Taproot,
-        DescriptorType::Wsh | DescriptorType::ShWsh | DescriptorType::ShWshSortedMulti => {
-            ScriptKind::WitnessScript
-        }
+        DescriptorType::Wsh
+        | DescriptorType::WshSortedMulti
+        | DescriptorType::ShWsh
+        | DescriptorType::ShWshSortedMulti => ScriptKind::WitnessScript,
         DescriptorType::Sh | DescriptorType::ShSortedMulti => ScriptKind::LegacyScript,
         _ => ScriptKind::Bare,
     }
@@ -772,6 +790,16 @@ mod tests {
         let unknown_purpose = format!("[9a6a2580/0'/1'/0']{TPUB}");
         let parsed = parse_input(&unknown_purpose).unwrap();
         assert!(parsed.warnings.contains(&InputWarning::AssumedSegwit));
+    }
+
+    #[test]
+    fn sorted_multisig_is_a_witness_script() {
+        let input = format!("wsh(sortedmulti(1,{TPUB}/<0;1>/*,{TPUB}/<2;3>/*))");
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
+        let (_, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::WitnessScript);
+        assert!(parsed.preview_address.unwrap().starts_with("tb1q"));
     }
 
     #[test]

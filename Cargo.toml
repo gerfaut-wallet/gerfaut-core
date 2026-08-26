@@ -22,6 +22,10 @@ argon2 = "0.5"
 rand = "0.9"
 zeroize = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+ur = "0.5"
+ciborium = "0.2"
+flate2 = "1"
+data-encoding = "2"
 
 [dev-dependencies]
 tempfile = "3"
