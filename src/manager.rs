@@ -198,6 +198,7 @@ impl WalletManager {
             recognized_as: parsed.kind,
             created_at: now_secs(),
             gap_limit: state.payload.settings.gap_limit,
+            scan_gap: 0,
             labels: Default::default(),
             last_sync: None,
             cached: CachedTotals::default(),
@@ -474,7 +475,9 @@ impl WalletManager {
         endpoints: &[Endpoint],
         started: Instant,
     ) -> CoreResult<SyncReport> {
-        let full = meta.last_sync.is_none();
+        // First sync, or a gap limit raised since the last full scan:
+        // only a full scan looks past the addresses already revealed.
+        let full = meta.last_sync.is_none() || meta.scan_gap < meta.gap_limit;
         let mut attempts: Vec<String> = Vec::new();
 
         for endpoint in endpoints {
@@ -521,7 +524,8 @@ impl WalletManager {
                         took_ms: started.elapsed().as_millis() as u64,
                         backend: endpoint.label(),
                     };
-                    finish_sync(&mut state, &meta.id, &report, tx_count_after)?;
+                    let scanned = full.then_some(meta.gap_limit);
+                    finish_sync(&mut state, &meta.id, &report, tx_count_after, scanned)?;
                     return Ok(report);
                 }
             }
@@ -569,7 +573,7 @@ impl WalletManager {
                         backend: endpoint.label(),
                     };
                     find_record_mut(&mut state.payload, &meta.id)?.address_state = Some(watch);
-                    finish_sync(&mut state, &meta.id, &report, tx_count_after)?;
+                    finish_sync(&mut state, &meta.id, &report, tx_count_after, None)?;
                     return Ok(report);
                 }
             }
@@ -796,12 +800,14 @@ fn merge_changeset(
 ///
 /// `tx_count` is the absolute engine count after the sync, never an
 /// accumulated delta: replacements, evictions, and interleaved syncs
-/// must not make the cached figure drift.
+/// must not make the cached figure drift. `scanned_gap` is the gap limit
+/// a full scan just covered, `None` after an incremental sync.
 fn finish_sync(
     state: &mut ManagerState,
     id: &str,
     report: &SyncReport,
     tx_count: u32,
+    scanned_gap: Option<u32>,
 ) -> CoreResult<()> {
     {
         let record = find_record_mut(&mut state.payload, id)?;
@@ -809,6 +815,9 @@ fn finish_sync(
             balance: report.balance,
             tx_count,
         };
+        if let Some(gap) = scanned_gap {
+            record.meta.scan_gap = gap;
+        }
         record.meta.last_sync = Some(SyncStamp {
             at: now_secs(),
             tip_height: report.tip_height,

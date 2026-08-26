@@ -65,10 +65,22 @@ pub struct WalletMeta {
     /// Unix timestamp, seconds.
     pub created_at: u64,
     pub gap_limit: u32,
+    /// Gap limit the last full scan actually used. When the setting is
+    /// raised above it, the next sync is a full scan again: incremental
+    /// syncs only watch revealed addresses and would never find funds
+    /// past the old limit.
+    #[serde(default = "default_scan_gap")]
+    pub scan_gap: u32,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub last_sync: Option<SyncStamp>,
     #[serde(default)]
     pub cached: CachedTotals,
+}
+
+/// Wallets stored before scan tracking existed were scanned with the
+/// default gap: only a setting above it needs a new full scan.
+fn default_scan_gap() -> u32 {
+    DEFAULT_GAP_LIMIT
 }

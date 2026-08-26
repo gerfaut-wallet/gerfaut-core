@@ -202,6 +202,7 @@ mod tests {
             recognized_as: RecognizedKind::Descriptor,
             created_at: 1_755_000_000,
             gap_limit: DEFAULT_GAP_LIMIT,
+            scan_gap: DEFAULT_GAP_LIMIT,
             labels: Default::default(),
             last_sync: None,
             cached: CachedTotals::default(),
