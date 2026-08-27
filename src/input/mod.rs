@@ -170,7 +170,7 @@ fn parse_bsms_record(input: &str) -> CoreResult<ParsedInput> {
             return Err(CoreError::InvalidInput {
                 kind: "bsms",
                 detail: format!(
-                    "the first address in the record ({}) is not the one this descriptor derives                      ({derived}); the file may be altered or belong to another network",
+                    "the first address in the record ({}) is not the one this descriptor derives ({derived}); the file may be altered or belong to another network",
                     record.first_address
                 ),
             });
