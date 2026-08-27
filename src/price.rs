@@ -32,6 +32,19 @@ impl PriceSource {
         }
     }
 
+    /// Whether this source quotes a currency without an API key.
+    ///
+    /// Kraken lists seven fiat pairs against XBT and the mempool
+    /// projects publish the same seven; CoinGecko publishes them all.
+    pub fn supports_currency(self, currency: FiatCurrency) -> bool {
+        match self {
+            PriceSource::Coingecko => true,
+            PriceSource::Kraken | PriceSource::MempoolSpace => {
+                currency.reach() == CurrencyReach::Every
+            }
+        }
+    }
+
     /// Chart ranges this source can serve without an API key.
     ///
     /// CoinGecko caps keyless history at 365 days; mempool.space only
@@ -82,33 +95,85 @@ impl PriceRange {
     }
 }
 
-/// Display currencies offered in the settings.
+/// How many price sources quote a currency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FiatCurrency {
-    Eur,
-    Usd,
-    Gbp,
-    Chf,
+pub enum CurrencyReach {
+    /// Every source quotes it: the seven Kraken and the mempool
+    /// projects publish.
+    Every,
+    /// CoinGecko alone quotes it.
+    CoingeckoOnly,
 }
 
-impl FiatCurrency {
-    pub const ALL: [FiatCurrency; 4] = [
-        FiatCurrency::Eur,
-        FiatCurrency::Usd,
-        FiatCurrency::Gbp,
-        FiatCurrency::Chf,
-    ];
-
-    /// ISO 4217 code, uppercase.
-    pub fn code(self) -> &'static str {
-        match self {
-            FiatCurrency::Eur => "EUR",
-            FiatCurrency::Usd => "USD",
-            FiatCurrency::Gbp => "GBP",
-            FiatCurrency::Chf => "CHF",
+/// The one table behind [`FiatCurrency`]: variant, ISO 4217 code, and
+/// which sources quote it. Order is display order.
+macro_rules! fiat_currencies {
+    ($($variant:ident, $code:literal, $reach:ident;)+) => {
+        /// Display currencies offered in the settings.
+        ///
+        /// The first seven are quoted by every source. The rest are the
+        /// currencies of the most populous countries and of the places
+        /// where Bitcoin is most used; CoinGecko is the only keyless
+        /// source that publishes them.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum FiatCurrency {
+            $($variant,)+
         }
-    }
+
+        impl FiatCurrency {
+            /// Every currency, in display order.
+            pub const ALL: &'static [FiatCurrency] = &[$(FiatCurrency::$variant,)+];
+
+            /// ISO 4217 code, uppercase.
+            pub fn code(self) -> &'static str {
+                match self {
+                    $(FiatCurrency::$variant => $code,)+
+                }
+            }
+
+            /// Which sources quote this currency.
+            pub fn reach(self) -> CurrencyReach {
+                match self {
+                    $(FiatCurrency::$variant => CurrencyReach::$reach,)+
+                }
+            }
+        }
+    };
+}
+
+fiat_currencies! {
+    Eur, "EUR", Every;
+    Usd, "USD", Every;
+    Gbp, "GBP", Every;
+    Chf, "CHF", Every;
+    Jpy, "JPY", Every;
+    Cad, "CAD", Every;
+    Aud, "AUD", Every;
+    Inr, "INR", CoingeckoOnly;
+    Cny, "CNY", CoingeckoOnly;
+    Brl, "BRL", CoingeckoOnly;
+    Ngn, "NGN", CoingeckoOnly;
+    Idr, "IDR", CoingeckoOnly;
+    Pkr, "PKR", CoingeckoOnly;
+    Bdt, "BDT", CoingeckoOnly;
+    Rub, "RUB", CoingeckoOnly;
+    Mxn, "MXN", CoingeckoOnly;
+    Php, "PHP", CoingeckoOnly;
+    Vnd, "VND", CoingeckoOnly;
+    Try, "TRY", CoingeckoOnly;
+    Ars, "ARS", CoingeckoOnly;
+    Krw, "KRW", CoingeckoOnly;
+    Zar, "ZAR", CoingeckoOnly;
+    Thb, "THB", CoingeckoOnly;
+    Uah, "UAH", CoingeckoOnly;
+    Pln, "PLN", CoingeckoOnly;
+    Sek, "SEK", CoingeckoOnly;
+    Sgd, "SGD", CoingeckoOnly;
+    Hkd, "HKD", CoingeckoOnly;
+    Aed, "AED", CoingeckoOnly;
+    Nzd, "NZD", CoingeckoOnly;
 }
 
 /// One BTC priced in a fiat currency, at a point in time.
@@ -159,8 +224,17 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Fetches the current BTC price from one source.
+/// Fetches the current BTC price from one source. The source must quote
+/// the currency ([`PriceSource::supports_currency`]); the settings
+/// screens only offer pairs that exist.
 pub async fn fetch_price(source: PriceSource, currency: FiatCurrency) -> CoreResult<PriceQuote> {
+    if !source.supports_currency(currency) {
+        return Err(price_error(format!(
+            "{} does not quote {}",
+            source.label(),
+            currency.code()
+        )));
+    }
     let rate = match source {
         PriceSource::Coingecko => {
             let code = currency.code().to_lowercase();
@@ -241,6 +315,13 @@ pub async fn fetch_price_history(
         return Err(price_error(format!(
             "{} cannot serve this range",
             source.label()
+        )));
+    }
+    if !source.supports_currency(currency) {
+        return Err(price_error(format!(
+            "{} does not quote {}",
+            source.label(),
+            currency.code()
         )));
     }
     let mut points = match source {
@@ -387,6 +468,76 @@ mod tests {
     }
 
     #[test]
+    fn currency_codes_are_unique_iso_4217() {
+        let codes: std::collections::BTreeSet<&str> =
+            FiatCurrency::ALL.iter().map(|c| c.code()).collect();
+        assert_eq!(codes.len(), FiatCurrency::ALL.len());
+        for currency in FiatCurrency::ALL {
+            let code = currency.code();
+            assert_eq!(code.len(), 3, "{code}");
+            assert!(code.chars().all(|c| c.is_ascii_uppercase()), "{code}");
+        }
+    }
+
+    #[test]
+    fn every_source_quotes_the_seven_shared_currencies() {
+        let shared: Vec<&FiatCurrency> = FiatCurrency::ALL
+            .iter()
+            .filter(|c| c.reach() == CurrencyReach::Every)
+            .collect();
+        assert_eq!(shared.len(), 7);
+        for currency in &shared {
+            for source in PriceSource::ALL {
+                assert!(
+                    source.supports_currency(**currency),
+                    "{source:?} misses {}",
+                    currency.code()
+                );
+            }
+        }
+        // The shared seven come first: the settings list them before the
+        // ones only one source can serve.
+        assert!(
+            FiatCurrency::ALL[..7]
+                .iter()
+                .all(|c| c.reach() == CurrencyReach::Every)
+        );
+    }
+
+    #[test]
+    fn the_wider_list_is_coingecko_alone() {
+        let wide: Vec<&FiatCurrency> = FiatCurrency::ALL
+            .iter()
+            .filter(|c| c.reach() == CurrencyReach::CoingeckoOnly)
+            .collect();
+        assert!(wide.len() >= 20, "the wider list is too thin");
+        for currency in wide {
+            assert!(PriceSource::Coingecko.supports_currency(*currency));
+            assert!(!PriceSource::Kraken.supports_currency(*currency));
+            assert!(!PriceSource::MempoolSpace.supports_currency(*currency));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_refuses_a_currency_it_does_not_quote() {
+        // Refused before any request goes out.
+        let error = fetch_price(PriceSource::Kraken, FiatCurrency::Inr)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("INR"), "{error}");
+        assert!(
+            fetch_price_history(
+                PriceSource::MempoolSpace,
+                FiatCurrency::Ngn,
+                PriceRange::Year
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
     fn range_support_matches_keyless_capabilities() {
         for range in PriceRange::ALL {
             assert!(PriceSource::Kraken.supports(range));
@@ -478,6 +629,37 @@ mod tests {
             }
         }
         assert!(reachable >= 1, "no price source reachable");
+    }
+
+    /// Cross-checks the table against the live APIs: every currency
+    /// listed must actually come back with a rate from every source
+    /// that claims to quote it.
+    #[tokio::test]
+    #[ignore = "talks to public price APIs"]
+    async fn every_listed_currency_is_really_quoted() {
+        let mut checked = 0;
+        for currency in FiatCurrency::ALL {
+            for source in PriceSource::ALL {
+                if !source.supports_currency(*currency) {
+                    continue;
+                }
+                match fetch_price(source, *currency).await {
+                    Ok(quote) => {
+                        checked += 1;
+                        assert!(
+                            quote.rate > 100.0,
+                            "{source:?} gave {} for {}",
+                            quote.rate,
+                            currency.code()
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!("{source:?} {} unreachable: {error}", currency.code())
+                    }
+                }
+            }
+        }
+        assert!(checked >= 10, "the APIs were unreachable, nothing checked");
     }
 
     #[tokio::test]
