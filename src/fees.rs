@@ -1,8 +1,9 @@
 //! Recommended network fee rates, for display.
 //!
-//! One keyless source, mempool.space, which serves per-network
-//! endpoints. Informative display data: failures degrade the UI to a
-//! quiet dash, never block anything. Regtest has no fee market.
+//! Keyless sources, asked in the order the backend settings imply: the
+//! host that already serves the wallet first. Informative display data:
+//! failures degrade the UI to a quiet dash, never block anything.
+//! Regtest has no fee market.
 
 use serde::{Deserialize, Serialize};
 
@@ -10,7 +11,7 @@ use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
 use crate::price::get_json;
 
-/// Recommended fee rates in sat/vB, as published by mempool.space.
+/// Recommended fee rates in sat/vB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FeeEstimates {
     /// Likely next block.
@@ -69,9 +70,12 @@ pub async fn fetch_fees_for(
     let preferred = backend.fee_base(network);
     let mut bases: Vec<&str> = preferred.into_iter().collect();
     if backend.fees_may_fall_back() {
-        bases.extend(api_bases(network).iter().copied());
+        for base in api_bases(network) {
+            if !bases.contains(base) {
+                bases.push(base);
+            }
+        }
     }
-    bases.dedup();
     if bases.is_empty() {
         return Err(fee_error(format!("no fee estimates on {network}")));
     }
