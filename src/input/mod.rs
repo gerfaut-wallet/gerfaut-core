@@ -10,6 +10,7 @@
 //! WIF keys, seed phrases — is rejected before any other processing and
 //! is never stored or logged.
 
+pub mod bsms;
 pub mod qr;
 pub mod xpub;
 
@@ -63,6 +64,8 @@ pub enum RecognizedKind {
     Address,
     /// A wallet export file (JSON).
     WalletExport,
+    /// A BSMS descriptor record (BIP-129).
+    Bsms,
 }
 
 /// Non-fatal findings the app must surface on the confirmation screen.
@@ -143,10 +146,43 @@ pub fn parse_input(input: &str) -> CoreResult<ParsedInput> {
 /// script type open (`script_options` non-empty); everything else fixes
 /// its own script type and ignores it.
 pub fn parse_input_with(input: &str, script: Option<ScriptKind>) -> CoreResult<ParsedInput> {
+    if bsms::is_bsms(input) {
+        return parse_bsms_record(input);
+    }
     let mut parsed = classify(input, script)?;
     if parsed.preview_address.is_none() {
         parsed.preview_address = preview_address(&parsed);
     }
+    Ok(parsed)
+}
+
+/// A BSMS record is its descriptor plus a promise: the first address the
+/// coordinator derived. Gerfaut derives it too and refuses the record
+/// when the two differ, the same check every signer makes.
+fn parse_bsms_record(input: &str) -> CoreResult<ParsedInput> {
+    reject_private_material(input.trim())?;
+    let record = bsms::parse_bsms(input)?;
+    let mut parsed = classify(&record.descriptor, None)?;
+    parsed.preview_address = preview_address(&parsed);
+    match parsed.preview_address.as_deref() {
+        Some(derived) if derived.eq_ignore_ascii_case(&record.first_address) => {}
+        Some(derived) => {
+            return Err(CoreError::InvalidInput {
+                kind: "bsms",
+                detail: format!(
+                    "the first address in the record ({}) is not the one this descriptor derives                      ({derived}); the file may be altered or belong to another network",
+                    record.first_address
+                ),
+            });
+        }
+        None => {
+            return Err(CoreError::InvalidInput {
+                kind: "bsms",
+                detail: "the descriptor in the record derives no address".to_owned(),
+            });
+        }
+    }
+    parsed.kind = RecognizedKind::Bsms;
     Ok(parsed)
 }
 
@@ -790,6 +826,38 @@ mod tests {
         let unknown_purpose = format!("[9a6a2580/0'/1'/0']{TPUB}");
         let parsed = parse_input(&unknown_purpose).unwrap();
         assert!(parsed.warnings.contains(&InputWarning::AssumedSegwit));
+    }
+
+    #[test]
+    fn bsms_record_is_checked_against_its_first_address() {
+        let template = format!(
+            "wsh(sortedmulti(1,[9a6a2580/48'/1'/0'/2']{TPUB}/**,[00000000/48'/1'/0'/2']{TPUB}/**))"
+        );
+        // Derive the truth once through the classifier itself.
+        let truth = parse_input(&template.replace("/**", "/<0;1>/*")).unwrap();
+        let first = truth.preview_address.clone().unwrap();
+
+        let record = format!("BSMS 1.0\n{template}\n/0/*,/1/*\n{first}\n");
+        let parsed = parse_input(&record).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::Bsms);
+        let (external, internal, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::WitnessScript);
+        assert!(external.contains("/0/*") && internal.unwrap().contains("/1/*"));
+        assert_eq!(parsed.preview_address.as_deref(), Some(first.as_str()));
+
+        let tampered = format!(
+            "BSMS 1.0\n{template}\n/0/*,/1/*\ntb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx\n"
+        );
+        let error = parse_input(&tampered).unwrap_err().to_string();
+        assert!(error.contains("first address"), "{error}");
+
+        let private = format!(
+            "BSMS 1.0\nwsh(pk(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/**))\n/0/*,/1/*\n{first}\n"
+        );
+        assert!(matches!(
+            parse_input(&private),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
     }
 
     #[test]
