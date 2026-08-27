@@ -632,34 +632,48 @@ mod tests {
     }
 
     /// Cross-checks the table against the live APIs: every currency
-    /// listed must actually come back with a rate from every source
-    /// that claims to quote it.
+    /// listed must actually come back with a rate.
+    ///
+    /// One request per source, never one per currency: the keyless
+    /// CoinGecko endpoint rate-limits a burst within seconds, and
+    /// sweeping thirty codes one by one would test the limiter instead
+    /// of the table.
     #[tokio::test]
     #[ignore = "talks to public price APIs"]
     async fn every_listed_currency_is_really_quoted() {
-        let mut checked = 0;
-        for currency in FiatCurrency::ALL {
-            for source in PriceSource::ALL {
-                if !source.supports_currency(*currency) {
-                    continue;
-                }
-                match fetch_price(source, *currency).await {
-                    Ok(quote) => {
-                        checked += 1;
-                        assert!(
-                            quote.rate > 100.0,
-                            "{source:?} gave {} for {}",
-                            quote.rate,
-                            currency.code()
-                        );
-                    }
-                    Err(error) => {
-                        eprintln!("{source:?} {} unreachable: {error}", currency.code())
-                    }
-                }
-            }
+        let codes: Vec<String> = FiatCurrency::ALL
+            .iter()
+            .map(|c| c.code().to_lowercase())
+            .collect();
+        let value = get_json(&format!(
+            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={}",
+            codes.join(",")
+        ))
+        .await
+        .expect("CoinGecko unreachable");
+        for code in &codes {
+            let rate = value["bitcoin"][code].as_f64();
+            assert!(rate.is_some_and(|r| r > 100.0), "CoinGecko misses {code}");
         }
-        assert!(checked >= 10, "the APIs were unreachable, nothing checked");
+
+        // The seven shared ones, from the other two sources.
+        let mempool = get_json("https://mempool.space/api/v1/prices")
+            .await
+            .expect("mempool.space unreachable");
+        for currency in FiatCurrency::ALL {
+            if currency.reach() != CurrencyReach::Every {
+                continue;
+            }
+            assert!(
+                mempool[currency.code()].as_f64().is_some_and(|r| r > 100.0),
+                "mempool.space misses {}",
+                currency.code()
+            );
+            let quote = fetch_price(PriceSource::Kraken, *currency)
+                .await
+                .unwrap_or_else(|e| panic!("Kraken misses {}: {e}", currency.code()));
+            assert!(quote.rate > 100.0);
+        }
     }
 
     #[tokio::test]
