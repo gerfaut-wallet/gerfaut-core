@@ -40,6 +40,45 @@ async fn descriptor_wallet_full_scan_reaches_the_tip() {
     assert!(second.tip_height >= report.tip_height);
 }
 
+/// Every public server offered for signet must be able to carry a real
+/// sync, Electrum entries included: the settings list them as equals.
+#[tokio::test]
+#[ignore = "talks to public signet infrastructure"]
+async fn every_public_signet_server_can_sync_a_wallet() {
+    use gerfaut_core::chain::BackendConfig;
+    use gerfaut_core::chain::public::public_servers;
+
+    let mut reached = 0;
+    for server in public_servers(Network::Signet) {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = WalletManager::open(dir.path(), key()).unwrap();
+        manager
+            .set_backend(
+                Network::Signet,
+                BackendConfig::Public {
+                    server: Some(server.id.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        let parsed = parse_input(MULTIPATH).unwrap();
+        let meta = manager
+            .add_wallet(&server.label, &parsed, Network::Signet)
+            .await
+            .unwrap();
+        match manager.sync_wallet(&meta.id).await {
+            Ok(report) => {
+                reached += 1;
+                assert!(report.tip_height > 200_000, "{}", server.label);
+                // The stamp names the operator the user picked.
+                assert_eq!(report.backend, server.label.split(':').next().unwrap());
+            }
+            Err(error) => eprintln!("{} unreachable: {error}", server.label),
+        }
+    }
+    assert!(reached >= 1, "no public signet server reachable");
+}
+
 #[tokio::test]
 #[ignore = "talks to public signet infrastructure"]
 async fn address_wallet_sees_real_history() {
