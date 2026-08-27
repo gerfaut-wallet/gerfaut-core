@@ -2,6 +2,7 @@
 
 pub(crate) mod electrum;
 pub(crate) mod esplora;
+pub mod public;
 
 use bdk_wallet::KeychainKind;
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
@@ -15,14 +16,22 @@ use crate::wallet::AddressWatchState;
 ///
 /// One configuration per network is stored in the settings; wallets on
 /// that network all use it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackendConfig {
-    /// The default public Esplora instances for the network, tried in
-    /// order. The honest default: the server operator sees the wallet's
+    /// One of the public servers listed in [`public`]. Without a chosen
+    /// operator, the public Esplora instances are tried in order. The
+    /// honest default: the server that answers sees the wallet's
     /// addresses, and the settings screen says so.
-    #[default]
-    PublicEsplora,
+    ///
+    /// The tag stays `public_esplora`, the spelling every stored vault
+    /// already carries, and `server` is omitted when unset so an
+    /// automatic configuration serializes exactly as it always did.
+    #[serde(rename = "public_esplora")]
+    Public {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
+    },
     /// The user's own Esplora-compatible HTTP endpoint.
     CustomEsplora { url: String },
     /// The user's own Electrum server, `ssl://host:port` or
@@ -30,20 +39,55 @@ pub enum BackendConfig {
     CustomElectrum { url: String },
 }
 
+impl Default for BackendConfig {
+    fn default() -> Self {
+        BackendConfig::Public { server: None }
+    }
+}
+
 impl BackendConfig {
     /// Short human-readable identifier for sync reports and logs:
     /// the host, never a full URL with potential credentials.
     pub fn label(&self, network: Network) -> String {
         match self {
-            BackendConfig::PublicEsplora => network
-                .default_esplora_urls()
-                .first()
-                .and_then(|url| host_of(url))
+            BackendConfig::Public { server } => server
+                .as_deref()
+                .and_then(|id| public::find(network, id))
+                .map(|entry| entry.label().to_owned())
+                .or_else(|| {
+                    network
+                        .default_esplora_urls()
+                        .first()
+                        .and_then(|url| host_of(url))
+                })
                 .unwrap_or_else(|| "public esplora".to_owned()),
             BackendConfig::CustomEsplora { url } | BackendConfig::CustomElectrum { url } => {
                 host_of(url).unwrap_or_else(|| "custom backend".to_owned())
             }
         }
+    }
+
+    /// The HTTP base fee estimates should come from, when this backend
+    /// speaks Esplora: the user's own node, or the public server they
+    /// picked. `None` means no preference, so the public rotation
+    /// answers.
+    pub(crate) fn fee_base(&self, network: Network) -> Option<&str> {
+        match self {
+            BackendConfig::Public { server } => server
+                .as_deref()
+                .and_then(|id| public::find(network, id))
+                .filter(|entry| entry.protocol() == public::ServerProtocol::Esplora)
+                .map(|entry| entry.url()),
+            BackendConfig::CustomEsplora { url } => Some(url.as_str()),
+            BackendConfig::CustomElectrum { .. } => None,
+        }
+    }
+
+    /// Whether fee estimates may fall back to the public servers. A
+    /// user running their own node asked for exactly one host: an empty
+    /// fee card beats a silent call to a public one.
+    pub(crate) fn fees_may_fall_back(&self) -> bool {
+        !matches!(self, BackendConfig::CustomEsplora { .. })
     }
 }
 
@@ -87,21 +131,37 @@ impl Endpoint {
 /// order they should be tried.
 pub(crate) fn endpoints(config: &BackendConfig, network: Network) -> CoreResult<Vec<Endpoint>> {
     match config {
-        BackendConfig::PublicEsplora => {
-            let urls = network.default_esplora_urls();
-            if urls.is_empty() {
-                return Err(CoreError::BackendUnavailable(format!(
-                    "no public backend exists for {network}; configure your own node"
-                )));
-            }
-            Ok(urls
-                .iter()
-                .map(|url| Endpoint::Esplora((*url).to_owned()))
-                .collect())
-        }
+        // A chosen operator is the only endpoint: the point of picking
+        // one is that no other host sees these addresses.
+        BackendConfig::Public { server: Some(id) } => match public::find(network, id) {
+            Some(entry) => Ok(vec![match entry.protocol() {
+                public::ServerProtocol::Esplora => Endpoint::Esplora(entry.url().to_owned()),
+                public::ServerProtocol::Electrum => Endpoint::Electrum(entry.url().to_owned()),
+            }]),
+            // A server dropped by a later version must not brick syncs:
+            // fall back to the rotation, which the settings also show.
+            None => automatic_endpoints(network),
+        },
+        BackendConfig::Public { server: None } => automatic_endpoints(network),
         BackendConfig::CustomEsplora { url } => Ok(vec![Endpoint::Esplora(url.clone())]),
         BackendConfig::CustomElectrum { url } => Ok(vec![Endpoint::Electrum(url.clone())]),
     }
+}
+
+/// The public Esplora rotation: every operator for the network, tried in
+/// order so that one blocked or down instance never looks like an empty
+/// wallet.
+fn automatic_endpoints(network: Network) -> CoreResult<Vec<Endpoint>> {
+    let urls = network.default_esplora_urls();
+    if urls.is_empty() {
+        return Err(CoreError::BackendUnavailable(format!(
+            "no public backend exists for {network}; configure your own node"
+        )));
+    }
+    Ok(urls
+        .iter()
+        .map(|url| Endpoint::Esplora((*url).to_owned()))
+        .collect())
 }
 
 /// A prepared sync request for a descriptor wallet.
@@ -203,7 +263,7 @@ mod tests {
     #[test]
     fn labels_are_hosts_only() {
         assert_eq!(
-            BackendConfig::PublicEsplora.label(Network::Mainnet),
+            BackendConfig::default().label(Network::Mainnet),
             "mempool.space"
         );
         assert_eq!(
@@ -220,5 +280,102 @@ mod tests {
             .label(Network::Signet),
             "fulcrum.example.org"
         );
+        assert_eq!(
+            BackendConfig::Public {
+                server: Some("electrum:electrum.blockstream.info".to_owned())
+            }
+            .label(Network::Mainnet),
+            "electrum.blockstream.info:50002"
+        );
+    }
+
+    /// Vaults written before the operator choice existed carry a bare
+    /// `{"type":"public_esplora"}`, and must keep reading and writing
+    /// that exact shape while nothing is chosen.
+    #[test]
+    fn the_automatic_public_backend_keeps_its_stored_shape() {
+        let stored: BackendConfig = serde_json::from_str(r#"{"type":"public_esplora"}"#).unwrap();
+        assert_eq!(stored, BackendConfig::default());
+        assert_eq!(
+            serde_json::to_string(&stored).unwrap(),
+            r#"{"type":"public_esplora"}"#
+        );
+        let chosen = BackendConfig::Public {
+            server: Some("blockstream.info".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_string(&chosen).unwrap(),
+            r#"{"type":"public_esplora","server":"blockstream.info"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<BackendConfig>(
+                r#"{"type":"public_esplora","server":"blockstream.info"}"#
+            )
+            .unwrap(),
+            chosen
+        );
+    }
+
+    #[test]
+    fn a_chosen_operator_is_the_only_endpoint() {
+        let esplora = BackendConfig::Public {
+            server: Some("mempool.emzy.de".to_owned()),
+        };
+        assert_eq!(
+            endpoints(&esplora, Network::Testnet4).unwrap(),
+            vec![Endpoint::Esplora(
+                "https://mempool.emzy.de/testnet4/api".to_owned()
+            )]
+        );
+        let electrum = BackendConfig::Public {
+            server: Some("electrum:blackie.c3-soft.com".to_owned()),
+        };
+        assert_eq!(
+            endpoints(&electrum, Network::Testnet4).unwrap(),
+            vec![Endpoint::Electrum(
+                "ssl://blackie.c3-soft.com:57010".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn automatic_and_unknown_operators_rotate_over_every_instance() {
+        let automatic = endpoints(&BackendConfig::default(), Network::Mainnet).unwrap();
+        assert_eq!(automatic.len(), 3);
+        let retired = BackendConfig::Public {
+            server: Some("gone.example.org".to_owned()),
+        };
+        assert_eq!(endpoints(&retired, Network::Mainnet).unwrap(), automatic);
+        // A network without a public instance still says so.
+        assert!(endpoints(&BackendConfig::default(), Network::Regtest).is_err());
+    }
+
+    #[test]
+    fn fee_estimates_follow_the_backend() {
+        assert_eq!(BackendConfig::default().fee_base(Network::Mainnet), None);
+        assert_eq!(
+            BackendConfig::Public {
+                server: Some("mempool.emzy.de".to_owned())
+            }
+            .fee_base(Network::Mainnet),
+            Some("https://mempool.emzy.de/api")
+        );
+        // An Electrum server serves no HTTP fee endpoint.
+        assert_eq!(
+            BackendConfig::Public {
+                server: Some("electrum:blockstream.info".to_owned())
+            }
+            .fee_base(Network::Mainnet),
+            None
+        );
+        let own = BackendConfig::CustomEsplora {
+            url: "https://node.example.org/api".to_owned(),
+        };
+        assert_eq!(
+            own.fee_base(Network::Mainnet),
+            Some("https://node.example.org/api")
+        );
+        assert!(!own.fees_may_fall_back());
+        assert!(BackendConfig::default().fees_may_fall_back());
     }
 }

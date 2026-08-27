@@ -274,7 +274,7 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(
             settings.backend_for(Network::Mainnet),
-            BackendConfig::PublicEsplora
+            BackendConfig::default()
         );
     }
 }
