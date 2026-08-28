@@ -350,6 +350,9 @@ pub(crate) fn connect(
         provider: provider.clone(),
     });
 
+    // A configuration per connection, so its session cache dies with it:
+    // a resumed session skips the certificate entirely, and the pin with
+    // it. Every connection does the full handshake, and the full check.
     let config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| ConnectError::Io(e.to_string()))?
