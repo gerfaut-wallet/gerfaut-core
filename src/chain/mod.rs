@@ -3,6 +3,9 @@
 pub(crate) mod electrum;
 pub(crate) mod esplora;
 pub mod public;
+pub(crate) mod tls;
+
+use std::collections::BTreeMap;
 
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
@@ -115,29 +118,45 @@ fn host_of(url: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Endpoint {
     Esplora(String),
-    Electrum(String),
+    Electrum(electrum::Target),
 }
 
 impl Endpoint {
     pub(crate) fn label(&self) -> String {
-        match self {
-            Endpoint::Esplora(url) | Endpoint::Electrum(url) => {
-                host_of(url).unwrap_or_else(|| "backend".to_owned())
-            }
-        }
+        let url = match self {
+            Endpoint::Esplora(url) => url.as_str(),
+            Endpoint::Electrum(target) => target.url.as_str(),
+        };
+        host_of(url).unwrap_or_else(|| "backend".to_owned())
     }
+}
+
+/// Certificate fingerprints the user accepted, by `host:port`. Kept in
+/// the encrypted vault and handed to every Electrum connection.
+pub type TrustedCerts = BTreeMap<String, String>;
+
+/// The fingerprint accepted for this server, if any.
+fn pin_for(certs: &TrustedCerts, url: &str) -> Option<String> {
+    certs.get(&electrum::certificate_key(url)).cloned()
 }
 
 /// Resolves a backend configuration into concrete endpoints, in the
 /// order they should be tried.
-pub(crate) fn endpoints(config: &BackendConfig, network: Network) -> CoreResult<Vec<Endpoint>> {
+pub(crate) fn endpoints(
+    config: &BackendConfig,
+    network: Network,
+    certs: &TrustedCerts,
+) -> CoreResult<Vec<Endpoint>> {
     match config {
         // A chosen operator is the only endpoint: the point of picking
         // one is that no other host sees these addresses.
         BackendConfig::Public { server: Some(id) } => match public::find(network, id) {
             Some(entry) => Ok(vec![match entry.protocol() {
                 public::ServerProtocol::Esplora => Endpoint::Esplora(entry.url().to_owned()),
-                public::ServerProtocol::Electrum => Endpoint::Electrum(entry.url().to_owned()),
+                public::ServerProtocol::Electrum => Endpoint::Electrum(electrum::Target::new(
+                    entry.url(),
+                    pin_for(certs, entry.url()),
+                )),
             }]),
             // A server dropped by a later version must not brick syncs:
             // fall back to the rotation, which the settings also show.
@@ -145,7 +164,9 @@ pub(crate) fn endpoints(config: &BackendConfig, network: Network) -> CoreResult<
         },
         BackendConfig::Public { server: None } => automatic_endpoints(network),
         BackendConfig::CustomEsplora { url } => Ok(vec![Endpoint::Esplora(url.clone())]),
-        BackendConfig::CustomElectrum { url } => Ok(vec![Endpoint::Electrum(url.clone())]),
+        BackendConfig::CustomElectrum { url } => Ok(vec![Endpoint::Electrum(
+            electrum::Target::new(url.clone(), pin_for(certs, url)),
+        )]),
     }
 }
 
@@ -199,23 +220,21 @@ pub(crate) async fn sync_engine(
                 .map(EngineResponse::Incremental)
                 .map_err(|e| e.to_string())
         }
-        (Endpoint::Electrum(url), EngineRequest::Full(request)) => {
-            let url = url.clone();
+        (Endpoint::Electrum(target), EngineRequest::Full(request)) => {
+            let target = target.clone();
             tokio::task::spawn_blocking(move || {
-                electrum::full_scan_blocking(&url, request, stop_gap)
+                electrum::full_scan_blocking(&target, request, stop_gap)
             })
             .await
             .map_err(|e| e.to_string())?
             .map(EngineResponse::Full)
-            .map_err(|e| e.to_string())
         }
-        (Endpoint::Electrum(url), EngineRequest::Incremental(request)) => {
-            let url = url.clone();
-            tokio::task::spawn_blocking(move || electrum::sync_blocking(&url, request))
+        (Endpoint::Electrum(target), EngineRequest::Incremental(request)) => {
+            let target = target.clone();
+            tokio::task::spawn_blocking(move || electrum::sync_blocking(&target, request))
                 .await
                 .map_err(|e| e.to_string())?
                 .map(EngineResponse::Incremental)
-                .map_err(|e| e.to_string())
         }
     }
 }
@@ -248,15 +267,68 @@ pub(crate) async fn broadcast(endpoint: &Endpoint, tx: &Transaction) -> Result<(
             let client = esplora::client(url).map_err(|e| e.to_string())?;
             esplora::broadcast(&client, tx).await
         }
-        Endpoint::Electrum(url) => {
-            let url = url.clone();
+        Endpoint::Electrum(target) => {
+            let target = target.clone();
             let tx = tx.clone();
-            tokio::task::spawn_blocking(move || electrum::broadcast_blocking(&url, &tx))
+            tokio::task::spawn_blocking(move || electrum::broadcast_blocking(&target, &tx))
                 .await
                 .map_err(|e| e.to_string())?
                 .map(|_| ())
         }
     }
+}
+
+/// What a server's certificate amounts to, for a settings screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CertificateStatus {
+    /// Plain TCP: there is no certificate, and anything on the path
+    /// reads the traffic.
+    NotTls,
+    /// A Tor hidden service: the onion address is the server's identity,
+    /// so no certificate has to vouch for it.
+    Tor,
+    /// A public certificate authority vouches for it.
+    Trusted,
+    /// It is exactly the certificate accepted for this host.
+    Pinned { fingerprint: String },
+    /// No authority vouches for it and this host has no accepted
+    /// certificate yet: the user decides, once, with what the
+    /// certificate says about itself in front of them.
+    Unknown {
+        fingerprint: String,
+        reason: String,
+        subject: Option<String>,
+        expires: Option<i64>,
+    },
+    /// This host was accepted with a different certificate. Something
+    /// changed on the server, or something sits in between.
+    Changed { stored: String, presented: String },
+    /// The server could not be reached, so nothing can be said about
+    /// its certificate.
+    Unreachable { detail: String },
+}
+
+/// One server's certificate, and where it is stored from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertificateReport {
+    /// `host:port`: what the acceptance is recorded against.
+    pub host: String,
+    #[serde(flatten)]
+    pub status: CertificateStatus,
+}
+
+/// What the settings screen should say about an Electrum server's
+/// certificate, and the fingerprint to offer for acceptance.
+pub(crate) async fn inspect_certificate(
+    url: String,
+    pin: Option<String>,
+) -> Result<electrum::Inspection, String> {
+    tokio::task::spawn_blocking(move || {
+        electrum::inspect_blocking(&electrum::Target::new(url, pin))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// What one endpoint knows about a coin about to be spent.
@@ -279,10 +351,10 @@ pub(crate) async fn fetch_prevout(
                 spent: facts.spent,
             })
         }
-        Endpoint::Electrum(url) => {
-            let url = url.clone();
+        Endpoint::Electrum(target) => {
+            let target = target.clone();
             let txout = tokio::task::spawn_blocking(move || {
-                electrum::fetch_prevout_blocking(&url, outpoint)
+                electrum::fetch_prevout_blocking(&target, outpoint)
             })
             .await
             .map_err(|e| e.to_string())??;
@@ -317,10 +389,10 @@ pub(crate) async fn tx_standing(
                 tip_height: standing.tip_height,
             })
         }
-        Endpoint::Electrum(url) => {
-            let url = url.clone();
+        Endpoint::Electrum(target) => {
+            let target = target.clone();
             let (found, block_height, tip_height) = tokio::task::spawn_blocking(move || {
-                electrum::tx_standing_blocking(&url, &txid, &script)
+                electrum::tx_standing_blocking(&target, &txid, &script)
             })
             .await
             .map_err(|e| e.to_string())??;
@@ -412,11 +484,12 @@ mod tests {
 
     #[test]
     fn a_chosen_operator_is_the_only_endpoint() {
+        let none = TrustedCerts::new();
         let esplora = BackendConfig::Public {
             server: Some("mempool.emzy.de".to_owned()),
         };
         assert_eq!(
-            endpoints(&esplora, Network::Testnet4).unwrap(),
+            endpoints(&esplora, Network::Testnet4, &none).unwrap(),
             vec![Endpoint::Esplora(
                 "https://mempool.emzy.de/testnet4/api".to_owned()
             )]
@@ -425,23 +498,72 @@ mod tests {
             server: Some("electrum:blackie.c3-soft.com".to_owned()),
         };
         assert_eq!(
-            endpoints(&electrum, Network::Testnet4).unwrap(),
-            vec![Endpoint::Electrum(
-                "ssl://blackie.c3-soft.com:57010".to_owned()
-            )]
+            endpoints(&electrum, Network::Testnet4, &none).unwrap(),
+            vec![Endpoint::Electrum(electrum::Target::new(
+                "ssl://blackie.c3-soft.com:57010",
+                None
+            ))]
+        );
+    }
+
+    /// The fingerprint the user accepted travels with the endpoint,
+    /// whether the server comes from the catalogue or from their own
+    /// configuration, and however they spelled the address.
+    #[test]
+    fn an_accepted_certificate_reaches_the_endpoint() {
+        let mut certs = TrustedCerts::new();
+        certs.insert(
+            "blackie.c3-soft.com:57010".to_owned(),
+            "AA:BB".repeat(16).trim_end_matches(':').to_owned(),
+        );
+        let pinned = certs.values().next().cloned();
+        let catalogue = BackendConfig::Public {
+            server: Some("electrum:blackie.c3-soft.com".to_owned()),
+        };
+        assert_eq!(
+            endpoints(&catalogue, Network::Testnet4, &certs).unwrap(),
+            vec![Endpoint::Electrum(electrum::Target::new(
+                "ssl://blackie.c3-soft.com:57010",
+                pinned.clone()
+            ))]
+        );
+        let own = BackendConfig::CustomElectrum {
+            url: "blackie.c3-soft.com:57010".to_owned(),
+        };
+        assert_eq!(
+            endpoints(&own, Network::Testnet4, &certs).unwrap(),
+            vec![Endpoint::Electrum(electrum::Target::new(
+                "blackie.c3-soft.com:57010",
+                pinned
+            ))]
+        );
+        // A server with nothing accepted for it carries no fingerprint.
+        let other = BackendConfig::CustomElectrum {
+            url: "ssl://elsewhere.example:50002".to_owned(),
+        };
+        assert_eq!(
+            endpoints(&other, Network::Testnet4, &certs).unwrap(),
+            vec![Endpoint::Electrum(electrum::Target::new(
+                "ssl://elsewhere.example:50002",
+                None
+            ))]
         );
     }
 
     #[test]
     fn automatic_and_unknown_operators_rotate_over_every_instance() {
-        let automatic = endpoints(&BackendConfig::default(), Network::Mainnet).unwrap();
+        let none = TrustedCerts::new();
+        let automatic = endpoints(&BackendConfig::default(), Network::Mainnet, &none).unwrap();
         assert_eq!(automatic.len(), 3);
         let retired = BackendConfig::Public {
             server: Some("gone.example.org".to_owned()),
         };
-        assert_eq!(endpoints(&retired, Network::Mainnet).unwrap(), automatic);
+        assert_eq!(
+            endpoints(&retired, Network::Mainnet, &none).unwrap(),
+            automatic
+        );
         // A network without a public instance still says so.
-        assert!(endpoints(&BackendConfig::default(), Network::Regtest).is_err());
+        assert!(endpoints(&BackendConfig::default(), Network::Regtest, &none).is_err());
     }
 
     #[test]

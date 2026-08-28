@@ -20,7 +20,10 @@ use bdk_wallet::bitcoin::{Address, Amount, TxOut};
 use crate::broadcast::{
     self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, TxPreview, WalletRef,
 };
-use crate::chain::{self, BackendConfig, Endpoint, EngineRequest, EngineResponse};
+use crate::chain::{
+    self, BackendConfig, CertificateReport, CertificateStatus, Endpoint, EngineRequest,
+    EngineResponse,
+};
 use crate::error::{CoreError, CoreResult};
 use crate::export::{ExportOptions, ExportResult};
 use crate::input::{ParsedInput, ParsedPayload};
@@ -58,8 +61,13 @@ struct ManagerState {
 }
 
 impl ManagerState {
-    fn settings_backend(&self, network: Network) -> BackendConfig {
-        self.payload.settings.backend_for(network)
+    /// Everything a connection needs from the settings: which backend,
+    /// and the certificates the user accepted for it.
+    fn chain_setup(&self, network: Network) -> (BackendConfig, chain::TrustedCerts) {
+        (
+            self.payload.settings.backend_for(network),
+            self.payload.settings.electrum_certs.clone(),
+        )
     }
 }
 
@@ -105,6 +113,80 @@ impl WalletManager {
     pub async fn set_backend(&self, network: Network, config: BackendConfig) -> CoreResult<()> {
         let mut state = self.state.lock().await;
         state.payload.settings.backends.insert(network, config);
+        state.vault.save(&state.payload)?;
+        Ok(())
+    }
+
+    // --- Electrum certificates ------------------------------------------
+
+    /// What this server's certificate amounts to right now, and the
+    /// fingerprint to show when the user has to decide. Reads only: the
+    /// settings screen asks, the user answers.
+    pub async fn inspect_certificate(&self, url: &str) -> CoreResult<CertificateReport> {
+        let host = chain::electrum::certificate_key(url);
+        let pin = self
+            .state
+            .lock()
+            .await
+            .payload
+            .settings
+            .electrum_certs
+            .get(&host)
+            .cloned();
+        let status = match chain::inspect_certificate(url.to_owned(), pin.clone()).await {
+            Ok(chain::electrum::Inspection::NotTls) => CertificateStatus::NotTls,
+            Ok(chain::electrum::Inspection::Tor) => CertificateStatus::Tor,
+            Ok(chain::electrum::Inspection::Tls(verdict)) => match verdict {
+                chain::tls::Verdict::Trusted => CertificateStatus::Trusted,
+                chain::tls::Verdict::Pinned => CertificateStatus::Pinned {
+                    fingerprint: pin.unwrap_or_default(),
+                },
+                chain::tls::Verdict::Unknown {
+                    fingerprint,
+                    reason,
+                    subject,
+                    expires,
+                } => CertificateStatus::Unknown {
+                    fingerprint,
+                    reason,
+                    subject,
+                    expires,
+                },
+                chain::tls::Verdict::Changed { stored, presented } => {
+                    CertificateStatus::Changed { stored, presented }
+                }
+            },
+            Err(detail) => CertificateStatus::Unreachable { detail },
+        };
+        Ok(CertificateReport { host, status })
+    }
+
+    /// Remembers the certificate the user accepted for this server.
+    /// From then on that host must present exactly this certificate:
+    /// anything else is refused, never accepted again in silence.
+    pub async fn trust_certificate(&self, url: &str, fingerprint: &str) -> CoreResult<()> {
+        if !chain::tls::is_fingerprint(fingerprint) {
+            return Err(CoreError::InvalidInput {
+                kind: "certificate fingerprint",
+                detail: "expected 32 hexadecimal bytes separated by colons".to_owned(),
+            });
+        }
+        let host = chain::electrum::certificate_key(url);
+        let mut state = self.state.lock().await;
+        state
+            .payload
+            .settings
+            .electrum_certs
+            .insert(host, fingerprint.to_ascii_uppercase());
+        state.vault.save(&state.payload)?;
+        Ok(())
+    }
+
+    /// Drops an accepted certificate: the next connection to that host
+    /// asks again.
+    pub async fn forget_certificate(&self, host: &str) -> CoreResult<()> {
+        let mut state = self.state.lock().await;
+        state.payload.settings.electrum_certs.remove(host);
         state.vault.save(&state.payload)?;
         Ok(())
     }
@@ -445,18 +527,16 @@ impl WalletManager {
         let started = Instant::now();
 
         // Snapshot what the sync needs; do not hold the lock during I/O.
-        let (meta, config) = {
+        let (meta, config, certs) = {
             let state = self.state.lock().await;
             let record = find_record(&state.payload, id)?;
             let mut meta = record.meta.clone();
             // The effective gap limit is the global setting.
             meta.gap_limit = state.payload.settings.gap_limit;
-            (
-                meta,
-                state.payload.settings.backend_for(record.meta.network),
-            )
+            let (config, certs) = state.chain_setup(record.meta.network);
+            (meta, config, certs)
         };
-        let mut endpoints = chain::endpoints(&config, meta.network)?;
+        let mut endpoints = chain::endpoints(&config, meta.network, &certs)?;
         // Try the backend that answered last time first: on networks
         // where one public instance is blocked, this skips a dead
         // 20-second timeout on every sync.
@@ -601,18 +681,15 @@ impl WalletManager {
     /// Returns how many transactions were added. Zero means the history
     /// is exhausted.
     pub async fn load_more_history(&self, id: &str) -> CoreResult<u32> {
-        let (meta, config, cursor) = {
+        let (meta, config, certs, cursor) = {
             let state = self.state.lock().await;
             let record = find_record(&state.payload, id)?;
             let cursor = record
                 .address_state
                 .as_ref()
                 .and_then(|watch| watch.history_cursor.clone());
-            (
-                record.meta.clone(),
-                state.payload.settings.backend_for(record.meta.network),
-                cursor,
-            )
+            let (config, certs) = state.chain_setup(record.meta.network);
+            (record.meta.clone(), config, certs, cursor)
         };
         let WalletKind::SingleAddress { address } = &meta.kind else {
             return Err(CoreError::InvalidInput {
@@ -623,7 +700,7 @@ impl WalletManager {
         let Some(cursor) = cursor else {
             return Ok(0);
         };
-        let endpoints = chain::endpoints(&config, meta.network)?;
+        let endpoints = chain::endpoints(&config, meta.network, &certs)?;
 
         let mut attempts: Vec<String> = Vec::new();
         for endpoint in &endpoints {
@@ -672,9 +749,9 @@ impl WalletManager {
         let outpoints = broadcast::outpoints(&decoded);
 
         // Everything the vault knows, under the lock.
-        let (config, mut input_facts, output_facts, tip_height) = {
+        let (config, certs, mut input_facts, output_facts, tip_height) = {
             let mut state = self.state.lock().await;
-            let config = state.payload.settings.backend_for(network);
+            let (config, certs) = state.chain_setup(network);
             let ids: Vec<(String, String, WalletKind)> = state
                 .payload
                 .wallets
@@ -764,7 +841,7 @@ impl WalletManager {
                     }
                 }
             }
-            (config, input_facts, output_facts, tip_height)
+            (config, certs, input_facts, output_facts, tip_height)
         };
 
         // What only the chain knows, outside the lock: the coins the
@@ -774,7 +851,7 @@ impl WalletManager {
             .filter(|&i| decoded.inputs[i].prevout.is_none() && input_facts[i].prevout.is_none())
             .collect();
         let needs_chain = !unresolved.is_empty() || input_facts.iter().any(|f| f.spent.is_none());
-        if needs_chain && let Ok(endpoints) = chain::endpoints(&config, network) {
+        if needs_chain && let Ok(endpoints) = chain::endpoints(&config, network, &certs) {
             for endpoint in &endpoints {
                 let mut answered = false;
                 for (i, facts) in input_facts.iter_mut().enumerate() {
@@ -830,8 +907,8 @@ impl WalletManager {
                 detail: "the transaction is not fully signed".to_owned(),
             });
         }
-        let config = self.state.lock().await.settings_backend(network);
-        let endpoints = chain::endpoints(&config, network)?;
+        let (config, certs) = self.state.lock().await.chain_setup(network);
+        let endpoints = chain::endpoints(&config, network, &certs)?;
         let mut refusals: Vec<(String, String)> = Vec::new();
         for endpoint in &endpoints {
             match chain::broadcast(endpoint, &decoded.tx).await {
@@ -867,8 +944,8 @@ impl WalletManager {
                 kind: "transaction",
                 detail: "the transaction creates nothing".to_owned(),
             })?;
-        let config = self.state.lock().await.settings_backend(network);
-        let endpoints = chain::endpoints(&config, network)?;
+        let (config, certs) = self.state.lock().await.chain_setup(network);
+        let endpoints = chain::endpoints(&config, network, &certs)?;
         let mut attempts: Vec<String> = Vec::new();
         for endpoint in &endpoints {
             match chain::tx_standing(endpoint, txid, script.clone()).await {

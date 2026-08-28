@@ -13,6 +13,14 @@ bdk_wallet = "3.1"
 bdk_esplora = { version = "0.22", default-features = false, features = ["async-https-rustls", "tokio"] }
 bdk_electrum = { version = "0.24", default-features = false, features = ["use-rustls-ring"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Direct, so Electrum connections can carry their own certificate
+# verifier; the same version and provider `bdk_electrum` pulls in.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+# Reads a certificate the way it was written: its fingerprint's
+# subject and expiry for the acceptance dialog, and its public key
+# when the certificate predates X.509 v3 and webpki declines it.
+x509-parser = { version = "0.18", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

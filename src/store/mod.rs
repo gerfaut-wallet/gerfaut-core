@@ -57,6 +57,12 @@ pub struct Settings {
     /// stores. Keys are namespaced by the apps.
     #[serde(default)]
     pub app_prefs: BTreeMap<String, String>,
+    /// Electrum certificates the user accepted, by `host:port`. An
+    /// entry is added only by an explicit acceptance, and a server whose
+    /// certificate stops matching its entry is refused, never trusted
+    /// again silently.
+    #[serde(default)]
+    pub electrum_certs: BTreeMap<String, String>,
 }
 
 fn default_gap_limit() -> u32 {
@@ -70,6 +76,7 @@ impl Default for Settings {
             backends: BTreeMap::new(),
             gap_limit: default_gap_limit(),
             app_prefs: BTreeMap::new(),
+            electrum_certs: BTreeMap::new(),
         }
     }
 }
