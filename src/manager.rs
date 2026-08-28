@@ -832,7 +832,7 @@ impl WalletManager {
         }
         let config = self.state.lock().await.settings_backend(network);
         let endpoints = chain::endpoints(&config, network)?;
-        let mut attempts: Vec<String> = Vec::new();
+        let mut refusals: Vec<(String, String)> = Vec::new();
         for endpoint in &endpoints {
             match chain::broadcast(endpoint, &decoded.tx).await {
                 Ok(()) => {
@@ -842,10 +842,10 @@ impl WalletManager {
                         at: now_secs(),
                     });
                 }
-                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
+                Err(detail) => refusals.push((endpoint.label(), detail)),
             }
         }
-        Err(sync_failure(&endpoints, attempts))
+        Err(broadcast_failure(refusals))
     }
 
     /// Where a broadcast transaction stands now. `hex` is the transaction
@@ -916,6 +916,35 @@ impl WalletManager {
 }
 
 // --- helpers -----------------------------------------------------------
+
+/// Every node said the same thing: say it once, with the first host.
+/// Different answers are listed, each with its host.
+fn broadcast_failure(refusals: Vec<(String, String)>) -> CoreError {
+    let Some((first_host, first_detail)) = refusals.first().cloned() else {
+        return CoreError::Broadcast {
+            backend: "backend".to_owned(),
+            detail: "no backend available".to_owned(),
+        };
+    };
+    if refusals.iter().all(|(_, detail)| *detail == first_detail) {
+        return CoreError::Broadcast {
+            backend: first_host,
+            detail: first_detail,
+        };
+    }
+    CoreError::Broadcast {
+        backend: refusals
+            .iter()
+            .map(|(host, _)| host.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        detail: refusals
+            .iter()
+            .map(|(host, detail)| format!("{host}: {detail}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
 
 /// One error covering every endpoint tried, so the user sees each
 /// backend's outcome instead of only the last one.

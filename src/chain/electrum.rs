@@ -61,11 +61,14 @@ pub(crate) fn broadcast_blocking(url: &str, tx: &Transaction) -> Result<Txid, St
 /// message is the reason; keep that.
 fn broadcast_error(error: &electrum_client::Error) -> String {
     match error {
-        electrum_client::Error::Protocol(value) => value
-            .get("message")
-            .and_then(|m| m.as_str())
-            .map(str::to_owned)
-            .unwrap_or_else(|| value.to_string()),
+        electrum_client::Error::Protocol(value) => {
+            let text = value
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            crate::chain::esplora::node_message(&text)
+        }
         other => other.to_string(),
     }
 }

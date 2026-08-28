@@ -276,6 +276,28 @@ fn script_address(script: &bdk_wallet::bitcoin::ScriptBuf, network: Network) -> 
 
 // --- broadcast ------------------------------------------------------------
 
+#[cfg(test)]
+mod broadcast_tests {
+    use super::node_message;
+
+    #[test]
+    fn the_node_reason_is_kept_whichever_spelling() {
+        let mempool = r#"sendrawtransaction RPC error: {"code":-27,"message":"Transaction outputs already in utxo set"}"#;
+        assert_eq!(
+            node_message(mempool),
+            "Transaction outputs already in utxo set"
+        );
+        let blockstream = "sendrawtransaction RPC error -26: mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)";
+        assert_eq!(
+            node_message(blockstream),
+            "mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)"
+        );
+        let escaped = r#"{\"code\":-26,\"message\":\"bad-txns-inputs-missingorspent\"}"#;
+        assert_eq!(node_message(escaped), "bad-txns-inputs-missingorspent");
+        assert_eq!(node_message("connection refused"), "connection refused");
+    }
+}
+
 /// Hands a signed transaction to the network through this instance.
 /// The instance's own node validates it; its refusal comes back as the
 /// message, verbatim, which is the most useful thing to show.
@@ -284,17 +306,37 @@ pub(crate) async fn broadcast(client: &AsyncClient, tx: &Transaction) -> Result<
 }
 
 /// Esplora wraps the node's refusal in an HTTP error whose body is the
-/// reason (`sendrawtransaction RPC error: {"code":-26,"message":"..."}`);
-/// keep the message, drop the wrapping.
+/// reason, in one of two spellings:
+/// `sendrawtransaction RPC error: {"code":-26,"message":"..."}` (the
+/// mempool instances) or `sendrawtransaction RPC error -26: ...`
+/// (blockstream.info). Keep the message, drop the wrapping.
 fn broadcast_error(error: &esplora_client::Error) -> String {
-    let text = error.to_string();
+    let text = match error {
+        esplora_client::Error::HttpResponse { message, .. } => message.clone(),
+        other => other.to_string(),
+    };
+    node_message(&text)
+}
+
+/// The reason inside a `sendrawtransaction` refusal, whichever way the
+/// server spelled it; the whole text when it is not one.
+pub(crate) fn node_message(text: &str) -> String {
+    // A body quoted inside another error arrives with its quotes
+    // escaped: read it as if it were not.
+    let text = text.replace("\\\"", "\"");
     if let Some(start) = text.find("\"message\":\"") {
         let rest = &text[start + 11..];
         if let Some(end) = rest.find('"') {
             return rest[..end].to_owned();
         }
     }
-    text
+    if let Some(start) = text.find("RPC error -") {
+        let rest = &text[start..];
+        if let Some(colon) = rest.find(": ") {
+            return rest[colon + 2..].trim().to_owned();
+        }
+    }
+    text.trim().to_owned()
 }
 
 /// The output an input spends, and whether it is already spent.

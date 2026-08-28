@@ -46,6 +46,11 @@ pub enum CoreError {
     #[error("sync failed via {backend}: {detail}")]
     Sync { backend: String, detail: String },
 
+    /// The network refused a transaction handed to it, or no backend
+    /// could be reached to try. `detail` is the node's own words.
+    #[error("{backend} refused the transaction: {detail}")]
+    Broadcast { backend: String, detail: String },
+
     /// The configured backend cannot serve this request
     /// (e.g. no public backend exists for regtest).
     #[error("backend unavailable: {0}")]
