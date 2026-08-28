@@ -7,12 +7,13 @@
 //! the same networks, kept so a user who already trusts one of them can
 //! point Gerfaut at it without typing a URL.
 //!
-//! The Electrum list is shorter than Sparrow's on purpose: several of
-//! its servers present a self-signed certificate, which the Electrum
-//! ecosystem accepts and Gerfaut does not. Offering a server that only
-//! answers with certificate checks turned off would be offering an
-//! unauthenticated connection under a trusted-looking name. The
-//! `every_public_electrum_answers` test refuses any entry that needs it.
+//! Several of those Electrum servers sign their own certificate, which
+//! nothing public vouches for. They are listed all the same, marked, and
+//! the settings screen shows their fingerprint for an explicit
+//! acceptance before the first connection — the trust-on-first-use of
+//! `chain::tls`. What is never done is connecting to them with
+//! verification turned off: that would be an unauthenticated connection
+//! under a trusted-looking name.
 //!
 //! Every entry is a keyless, free, publicly documented endpoint. The
 //! identifiers are stable: they are what the settings store, so a host
@@ -40,6 +41,9 @@ pub struct PublicServer {
     pub protocol: ServerProtocol,
     /// Endpoint Gerfaut talks to.
     pub url: String,
+    /// Whether this server signs its own certificate, so the settings
+    /// screen can say it before the user picks it rather than after.
+    pub self_signed: bool,
 }
 
 pub(crate) struct Entry {
@@ -47,6 +51,7 @@ pub(crate) struct Entry {
     label: &'static str,
     protocol: ServerProtocol,
     url: &'static str,
+    self_signed: bool,
 }
 
 use ServerProtocol::{Electrum, Esplora};
@@ -59,42 +64,79 @@ const MAINNET: &[Entry] = &[
         label: "mempool.space",
         protocol: Esplora,
         url: "https://mempool.space/api",
+        self_signed: false,
     },
     Entry {
         id: "blockstream.info",
         label: "blockstream.info",
         protocol: Esplora,
         url: "https://blockstream.info/api",
+        self_signed: false,
     },
     Entry {
         id: "mempool.emzy.de",
         label: "mempool.emzy.de",
         protocol: Esplora,
         url: "https://mempool.emzy.de/api",
+        self_signed: false,
     },
     Entry {
         id: "electrum:blockstream.info",
         label: "blockstream.info:700",
         protocol: Electrum,
         url: "ssl://blockstream.info:700",
+        self_signed: false,
     },
     Entry {
         id: "electrum:electrum.blockstream.info",
         label: "electrum.blockstream.info:50002",
         protocol: Electrum,
         url: "ssl://electrum.blockstream.info:50002",
+        self_signed: false,
     },
     Entry {
         id: "electrum:electrum.diynodes.com",
         label: "electrum.diynodes.com:50022",
         protocol: Electrum,
         url: "ssl://electrum.diynodes.com:50022",
+        self_signed: false,
     },
     Entry {
         id: "electrum:frigate.2140.dev",
         label: "frigate.2140.dev:50002",
         protocol: Electrum,
         url: "ssl://frigate.2140.dev:50002",
+        self_signed: false,
+    },
+    // The rest of Sparrow's list. These sign their own certificate:
+    // picking one asks for its fingerprint before anything connects.
+    Entry {
+        id: "electrum:bitcoin.lu.ke",
+        label: "bitcoin.lu.ke:50002",
+        protocol: Electrum,
+        url: "ssl://bitcoin.lu.ke:50002",
+        self_signed: true,
+    },
+    Entry {
+        id: "electrum:electrum.emzy.de",
+        label: "electrum.emzy.de:50002",
+        protocol: Electrum,
+        url: "ssl://electrum.emzy.de:50002",
+        self_signed: true,
+    },
+    Entry {
+        id: "electrum:electrum.bitaroo.net",
+        label: "electrum.bitaroo.net:50002",
+        protocol: Electrum,
+        url: "ssl://electrum.bitaroo.net:50002",
+        self_signed: true,
+    },
+    Entry {
+        id: "electrum:fulcrum.sethforprivacy.com",
+        label: "fulcrum.sethforprivacy.com:50002",
+        protocol: Electrum,
+        url: "ssl://fulcrum.sethforprivacy.com:50002",
+        self_signed: true,
     },
 ];
 
@@ -104,24 +146,28 @@ const SIGNET: &[Entry] = &[
         label: "mempool.space",
         protocol: Esplora,
         url: "https://mempool.space/signet/api",
+        self_signed: false,
     },
     Entry {
         id: "blockstream.info",
         label: "blockstream.info",
         protocol: Esplora,
         url: "https://blockstream.info/signet/api",
+        self_signed: false,
     },
     Entry {
         id: "mempool.emzy.de",
         label: "mempool.emzy.de",
         protocol: Esplora,
         url: "https://mempool.emzy.de/signet/api",
+        self_signed: false,
     },
     Entry {
         id: "electrum:mempool.space",
         label: "mempool.space:60602",
         protocol: Electrum,
         url: "ssl://mempool.space:60602",
+        self_signed: false,
     },
 ];
 
@@ -131,24 +177,28 @@ const TESTNET4: &[Entry] = &[
         label: "mempool.space",
         protocol: Esplora,
         url: "https://mempool.space/testnet4/api",
+        self_signed: false,
     },
     Entry {
         id: "mempool.emzy.de",
         label: "mempool.emzy.de",
         protocol: Esplora,
         url: "https://mempool.emzy.de/testnet4/api",
+        self_signed: false,
     },
     Entry {
         id: "electrum:mempool.space",
         label: "mempool.space:40002",
         protocol: Electrum,
         url: "ssl://mempool.space:40002",
+        self_signed: false,
     },
     Entry {
         id: "electrum:blackie.c3-soft.com",
         label: "blackie.c3-soft.com:57010",
         protocol: Electrum,
         url: "ssl://blackie.c3-soft.com:57010",
+        self_signed: false,
     },
 ];
 
@@ -172,6 +222,7 @@ pub fn public_servers(network: Network) -> Vec<PublicServer> {
             label: entry.label.to_owned(),
             protocol: entry.protocol,
             url: entry.url.to_owned(),
+            self_signed: entry.self_signed,
         })
         .collect()
 }
@@ -306,12 +357,15 @@ mod tests {
         assert!(reached >= 1, "no public Esplora reachable at all");
     }
 
-    /// Same for the Electrum list: a TLS handshake plus a header
-    /// subscription is exactly what a sync starts with.
+    /// Same for the Electrum list, through Gerfaut's own TLS: a server
+    /// listed as vouched for must be vouched for, one listed as
+    /// self-signed must present exactly that — a certificate nothing
+    /// vouches for, which then serves once its fingerprint is accepted.
     #[test]
     #[ignore = "talks to the public servers"]
     fn every_public_electrum_answers() {
-        use bdk_electrum::electrum_client::{Client, Config, ElectrumApi};
+        use crate::chain::electrum::{Inspection, Target, inspect_blocking};
+        use crate::chain::tls::Verdict;
 
         let mut reached = 0;
         for network in Network::ALL {
@@ -319,40 +373,40 @@ mod tests {
                 if server.protocol != ServerProtocol::Electrum {
                     continue;
                 }
-                let config = Config::builder()
-                    .timeout(Some(std::time::Duration::from_secs(15)))
-                    .build();
-                match Client::from_config(&server.url, config)
-                    .and_then(|client| client.block_headers_subscribe())
-                {
-                    Ok(header) => {
-                        reached += 1;
-                        assert!(
-                            header.height > 100_000,
-                            "{} on {network}: {}",
-                            server.label,
-                            header.height
-                        );
-                        eprintln!("{} on {network}: tip {}", server.label, header.height);
-                    }
+                let verdict = match inspect_blocking(&Target::new(&server.url, None)) {
+                    Ok(Inspection::Tls(verdict)) => verdict,
+                    // Kept loud rather than fatal: a public server can be
+                    // down for a day without failing a build.
+                    Ok(other) => panic!("{} is not a TLS server: {other:?}", server.label),
                     Err(error) => {
-                        // Kept loud rather than fatal: a public server
-                        // can be down for a day without failing a build.
                         eprintln!("{} on {network} unreachable: {error}", server.label);
-                        let lax = Config::builder()
-                            .timeout(Some(std::time::Duration::from_secs(15)))
-                            .validate_domain(false)
-                            .build();
-                        if Client::from_config(&server.url, lax)
-                            .and_then(|client| client.block_headers_subscribe())
-                            .is_ok()
-                        {
-                            panic!(
-                                "{} answers only with certificate validation off; it does                                  not belong in the catalogue",
-                                server.label
-                            );
-                        }
+                        continue;
                     }
+                };
+                reached += 1;
+                match (server.self_signed, verdict) {
+                    (false, Verdict::Trusted) => {
+                        eprintln!("{} on {network}: vouched for", server.label);
+                    }
+                    (true, Verdict::Unknown { fingerprint, .. }) => {
+                        // Accepted once, it must carry a real sync.
+                        let accepted = Target::new(&server.url, Some(fingerprint.clone()));
+                        assert_eq!(
+                            inspect_blocking(&accepted).unwrap(),
+                            Inspection::Tls(Verdict::Pinned),
+                            "{} refuses the fingerprint it just presented",
+                            server.label
+                        );
+                        eprintln!("{} on {network}: self-signed, {fingerprint}", server.label);
+                    }
+                    (false, other) => panic!(
+                        "{} is listed as vouched for but presents {other:?}",
+                        server.label
+                    ),
+                    (true, other) => panic!(
+                        "{} is listed as self-signed but presents {other:?}",
+                        server.label
+                    ),
                 }
             }
         }
