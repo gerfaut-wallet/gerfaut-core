@@ -141,3 +141,96 @@ async fn address_wallet_sees_real_history() {
         .unwrap();
     assert!(!detail.outputs.is_empty());
 }
+
+/// A transaction already in the chain exercises every broadcast path
+/// without signing anything: the preview reads its inputs as spent,
+/// the node refuses it by name, and the status finds it confirmed.
+#[tokio::test]
+#[ignore = "talks to public signet infrastructure"]
+async fn broadcast_paths_answer_on_a_mined_transaction() {
+    use gerfaut_core::broadcast::TxWarningKind;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .unwrap();
+    // A recent non-coinbase transaction, whatever instance answers.
+    let mut hex = None;
+    for base in Network::Signet.default_esplora_urls() {
+        let fetch = async {
+            let blocks: serde_json::Value = client
+                .get(format!("{base}/blocks"))
+                .send()
+                .await
+                .ok()?
+                .json()
+                .await
+                .ok()?;
+            for block in blocks.as_array()? {
+                let id = block["id"].as_str()?;
+                let txids: Vec<String> = client
+                    .get(format!("{base}/block/{id}/txids"))
+                    .send()
+                    .await
+                    .ok()?
+                    .json()
+                    .await
+                    .ok()?;
+                if let Some(txid) = txids.get(1) {
+                    let hex = client
+                        .get(format!("{base}/tx/{txid}/hex"))
+                        .send()
+                        .await
+                        .ok()?
+                        .text()
+                        .await
+                        .ok()?;
+                    return Some(hex);
+                }
+            }
+            None
+        };
+        if let Some(found) = fetch.await {
+            hex = Some(found);
+            break;
+        }
+    }
+    let hex = hex.expect("no signet instance reachable");
+
+    let dir = tempfile::tempdir().unwrap();
+    let manager = WalletManager::open(dir.path(), key()).unwrap();
+
+    let preview = manager
+        .preview_transaction(&hex, Network::Signet)
+        .await
+        .unwrap();
+    assert!(preview.ready, "a mined transaction is fully signed");
+    assert!(preview.fee_sats.is_some(), "prevouts come from the chain");
+    assert!(
+        preview
+            .warnings
+            .iter()
+            .any(|w| w.kind == TxWarningKind::InputSpent),
+        "{:?}",
+        preview.warnings
+    );
+
+    let refused = manager
+        .broadcast_transaction(Network::Signet, &hex)
+        .await
+        .unwrap_err()
+        .to_string();
+    // The node's own words, whichever instance answered.
+    assert!(
+        refused.contains("already") || refused.contains("spent") || refused.contains("conflict"),
+        "{refused}"
+    );
+
+    let status = manager
+        .transaction_status(Network::Signet, &hex)
+        .await
+        .unwrap();
+    assert!(status.found && status.confirmed);
+    assert!(status.confirmations >= 1);
+    assert_eq!(status.txid, preview.txid);
+}

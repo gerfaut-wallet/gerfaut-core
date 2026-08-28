@@ -9,7 +9,9 @@
 //!
 //! The decoders here only ever see public material: a `crypto-output`
 //! carries extended *public* keys, a BBQr text part is parsed as text.
-//! A BBQr holding a PSBT or a transaction is refused as such.
+//! A PSBT or a transaction (`ur:crypto-psbt`, BBQr `P` and `T`) comes
+//! out in its text form for the broadcast page; the wallet import
+//! refuses it there, by name.
 
 use bdk_wallet::bitcoin::NetworkKind;
 use bdk_wallet::bitcoin::bip32::{ChainCode, ChildNumber, Fingerprint, Xpub};
@@ -171,7 +173,16 @@ fn ur_message_to_text(ur_type: &str, bytes: &[u8]) -> CoreResult<String> {
                 .map_err(|e| qr_error(format!("invalid crypto-hdkey: {e}")))?;
             hdkey_expression(&value)
         }
-        "crypto-psbt" | "psbt" => Err(qr_error("this QR code holds a PSBT, not a wallet to watch")),
+        // A PSBT rides as a CBOR byte string (BCR-2020-006). It comes
+        // out as base64, the text every other PSBT path accepts.
+        "crypto-psbt" | "psbt" => {
+            let value: Value = ciborium::from_reader(bytes)
+                .map_err(|e| qr_error(format!("invalid crypto-psbt: {e}")))?;
+            let Value::Bytes(raw) = value else {
+                return Err(qr_error("crypto-psbt does not hold a byte string"));
+            };
+            Ok(data_encoding::BASE64.encode(&raw))
+        }
         other => Err(qr_error(format!("unsupported UR type `{other}`"))),
     }
 }
@@ -489,15 +500,11 @@ fn assemble_bbqr(frames: &[&str]) -> CoreResult<QrProgress> {
         });
     }
 
-    match first.file_type {
-        'U' | 'J' => {}
-        'P' => return Err(qr_error("this QR code holds a PSBT, not a wallet to watch")),
-        'T' => {
-            return Err(qr_error(
-                "this QR code holds a transaction, not a wallet to watch",
-            ));
-        }
-        other => return Err(qr_error(format!("unsupported BBQr file type `{other}`"))),
+    if !matches!(first.file_type, 'U' | 'J' | 'P' | 'T') {
+        return Err(qr_error(format!(
+            "unsupported BBQr file type `{}`",
+            first.file_type
+        )));
     }
     let joined: String = parts.iter().map(|p| p.unwrap_or_default()).collect();
     let bytes = match first.encoding {
@@ -515,7 +522,13 @@ fn assemble_bbqr(frames: &[&str]) -> CoreResult<QrProgress> {
         }
         other => return Err(qr_error(format!("unsupported BBQr encoding `{other}`"))),
     };
-    let text = String::from_utf8(bytes).map_err(|_| qr_error("BBQr payload is not text"))?;
+    // Binary file types come out as the text form every other path
+    // accepts: a PSBT as base64, a transaction as hex.
+    let text = match first.file_type {
+        'P' => data_encoding::BASE64.encode(&bytes),
+        'T' => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        _ => String::from_utf8(bytes).map_err(|_| qr_error("BBQr payload is not text"))?,
+    };
     Ok(QrProgress {
         format: QrFormat::Bbqr,
         received,
@@ -725,11 +738,18 @@ mod tests {
         ));
     }
 
+    /// A `crypto-psbt` comes out as base64: the text the broadcast page
+    /// and every PSBT tool accept.
     #[test]
-    fn psbt_urs_are_refused_as_such() {
-        let ur_text = ur::ur::encode(b"psbt", &ur::ur::Type::Custom("crypto-psbt"));
-        let error = assemble(&[ur_text]).unwrap_err().to_string();
-        assert!(error.contains("PSBT"), "{error}");
+    fn psbt_urs_open_as_base64() {
+        let payload = b"psbt\xff\x01\x00";
+        let ur_text = encode_ur("crypto-psbt", &Value::Bytes(payload.to_vec()));
+        let progress = assemble(&[ur_text]).unwrap();
+        assert!(progress.complete);
+        assert_eq!(
+            progress.text.as_deref(),
+            Some(data_encoding::BASE64.encode(payload).as_str())
+        );
     }
 
     fn bbqr_frames(text: &str, parts: usize) -> Vec<String> {
@@ -771,10 +791,17 @@ mod tests {
         assert_eq!(full.text.unwrap(), descriptor);
     }
 
+    /// BBQr binary types come out in their text form: a PSBT as base64,
+    /// a transaction as hex.
     #[test]
-    fn bbqr_psbt_is_refused() {
-        let frame = format!("B$HP0100{}", "00");
-        let error = assemble(&[frame]).unwrap_err().to_string();
-        assert!(error.contains("PSBT"), "{error}");
+    fn bbqr_binary_types_open_as_text() {
+        let psbt = assemble(&["B$HP01007073627400".to_owned()]).unwrap();
+        assert_eq!(psbt.text.as_deref(), Some("cHNidAA="));
+        let tx = assemble(&["B$HT0100DEADBEEF".to_owned()]).unwrap();
+        assert_eq!(tx.text.as_deref(), Some("deadbeef"));
+        let error = assemble(&["B$HX010000".to_owned()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("file type"), "{error}");
     }
 }

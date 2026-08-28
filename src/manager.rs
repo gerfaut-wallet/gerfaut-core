@@ -13,6 +13,13 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use std::str::FromStr;
+
+use bdk_wallet::bitcoin::{Address, Amount, TxOut};
+
+use crate::broadcast::{
+    self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, TxPreview, WalletRef,
+};
 use crate::chain::{self, BackendConfig, Endpoint, EngineRequest, EngineResponse};
 use crate::error::{CoreError, CoreResult};
 use crate::export::{ExportOptions, ExportResult};
@@ -48,6 +55,12 @@ struct ManagerState {
     payload: VaultPayload,
     /// Loaded BDK engines, keyed by wallet id. Lazily populated.
     engines: HashMap<String, bdk_wallet::Wallet>,
+}
+
+impl ManagerState {
+    fn settings_backend(&self, network: Network) -> BackendConfig {
+        self.payload.settings.backend_for(network)
+    }
 }
 
 /// The facade. Cheap to share behind an `Arc`.
@@ -638,6 +651,243 @@ impl WalletManager {
                     state.vault.save(&state.payload)?;
                     return Ok(added);
                 }
+            }
+        }
+        Err(sync_failure(&endpoints, attempts))
+    }
+
+    // --- broadcast -------------------------------------------------------
+
+    /// Decodes a transaction and shows what it does, before anything
+    /// leaves the machine. What the container does not carry (previous
+    /// outputs, ownership) is taken from the watched wallets first and
+    /// from the backend second; a backend that does not answer costs a
+    /// less complete preview, never an error.
+    pub async fn preview_transaction(
+        &self,
+        input: &str,
+        network: Network,
+    ) -> CoreResult<TxPreview> {
+        let decoded = broadcast::decode_transaction(input)?;
+        let outpoints = broadcast::outpoints(&decoded);
+
+        // Everything the vault knows, under the lock.
+        let (config, mut input_facts, output_facts, tip_height) = {
+            let mut state = self.state.lock().await;
+            let config = state.payload.settings.backend_for(network);
+            let ids: Vec<(String, String, WalletKind)> = state
+                .payload
+                .wallets
+                .iter()
+                .filter(|record| record.meta.network == network)
+                .map(|record| {
+                    (
+                        record.meta.id.clone(),
+                        record.meta.name.clone(),
+                        record.meta.kind.clone(),
+                    )
+                })
+                .collect();
+            let mut input_facts: Vec<InputFacts> =
+                outpoints.iter().map(|_| InputFacts::default()).collect();
+            let mut output_facts: Vec<OutputFacts> = decoded
+                .tx
+                .output
+                .iter()
+                .map(|_| OutputFacts::default())
+                .collect();
+            let mut tip_height: Option<u32> = None;
+            for (id, name, kind) in ids {
+                let wallet_ref = WalletRef {
+                    id: id.clone(),
+                    name,
+                };
+                match kind {
+                    WalletKind::Descriptors { .. } => {
+                        let engine = ensure_engine(&mut state, &id)?;
+                        tip_height = tip_height.max(Some(views::tip_height(engine)));
+                        for (i, outpoint) in outpoints.iter().enumerate() {
+                            if let Some(utxo) = engine.get_utxo(*outpoint) {
+                                input_facts[i].prevout = Some(utxo.txout.clone());
+                                input_facts[i].wallet = Some(wallet_ref.clone());
+                                input_facts[i].spent = Some(false);
+                            } else if let Some(tx) = engine.get_tx(outpoint.txid)
+                                && let Some(txout) = tx.tx_node.output.get(outpoint.vout as usize)
+                                && engine.is_mine(txout.script_pubkey.clone())
+                            {
+                                // A coin of this wallet, no longer unspent.
+                                input_facts[i].prevout = Some(txout.clone());
+                                input_facts[i].wallet = Some(wallet_ref.clone());
+                                input_facts[i].spent = Some(true);
+                            }
+                        }
+                        for (i, output) in decoded.tx.output.iter().enumerate() {
+                            if engine.is_mine(output.script_pubkey.clone()) {
+                                output_facts[i].wallet = Some(wallet_ref.clone());
+                                output_facts[i].change = engine
+                                    .derivation_of_spk(output.script_pubkey.clone())
+                                    .is_some_and(|(keychain, _)| {
+                                        keychain == bdk_wallet::KeychainKind::Internal
+                                    });
+                            }
+                        }
+                    }
+                    WalletKind::SingleAddress { address } => {
+                        let script = Address::from_str(&address)
+                            .ok()
+                            .and_then(|a| a.require_network(network.to_bitcoin()).ok())
+                            .map(|a| a.script_pubkey());
+                        let Some(script) = script else {
+                            continue;
+                        };
+                        let watch = find_record(&state.payload, &id)?
+                            .address_state
+                            .clone()
+                            .unwrap_or_default();
+                        for (i, outpoint) in outpoints.iter().enumerate() {
+                            if let Some(utxo) = watch.utxos.iter().find(|u| {
+                                u.txid == outpoint.txid.to_string() && u.vout == outpoint.vout
+                            }) {
+                                input_facts[i].prevout = Some(TxOut {
+                                    value: Amount::from_sat(utxo.value_sats),
+                                    script_pubkey: script.clone(),
+                                });
+                                input_facts[i].wallet = Some(wallet_ref.clone());
+                                input_facts[i].spent = Some(false);
+                            }
+                        }
+                        for (i, output) in decoded.tx.output.iter().enumerate() {
+                            if output.script_pubkey == script {
+                                output_facts[i].wallet = Some(wallet_ref.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            (config, input_facts, output_facts, tip_height)
+        };
+
+        // What only the chain knows, outside the lock: the coins the
+        // vault does not hold, and whether known coins are still
+        // unspent. One endpoint, the first that answers.
+        let unresolved: Vec<usize> = (0..outpoints.len())
+            .filter(|&i| decoded.inputs[i].prevout.is_none() && input_facts[i].prevout.is_none())
+            .collect();
+        let needs_chain = !unresolved.is_empty() || input_facts.iter().any(|f| f.spent.is_none());
+        if needs_chain && let Ok(endpoints) = chain::endpoints(&config, network) {
+            for endpoint in &endpoints {
+                let mut answered = false;
+                for (i, facts) in input_facts.iter_mut().enumerate() {
+                    let wanted = unresolved.contains(&i) || facts.spent.is_none();
+                    if !wanted {
+                        continue;
+                    }
+                    match chain::fetch_prevout(endpoint, outpoints[i]).await {
+                        Ok(chain_facts) => {
+                            answered = true;
+                            if unresolved.contains(&i) {
+                                match chain_facts.txout {
+                                    Some(txout) => facts.prevout = Some(txout),
+                                    None => facts.unknown = true,
+                                }
+                            }
+                            if facts.spent.is_none() {
+                                facts.spent = chain_facts.spent;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if answered {
+                    break;
+                }
+            }
+        }
+
+        Ok(broadcast::build_preview(
+            &decoded,
+            network,
+            &input_facts,
+            &output_facts,
+            tip_height,
+            now_secs(),
+        ))
+    }
+
+    /// Hands a signed transaction to the network through the backend
+    /// configured for it. Every endpoint is tried in turn; the node's
+    /// own refusal (a missing signature, a spent input, a fee below the
+    /// floor) is returned verbatim.
+    pub async fn broadcast_transaction(
+        &self,
+        network: Network,
+        hex: &str,
+    ) -> CoreResult<BroadcastReport> {
+        let decoded = broadcast::decode_transaction(hex)?;
+        if !decoded.ready {
+            return Err(CoreError::InvalidInput {
+                kind: "transaction",
+                detail: "the transaction is not fully signed".to_owned(),
+            });
+        }
+        let config = self.state.lock().await.settings_backend(network);
+        let endpoints = chain::endpoints(&config, network)?;
+        let mut attempts: Vec<String> = Vec::new();
+        for endpoint in &endpoints {
+            match chain::broadcast(endpoint, &decoded.tx).await {
+                Ok(()) => {
+                    return Ok(BroadcastReport {
+                        txid: decoded.tx.compute_txid().to_string(),
+                        backend: endpoint.label(),
+                        at: now_secs(),
+                    });
+                }
+                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
+            }
+        }
+        Err(sync_failure(&endpoints, attempts))
+    }
+
+    /// Where a broadcast transaction stands now. `hex` is the transaction
+    /// itself: Electrum can only look a transaction up through one of
+    /// its scripts, and the apps already hold the bytes.
+    pub async fn transaction_status(
+        &self,
+        network: Network,
+        hex: &str,
+    ) -> CoreResult<BroadcastStatus> {
+        let decoded = broadcast::decode_transaction(hex)?;
+        let txid = decoded.tx.compute_txid();
+        let script = decoded
+            .tx
+            .output
+            .first()
+            .map(|o| o.script_pubkey.clone())
+            .ok_or_else(|| CoreError::InvalidInput {
+                kind: "transaction",
+                detail: "the transaction creates nothing".to_owned(),
+            })?;
+        let config = self.state.lock().await.settings_backend(network);
+        let endpoints = chain::endpoints(&config, network)?;
+        let mut attempts: Vec<String> = Vec::new();
+        for endpoint in &endpoints {
+            match chain::tx_standing(endpoint, txid, script.clone()).await {
+                Ok(standing) => {
+                    let confirmations = standing
+                        .block_height
+                        .map(|height| standing.tip_height.saturating_sub(height) + 1)
+                        .unwrap_or(0);
+                    return Ok(BroadcastStatus {
+                        txid: txid.to_string(),
+                        found: standing.found,
+                        confirmed: standing.block_height.is_some(),
+                        block_height: standing.block_height,
+                        confirmations,
+                        backend: endpoint.label(),
+                        at: now_secs(),
+                    });
+                }
+                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
             }
         }
         Err(sync_failure(&endpoints, attempts))

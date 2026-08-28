@@ -5,6 +5,7 @@ pub(crate) mod esplora;
 pub mod public;
 
 use bdk_wallet::KeychainKind;
+use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
 use serde::{Deserialize, Serialize};
 
@@ -236,6 +237,99 @@ pub(crate) async fn fetch_address_state(
         Endpoint::Electrum(_) => Err("single-address wallets need an Esplora backend for now; \
              switch the backend or import a descriptor"
             .to_owned()),
+    }
+}
+
+/// Hands a signed transaction to one endpoint. Returns the host that
+/// accepted it; the node's refusal comes back as the error text.
+pub(crate) async fn broadcast(endpoint: &Endpoint, tx: &Transaction) -> Result<(), String> {
+    match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            esplora::broadcast(&client, tx).await
+        }
+        Endpoint::Electrum(url) => {
+            let url = url.clone();
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || electrum::broadcast_blocking(&url, &tx))
+                .await
+                .map_err(|e| e.to_string())?
+                .map(|_| ())
+        }
+    }
+}
+
+/// What one endpoint knows about a coin about to be spent.
+pub(crate) struct PrevoutFacts {
+    pub txout: Option<TxOut>,
+    /// `None` when the endpoint cannot say (Electrum).
+    pub spent: Option<bool>,
+}
+
+pub(crate) async fn fetch_prevout(
+    endpoint: &Endpoint,
+    outpoint: OutPoint,
+) -> Result<PrevoutFacts, String> {
+    match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            let facts = esplora::fetch_prevout(&client, outpoint).await?;
+            Ok(PrevoutFacts {
+                txout: facts.txout,
+                spent: facts.spent,
+            })
+        }
+        Endpoint::Electrum(url) => {
+            let url = url.clone();
+            let txout = tokio::task::spawn_blocking(move || {
+                electrum::fetch_prevout_blocking(&url, outpoint)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            Ok(PrevoutFacts { txout, spent: None })
+        }
+    }
+}
+
+/// Where a transaction stands at one endpoint. `script` is one of the
+/// transaction's output scripts, the handle Electrum needs.
+pub(crate) struct TxStanding {
+    pub found: bool,
+    pub block_height: Option<u32>,
+    pub tip_height: u32,
+}
+
+pub(crate) async fn tx_standing(
+    endpoint: &Endpoint,
+    txid: Txid,
+    script: ScriptBuf,
+) -> Result<TxStanding, String> {
+    match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            let standing = esplora::tx_standing(&client, &txid).await?;
+            Ok(TxStanding {
+                found: standing.found,
+                block_height: standing
+                    .confirmed
+                    .then_some(standing.block_height)
+                    .flatten(),
+                tip_height: standing.tip_height,
+            })
+        }
+        Endpoint::Electrum(url) => {
+            let url = url.clone();
+            let (found, block_height, tip_height) = tokio::task::spawn_blocking(move || {
+                electrum::tx_standing_blocking(&url, &txid, &script)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            Ok(TxStanding {
+                found,
+                block_height,
+                tip_height,
+            })
+        }
     }
 }
 

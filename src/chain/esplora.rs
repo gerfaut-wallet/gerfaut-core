@@ -6,7 +6,7 @@ use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::address::Address;
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
 
-use bdk_wallet::bitcoin::{Amount, OutPoint, TxOut, Txid};
+use bdk_wallet::bitcoin::{Amount, OutPoint, Transaction, TxOut, Txid};
 
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
@@ -272,4 +272,94 @@ fn script_address(script: &bdk_wallet::bitcoin::ScriptBuf, network: Network) -> 
     Address::from_script(script, network.to_bitcoin())
         .ok()
         .map(|a| a.to_string())
+}
+
+// --- broadcast ------------------------------------------------------------
+
+/// Hands a signed transaction to the network through this instance.
+/// The instance's own node validates it; its refusal comes back as the
+/// message, verbatim, which is the most useful thing to show.
+pub(crate) async fn broadcast(client: &AsyncClient, tx: &Transaction) -> Result<(), String> {
+    client.broadcast(tx).await.map_err(|e| broadcast_error(&e))
+}
+
+/// Esplora wraps the node's refusal in an HTTP error whose body is the
+/// reason (`sendrawtransaction RPC error: {"code":-26,"message":"..."}`);
+/// keep the message, drop the wrapping.
+fn broadcast_error(error: &esplora_client::Error) -> String {
+    let text = error.to_string();
+    if let Some(start) = text.find("\"message\":\"") {
+        let rest = &text[start + 11..];
+        if let Some(end) = rest.find('"') {
+            return rest[..end].to_owned();
+        }
+    }
+    text
+}
+
+/// The output an input spends, and whether it is already spent.
+pub(crate) struct PrevoutFacts {
+    pub txout: Option<TxOut>,
+    pub spent: Option<bool>,
+}
+
+/// Fetches a previous output. `None` in `txout` means the backend does
+/// not know the transaction at all.
+pub(crate) async fn fetch_prevout(
+    client: &AsyncClient,
+    outpoint: OutPoint,
+) -> Result<PrevoutFacts, String> {
+    let tx = client
+        .get_tx(&outpoint.txid)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(tx) = tx else {
+        return Ok(PrevoutFacts {
+            txout: None,
+            spent: None,
+        });
+    };
+    let txout = tx.output.get(outpoint.vout as usize).cloned();
+    let spent = client
+        .get_output_status(&outpoint.txid, outpoint.vout as u64)
+        .await
+        .ok()
+        .flatten()
+        .map(|status| status.spent);
+    Ok(PrevoutFacts { txout, spent })
+}
+
+/// Where a transaction stands: unknown, in the mempool, or at a height.
+pub(crate) struct TxStanding {
+    pub found: bool,
+    pub confirmed: bool,
+    pub block_height: Option<u32>,
+    pub tip_height: u32,
+}
+
+pub(crate) async fn tx_standing(client: &AsyncClient, txid: &Txid) -> Result<TxStanding, String> {
+    let tip_height = client.get_height().await.map_err(|e| e.to_string())?;
+    let found = client
+        .get_tx_info(txid)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if !found {
+        return Ok(TxStanding {
+            found: false,
+            confirmed: false,
+            block_height: None,
+            tip_height,
+        });
+    }
+    let status = client
+        .get_tx_status(txid)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(TxStanding {
+        found: true,
+        confirmed: status.confirmed,
+        block_height: status.block_height,
+        tip_height,
+    })
 }

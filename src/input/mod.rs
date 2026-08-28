@@ -217,6 +217,16 @@ fn classify(input: &str, script: Option<ScriptKind>) -> CoreResult<ParsedInput> 
         return parse_json_export(trimmed);
     }
 
+    // A signed transaction or a PSBT is a thing to broadcast, not a
+    // thing to watch: say so instead of "unrecognized".
+    if crate::broadcast::looks_like_transaction(trimmed) {
+        return Err(CoreError::InvalidInput {
+            kind: "transaction",
+            detail: "this is a transaction, not a wallet to watch: the Broadcast page sends it"
+                .to_owned(),
+        });
+    }
+
     let lines: Vec<&str> = trimmed
         .lines()
         .map(str::trim)
