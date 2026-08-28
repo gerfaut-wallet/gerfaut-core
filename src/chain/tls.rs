@@ -297,7 +297,9 @@ impl ServerCertVerifier for Tofu {
     }
 }
 
-/// Short reason, in the words a user can act on.
+/// Short reason, in the words a user can act on. Never the verifier's
+/// own debug spelling: what reaches the dialog is read by someone
+/// deciding whether to trust a server, not by a developer.
 fn reason_of(error: &rustls::Error) -> String {
     use rustls::CertificateError as C;
     match error {
@@ -308,6 +310,17 @@ fn reason_of(error: &rustls::Error) -> String {
         rustls::Error::InvalidCertificate(C::NotValidYet) => "not valid yet".to_owned(),
         rustls::Error::InvalidCertificate(C::NotValidForName) => {
             "issued for a different host name".to_owned()
+        }
+        // Certificates written before X.509 v3 are still served by
+        // long-lived Electrum servers; the standard verifier declines to
+        // read them at all, which is not the same as finding them wrong.
+        rustls::Error::InvalidCertificate(_)
+            if error.to_string().contains("UnsupportedCertVersion") =>
+        {
+            "written in X.509 version 1, older than the standard verifier reads".to_owned()
+        }
+        rustls::Error::InvalidCertificate(_) => {
+            "it cannot be checked against the public authorities".to_owned()
         }
         other => other.to_string(),
     }
@@ -412,6 +425,41 @@ fn tcp_connect(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, Co
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whatever the verifier refuses, the reason reaches the user as a
+    /// sentence, never as a debug dump.
+    #[test]
+    fn the_reason_is_written_for_a_reader() {
+        use rustls::CertificateError as C;
+        assert_eq!(
+            reason_of(&rustls::Error::InvalidCertificate(C::UnknownIssuer)),
+            "self-signed, or signed by an authority this machine does not know"
+        );
+        assert_eq!(
+            reason_of(&rustls::Error::InvalidCertificate(C::Expired)),
+            "expired"
+        );
+        let unreadable = rustls::Error::InvalidCertificate(C::Other(rustls::OtherError(
+            std::sync::Arc::new(UnsupportedCertVersion),
+        )));
+        assert_eq!(
+            reason_of(&unreadable),
+            "written in X.509 version 1, older than the standard verifier reads"
+        );
+        assert!(!reason_of(&unreadable).contains("Other("));
+    }
+
+    /// Stands in for the error webpki raises on a pre-v3 certificate.
+    #[derive(Debug)]
+    struct UnsupportedCertVersion;
+
+    impl std::fmt::Display for UnsupportedCertVersion {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "UnsupportedCertVersion")
+        }
+    }
+
+    impl std::error::Error for UnsupportedCertVersion {}
 
     #[test]
     fn a_certificate_is_read_for_what_it_says_about_itself() {
