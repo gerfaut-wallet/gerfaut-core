@@ -276,28 +276,6 @@ fn script_address(script: &bdk_wallet::bitcoin::ScriptBuf, network: Network) -> 
 
 // --- broadcast ------------------------------------------------------------
 
-#[cfg(test)]
-mod broadcast_tests {
-    use super::node_message;
-
-    #[test]
-    fn the_node_reason_is_kept_whichever_spelling() {
-        let mempool = r#"sendrawtransaction RPC error: {"code":-27,"message":"Transaction outputs already in utxo set"}"#;
-        assert_eq!(
-            node_message(mempool),
-            "Transaction outputs already in utxo set"
-        );
-        let blockstream = "sendrawtransaction RPC error -26: mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)";
-        assert_eq!(
-            node_message(blockstream),
-            "mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)"
-        );
-        let escaped = r#"{\"code\":-26,\"message\":\"bad-txns-inputs-missingorspent\"}"#;
-        assert_eq!(node_message(escaped), "bad-txns-inputs-missingorspent");
-        assert_eq!(node_message("connection refused"), "connection refused");
-    }
-}
-
 /// Hands a signed transaction to the network through this instance.
 /// The instance's own node validates it; its refusal comes back as the
 /// message, verbatim, which is the most useful thing to show.
@@ -404,4 +382,26 @@ pub(crate) async fn tx_standing(client: &AsyncClient, txid: &Txid) -> Result<TxS
         block_height: status.block_height,
         tip_height,
     })
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::node_message;
+
+    #[test]
+    fn the_node_reason_is_kept_whichever_spelling() {
+        let mempool = r#"sendrawtransaction RPC error: {"code":-27,"message":"Transaction outputs already in utxo set"}"#;
+        assert_eq!(
+            node_message(mempool),
+            "Transaction outputs already in utxo set"
+        );
+        let blockstream = "sendrawtransaction RPC error -26: mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)";
+        assert_eq!(
+            node_message(blockstream),
+            "mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)"
+        );
+        let escaped = r#"{\"code\":-26,\"message\":\"bad-txns-inputs-missingorspent\"}"#;
+        assert_eq!(node_message(escaped), "bad-txns-inputs-missingorspent");
+        assert_eq!(node_message("connection refused"), "connection refused");
+    }
 }

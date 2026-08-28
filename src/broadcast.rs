@@ -218,7 +218,7 @@ pub fn decode_transaction(input: &str) -> CoreResult<DecodedTx> {
         return Err(tx_error("input too large"));
     }
     if crate::input::qr::is_envelope(&text) {
-        let progress = crate::input::qr::assemble(&[text.clone()])?;
+        let progress = crate::input::qr::assemble(std::slice::from_ref(&text))?;
         return match progress.text {
             Some(inner) => decode_transaction(&inner),
             None => Err(tx_error(format!(
@@ -265,7 +265,7 @@ pub fn decode_bytes_as_transaction(bytes: &[u8]) -> CoreResult<DecodedTx> {
 
 /// Text to bytes: hex first (a hex string is unambiguous), base64 next.
 fn decode_bytes(text: &str) -> CoreResult<Vec<u8>> {
-    if text.len() % 2 == 0 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if text.len().is_multiple_of(2) && text.bytes().all(|b| b.is_ascii_hexdigit()) {
         return data_encoding::HEXLOWER_PERMISSIVE
             .decode(text.as_bytes())
             .map_err(|_| tx_error("invalid hex"));
