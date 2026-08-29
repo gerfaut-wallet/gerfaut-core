@@ -83,6 +83,9 @@ pub enum InputWarning {
     /// The export file contains several account types; the preferred one
     /// was selected.
     MultipleAccountsInFile,
+    /// The branches differ from the BIP32 convention (`0/*` receive,
+    /// `1/*` change): a wallet that follows it shows other addresses.
+    NonStandardDerivation,
 }
 
 /// Normalized wallet material produced by the classifier.
@@ -111,10 +114,19 @@ pub struct ParsedInput {
     pub warnings: Vec<InputWarning>,
     /// Script types the user may pick instead of the one in `payload`.
     /// Non-empty only when the input does not fix the script type by
-    /// itself (a lone extended key). Re-run [`parse_input_with`] with
-    /// the choice to rebuild the descriptors.
+    /// itself (a lone extended key). Re-run [`parse_input_with_options`]
+    /// with the choice to rebuild the descriptors.
     #[serde(default)]
     pub script_options: Vec<ScriptKind>,
+    /// Branches and origin behind `payload` for a lone extended key,
+    /// defaults filled in. `None` when the input spells out its own.
+    #[serde(default)]
+    pub derivation: Option<DerivationChoice>,
+    /// True when `derivation` may still be changed; only a lone extended
+    /// key leaves it open. Re-run [`parse_input_with_options`] with the
+    /// new choice to rebuild the descriptors.
+    #[serde(default)]
+    pub derivation_editable: bool,
     /// First receive address, derived for the first candidate network,
     /// so the user can compare it with the wallet they are importing.
     /// `None` for single addresses and for descriptors that cannot
@@ -131,6 +143,48 @@ pub const SINGLE_KEY_SCRIPTS: [ScriptKind; 4] = [
     ScriptKind::Taproot,
 ];
 
+/// Receive branch every single-key wallet uses, BIP44 through BIP86.
+const RECEIVE_BRANCH: &str = "0/*";
+/// Change branch of the same convention.
+const CHANGE_BRANCH: &str = "1/*";
+
+/// Where a lone extended key derives its addresses from.
+///
+/// Wallets agree on `0/*` for receive and `1/*` for change, so the
+/// defaults cover almost every import. The fields exist for the rest: a
+/// key exported one level up, an odd branch, an origin the signer will
+/// need in the descriptor later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivationChoice {
+    /// Receive branch, relative to the key, unhardened, wildcard last
+    /// (`0/*`, `*`, `2/0/*`).
+    pub receive: String,
+    /// Change branch in the same form; `None` leaves change untracked.
+    pub change: Option<String>,
+    /// Key origin, `[fingerprint/path]`; `None` keeps the one the input
+    /// carries, if any.
+    pub origin: Option<String>,
+}
+
+impl Default for DerivationChoice {
+    fn default() -> Self {
+        Self {
+            receive: RECEIVE_BRANCH.to_owned(),
+            change: Some(CHANGE_BRANCH.to_owned()),
+            origin: None,
+        }
+    }
+}
+
+/// What the user picked on the confirmation screen. Each choice only
+/// applies to inputs that leave it open, which is a lone extended key;
+/// the others fix their own and ignore it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImportOptions {
+    pub script: Option<ScriptKind>,
+    pub derivation: Option<DerivationChoice>,
+}
+
 /// Classifies raw user input into wallet material.
 ///
 /// The classification order is: private material rejection, JSON export,
@@ -138,18 +192,30 @@ pub const SINGLE_KEY_SCRIPTS: [ScriptKind; 4] = [
 /// but invalid format are reported as such; only inputs matching nothing
 /// at all yield [`CoreError::UnrecognizedInput`].
 pub fn parse_input(input: &str) -> CoreResult<ParsedInput> {
-    parse_input_with(input, None)
+    parse_input_with_options(input, &ImportOptions::default())
 }
 
 /// Same as [`parse_input`], with the script type the user picked for a
-/// lone extended key. The choice only applies to inputs that leave the
-/// script type open (`script_options` non-empty); everything else fixes
-/// its own script type and ignores it.
+/// lone extended key.
 pub fn parse_input_with(input: &str, script: Option<ScriptKind>) -> CoreResult<ParsedInput> {
+    parse_input_with_options(
+        input,
+        &ImportOptions {
+            script,
+            derivation: None,
+        },
+    )
+}
+
+/// Same as [`parse_input`], with everything the user may pick for a
+/// lone extended key. Inputs that fix their own script type and paths
+/// (`script_options` empty, `derivation_editable` false) ignore the
+/// options.
+pub fn parse_input_with_options(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
     if bsms::is_bsms(input) {
         return parse_bsms_record(input);
     }
-    let mut parsed = classify(input, script)?;
+    let mut parsed = classify(input, options)?;
     if parsed.preview_address.is_none() {
         parsed.preview_address = preview_address(&parsed);
     }
@@ -162,7 +228,7 @@ pub fn parse_input_with(input: &str, script: Option<ScriptKind>) -> CoreResult<P
 fn parse_bsms_record(input: &str) -> CoreResult<ParsedInput> {
     reject_private_material(input.trim())?;
     let record = bsms::parse_bsms(input)?;
-    let mut parsed = classify(&record.descriptor, None)?;
+    let mut parsed = classify(&record.descriptor, &ImportOptions::default())?;
     parsed.preview_address = preview_address(&parsed);
     match parsed.preview_address.as_deref() {
         Some(derived) if derived.eq_ignore_ascii_case(&record.first_address) => {}
@@ -186,7 +252,7 @@ fn parse_bsms_record(input: &str) -> CoreResult<ParsedInput> {
     Ok(parsed)
 }
 
-fn classify(input: &str, script: Option<ScriptKind>) -> CoreResult<ParsedInput> {
+fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(CoreError::UnrecognizedInput("empty input".to_owned()));
@@ -202,7 +268,7 @@ fn classify(input: &str, script: Option<ScriptKind>) -> CoreResult<ParsedInput> 
     if qr::is_envelope(trimmed) {
         let progress = qr::assemble(&[trimmed.to_owned()])?;
         return match progress.text {
-            Some(text) => classify(&text, script),
+            Some(text) => classify(&text, options),
             None => Err(CoreError::InvalidInput {
                 kind: "qr",
                 detail: format!(
@@ -247,10 +313,10 @@ fn classify(input: &str, script: Option<ScriptKind>) -> CoreResult<ParsedInput> 
         return parse_single_descriptor(token);
     }
     if let Some((origin, key)) = split_key_origin(token) {
-        return parse_extended_key(key, Some(origin), script);
+        return parse_extended_key(key, Some(origin), options);
     }
     if xpub::looks_like_extended_key(token) {
-        return parse_extended_key(token, None, script);
+        return parse_extended_key(token, None, options);
     }
     if let Ok(address) = token.parse::<Address<_>>() {
         return classify_address(address);
@@ -401,6 +467,8 @@ fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
             },
             warnings: vec![],
             script_options: vec![],
+            derivation: None,
+            derivation_editable: false,
             preview_address: None,
         });
     }
@@ -419,6 +487,8 @@ fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
         },
         warnings,
         script_options: vec![],
+        derivation: None,
+        derivation_editable: false,
         preview_address: None,
     })
 }
@@ -449,47 +519,41 @@ fn parse_descriptor_pair(first: &str, second: &str) -> CoreResult<ParsedInput> {
         },
         warnings: vec![],
         script_options: vec![],
+        derivation: None,
+        derivation_editable: false,
         preview_address: None,
     })
 }
 
 // --- extended keys -----------------------------------------------------
 
-/// Builds the external/internal descriptor pair for a lone extended key.
+/// Builds the descriptors of a lone extended key: external on the
+/// receive branch, internal on the change branch when there is one.
 fn descriptors_for_xpub(
     key: &str,
-    origin: Option<&str>,
     script: ScriptKind,
-) -> CoreResult<(String, String)> {
-    let origin = origin.unwrap_or("");
-    let (external, internal) = match script {
-        ScriptKind::Legacy => (
-            format!("pkh({origin}{key}/0/*)"),
-            format!("pkh({origin}{key}/1/*)"),
-        ),
-        ScriptKind::NestedSegwit => (
-            format!("sh(wpkh({origin}{key}/0/*))"),
-            format!("sh(wpkh({origin}{key}/1/*))"),
-        ),
-        ScriptKind::Segwit => (
-            format!("wpkh({origin}{key}/0/*)"),
-            format!("wpkh({origin}{key}/1/*)"),
-        ),
-        ScriptKind::Taproot => (
-            format!("tr({origin}{key}/0/*)"),
-            format!("tr({origin}{key}/1/*)"),
-        ),
-        other => {
-            return Err(CoreError::Internal(format!(
-                "no single-key descriptor template for {other:?}"
-            )));
-        }
+    derivation: &DerivationChoice,
+) -> CoreResult<(String, Option<String>)> {
+    let origin = derivation.origin.as_deref().unwrap_or("");
+    let build = |branch: &str| -> CoreResult<String> {
+        let key = format!("{origin}{key}/{branch}");
+        let descriptor = match script {
+            ScriptKind::Legacy => format!("pkh({key})"),
+            ScriptKind::NestedSegwit => format!("sh(wpkh({key}))"),
+            ScriptKind::Segwit => format!("wpkh({key})"),
+            ScriptKind::Taproot => format!("tr({key})"),
+            other => {
+                return Err(CoreError::Internal(format!(
+                    "no single-key descriptor template for {other:?}"
+                )));
+            }
+        };
+        // Canonicalize through the parser: validates and appends checksums.
+        Ok(parse_descriptor_str(&descriptor)?.to_string())
     };
-    // Canonicalize through the parser: validates and appends checksums.
-    Ok((
-        parse_descriptor_str(&external)?.to_string(),
-        parse_descriptor_str(&internal)?.to_string(),
-    ))
+    let external = build(&derivation.receive)?;
+    let internal = derivation.change.as_deref().map(build).transpose()?;
+    Ok((external, internal))
 }
 
 /// Splits a key-origin prefixed extended key, `[fingerprint/path]xpub…`,
@@ -518,16 +582,173 @@ fn script_from_origin(origin: &str) -> Option<ScriptKind> {
     }
 }
 
+/// First hardened index; a public key stops deriving right below it.
+const HARDENED_INDEX: u32 = 1 << 31;
+
+fn derivation_error(detail: String) -> CoreError {
+    CoreError::InvalidInput {
+        kind: "derivation path",
+        detail,
+    }
+}
+
+/// One step of a path: its index and whether it is hardened. The error
+/// is a sentence tail to hang after the path's name.
+fn parse_step(step: &str) -> Result<(u32, bool), String> {
+    if step.is_empty() {
+        return Err("has an empty step".to_owned());
+    }
+    let (digits, hardened) = match step.strip_suffix(['\'', 'h', 'H']) {
+        Some(digits) => (digits, true),
+        None => (step, false),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("has a step that is not a number (`{step}`)"));
+    }
+    let index = digits
+        .parse::<u32>()
+        .ok()
+        .filter(|index| *index < HARDENED_INDEX)
+        .ok_or_else(|| format!("has an index above {} (`{step}`)", HARDENED_INDEX - 1))?;
+    Ok((index, hardened))
+}
+
+/// Checks a receive or change branch and returns it in canonical form.
+/// An extended public key only derives unhardened children, and the
+/// wildcard has to come last so that every address gets its own index.
+fn canonical_branch(path: &str, which: &str) -> CoreResult<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(derivation_error(format!(
+            "the {which} path is empty; wallets use `0/*` for receive and `1/*` for change"
+        )));
+    }
+    let refuse = |reason: String| derivation_error(format!("the {which} path `{path}` {reason}"));
+    let steps = match path.strip_suffix('*') {
+        Some("") => "",
+        Some(steps) => steps
+            .strip_suffix('/')
+            .ok_or_else(|| refuse("must end with `/*`".to_owned()))?,
+        None => {
+            return Err(refuse(
+                "must end with `*`, the placeholder for the address index".to_owned(),
+            ));
+        }
+    };
+    let steps = steps.strip_prefix('/').unwrap_or(steps);
+    let mut canonical = Vec::new();
+    if !steps.is_empty() {
+        for step in steps.split('/') {
+            if step == "*" {
+                return Err(refuse(
+                    "has `*` before the end; it can only be the last step".to_owned(),
+                ));
+            }
+            let (index, hardened) = parse_step(step).map_err(&refuse)?;
+            if hardened {
+                return Err(refuse(format!(
+                    "has a hardened step (`{step}`): an extended public key cannot derive \
+                     hardened children"
+                )));
+            }
+            canonical.push(index.to_string());
+        }
+    }
+    canonical.push("*".to_owned());
+    Ok(canonical.join("/"))
+}
+
+/// Checks a key origin and returns it in canonical form,
+/// `[fingerprint/path]` with `'` on hardened steps, the way the
+/// descriptor prints it. Hardened steps are fine here: the origin
+/// records what the signer derived, not what this key will.
+fn canonical_origin(origin: &str) -> CoreResult<String> {
+    let origin = origin.trim();
+    let refuse = |reason: String| derivation_error(format!("the key origin `{origin}` {reason}"));
+    let inner = match origin
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        Some(inner) => inner,
+        None if origin.starts_with('[') || origin.ends_with(']') => {
+            return Err(refuse(
+                "must be written between brackets, `[fingerprint/path]`".to_owned(),
+            ));
+        }
+        None => origin,
+    };
+    let mut steps = inner.split('/');
+    let fingerprint = steps.next().unwrap_or_default();
+    if fingerprint.len() != 8 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(refuse(format!(
+            "must start with the master key fingerprint, 8 hexadecimal characters, not \
+             `{fingerprint}`"
+        )));
+    }
+    let mut canonical = fingerprint.to_ascii_lowercase();
+    for step in steps {
+        if step.contains('*') {
+            return Err(refuse(
+                "cannot contain a wildcard; `*` belongs to the receive and change paths".to_owned(),
+            ));
+        }
+        let (index, hardened) = parse_step(step).map_err(&refuse)?;
+        canonical.push('/');
+        canonical.push_str(&index.to_string());
+        if hardened {
+            canonical.push('\'');
+        }
+    }
+    Ok(format!("[{canonical}]"))
+}
+
+/// The derivation in effect for a lone extended key: the user's choice
+/// when there is one, the BIP32 convention otherwise, and the origin
+/// the input carries unless the choice names another.
+fn effective_derivation(
+    input_origin: Option<&str>,
+    choice: Option<&DerivationChoice>,
+) -> CoreResult<DerivationChoice> {
+    let default = DerivationChoice::default();
+    let choice = choice.unwrap_or(&default);
+    let receive = canonical_branch(&choice.receive, "receive")?;
+    let change = choice
+        .change
+        .as_deref()
+        .map(|change| canonical_branch(change, "change"))
+        .transpose()?;
+    if change.as_deref() == Some(receive.as_str()) {
+        return Err(derivation_error(format!(
+            "the receive and change paths are both `{receive}`; change needs its own branch"
+        )));
+    }
+    let origin = choice
+        .origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .or(input_origin)
+        .map(canonical_origin)
+        .transpose()?;
+    Ok(DerivationChoice {
+        receive,
+        change,
+        origin,
+    })
+}
+
 /// A lone extended key, with or without a key origin.
 ///
 /// The script type comes, in order, from the user's explicit choice,
 /// the SLIP-132 prefix (`ypub`, `zpub`, …), the purpose of the origin
-/// path, and finally the BIP84 default with a warning. In every case the
-/// user may still switch: `script_options` lists the alternatives.
+/// path, and finally the BIP84 default with a warning. The branches
+/// come from the user's choice or the BIP32 convention. In every case
+/// the user may still switch: `script_options` lists the alternatives
+/// and `derivation_editable` opens the paths.
 fn parse_extended_key(
     token: &str,
     origin: Option<&str>,
-    choice: Option<ScriptKind>,
+    options: &ImportOptions,
 ) -> CoreResult<ParsedInput> {
     let decoded = xpub::decode_extended_key(token)?;
     if decoded.multisig_only {
@@ -538,7 +759,7 @@ fn parse_extended_key(
                 .to_owned(),
         });
     }
-    if let Some(choice) = choice
+    if let Some(choice) = options.script
         && !SINGLE_KEY_SCRIPTS.contains(&choice)
     {
         return Err(CoreError::InvalidInput {
@@ -546,15 +767,16 @@ fn parse_extended_key(
             detail: format!("{choice:?} cannot be built from a single key"),
         });
     }
+    let derivation = effective_derivation(origin, options.derivation.as_ref())?;
 
     let mut warnings = vec![];
     if decoded.converted {
         warnings.push(InputWarning::Slip132Converted);
     }
     let script = match (
-        choice,
+        options.script,
         decoded.script_hint,
-        origin.and_then(script_from_origin),
+        derivation.origin.as_deref().and_then(script_from_origin),
     ) {
         (Some(choice), ..) => choice,
         (None, Some(hint), _) | (None, None, Some(hint)) => hint,
@@ -563,18 +785,26 @@ fn parse_extended_key(
             ScriptKind::Segwit
         }
     };
-    let (external, internal) = descriptors_for_xpub(&decoded.normalized, origin, script)?;
+    let (external, internal) = descriptors_for_xpub(&decoded.normalized, script, &derivation)?;
+    if derivation.receive != RECEIVE_BRANCH || derivation.change.as_deref() != Some(CHANGE_BRANCH) {
+        warnings.push(InputWarning::NonStandardDerivation);
+    }
+    if internal.is_none() {
+        warnings.push(InputWarning::ChangeNotTracked);
+    }
 
     Ok(ParsedInput {
         kind: RecognizedKind::ExtendedKey,
         networks: networks_for_kind(Some(decoded.network_kind)),
         payload: ParsedPayload::Descriptors {
             external,
-            internal: Some(internal),
+            internal,
             script,
         },
         warnings,
         script_options: SINGLE_KEY_SCRIPTS.to_vec(),
+        derivation: Some(derivation),
+        derivation_editable: true,
         preview_address: None,
     })
 }
@@ -617,6 +847,8 @@ fn classify_address(
         payload: ParsedPayload::Address { address: canonical },
         warnings: vec![],
         script_options: vec![],
+        derivation: None,
+        derivation_editable: false,
         preview_address: None,
     })
 }
@@ -683,8 +915,11 @@ fn parse_json_export(input: &str) -> CoreResult<ParsedInput> {
             _ => None,
         };
 
-        let (external, internal) =
-            descriptors_for_xpub(&decoded.normalized, origin.as_deref(), *script)?;
+        let derivation = DerivationChoice {
+            origin,
+            ..DerivationChoice::default()
+        };
+        let (external, internal) = descriptors_for_xpub(&decoded.normalized, *script, &derivation)?;
         let mut warnings = vec![];
         if present.len() > 1 {
             warnings.push(InputWarning::MultipleAccountsInFile);
@@ -694,11 +929,13 @@ fn parse_json_export(input: &str) -> CoreResult<ParsedInput> {
             networks: networks_for_kind(Some(decoded.network_kind)),
             payload: ParsedPayload::Descriptors {
                 external,
-                internal: Some(internal),
+                internal,
                 script: *script,
             },
             warnings,
             script_options: vec![],
+            derivation: None,
+            derivation_editable: false,
             preview_address: None,
         });
     }
@@ -715,6 +952,21 @@ mod tests {
     /// Public two-path descriptor from the BDK documentation.
     const MULTIPATH: &str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)";
     const TPUB: &str = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
+    /// BIP32 test vector 1, master public key.
+    const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+    /// First receive address of `TPUB` on the default derivation.
+    const DEFAULT_PREVIEW: &str = "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx";
+
+    fn with_derivation(receive: &str, change: Option<&str>, origin: Option<&str>) -> ImportOptions {
+        ImportOptions {
+            script: None,
+            derivation: Some(DerivationChoice {
+                receive: receive.to_owned(),
+                change: change.map(str::to_owned),
+                origin: origin.map(str::to_owned),
+            }),
+        }
+    }
 
     fn descriptors(parsed: &ParsedInput) -> (&str, Option<&str>, ScriptKind) {
         match &parsed.payload {
@@ -985,5 +1237,242 @@ mod tests {
             parse_input("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"),
             Err(CoreError::UnrecognizedInput(_))
         ));
+    }
+
+    #[test]
+    fn default_derivation_matches_the_plain_import() {
+        let parsed = parse_input_with_options(TPUB, &ImportOptions::default()).unwrap();
+        let (external, internal, _) = descriptors(&parsed);
+        assert_eq!(external, format!("wpkh({TPUB}/0/*)#dmh8w44d"));
+        assert_eq!(internal.unwrap(), format!("wpkh({TPUB}/1/*)#u0jxnq94"));
+        assert!(parsed.derivation_editable);
+        assert_eq!(parsed.derivation, Some(DerivationChoice::default()));
+        assert!(
+            !parsed
+                .warnings
+                .contains(&InputWarning::NonStandardDerivation)
+        );
+        assert_eq!(parsed.preview_address.as_deref(), Some(DEFAULT_PREVIEW));
+    }
+
+    #[test]
+    fn key_origin_fills_the_derivation() {
+        let parsed = parse_input(&format!("[9a6a2580/84h/1h/0h]{TPUB}")).unwrap();
+        assert!(parsed.derivation_editable);
+        assert!(parsed.warnings.is_empty());
+        let derivation = parsed.derivation.as_ref().unwrap();
+        assert_eq!(derivation.origin.as_deref(), Some("[9a6a2580/84'/1'/0']"));
+        assert_eq!(derivation.receive, "0/*");
+        assert_eq!(derivation.change.as_deref(), Some("1/*"));
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.starts_with("wpkh([9a6a2580/84'/1'/0']"));
+    }
+
+    #[test]
+    fn untracked_change_is_a_single_descriptor() {
+        let options = with_derivation("0/*", None, None);
+        let parsed = parse_input_with_options(TPUB, &options).unwrap();
+        let (external, internal, _) = descriptors(&parsed);
+        assert_eq!(external, format!("wpkh({TPUB}/0/*)#dmh8w44d"));
+        assert!(internal.is_none());
+        assert!(parsed.warnings.contains(&InputWarning::ChangeNotTracked));
+        assert!(
+            parsed
+                .warnings
+                .contains(&InputWarning::NonStandardDerivation)
+        );
+        assert_eq!(parsed.derivation.unwrap().change, None);
+    }
+
+    #[test]
+    fn custom_branches_rebuild_both_descriptors() {
+        let options = with_derivation("5/*", Some("6/*"), None);
+        let parsed = parse_input_with_options(TPUB, &options).unwrap();
+        let (external, internal, _) = descriptors(&parsed);
+        assert!(external.contains(&format!("{TPUB}/5/*")), "{external}");
+        assert!(internal.unwrap().contains(&format!("{TPUB}/6/*")));
+        assert!(
+            parsed
+                .warnings
+                .contains(&InputWarning::NonStandardDerivation)
+        );
+        assert!(!parsed.warnings.contains(&InputWarning::ChangeNotTracked));
+        let preview = parsed.preview_address.unwrap();
+        assert!(preview.starts_with("tb1q"), "{preview}");
+        assert_ne!(preview, DEFAULT_PREVIEW);
+    }
+
+    #[test]
+    fn branches_are_canonicalized() {
+        let options = with_derivation(" 007/* ", Some("/*"), None);
+        let parsed = parse_input_with_options(TPUB, &options).unwrap();
+        let derivation = parsed.derivation.as_ref().unwrap();
+        assert_eq!(derivation.receive, "7/*");
+        assert_eq!(derivation.change.as_deref(), Some("*"));
+        let (external, internal, _) = descriptors(&parsed);
+        assert!(external.contains(&format!("{TPUB}/7/*")));
+        assert!(internal.unwrap().contains(&format!("{TPUB}/*)")));
+    }
+
+    #[test]
+    fn bad_branches_are_refused_as_derivation_paths() {
+        let rejected = |receive: &str, change: Option<&str>| {
+            let options = with_derivation(receive, change, None);
+            match parse_input_with_options(TPUB, &options) {
+                Err(CoreError::InvalidInput {
+                    kind: "derivation path",
+                    detail,
+                }) => detail,
+                other => panic!("{receive:?}/{change:?} should be refused, got {other:?}"),
+            }
+        };
+        assert!(rejected("0'/*", Some("1/*")).contains("hardened"));
+        assert!(rejected("0h/*", Some("1/*")).contains("hardened"));
+        assert!(rejected("0/*", Some("1H/*")).contains("hardened"));
+        assert!(rejected("0", Some("1/*")).contains('*'));
+        assert!(rejected("0*", Some("1/*")).contains("/*"));
+        assert!(rejected("0/*", Some("0/*")).contains("both"));
+        assert!(rejected("", Some("1/*")).contains("empty"));
+        assert!(rejected("0//*", Some("1/*")).contains("empty step"));
+        assert!(rejected("a/*", Some("1/*")).contains("not a number"));
+        assert!(rejected("2147483648/*", Some("1/*")).contains("above"));
+        assert!(rejected("*/0/*", Some("1/*")).contains("last"));
+    }
+
+    #[test]
+    fn bad_origins_are_refused_as_derivation_paths() {
+        let rejected = |origin: &str| {
+            let options = with_derivation("0/*", Some("1/*"), Some(origin));
+            match parse_input_with_options(TPUB, &options) {
+                Err(CoreError::InvalidInput {
+                    kind: "derivation path",
+                    detail,
+                }) => detail,
+                other => panic!("{origin:?} should be refused, got {other:?}"),
+            }
+        };
+        assert!(rejected("[zz]").contains("fingerprint"));
+        assert!(rejected("[deadbeef0/84']").contains("fingerprint"));
+        assert!(rejected("[deadbeef/84'/*]").contains("wildcard"));
+        assert!(rejected("[deadbeef/84'/x]").contains("not a number"));
+        assert!(rejected("[deadbeef/84'/]").contains("empty step"));
+        assert!(rejected("[deadbeef/84'").contains("brackets"));
+    }
+
+    #[test]
+    fn chosen_origin_overrides_the_input() {
+        let options = with_derivation("0/*", Some("1/*"), Some("[DEADBEEF/84h/0h/0h]"));
+        let parsed = parse_input_with_options(XPUB, &options).unwrap();
+        let (external, internal, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.starts_with("wpkh([deadbeef/84'/0'/0']xpub"));
+        assert!(
+            internal
+                .unwrap()
+                .starts_with("wpkh([deadbeef/84'/0'/0']xpub")
+        );
+        assert!(!parsed.warnings.contains(&InputWarning::AssumedSegwit));
+        assert_eq!(parsed.networks, vec![Network::Mainnet]);
+        assert_eq!(
+            parsed.derivation.unwrap().origin.as_deref(),
+            Some("[deadbeef/84'/0'/0']")
+        );
+
+        let input = format!("[9a6a2580/86'/1'/0']{TPUB}");
+        let options = with_derivation("0/*", Some("1/*"), Some("[deadbeef/44'/1'/0']"));
+        let parsed = parse_input_with_options(&input, &options).unwrap();
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Legacy);
+        assert!(external.starts_with("pkh([deadbeef/44'/1'/0']"));
+
+        // A blank choice keeps the input's origin.
+        let options = with_derivation("0/*", Some("1/*"), Some(" "));
+        let parsed = parse_input_with_options(&input, &options).unwrap();
+        assert_eq!(
+            parsed.derivation.unwrap().origin.as_deref(),
+            Some("[9a6a2580/86'/1'/0']")
+        );
+    }
+
+    #[test]
+    fn fingerprint_only_origin_is_accepted() {
+        let options = with_derivation("0/*", Some("1/*"), Some("deadbeef"));
+        let parsed = parse_input_with_options(TPUB, &options).unwrap();
+        assert_eq!(
+            parsed.derivation.as_ref().unwrap().origin.as_deref(),
+            Some("[deadbeef]")
+        );
+        assert!(parsed.warnings.contains(&InputWarning::AssumedSegwit));
+        let (external, _, _) = descriptors(&parsed);
+        assert!(external.starts_with("wpkh([deadbeef]tpub"));
+    }
+
+    #[test]
+    fn explicit_script_wins_over_the_chosen_origin() {
+        let options = ImportOptions {
+            script: Some(ScriptKind::Taproot),
+            derivation: Some(DerivationChoice {
+                origin: Some("[deadbeef/84'/1'/0']".to_owned()),
+                ..DerivationChoice::default()
+            }),
+        };
+        let parsed = parse_input_with_options(TPUB, &options).unwrap();
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Taproot);
+        assert!(external.starts_with("tr([deadbeef/84'/1'/0']"));
+        assert!(
+            !parsed
+                .warnings
+                .contains(&InputWarning::NonStandardDerivation)
+        );
+    }
+
+    #[test]
+    fn fixed_inputs_ignore_the_derivation() {
+        let options = with_derivation("5/*", None, Some("[deadbeef]"));
+
+        let single = format!("wpkh({TPUB}/0/*)");
+        let parsed = parse_input_with_options(&single, &options).unwrap();
+        assert!(!parsed.derivation_editable);
+        assert!(parsed.derivation.is_none());
+        let (external, _, _) = descriptors(&parsed);
+        assert!(external.contains("/0/*") && !external.contains("deadbeef"));
+
+        let address =
+            parse_input_with_options("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", &options)
+                .unwrap();
+        assert!(!address.derivation_editable && address.derivation.is_none());
+
+        let template = format!(
+            "wsh(sortedmulti(1,[9a6a2580/48'/1'/0'/2']{TPUB}/**,[00000000/48'/1'/0'/2']{TPUB}/**))"
+        );
+        let truth = parse_input(&template.replace("/**", "/<0;1>/*")).unwrap();
+        let first = truth.preview_address.unwrap();
+        let record = format!("BSMS 1.0\n{template}\n/0/*,/1/*\n{first}\n");
+        let bsms = parse_input_with_options(&record, &options).unwrap();
+        assert_eq!(bsms.kind, RecognizedKind::Bsms);
+        assert!(!bsms.derivation_editable && bsms.derivation.is_none());
+    }
+
+    #[test]
+    fn parsed_input_without_derivation_fields_still_loads() {
+        let json = format!(
+            "{{\"kind\":\"extended_key\",\"networks\":[\"signet\"],\"payload\":{{\"type\":\
+             \"descriptors\",\"external\":\"wpkh({TPUB}/0/*)\",\"internal\":null,\
+             \"script\":\"segwit\"}},\"warnings\":[\"assumed_segwit\"]}}"
+        );
+        let parsed: ParsedInput = serde_json::from_str(&json).unwrap();
+        assert!(parsed.derivation.is_none());
+        assert!(!parsed.derivation_editable);
+
+        let options = with_derivation("5/*", Some("6/*"), Some("[deadbeef/84'/1'/0']"));
+        let original = parse_input_with_options(TPUB, &options).unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("\"non_standard_derivation\""), "{json}");
+        assert!(json.contains("\"derivation_editable\":true"), "{json}");
+        let restored: ParsedInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.derivation, original.derivation);
+        assert!(restored.derivation_editable);
     }
 }
