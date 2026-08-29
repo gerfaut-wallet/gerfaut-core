@@ -24,7 +24,7 @@ use crate::backup::{
 use crate::broadcast::{
     self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, TxPreview, WalletRef,
 };
-use crate::chain::tor::{self, TorSettings};
+use crate::chain::tor::{self, TorRoute, TorSettings, TorStatus};
 use crate::chain::{
     self, BackendConfig, CertificateReport, CertificateStatus, Endpoint, EngineRequest,
     EngineResponse,
@@ -552,7 +552,7 @@ impl WalletManager {
                     started,
                     from_scratch,
                 )
-                    .await
+                .await
             }
             WalletKind::SingleAddress { address } => {
                 self.sync_address_wallet(&meta, address, &endpoints, proxy.as_deref(), started)
@@ -1365,8 +1365,46 @@ impl WalletManager {
             skipped,
             settings_applied,
         })
+    }
 
     // --- tor -----------------------------------------------------------
+
+    /// Where Tor stands: the mode, the proxy in effect, and how far the
+    /// embedded client got. Reads only; nothing is probed or started.
+    pub async fn tor_status(&self) -> TorStatus {
+        let settings = self.state.lock().await.payload.settings.tor.clone();
+        tor::status(&settings).await
+    }
+
+    /// Persists how `.onion` hosts are reached. A proxy address is
+    /// `host:port`, checked here so a typo fails at the settings screen
+    /// and not at the next sync; blank means the default.
+    pub async fn set_tor_settings(&self, settings: TorSettings) -> CoreResult<()> {
+        let socks_proxy = settings
+            .socks_proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(tor::parse_socks_address)
+            .transpose()?;
+        let mut state = self.state.lock().await;
+        state.payload.settings.tor = TorSettings {
+            mode: settings.mode,
+            socks_proxy,
+        };
+        state.vault.save(&state.payload)?;
+        Ok(())
+    }
+
+    /// Reaches Tor now, the way the settings say, so a settings screen
+    /// can show the outcome before any wallet needs it. With the
+    /// embedded client this is its bootstrap: up to about 90 seconds on
+    /// a first run, a few on later ones. A mode that leads to a system
+    /// proxy costs one probe.
+    pub async fn tor_connect(&self) -> CoreResult<TorRoute> {
+        let (settings, data_dir) = self.tor_setup().await;
+        tor::resolve(&settings, &data_dir).await
+    }
 
     /// The proxy to hand the chain layer for these endpoints: a Tor
     /// route when at least one host is an onion, nothing otherwise. A
@@ -1677,6 +1715,7 @@ fn recognized_kind(kind: &WalletKind) -> RecognizedKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::tor::TorMode;
     use crate::input::parse_input;
 
     const MULTIPATH: &str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)";
@@ -2384,5 +2423,119 @@ mod tests {
             parse_input(&text),
             Err(CoreError::InvalidInput { kind: "backup", .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn tor_settings_are_checked_and_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        assert_eq!(manager.settings().await.tor, TorSettings::default());
+
+        manager
+            .set_tor_settings(TorSettings {
+                mode: TorMode::Embedded,
+                socks_proxy: Some(" 127.0.0.1:9150 ".to_owned()),
+            })
+            .await
+            .unwrap();
+        let status = manager.tor_status().await;
+        assert_eq!(status.mode, TorMode::Embedded);
+        assert_eq!(status.socks_proxy, "127.0.0.1:9150");
+        assert_eq!(status.embedded_available, cfg!(feature = "embedded-tor"));
+
+        // Blank means the default.
+        manager
+            .set_tor_settings(TorSettings {
+                mode: TorMode::System,
+                socks_proxy: Some("  ".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(manager.settings().await.tor.socks_proxy, None);
+
+        // A typo is refused before it is stored.
+        let error = manager
+            .set_tor_settings(TorSettings {
+                mode: TorMode::Auto,
+                socks_proxy: Some("nonsense".to_owned()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CoreError::InvalidInput {
+                kind: "tor proxy",
+                ..
+            }
+        ));
+
+        let manager = WalletManager::open(dir.path(), key()).unwrap();
+        assert_eq!(
+            manager.settings().await.tor,
+            TorSettings {
+                mode: TorMode::System,
+                socks_proxy: None
+            }
+        );
+    }
+
+    /// A loopback port nothing listens on: a system Tor that is not
+    /// there, without depending on what runs on this machine.
+    async fn closed_port() -> String {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        address
+    }
+
+    #[tokio::test]
+    async fn an_onion_backend_without_tor_fails_before_any_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input(MULTIPATH).unwrap();
+        let meta = manager
+            .add_wallet("Over Tor", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        manager
+            .set_backend(
+                Network::Signet,
+                BackendConfig::CustomEsplora {
+                    url: "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/signet/api"
+                        .to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .set_tor_settings(TorSettings {
+                mode: TorMode::System,
+                socks_proxy: Some(closed_port().await),
+            })
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        let error = manager.sync_wallet(&meta.id).await.unwrap_err();
+        assert!(matches!(error, CoreError::Tor(_)), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the onion host is never contacted, let alone looked up"
+        );
+        assert!(matches!(
+            manager.tor_connect().await,
+            Err(CoreError::Tor(_))
+        ));
+
+        // A workspace sync reports it per wallet, like any other failure.
+        let report = manager.sync_all(Some(Network::Signet)).await;
+        assert_eq!(report.failures.len(), 1);
+        assert!(
+            report.failures[0].message.starts_with("tor: "),
+            "{}",
+            report.failures[0].message
+        );
     }
 }
