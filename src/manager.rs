@@ -6,7 +6,7 @@
 //! blocks reads: requests are built under the lock, executed outside it,
 //! and applied back under the lock.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -17,6 +17,10 @@ use std::str::FromStr;
 
 use bdk_wallet::bitcoin::{Address, Amount, TxOut};
 
+use crate::backup::{
+    self, BACKUP_VERSION, BackupBundle, BackupOptions, BackupPayload, BackupPreview, BackupWallet,
+    BackupWalletPreview, ImportChoices, ImportReport,
+};
 use crate::broadcast::{
     self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, TxPreview, WalletRef,
 };
@@ -1137,6 +1141,203 @@ impl WalletManager {
             _ => attempts.fail(now),
         }
     }
+
+    // --- backup ----------------------------------------------------------
+
+    /// Seals the chosen wallets (every wallet by default) and, on
+    /// request, the settings worth carrying over, under a password. The
+    /// sealed bytes come back in both transport forms: base64 for a
+    /// file, `ur:bytes` frames for an animated QR.
+    pub async fn export_backup(
+        &self,
+        options: &BackupOptions,
+        password: &str,
+    ) -> CoreResult<BackupBundle> {
+        let payload = {
+            let state = self.state.lock().await;
+            let settings = &state.payload.settings;
+            let chosen = match &options.wallet_ids {
+                Some(ids) => {
+                    for id in ids {
+                        find_record(&state.payload, id)?;
+                    }
+                    Some(ids.iter().map(String::as_str).collect::<HashSet<_>>())
+                }
+                None => None,
+            };
+            let wallets = state
+                .payload
+                .wallets
+                .iter()
+                .filter(|record| {
+                    chosen
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(record.meta.id.as_str()))
+                })
+                .map(|record| BackupWallet {
+                    name: record.meta.name.clone(),
+                    network: record.meta.network,
+                    kind: record.meta.kind.clone(),
+                    // The effective limit is the global setting.
+                    gap_limit: settings.gap_limit,
+                    labels: record.meta.labels.clone(),
+                    created_at: record.meta.created_at,
+                })
+                .collect();
+            BackupPayload {
+                version: BACKUP_VERSION,
+                created_at: now_secs(),
+                wallets,
+                backends: options.include_settings.then(|| settings.backends.clone()),
+                electrum_certs: options
+                    .include_settings
+                    .then(|| settings.electrum_certs.clone()),
+                gap_limit: options.include_settings.then_some(settings.gap_limit),
+            }
+        };
+        // The key derivation is slow on purpose: not under the lock.
+        let sealed = backup::seal(&payload, password)?;
+        Ok(BackupBundle {
+            data: data_encoding::BASE64.encode(&sealed),
+            frames: backup::frames(&sealed),
+            wallet_count: payload.wallets.len() as u32,
+            size_bytes: sealed.len() as u32,
+        })
+    }
+
+    /// Reads a backup without touching the vault: what it holds, and
+    /// which of its wallets this vault already watches.
+    pub async fn preview_backup(&self, source: &str, password: &str) -> CoreResult<BackupPreview> {
+        let payload = backup::open(&backup::decode_source(source)?, password)?;
+        let state = self.state.lock().await;
+        Ok(BackupPreview {
+            created_at: payload.created_at,
+            has_settings: payload.has_settings(),
+            wallets: payload
+                .wallets
+                .iter()
+                .enumerate()
+                .map(|(index, wallet)| BackupWalletPreview {
+                    index: index as u32,
+                    name: wallet.name.clone(),
+                    network: wallet.network,
+                    kind: wallet.kind.clone(),
+                    already_watched: find_watched(&state.payload, wallet.network, &wallet.kind)
+                        .is_some(),
+                })
+                .collect(),
+        })
+    }
+
+    /// Restores the chosen wallets (all by default) as new records, the
+    /// way [`Self::add_wallet`] creates them, keeping their names and
+    /// labels; a wallet already watched is skipped, never duplicated or
+    /// overwritten. The settings the backup carries are applied only
+    /// when asked: backends replace the ones present for the same
+    /// networks, accepted certificates are added but never replaced (a
+    /// fingerprint that changed is exactly what pinning refuses to
+    /// switch in silence), the gap limit is bounded like
+    /// [`Self::set_gap_limit`].
+    pub async fn import_backup(
+        &self,
+        source: &str,
+        password: &str,
+        choices: &ImportChoices,
+    ) -> CoreResult<ImportReport> {
+        let payload = backup::open(&backup::decode_source(source)?, password)?;
+        let chosen: BTreeSet<usize> = match &choices.indexes {
+            Some(indexes) => indexes
+                .iter()
+                .map(|&index| {
+                    let index = index as usize;
+                    if index < payload.wallets.len() {
+                        Ok(index)
+                    } else {
+                        Err(CoreError::InvalidInput {
+                            kind: "backup",
+                            detail: format!("this backup has no wallet at index {index}"),
+                        })
+                    }
+                })
+                .collect::<CoreResult<_>>()?,
+            None => (0..payload.wallets.len()).collect(),
+        };
+        let settings_applied = choices.apply_settings && payload.has_settings();
+
+        let mut state = self.state.lock().await;
+        // Restored wallets take the gap limit in force once the settings
+        // are applied.
+        let gap_limit = match payload.gap_limit.filter(|_| settings_applied) {
+            Some(gap_limit) => gap_limit.clamp(1, 500),
+            None => state.payload.settings.gap_limit,
+        };
+
+        // Everything that can fail happens before the vault changes: a
+        // descriptor the engine refuses leaves nothing half-restored.
+        let mut pending: Vec<(WalletRecord, Option<bdk_wallet::Wallet>)> = Vec::new();
+        let mut skipped = (payload.wallets.len() - chosen.len()) as u32;
+        for index in chosen {
+            let wallet = &payload.wallets[index];
+            let watched = find_watched(&state.payload, wallet.network, &wallet.kind).is_some()
+                || pending.iter().any(|(record, _)| {
+                    record.meta.network == wallet.network && record.meta.kind == wallet.kind
+                });
+            if watched {
+                skipped += 1;
+                continue;
+            }
+            let name = wallet.name.trim();
+            if name.is_empty() {
+                return Err(CoreError::InvalidInput {
+                    kind: "wallet name",
+                    detail: "a wallet needs a name".to_owned(),
+                });
+            }
+            let mut meta = fresh_meta(
+                name,
+                wallet.network,
+                wallet.kind.clone(),
+                recognized_kind(&wallet.kind),
+                gap_limit,
+            );
+            meta.labels = wallet.labels.clone();
+            pending.push(build_record(meta)?);
+        }
+
+        if settings_applied {
+            let settings = &mut state.payload.settings;
+            if let Some(backends) = &payload.backends {
+                settings.backends.extend(
+                    backends
+                        .iter()
+                        .map(|(network, config)| (*network, config.clone())),
+                );
+            }
+            if let Some(certs) = &payload.electrum_certs {
+                for (host, fingerprint) in certs {
+                    settings
+                        .electrum_certs
+                        .entry(host.clone())
+                        .or_insert_with(|| fingerprint.clone());
+                }
+            }
+            settings.gap_limit = gap_limit;
+        }
+        let mut added = Vec::with_capacity(pending.len());
+        for (record, engine) in pending {
+            if let Some(engine) = engine {
+                state.engines.insert(record.meta.id.clone(), engine);
+            }
+            added.push(record.meta.clone());
+            state.payload.wallets.push(record);
+        }
+        state.vault.save(&state.payload)?;
+        Ok(ImportReport {
+            added,
+            skipped,
+            settings_applied,
+        })
+    }
 }
 
 // --- helpers -----------------------------------------------------------
@@ -1410,6 +1611,18 @@ fn finish_sync(
     }
     state.vault.save(&state.payload)?;
     Ok(())
+}
+
+/// What the import screen would have recognized a restored wallet as:
+/// the material says it all.
+fn recognized_kind(kind: &WalletKind) -> RecognizedKind {
+    match kind {
+        WalletKind::Descriptors {
+            internal: Some(_), ..
+        } => RecognizedKind::DescriptorPair,
+        WalletKind::Descriptors { .. } => RecognizedKind::Descriptor,
+        WalletKind::SingleAddress { .. } => RecognizedKind::Address,
+    }
 }
 
 #[cfg(test)]
@@ -1859,6 +2072,268 @@ mod tests {
         assert!(matches!(
             manager.sync_wallet(&meta.id).await,
             Err(CoreError::BackendUnavailable(_))
+        ));
+    }
+
+    const BACKUP_PASSWORD: &str = "correct horse battery staple";
+    const ADDRESS: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+
+    fn fingerprint(byte: &str) -> String {
+        vec![byte; 32].join(":")
+    }
+
+    /// A manager watching a descriptor wallet and a single address.
+    async fn seeded(dir: &std::path::Path) -> (WalletManager, WalletMeta, WalletMeta) {
+        let manager = manager(dir).await;
+        let cold = manager
+            .add_wallet("Cold", &parse_input(MULTIPATH).unwrap(), Network::Signet)
+            .await
+            .unwrap();
+        let watch = manager
+            .add_wallet("Watch", &parse_input(ADDRESS).unwrap(), Network::Signet)
+            .await
+            .unwrap();
+        (manager, cold, watch)
+    }
+
+    #[tokio::test]
+    async fn backup_restores_wallets_in_a_fresh_vault() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let (source, cold, watch) = seeded(source_dir.path()).await;
+        source.set_gap_limit(50).await.unwrap();
+        let esplora = BackendConfig::CustomEsplora {
+            url: "https://esplora.example.org/api".to_owned(),
+        };
+        source
+            .set_backend(Network::Signet, esplora.clone())
+            .await
+            .unwrap();
+        source
+            .trust_certificate("ssl://electrum.example.org:50002", &fingerprint("AB"))
+            .await
+            .unwrap();
+
+        let options = BackupOptions {
+            wallet_ids: None,
+            include_settings: true,
+        };
+        let bundle = source
+            .export_backup(&options, BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        assert_eq!(bundle.wallet_count, 2);
+        let file = data_encoding::BASE64
+            .decode(bundle.data.as_bytes())
+            .unwrap();
+        assert_eq!(bundle.size_bytes as usize, file.len());
+        assert!(bundle.frames.len() > 1);
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = manager(target_dir.path()).await;
+        let preview = target
+            .preview_backup(&bundle.data, BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        assert!(preview.has_settings);
+        assert_eq!(preview.wallets.len(), 2);
+        assert!(preview.wallets.iter().all(|w| !w.already_watched));
+        assert_eq!(preview.wallets[0].name, "Cold");
+        assert_eq!(preview.wallets[1].index, 1);
+
+        // Wallets only: the settings stay as they were.
+        let wallets_only = ImportChoices {
+            indexes: None,
+            apply_settings: false,
+        };
+        let report = target
+            .import_backup(&bundle.data, BACKUP_PASSWORD, &wallets_only)
+            .await
+            .unwrap();
+        assert_eq!(report.added.len(), 2);
+        assert_eq!(report.skipped, 0);
+        assert!(!report.settings_applied);
+        let settings = target.settings().await;
+        assert_eq!(settings.gap_limit, 20);
+        assert_eq!(
+            settings.backend_for(Network::Signet),
+            BackendConfig::default()
+        );
+
+        let restored = target.list_wallets(None).await;
+        let identity = |m: &WalletMeta| (m.name.clone(), m.network, m.kind.clone());
+        assert_eq!(
+            restored.iter().map(identity).collect::<Vec<_>>(),
+            vec![identity(&cold), identity(&watch)]
+        );
+        assert_ne!(restored[0].id, cold.id, "a restored wallet gets its own id");
+        assert_eq!(restored[0].recognized_as, RecognizedKind::DescriptorPair);
+        assert_eq!(restored[1].recognized_as, RecognizedKind::Address);
+        assert_eq!(
+            target.receive_addresses(&restored[0].id, 0).await.unwrap()[0].address,
+            source.receive_addresses(&cold.id, 0).await.unwrap()[0].address,
+            "the restored engine derives the source's addresses"
+        );
+
+        // A second pass finds everything already there.
+        let preview = target
+            .preview_backup(&bundle.data, BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        assert!(preview.wallets.iter().all(|w| w.already_watched));
+        let report = target
+            .import_backup(&bundle.data, BACKUP_PASSWORD, &wallets_only)
+            .await
+            .unwrap();
+        assert!(report.added.is_empty());
+        assert_eq!(report.skipped, 2);
+
+        // Settings when asked; an acceptance made here is never replaced.
+        target
+            .trust_certificate("ssl://electrum.example.org:50002", &fingerprint("CD"))
+            .await
+            .unwrap();
+        let with_settings = ImportChoices {
+            indexes: None,
+            apply_settings: true,
+        };
+        let report = target
+            .import_backup(&bundle.data, BACKUP_PASSWORD, &with_settings)
+            .await
+            .unwrap();
+        assert!(report.settings_applied);
+        let settings = target.settings().await;
+        assert_eq!(settings.gap_limit, 50);
+        assert_eq!(settings.backend_for(Network::Signet), esplora);
+        assert_eq!(
+            settings.electrum_certs.values().collect::<Vec<_>>(),
+            vec![&fingerprint("CD")]
+        );
+
+        // Everything survived on disk.
+        drop(target);
+        let target = WalletManager::open(target_dir.path(), key()).unwrap();
+        assert_eq!(target.list_wallets(None).await.len(), 2);
+        assert_eq!(target.settings().await.gap_limit, 50);
+    }
+
+    #[tokio::test]
+    async fn backup_picks_wallets_on_both_sides() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let (source, cold, _) = seeded(source_dir.path()).await;
+        let only_cold = BackupOptions {
+            wallet_ids: Some(vec![cold.id.clone()]),
+            include_settings: false,
+        };
+        let bundle = source
+            .export_backup(&only_cold, BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        assert_eq!(bundle.wallet_count, 1);
+        let unknown = BackupOptions {
+            wallet_ids: Some(vec!["nope".to_owned()]),
+            include_settings: false,
+        };
+        assert!(matches!(
+            source.export_backup(&unknown, BACKUP_PASSWORD).await,
+            Err(CoreError::WalletNotFound(_))
+        ));
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = manager(target_dir.path()).await;
+        let preview = target
+            .preview_backup(&bundle.data, BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        assert!(!preview.has_settings);
+        assert_eq!(preview.wallets.len(), 1);
+        assert_eq!(preview.wallets[0].name, "Cold");
+
+        // Both wallets in, one chosen: the other counts as skipped, and
+        // there are no settings to apply.
+        let full = source
+            .export_backup(&BackupOptions::default(), BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        let second_only = ImportChoices {
+            indexes: Some(vec![1, 1]),
+            apply_settings: true,
+        };
+        let report = target
+            .import_backup(&full.data, BACKUP_PASSWORD, &second_only)
+            .await
+            .unwrap();
+        assert_eq!(report.added.len(), 1);
+        assert_eq!(report.added[0].name, "Watch");
+        assert_eq!(report.skipped, 1);
+        assert!(!report.settings_applied);
+        let out_of_range = ImportChoices {
+            indexes: Some(vec![7]),
+            apply_settings: false,
+        };
+        let error = target
+            .import_backup(&full.data, BACKUP_PASSWORD, &out_of_range)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CoreError::InvalidInput { kind: "backup", .. }),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_needs_its_password_and_scans_as_a_qr() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let (source, _, _) = seeded(source_dir.path()).await;
+        let error = source
+            .export_backup(&BackupOptions::default(), "short")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CoreError::InvalidInput {
+                    kind: "backup password",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        let bundle = source
+            .export_backup(&BackupOptions::default(), BACKUP_PASSWORD)
+            .await
+            .unwrap();
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = manager(target_dir.path()).await;
+        assert!(matches!(
+            target
+                .preview_backup(&bundle.data, "not the password")
+                .await,
+            Err(CoreError::Vault(
+                crate::error::VaultError::WrongKeyOrCorrupted
+            ))
+        ));
+        assert!(matches!(
+            target
+                .import_backup("not a backup", BACKUP_PASSWORD, &ImportChoices::default())
+                .await,
+            Err(CoreError::InvalidInput { kind: "backup", .. })
+        ));
+
+        // The frames a camera sees assemble into the text the restore
+        // accepts, and the wallet import refuses by name.
+        let scanned = crate::input::qr::assemble(&bundle.frames).unwrap();
+        assert!(scanned.complete);
+        let text = scanned.text.unwrap();
+        assert!(text.starts_with(crate::backup::BACKUP_PREFIX));
+        let report = target
+            .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+            .await
+            .unwrap();
+        assert_eq!(report.added.len(), 2);
+        assert!(matches!(
+            parse_input(&text),
+            Err(CoreError::InvalidInput { kind: "backup", .. })
         ));
     }
 }
