@@ -1,16 +1,19 @@
-//! Authenticated encryption of the vault file.
+//! Authenticated encryption of the vault file, and of the backups that
+//! share its format.
 //!
 //! Format, all fields fixed-size before the ciphertext:
 //!
 //! ```text
-//! magic "GFVAULT1" (8) | version (1) | kdf (1) | salt (16) | nonce (24) | ciphertext
+//! magic (8) | version (1) | kdf (1) | salt (16) | nonce (24) | ciphertext
 //! ```
 //!
-//! XChaCha20-Poly1305 with a random 24-byte nonce per write; the whole
-//! header is bound as associated data (since version 2). The key is
-//! either provided raw by the platform (32 bytes out of the OS keystore)
-//! or derived from a password with Argon2id (pinned parameters). A fresh
-//! salt and nonce are drawn on every save.
+//! The magic names the file: `GFVAULT1` for the vault, `GFBACKUP` for a
+//! backup. It is bound with the rest of the header, so a backup can never
+//! be opened as a vault or the reverse. XChaCha20-Poly1305 with a random
+//! 24-byte nonce per write; the whole header is bound as associated data
+//! (since version 2). The key is either provided raw by the platform (32
+//! bytes out of the OS keystore) or derived from a password with Argon2id
+//! (pinned parameters). A fresh salt and nonce are drawn on every save.
 
 use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -21,6 +24,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::error::VaultError;
 
 const MAGIC: &[u8; 8] = b"GFVAULT1";
+/// Magic of a backup file: same envelope, different name, so the two
+/// can never be mistaken for one another.
+pub const BACKUP_MAGIC: &[u8; 8] = b"GFBACKUP";
 const VERSION: u8 = 2;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
@@ -75,13 +81,19 @@ impl VaultKey {
 /// The whole header (magic, version, KDF id, salt, nonce) is bound as
 /// associated data: flipping any header byte fails authentication.
 pub fn seal(plaintext: &[u8], key: &VaultKey) -> Result<Vec<u8>, VaultError> {
+    seal_with(MAGIC, plaintext, key)
+}
+
+/// [`seal`] under another magic, for files that share the envelope
+/// without being vaults.
+pub fn seal_with(magic: &[u8; 8], plaintext: &[u8], key: &VaultKey) -> Result<Vec<u8>, VaultError> {
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     rand::rng().fill_bytes(&mut salt);
     rand::rng().fill_bytes(&mut nonce);
 
     let mut header = Vec::with_capacity(HEADER_LEN);
-    header.extend_from_slice(MAGIC);
+    header.extend_from_slice(magic);
     header.push(VERSION);
     header.push(key.kdf_id());
     header.extend_from_slice(&salt);
@@ -112,7 +124,13 @@ pub fn seal(plaintext: &[u8], key: &VaultKey) -> Result<Vec<u8>, VaultError> {
 /// design. Version 1 files (no header binding) are still readable; they
 /// are rewritten as version 2 at the next save.
 pub fn unseal(file: &[u8], key: &VaultKey) -> Result<Vec<u8>, VaultError> {
-    if file.len() < HEADER_LEN || &file[..8] != MAGIC {
+    unseal_with(MAGIC, file, key)
+}
+
+/// [`unseal`] under another magic. A file carrying a different magic is
+/// [`VaultError::NotAVault`], whichever way round.
+pub fn unseal_with(magic: &[u8; 8], file: &[u8], key: &VaultKey) -> Result<Vec<u8>, VaultError> {
+    if file.len() < HEADER_LEN || &file[..8] != magic {
         return Err(VaultError::NotAVault);
     }
     let version = file[8];
@@ -277,6 +295,25 @@ mod tests {
         assert!(matches!(
             unseal(&sealed, &raw_key(7)),
             Err(VaultError::UnsupportedVersion(99))
+        ));
+    }
+
+    #[test]
+    fn backup_and_vault_magics_refuse_each_other() {
+        let key = VaultKey::Password("correct horse".to_owned());
+        let backup = seal_with(BACKUP_MAGIC, b"payload", &key).unwrap();
+        assert_eq!(&backup[..8], BACKUP_MAGIC);
+        assert_eq!(
+            unseal_with(BACKUP_MAGIC, &backup, &key).unwrap(),
+            b"payload"
+        );
+        assert!(matches!(unseal(&backup, &key), Err(VaultError::NotAVault)));
+        assert!(matches!(kdf_kind(&backup), Err(VaultError::NotAVault)));
+
+        let vault = seal(b"payload", &key).unwrap();
+        assert!(matches!(
+            unseal_with(BACKUP_MAGIC, &vault, &key),
+            Err(VaultError::NotAVault)
         ));
     }
 
