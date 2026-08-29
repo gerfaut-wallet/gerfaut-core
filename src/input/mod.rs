@@ -21,6 +21,7 @@ use bdk_wallet::miniscript::ForEachKey;
 use bdk_wallet::miniscript::descriptor::{Descriptor, DescriptorPublicKey, DescriptorType};
 use serde::{Deserialize, Serialize};
 
+use crate::backup::BACKUP_PREFIX;
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
 
@@ -262,6 +263,15 @@ fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
     }
 
     reject_private_material(trimmed)?;
+
+    // A backup is restored from the settings, not watched as a wallet.
+    if trimmed.starts_with(BACKUP_PREFIX) {
+        return Err(CoreError::InvalidInput {
+            kind: "backup",
+            detail: "this is a Gerfaut backup, not a wallet to watch: restore it from Settings"
+                .to_owned(),
+        });
+    }
 
     // A pasted QR payload (UR, BBQr) is opened first; a multi-part one
     // cannot be typed in, it has to be scanned frame by frame.
@@ -1002,6 +1012,25 @@ mod tests {
         assert!(parsed.warnings.contains(&InputWarning::ChangeNotTracked));
         let (_, internal, _) = descriptors(&parsed);
         assert!(internal.is_none());
+    }
+
+    #[test]
+    fn a_backup_is_refused_by_name() {
+        let refused = |input: &str| {
+            let error = parse_input(input).unwrap_err();
+            assert!(
+                matches!(error, CoreError::InvalidInput { kind: "backup", .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains("restore it"), "{error}");
+        };
+        refused("gerfaut-backup:R0ZCQUNLVVAAAQ==");
+        // The same backup scanned as a single ur:bytes frame.
+        let mut bytes = crate::store::cipher::BACKUP_MAGIC.to_vec();
+        bytes.extend([1u8; 20]);
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&ciborium::Value::Bytes(bytes), &mut cbor).unwrap();
+        refused(&ur::ur::encode(&cbor, &ur::ur::Type::Bytes));
     }
 
     #[test]
