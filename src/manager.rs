@@ -524,6 +524,19 @@ impl WalletManager {
     /// Syncs one wallet against its network's backend. Public backends
     /// are tried in order until one answers.
     pub async fn sync_wallet(&self, id: &str) -> CoreResult<SyncReport> {
+        self.sync_wallet_with(id, false).await
+    }
+
+    /// Scans a wallet again from its first address with the current gap
+    /// limit, whatever it already knows: an incremental sync only
+    /// watches the addresses it revealed, so funds that landed past
+    /// them, or a descriptor also used elsewhere, are only found by
+    /// starting over. A watched address has no gap: this is a sync.
+    pub async fn rescan_wallet(&self, id: &str) -> CoreResult<SyncReport> {
+        self.sync_wallet_with(id, true).await
+    }
+
+    async fn sync_wallet_with(&self, id: &str, from_scratch: bool) -> CoreResult<SyncReport> {
         let started = Instant::now();
 
         // Snapshot what the sync needs; do not hold the lock during I/O.
@@ -552,7 +565,7 @@ impl WalletManager {
 
         match &meta.kind {
             WalletKind::Descriptors { .. } => {
-                self.sync_descriptor_wallet(&meta, &endpoints, started)
+                self.sync_descriptor_wallet(&meta, &endpoints, started, from_scratch)
                     .await
             }
             WalletKind::SingleAddress { address } => {
@@ -567,10 +580,12 @@ impl WalletManager {
         meta: &WalletMeta,
         endpoints: &[Endpoint],
         started: Instant,
+        from_scratch: bool,
     ) -> CoreResult<SyncReport> {
-        // First sync, or a gap limit raised since the last full scan:
-        // only a full scan looks past the addresses already revealed.
-        let full = meta.last_sync.is_none() || meta.scan_gap < meta.gap_limit;
+        // First sync, a gap limit raised since the last full scan, or a
+        // rescan asked for: only a full scan looks past the addresses
+        // already revealed.
+        let full = from_scratch || meta.last_sync.is_none() || meta.scan_gap < meta.gap_limit;
         let mut attempts: Vec<String> = Vec::new();
 
         for endpoint in endpoints {
