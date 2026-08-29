@@ -26,7 +26,7 @@ use crate::chain::{
 };
 use crate::error::{CoreError, CoreResult};
 use crate::export::{ExportOptions, ExportResult};
-use crate::input::{ParsedInput, ParsedPayload};
+use crate::input::{ParsedInput, ParsedPayload, RecognizedKind};
 use crate::lock::{self, AppLock, LockAttempts, LockKind, LockVerdict};
 use crate::network::Network;
 use crate::store::{Settings, Vault, VaultKey, VaultPayload, WalletRecord};
@@ -290,62 +290,21 @@ impl WalletManager {
         };
 
         let mut state = self.state.lock().await;
-        for record in &state.payload.wallets {
-            if record.meta.network == network && record.meta.kind == kind {
-                return Err(CoreError::DuplicateWallet(record.meta.name.clone()));
-            }
+        if let Some(existing) = find_watched(&state.payload, network, &kind) {
+            return Err(CoreError::DuplicateWallet(existing.meta.name.clone()));
         }
 
-        let meta = WalletMeta {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: name.to_owned(),
+        let meta = fresh_meta(
+            name,
             network,
-            kind: kind.clone(),
-            recognized_as: parsed.kind,
-            created_at: now_secs(),
-            gap_limit: state.payload.settings.gap_limit,
-            scan_gap: 0,
-            labels: Default::default(),
-            last_sync: None,
-            cached: CachedTotals::default(),
-        };
-
-        // Build the engine now: an invalid descriptor/network combination
-        // must fail here, not at the first sync.
-        let record = match &kind {
-            WalletKind::Descriptors {
-                external, internal, ..
-            } => {
-                let mut engine = create_engine(external, internal.as_deref(), network)?;
-                let changeset = engine.take_staged().ok_or_else(|| {
-                    CoreError::Internal("new wallet produced no initial change set".to_owned())
-                })?;
-                state.engines.insert(meta.id.clone(), engine);
-                WalletRecord {
-                    meta: meta.clone(),
-                    changeset: Some(changeset),
-                    address_state: None,
-                }
-            }
-            WalletKind::SingleAddress { address } => {
-                // The classifier validated the address; re-check against
-                // the chosen network as a defense in depth.
-                address
-                    .parse::<bdk_wallet::bitcoin::Address<_>>()
-                    .ok()
-                    .and_then(|a| a.require_network(network.to_bitcoin()).ok())
-                    .ok_or_else(|| CoreError::NetworkMismatch {
-                        expected: network.to_string(),
-                        found: "address".to_owned(),
-                    })?;
-                WalletRecord {
-                    meta: meta.clone(),
-                    changeset: None,
-                    address_state: None,
-                }
-            }
-        };
-
+            kind,
+            parsed.kind,
+            state.payload.settings.gap_limit,
+        );
+        let (record, engine) = build_record(meta.clone())?;
+        if let Some(engine) = engine {
+            state.engines.insert(meta.id.clone(), engine);
+        }
         state.payload.wallets.push(record);
         state.vault.save(&state.payload)?;
         Ok(meta)
@@ -1292,6 +1251,87 @@ fn create_engine(
         .network(network.to_bitcoin())
         .create_wallet_no_persist()
         .map_err(|e| CoreError::Descriptor(e.to_string()))
+}
+
+/// The wallet already watching the same material on the same network,
+/// if any. Identity is the material, never the name.
+fn find_watched<'a>(
+    payload: &'a VaultPayload,
+    network: Network,
+    kind: &WalletKind,
+) -> Option<&'a WalletRecord> {
+    payload
+        .wallets
+        .iter()
+        .find(|record| record.meta.network == network && record.meta.kind == *kind)
+}
+
+/// A brand new wallet identity: fresh id, created now, never scanned.
+fn fresh_meta(
+    name: &str,
+    network: Network,
+    kind: WalletKind,
+    recognized_as: RecognizedKind,
+    gap_limit: u32,
+) -> WalletMeta {
+    WalletMeta {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: name.to_owned(),
+        network,
+        kind,
+        recognized_as,
+        created_at: now_secs(),
+        gap_limit,
+        scan_gap: 0,
+        labels: Default::default(),
+        last_sync: None,
+        cached: CachedTotals::default(),
+    }
+}
+
+/// Turns a new identity into its stored record, plus the engine to cache
+/// for a descriptor wallet. The engine is built now so an invalid
+/// descriptor/network combination fails here, not at the first sync; a
+/// single address is re-checked against its network as a defense in
+/// depth, whatever validated it upstream.
+fn build_record(meta: WalletMeta) -> CoreResult<(WalletRecord, Option<bdk_wallet::Wallet>)> {
+    let kind = meta.kind.clone();
+    match &kind {
+        WalletKind::Descriptors {
+            external, internal, ..
+        } => {
+            let mut engine = create_engine(external, internal.as_deref(), meta.network)?;
+            let changeset = engine.take_staged().ok_or_else(|| {
+                CoreError::Internal("new wallet produced no initial change set".to_owned())
+            })?;
+            Ok((
+                WalletRecord {
+                    meta,
+                    changeset: Some(changeset),
+                    address_state: None,
+                },
+                Some(engine),
+            ))
+        }
+        WalletKind::SingleAddress { address } => {
+            address
+                .parse::<bdk_wallet::bitcoin::Address<_>>()
+                .ok()
+                .and_then(|a| a.require_network(meta.network.to_bitcoin()).ok())
+                .ok_or_else(|| CoreError::NetworkMismatch {
+                    expected: meta.network.to_string(),
+                    found: "address".to_owned(),
+                })?;
+            Ok((
+                WalletRecord {
+                    meta,
+                    changeset: None,
+                    address_state: None,
+                },
+                None,
+            ))
+        }
+    }
 }
 
 /// Loads the BDK engine for a wallet from its stored change set, caching
