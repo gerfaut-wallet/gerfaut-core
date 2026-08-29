@@ -15,6 +15,7 @@ pub mod export;
 pub mod fees;
 pub mod format;
 pub mod input;
+pub mod lock;
 pub mod manager;
 pub mod network;
 pub mod price;

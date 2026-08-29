@@ -29,6 +29,8 @@ chacha20poly1305 = "0.10"
 argon2 = "0.5"
 rand = "0.9"
 zeroize = { version = "1", features = ["derive"] }
+# Constant-time comparison of the app lock hash.
+subtle = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 ur = "0.5"
 ciborium = "0.2"

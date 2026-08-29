@@ -27,6 +27,7 @@ use crate::chain::{
 use crate::error::{CoreError, CoreResult};
 use crate::export::{ExportOptions, ExportResult};
 use crate::input::{ParsedInput, ParsedPayload};
+use crate::lock::{self, AppLock, LockAttempts, LockKind, LockVerdict};
 use crate::network::Network;
 use crate::store::{Settings, Vault, VaultKey, VaultPayload, WalletRecord};
 use crate::wallet::meta::{CachedTotals, SyncStamp, WalletKind, WalletMeta};
@@ -74,6 +75,9 @@ impl ManagerState {
 /// The facade. Cheap to share behind an `Arc`.
 pub struct WalletManager {
     state: Mutex<ManagerState>,
+    /// Recent failed unlock attempts, kept apart from the vault lock so
+    /// an unlock never waits on a sync.
+    attempts: Mutex<LockAttempts>,
 }
 
 fn now_secs() -> u64 {
@@ -94,13 +98,20 @@ impl WalletManager {
                 payload,
                 engines: HashMap::new(),
             }),
+            attempts: Mutex::new(LockAttempts::default()),
         })
     }
 
     // --- settings ------------------------------------------------------
 
+    /// The settings as the apps may see them: the lock's hash stays in
+    /// the vault, the apps only need to know a lock exists and its kind.
     pub async fn settings(&self) -> Settings {
-        self.state.lock().await.payload.settings.clone()
+        let mut settings = self.state.lock().await.payload.settings.clone();
+        if let Some(lock) = &mut settings.app_lock {
+            lock.secret = None;
+        }
+        settings
     }
 
     pub async fn set_active_network(&self, network: Network) -> CoreResult<()> {
@@ -1017,6 +1028,156 @@ impl WalletManager {
         }
         report
     }
+
+    // --- app lock ------------------------------------------------------
+
+    /// The lock in place, without its hash.
+    pub async fn app_lock(&self) -> Option<AppLock> {
+        self.state
+            .lock()
+            .await
+            .payload
+            .settings
+            .app_lock
+            .clone()
+            .map(|mut lock| {
+                lock.secret = None;
+                lock
+            })
+    }
+
+    /// Sets a lock, or replaces the secret of the one in place. Replacing
+    /// asks for the current secret: an unlocked phone in the wrong hands
+    /// must not be able to change the PIN into one its holder knows.
+    pub async fn set_app_lock(
+        &self,
+        kind: LockKind,
+        secret: &str,
+        current: Option<&str>,
+    ) -> CoreResult<()> {
+        lock::validate_secret(kind, secret)?;
+        let existing = self.state.lock().await.payload.settings.app_lock.clone();
+        if let Some(existing) = &existing {
+            self.require_current(existing, current).await?;
+        }
+        let stored = lock::hash_secret(secret)?;
+        let mut state = self.state.lock().await;
+        let previous = state.payload.settings.app_lock.take();
+        state.payload.settings.app_lock = Some(AppLock {
+            kind,
+            auto_lock_secs: previous
+                .as_ref()
+                .map_or(Some(lock::DEFAULT_AUTO_LOCK_SECS), |p| p.auto_lock_secs),
+            biometric: previous.as_ref().is_some_and(|p| p.biometric),
+            secret: Some(stored),
+        });
+        state.vault.save(&state.payload)?;
+        Ok(())
+    }
+
+    /// Removes the lock. The current secret is required, for the same
+    /// reason as above.
+    pub async fn clear_app_lock(&self, current: &str) -> CoreResult<()> {
+        let existing = self.existing_lock().await?;
+        self.require_current(&existing, Some(current)).await?;
+        let mut state = self.state.lock().await;
+        state.payload.settings.app_lock = None;
+        state.vault.save(&state.payload)?;
+        Ok(())
+    }
+
+    /// Tries a secret against the lock. Failures are counted and, past
+    /// three, delayed: the verdict says how long before the next try
+    /// is even looked at.
+    pub async fn verify_app_lock(&self, secret: &str) -> CoreResult<LockVerdict> {
+        let existing = self.existing_lock().await?;
+        Ok(self.check_secret(&existing, secret).await)
+    }
+
+    /// How long the app may stay in the background before locking:
+    /// `Some(0)` at once, `None` only at launch and on request.
+    pub async fn set_auto_lock(&self, secs: Option<u32>) -> CoreResult<()> {
+        self.existing_lock().await?;
+        let mut state = self.state.lock().await;
+        if let Some(lock) = &mut state.payload.settings.app_lock {
+            lock.auto_lock_secs = secs;
+        }
+        state.vault.save(&state.payload)?;
+        Ok(())
+    }
+
+    /// Whether the platform's biometric prompt may stand in for the
+    /// secret. Recorded here so both apps read one setting; the prompt
+    /// itself is the platform's.
+    pub async fn set_biometric_unlock(&self, enabled: bool) -> CoreResult<()> {
+        self.existing_lock().await?;
+        let mut state = self.state.lock().await;
+        if let Some(lock) = &mut state.payload.settings.app_lock {
+            lock.biometric = enabled;
+        }
+        state.vault.save(&state.payload)?;
+        Ok(())
+    }
+
+    async fn existing_lock(&self) -> CoreResult<AppLock> {
+        self.state
+            .lock()
+            .await
+            .payload
+            .settings
+            .app_lock
+            .clone()
+            .ok_or_else(|| CoreError::InvalidInput {
+                kind: "lock",
+                detail: "no lock is set".to_owned(),
+            })
+    }
+
+    /// The current secret must be given and must verify, delays
+    /// included: changing the lock is an unlock attempt like any other.
+    async fn require_current(&self, existing: &AppLock, current: Option<&str>) -> CoreResult<()> {
+        let Some(current) = current else {
+            return Err(CoreError::InvalidInput {
+                kind: "lock",
+                detail: "the current PIN or password is required".to_owned(),
+            });
+        };
+        let verdict = self.check_secret(existing, current).await;
+        if verdict.unlocked {
+            return Ok(());
+        }
+        Err(CoreError::InvalidInput {
+            kind: "lock",
+            detail: if verdict.retry_after_secs > 0 {
+                format!(
+                    "too many attempts: try again in {} s",
+                    verdict.retry_after_secs
+                )
+            } else {
+                "wrong PIN or password".to_owned()
+            },
+        })
+    }
+
+    /// Hashes and compares under the attempts lock, so guesses are
+    /// serialized and the delay cannot be raced. The vault lock is not
+    /// held meanwhile: an unlock never waits on a sync.
+    async fn check_secret(&self, existing: &AppLock, secret: &str) -> LockVerdict {
+        let mut attempts = self.attempts.lock().await;
+        let now = Instant::now();
+        let wait = attempts.retry_after(now);
+        if wait > 0 {
+            return LockVerdict {
+                unlocked: false,
+                failures: attempts.failures(),
+                retry_after_secs: wait,
+            };
+        }
+        match &existing.secret {
+            Some(stored) if lock::verify_secret(secret, stored) => attempts.succeed(),
+            _ => attempts.fail(now),
+        }
+    }
 }
 
 // --- helpers -----------------------------------------------------------
@@ -1224,6 +1385,112 @@ mod tests {
 
     async fn manager(dir: &std::path::Path) -> WalletManager {
         WalletManager::open(dir, key()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn app_lock_set_verify_change_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        assert!(manager.app_lock().await.is_none());
+        assert!(manager.verify_app_lock("1234").await.is_err());
+
+        manager
+            .set_app_lock(LockKind::Pin, "1234", None)
+            .await
+            .unwrap();
+        let lock = manager.app_lock().await.unwrap();
+        assert_eq!(lock.kind, LockKind::Pin);
+        assert!(lock.secret.is_none(), "the hash never leaves the vault");
+        assert!(manager.settings().await.app_lock.unwrap().secret.is_none());
+        assert!(manager.verify_app_lock("1234").await.unwrap().unlocked);
+        assert!(!manager.verify_app_lock("4321").await.unwrap().unlocked);
+        assert!(manager.verify_app_lock("1234").await.unwrap().unlocked);
+
+        // Changing or clearing needs the current secret.
+        assert!(
+            manager
+                .set_app_lock(LockKind::Password, "long enough", None)
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .set_app_lock(LockKind::Password, "long enough", Some("0000"))
+                .await
+                .is_err()
+        );
+        manager
+            .set_app_lock(LockKind::Password, "long enough", Some("1234"))
+            .await
+            .unwrap();
+        assert_eq!(manager.app_lock().await.unwrap().kind, LockKind::Password);
+        assert!(
+            manager
+                .verify_app_lock("long enough")
+                .await
+                .unwrap()
+                .unlocked
+        );
+        assert!(manager.clear_app_lock("nope nope").await.is_err());
+        manager.clear_app_lock("long enough").await.unwrap();
+        assert!(manager.app_lock().await.is_none());
+
+        // It survives a reopen, hash included.
+        manager
+            .set_app_lock(LockKind::Pin, "9876", None)
+            .await
+            .unwrap();
+        drop(manager);
+        let reopened = WalletManager::open(dir.path(), key()).unwrap();
+        assert!(reopened.verify_app_lock("9876").await.unwrap().unlocked);
+    }
+
+    #[tokio::test]
+    async fn app_lock_slows_down_after_three_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        manager
+            .set_app_lock(LockKind::Pin, "1234", None)
+            .await
+            .unwrap();
+        for expected in 1..=2 {
+            let verdict = manager.verify_app_lock("0000").await.unwrap();
+            assert_eq!(verdict.failures, expected);
+            assert_eq!(verdict.retry_after_secs, 0);
+        }
+        let verdict = manager.verify_app_lock("0000").await.unwrap();
+        assert_eq!(verdict.failures, 3);
+        assert!(verdict.retry_after_secs >= 4);
+        // While delayed, even the right secret is not looked at.
+        let verdict = manager.verify_app_lock("1234").await.unwrap();
+        assert!(!verdict.unlocked);
+        assert!(verdict.retry_after_secs > 0);
+        assert!(manager.clear_app_lock("1234").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn app_lock_timing_and_biometric_need_a_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        assert!(manager.set_auto_lock(Some(300)).await.is_err());
+        assert!(manager.set_biometric_unlock(true).await.is_err());
+        manager
+            .set_app_lock(LockKind::Pin, "1234", None)
+            .await
+            .unwrap();
+        manager.set_auto_lock(None).await.unwrap();
+        manager.set_biometric_unlock(true).await.unwrap();
+        let lock = manager.app_lock().await.unwrap();
+        assert_eq!(lock.auto_lock_secs, None);
+        assert!(lock.biometric);
+        // A new secret keeps the timing and the biometric choice.
+        manager
+            .set_app_lock(LockKind::Pin, "5678", Some("1234"))
+            .await
+            .unwrap();
+        let lock = manager.app_lock().await.unwrap();
+        assert_eq!(lock.auto_lock_secs, None);
+        assert!(lock.biometric);
     }
 
     #[tokio::test]

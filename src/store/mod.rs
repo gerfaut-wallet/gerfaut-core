@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chain::BackendConfig;
 use crate::error::VaultError;
+use crate::lock::AppLock;
 use crate::network::Network;
 use crate::wallet::AddressWatchState;
 use crate::wallet::meta::WalletMeta;
@@ -63,6 +64,11 @@ pub struct Settings {
     /// again silently.
     #[serde(default)]
     pub electrum_certs: BTreeMap<String, String>,
+    /// The PIN or password asked before the interface shows, when the
+    /// user set one. Its hash lives here, in the encrypted file, so a
+    /// plain preference store never learns it exists.
+    #[serde(default)]
+    pub app_lock: Option<AppLock>,
 }
 
 fn default_gap_limit() -> u32 {
@@ -77,6 +83,7 @@ impl Default for Settings {
             gap_limit: default_gap_limit(),
             app_prefs: BTreeMap::new(),
             electrum_certs: BTreeMap::new(),
+            app_lock: None,
         }
     }
 }
