@@ -56,6 +56,11 @@ pub enum CoreError {
     #[error("backend unavailable: {0}")]
     BackendUnavailable(String),
 
+    /// An onion backend could not be given a way through Tor: no proxy
+    /// answers, or the embedded client could not start.
+    #[error("tor: {0}")]
+    Tor(String),
+
     /// Descriptor-level error surfaced by the wallet engine.
     #[error("descriptor error: {0}")]
     Descriptor(String),

@@ -4,6 +4,7 @@ pub(crate) mod electrum;
 pub(crate) mod esplora;
 pub mod public;
 pub(crate) mod tls;
+pub mod tor;
 
 use std::collections::BTreeMap;
 
@@ -106,7 +107,7 @@ pub(crate) fn is_onion(url: &str) -> bool {
 }
 
 /// Extracts the host part of a URL-ish string, without any userinfo.
-fn host_of(url: &str) -> Option<String> {
+pub(crate) fn host_of(url: &str) -> Option<String> {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let host_port = rest.split(['/', '?']).next()?;
     let host = host_port.rsplit_once('@').map_or(host_port, |(_, h)| h);

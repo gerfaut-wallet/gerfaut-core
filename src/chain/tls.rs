@@ -128,8 +128,9 @@ pub fn is_fingerprint(value: &str) -> bool {
             .all(|part| part.len() == 2 && part.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// The crypto provider both this module and `electrum-client` use.
-fn provider() -> Arc<CryptoProvider> {
+/// The crypto provider this module, `electrum-client` and the embedded
+/// Tor client all use.
+pub(crate) fn provider() -> Arc<CryptoProvider> {
     // `electrum-client` installs the same ring provider the first time
     // it opens a TLS connection; installing it here first is harmless
     // and makes this module usable on its own.

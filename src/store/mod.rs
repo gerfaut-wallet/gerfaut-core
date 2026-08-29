@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::BackendConfig;
+use crate::chain::tor::TorSettings;
 use crate::error::VaultError;
 use crate::lock::AppLock;
 use crate::network::Network;
@@ -69,6 +70,10 @@ pub struct Settings {
     /// plain preference store never learns it exists.
     #[serde(default)]
     pub app_lock: Option<AppLock>,
+    /// How `.onion` backends are reached. Vaults written before it
+    /// existed read as the default, the system Tor first.
+    #[serde(default)]
+    pub tor: TorSettings,
 }
 
 fn default_gap_limit() -> u32 {
@@ -84,6 +89,7 @@ impl Default for Settings {
             app_prefs: BTreeMap::new(),
             electrum_certs: BTreeMap::new(),
             app_lock: None,
+            tor: TorSettings::default(),
         }
     }
 }
@@ -290,5 +296,28 @@ mod tests {
             settings.backend_for(Network::Mainnet),
             BackendConfig::default()
         );
+    }
+
+    /// A vault written before Tor had settings must open as it always
+    /// did, with Tor in its default mode, and write those settings back
+    /// in the shape the apps read.
+    #[test]
+    fn a_vault_without_tor_settings_reads_as_auto() {
+        use crate::chain::tor::TorMode;
+        let stored: Settings =
+            serde_json::from_str(r#"{"active_network":"mainnet","gap_limit":20}"#).unwrap();
+        assert_eq!(stored.tor, TorSettings::default());
+        assert_eq!(stored.tor.mode, TorMode::Auto);
+        assert_eq!(stored.tor.socks_proxy, None);
+
+        let mut settings = stored;
+        settings.tor = TorSettings {
+            mode: TorMode::System,
+            socks_proxy: Some("127.0.0.1:9150".to_owned()),
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""tor":{"mode":"system","socks_proxy":"127.0.0.1:9150"}"#));
+        let again: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(again.tor, settings.tor);
     }
 }
