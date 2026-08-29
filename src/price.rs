@@ -187,16 +187,38 @@ pub struct PriceQuote {
     pub at: u64,
 }
 
-pub(crate) fn http_client() -> CoreResult<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent("gerfaut")
+/// An HTTP client, optionally through a SOCKS proxy.
+///
+/// `socks5h` and not `socks5`: the proxy resolves the name, so a
+/// `.onion` host never reaches this machine's DNS resolver.
+pub(crate) fn client_through(proxy: Option<&str>) -> CoreResult<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(if proxy.is_some() {
+            60
+        } else {
+            15
+        }))
+        .user_agent("gerfaut");
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(
+            reqwest::Proxy::all(format!("socks5h://{proxy}"))
+                .map_err(|e| CoreError::Internal(format!("tor proxy: {e}")))?,
+        );
+    }
+    builder
         .build()
         .map_err(|e| CoreError::Internal(format!("http client: {e}")))
 }
 
 pub(crate) async fn get_json(url: &str) -> CoreResult<serde_json::Value> {
-    let response = http_client()?
+    get_json_through(url, None).await
+}
+
+pub(crate) async fn get_json_through(
+    url: &str,
+    proxy: Option<&str>,
+) -> CoreResult<serde_json::Value> {
+    let response = client_through(proxy)?
         .get(url)
         .send()
         .await

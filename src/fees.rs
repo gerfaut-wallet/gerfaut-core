@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
-use crate::price::get_json;
+use crate::price::get_json_through;
 
 /// Recommended fee rates in sat/vB.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,6 +66,7 @@ fn now_secs() -> u64 {
 pub async fn fetch_fees_for(
     network: Network,
     backend: &crate::chain::BackendConfig,
+    proxy: Option<&str>,
 ) -> CoreResult<FeeEstimates> {
     let preferred = backend.fee_base(network);
     let mut bases: Vec<&str> = preferred.into_iter().collect();
@@ -81,7 +82,20 @@ pub async fn fetch_fees_for(
     }
     let mut last_error = None;
     for base in bases {
-        match fetch_from(base).await {
+        // An onion host without a route is not asked at all: the point
+        // of Tor is that the name never reaches this machine's DNS.
+        let route = if crate::chain::is_onion(base) {
+            match proxy {
+                Some(proxy) => Some(proxy),
+                None => {
+                    last_error = Some(fee_error(crate::chain::tor::no_route(base)));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        match fetch_from(base, route).await {
             Ok(fees) => return Ok(fees),
             Err(error) => last_error = Some(error),
         }
@@ -92,18 +106,18 @@ pub async fn fetch_fees_for(
 /// Asks one host, in both flavours: the mempool projects publish named
 /// targets, a plain Esplora publishes a block-to-rate map. The error
 /// reported is the second one, the only shape every Esplora serves.
-async fn fetch_from(base: &str) -> CoreResult<FeeEstimates> {
-    if let Ok(value) = get_json(&format!("{base}/v1/fees/recommended")).await
+async fn fetch_from(base: &str, proxy: Option<&str>) -> CoreResult<FeeEstimates> {
+    if let Ok(value) = get_json_through(&format!("{base}/v1/fees/recommended"), proxy).await
         && let Ok(fees) = parse_fees(&value)
     {
         return Ok(fees);
     }
-    parse_esplora_fees(&get_json(&format!("{base}/fee-estimates")).await?)
+    parse_esplora_fees(&get_json_through(&format!("{base}/fee-estimates"), proxy).await?)
 }
 
 /// Fetches the recommended fee rates from the public servers.
 pub async fn fetch_fees(network: Network) -> CoreResult<FeeEstimates> {
-    fetch_fees_for(network, &crate::chain::BackendConfig::default()).await
+    fetch_fees_for(network, &crate::chain::BackendConfig::default(), None).await
 }
 
 /// mempool.space shape: `{"fastestFee": n, "halfHourFee": n, ...}`.
@@ -254,7 +268,7 @@ mod tests {
                 let backend = BackendConfig::Public {
                     server: Some(server.id.clone()),
                 };
-                match fetch_fees_for(network, &backend).await {
+                match fetch_fees_for(network, &backend, None).await {
                     Ok(fees) => assert!(fees.fastest >= fees.minimum, "{}", server.label),
                     Err(error) => eprintln!("{} on {network} unreachable: {error}", server.label),
                 }

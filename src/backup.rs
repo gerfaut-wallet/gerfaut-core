@@ -39,6 +39,11 @@ pub const BACKUP_PREFIX: &str = "gerfaut-backup:";
 /// is orders of magnitude past any real wallet list.
 pub const MAX_BACKUP_TEXT: usize = 8 * 1024 * 1024;
 
+/// Largest payload a backup may decompress to. Zlib reaches a thousand
+/// to one: without a bound, a crafted file inflates until the device
+/// gives up. A hundred wallets fit in a fraction of this.
+pub const MAX_BACKUP_PAYLOAD: usize = 16 * 1024 * 1024;
+
 /// Shortest accepted password, after trimming.
 const MIN_PASSWORD_CHARS: usize = 8;
 
@@ -188,9 +193,17 @@ pub fn open(bytes: &[u8], password: &str) -> CoreResult<BackupPayload> {
     let key = password_key(password)?;
     let compressed = cipher::unseal_with(BACKUP_MAGIC, bytes, &key)?;
     let mut json = Vec::new();
+    // Bounded: zlib reaches a thousand to one, and a crafted file must
+    // not be able to inflate until the device gives up.
     flate2::read::ZlibDecoder::new(&compressed[..])
+        .take(MAX_BACKUP_PAYLOAD as u64 + 1)
         .read_to_end(&mut json)
         .map_err(|e| VaultError::CorruptedPayload(e.to_string()))?;
+    if json.len() > MAX_BACKUP_PAYLOAD {
+        return Err(backup_error(
+            "this backup expands to far more than any wallet list",
+        ));
+    }
 
     #[derive(Deserialize)]
     struct Versioned {
@@ -219,12 +232,11 @@ pub fn decode_source(source: &str) -> CoreResult<Vec<u8>> {
         ));
     }
     let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
-    let body = if compact.len() >= BACKUP_PREFIX.len()
-        && compact[..BACKUP_PREFIX.len()].eq_ignore_ascii_case(BACKUP_PREFIX)
-    {
-        &compact[BACKUP_PREFIX.len()..]
-    } else {
-        compact.as_str()
+    // `get` and not a slice: the text may be anything a camera decoded,
+    // and a byte index that lands inside a character would panic.
+    let body = match compact.get(..BACKUP_PREFIX.len()) {
+        Some(head) if head.eq_ignore_ascii_case(BACKUP_PREFIX) => &compact[BACKUP_PREFIX.len()..],
+        _ => compact.as_str(),
     };
     if body.is_empty() {
         return Err(backup_error("nothing to restore"));
@@ -519,5 +531,38 @@ mod tests {
             "{refused}"
         );
         assert!(refused.to_string().contains("too large"), "{refused}");
+    }
+
+    #[test]
+    fn text_that_is_not_ascii_is_refused_not_a_panic() {
+        // A camera decodes whatever is in front of it: the prefix test
+        // must never index into the middle of a character.
+        for text in ["éééééééé", "🙂🙂🙂🙂", "gerfaut-backué:AAAA"] {
+            assert!(decode_source(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_payload_that_inflates_without_end_is_refused() {
+        // A megabyte of zeroes compresses to almost nothing; a payload
+        // past the cap must be stopped rather than read to the end.
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder
+            .write_all(&vec![0u8; MAX_BACKUP_PAYLOAD + 1024])
+            .unwrap();
+        let bomb = encoder.finish().unwrap();
+        assert!(
+            bomb.len() < 100_000,
+            "the bomb should be small: {}",
+            bomb.len()
+        );
+
+        let key = password_key(PASSWORD).unwrap();
+        let sealed = cipher::seal_with(BACKUP_MAGIC, &bomb, &key).unwrap();
+        let refused = open(&sealed, PASSWORD).unwrap_err();
+        assert!(
+            refused.to_string().contains("expands to far more"),
+            "{refused}"
+        );
     }
 }

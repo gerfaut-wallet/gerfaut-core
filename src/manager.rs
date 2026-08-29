@@ -1343,10 +1343,18 @@ impl WalletManager {
             }
             if let Some(certs) = &payload.electrum_certs {
                 for (host, fingerprint) in certs {
+                    // The same check an acceptance made by hand goes
+                    // through: a backup must not be able to pin what the
+                    // dialog would have refused, nor a fingerprint shaped
+                    // so that no real certificate can ever match it and
+                    // the host becomes permanently unreachable.
+                    if !chain::tls::is_fingerprint(fingerprint) {
+                        continue;
+                    }
                     settings
                         .electrum_certs
                         .entry(host.clone())
-                        .or_insert_with(|| fingerprint.clone());
+                        .or_insert_with(|| fingerprint.to_ascii_uppercase());
                 }
             }
             settings.gap_limit = gap_limit;
@@ -1418,6 +1426,19 @@ impl WalletManager {
         let (settings, data_dir) = self.tor_setup().await;
         let route = tor::resolve(&settings, &data_dir).await?;
         Ok(Some(route.socks))
+    }
+
+    /// Fee estimates for a network, through the same route the chain
+    /// takes: an onion backend must not have its name looked up here
+    /// when every other call is careful not to.
+    pub async fn fetch_fees(&self, network: Network) -> CoreResult<crate::fees::FeeEstimates> {
+        let (config, certs) = {
+            let state = self.state.lock().await;
+            state.chain_setup(network)
+        };
+        let endpoints = chain::endpoints(&config, network, &certs)?;
+        let proxy = self.tor_proxy_for(&endpoints).await?;
+        crate::fees::fetch_fees_for(network, &config, proxy.as_deref()).await
     }
 
     /// What resolving a route needs from the state, copied out.
@@ -2536,6 +2557,37 @@ mod tests {
             report.failures[0].message.starts_with("tor: "),
             "{}",
             report.failures[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn an_onion_backend_never_has_its_fees_looked_up() {
+        // Every other call is careful to route an onion host through
+        // Tor; the fee card must not be the one that leaks the name.
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        manager
+            .set_backend(
+                Network::Signet,
+                BackendConfig::CustomEsplora {
+                    url: "http://gerfautexample000000000000000000000000000000000000000.onion"
+                        .to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .set_tor_settings(TorSettings {
+                mode: TorMode::System,
+                socks_proxy: Some("127.0.0.1:1".to_owned()),
+            })
+            .await
+            .unwrap();
+
+        let refused = manager.fetch_fees(Network::Signet).await.unwrap_err();
+        assert!(
+            matches!(refused, CoreError::Tor(_)),
+            "the route must be refused before the name is used: {refused}"
         );
     }
 }
