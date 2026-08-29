@@ -35,6 +35,10 @@ pub const BACKUP_VERSION: u32 = 1;
 /// of the forms the restore screen accepts.
 pub const BACKUP_PREFIX: &str = "gerfaut-backup:";
 
+/// Largest text a backup may arrive as, base64 included: 8 MiB, which
+/// is orders of magnitude past any real wallet list.
+pub const MAX_BACKUP_TEXT: usize = 8 * 1024 * 1024;
+
 /// Shortest accepted password, after trimming.
 const MIN_PASSWORD_CHARS: usize = 8;
 
@@ -206,6 +210,14 @@ pub fn open(bytes: &[u8], password: &str) -> CoreResult<BackupPayload> {
 /// the `gerfaut-backup:` form a scanned QR yields. Whitespace and line
 /// breaks are ignored either way, so a pasted file survives wrapping.
 pub fn decode_source(source: &str) -> CoreResult<Vec<u8>> {
+    // A backup of a hundred wallets is a few tens of kilobytes. Anything
+    // past the cap is not one, and decoding it would only spend memory
+    // to reach the same answer.
+    if source.len() > MAX_BACKUP_TEXT {
+        return Err(backup_error(
+            "this file is far too large to be a Gerfaut backup",
+        ));
+    }
     let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
     let body = if compact.len() >= BACKUP_PREFIX.len()
         && compact[..BACKUP_PREFIX.len()].eq_ignore_ascii_case(BACKUP_PREFIX)
@@ -494,5 +506,18 @@ mod tests {
             progress.text.unwrap(),
             format!("{BACKUP_PREFIX}{}", data_encoding::BASE64.encode(&bytes))
         );
+    }
+
+    #[test]
+    fn an_absurd_file_is_refused_before_it_is_decoded() {
+        // Whatever this is, it is not a wallet list: say so instead of
+        // spending memory to find out.
+        let huge = "A".repeat(MAX_BACKUP_TEXT + 1);
+        let refused = decode_source(&huge).unwrap_err();
+        assert!(
+            matches!(refused, CoreError::InvalidInput { kind: "backup", .. }),
+            "{refused}"
+        );
+        assert!(refused.to_string().contains("too large"), "{refused}");
     }
 }
