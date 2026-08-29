@@ -9,7 +9,15 @@ license = "AGPL-3.0-only"
 publish = false
 
 [features]
-default = ["embedded-tor"]
+# No Tor client is built in by default: a consumer asks for one.
+#
+# The mobile app does, because a phone rarely runs a Tor daemon and
+# Orbot is a second app to install. The desktop does not: a machine
+# that wants .onion runs Tor or the Tor Browser already, and arti pulls
+# in `saturating-time`, whose limit search does not terminate when the
+# clock's resolution is coarser than a nanosecond — which is the case
+# on Windows. Turning it on there needs an upstream fix.
+default = []
 # A Tor client built into the library, so .onion backends work on a
 # device with no Tor daemon. Off, .onion hosts still work through a
 # system Tor.
