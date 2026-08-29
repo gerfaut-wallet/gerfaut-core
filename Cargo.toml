@@ -2,11 +2,18 @@
 name = "gerfaut-core"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.91"
 description = "Core library of Gerfaut, a Bitcoin watch-only wallet"
 repository = "https://github.com/gerfaut-wallet/gerfaut-core"
 license = "AGPL-3.0-only"
 publish = false
+
+[features]
+default = ["embedded-tor"]
+# A Tor client built into the library, so .onion backends work on a
+# device with no Tor daemon. Off, .onion hosts still work through a
+# system Tor.
+embedded-tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:futures-util"]
 
 [dependencies]
 bdk_wallet = "3.1"
@@ -24,7 +31,7 @@ x509-parser = { version = "0.18", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
 rand = "0.9"
@@ -36,6 +43,12 @@ ur = "0.5"
 ciborium = "0.2"
 flate2 = "1"
 data-encoding = "2"
+# Embedded Tor. The rustls runtime keeps the tree free of OpenSSL, the
+# bundled sqlite keeps it free of system libraries, and the onion
+# service client is what a .onion backend needs.
+arti-client = { version = "0.45", default-features = false, features = ["tokio", "rustls", "compression", "flowctl-cc", "onion-service-client", "vanguards", "static-sqlite"], optional = true }
+tor-rtcompat = { version = "0.45", default-features = false, features = ["tokio", "rustls"], optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
