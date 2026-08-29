@@ -6,7 +6,7 @@
 //! blocks reads: requests are built under the lock, executed outside it,
 //! and applied back under the lock.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -31,7 +31,7 @@ use crate::network::Network;
 use crate::store::{Settings, Vault, VaultKey, VaultPayload, WalletRecord};
 use crate::wallet::meta::{CachedTotals, SyncStamp, WalletKind, WalletMeta};
 use crate::wallet::snapshot::{
-    AddressEntry, AddressList, SyncReport, TxDetail, UtxoInfo, WalletSnapshot,
+    AddressEntry, AddressList, NewTx, SyncReport, TxDetail, UtxoInfo, WalletSnapshot,
 };
 use crate::wallet::views;
 use crate::wallet::{AddressTx, AddressWatchState};
@@ -576,7 +576,7 @@ impl WalletManager {
         for endpoint in endpoints {
             // Build a fresh request under the lock (requests are consumed
             // by each attempt).
-            let (request, tx_count_before) = {
+            let (request, known) = {
                 let mut state = self.state.lock().await;
                 let engine = ensure_engine(&mut state, &meta.id)?;
                 let request = if full {
@@ -584,7 +584,8 @@ impl WalletManager {
                 } else {
                     EngineRequest::Incremental(engine.start_sync_with_revealed_spks().build())
                 };
-                (request, engine.transactions().count() as u32)
+                let known: HashSet<_> = engine.transactions().map(|tx| tx.tx_node.txid).collect();
+                (request, known)
             };
 
             match chain::sync_engine(endpoint, request, meta.gap_limit).await {
@@ -604,6 +605,7 @@ impl WalletManager {
                     let balance = views::balance(engine);
                     let tip_height = views::tip_height(engine);
                     let tx_count_after = engine.transactions().count() as u32;
+                    let new_txs = views::new_txs(engine, &known);
                     let staged = engine.take_staged();
 
                     if let Some(staged) = staged {
@@ -611,7 +613,8 @@ impl WalletManager {
                     }
                     let report = SyncReport {
                         wallet_id: meta.id.clone(),
-                        new_tx_count: tx_count_after.saturating_sub(tx_count_before),
+                        new_tx_count: new_txs.len() as u32,
+                        new_txs,
                         balance,
                         tip_height,
                         took_ms: started.elapsed().as_millis() as u64,
@@ -640,13 +643,11 @@ impl WalletManager {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(mut watch) => {
                     let mut state = self.state.lock().await;
-                    let tx_count_before = {
-                        let record = find_record(&state.payload, &meta.id)?;
-                        record
-                            .address_state
-                            .as_ref()
-                            .map_or(0, |s| s.txs.len() as u32)
-                    };
+                    let known: HashSet<String> = find_record(&state.payload, &meta.id)?
+                        .address_state
+                        .as_ref()
+                        .map(|s| s.txs.iter().map(|tx| tx.txid.clone()).collect())
+                        .unwrap_or_default();
                     // A sync fetches the newest round only. Keep the older
                     // rounds the user already loaded, otherwise every sync
                     // would silently undo "load older transactions".
@@ -657,9 +658,20 @@ impl WalletManager {
                         keep_older_history(&mut watch, previous);
                     }
                     let tx_count_after = watch.txs.len() as u32;
+                    let new_txs: Vec<NewTx> = watch
+                        .txs
+                        .iter()
+                        .filter(|tx| !known.contains(&tx.txid))
+                        .map(|tx| NewTx {
+                            txid: tx.txid.clone(),
+                            net_sats: tx.net_sats,
+                            confirmed: tx.height.is_some(),
+                        })
+                        .collect();
                     let report = SyncReport {
                         wallet_id: meta.id.clone(),
-                        new_tx_count: tx_count_after.saturating_sub(tx_count_before),
+                        new_tx_count: new_txs.len() as u32,
+                        new_txs,
                         balance: views::address_balance(&watch),
                         tip_height: watch.tip_height,
                         took_ms: started.elapsed().as_millis() as u64,

@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 use crate::wallet::meta::WalletMeta;
 use crate::wallet::tx_extras::{OpReturnData, TxExtras};
 
+/// A transaction a sync brought in for the first time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewTx {
+    pub txid: String,
+    /// Net effect on the wallet, in satoshis, signed like a summary.
+    pub net_sats: i64,
+    pub confirmed: bool,
+}
+
 /// Balance breakdown, in satoshis.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BalanceSnapshot {
@@ -166,6 +175,10 @@ pub struct SyncReport {
     pub wallet_id: String,
     /// Transactions that appeared since the previous sync.
     pub new_tx_count: u32,
+    /// The same transactions, one line each, so the apps can say what
+    /// happened (a notification, a banner) without reloading the wallet.
+    #[serde(default)]
+    pub new_txs: Vec<NewTx>,
     pub balance: BalanceSnapshot,
     pub tip_height: u32,
     pub took_ms: u64,

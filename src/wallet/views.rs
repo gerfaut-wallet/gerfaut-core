@@ -9,8 +9,8 @@ use bdk_wallet::chain::ChainPosition;
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
 use crate::wallet::snapshot::{
-    AddressEntry, AddressList, AddressRow, BalanceSnapshot, Keychain, TxDetail, TxIo, TxStatus,
-    TxSummary, UtxoInfo,
+    AddressEntry, AddressList, AddressRow, BalanceSnapshot, Keychain, NewTx, TxDetail, TxIo,
+    TxStatus, TxSummary, UtxoInfo,
 };
 use crate::wallet::{AddressTx, AddressWatchState, tx_extras};
 
@@ -80,6 +80,26 @@ pub(crate) fn tx_summaries(wallet: &bdk_wallet::Wallet) -> Vec<TxSummary> {
 }
 
 /// Pending first, then by descending height, txid as a stable tiebreak.
+/// The transactions the engine holds that `known` does not: what a
+/// sync just brought in.
+pub(crate) fn new_txs(
+    wallet: &bdk_wallet::Wallet,
+    known: &std::collections::HashSet<bdk_wallet::bitcoin::Txid>,
+) -> Vec<NewTx> {
+    wallet
+        .transactions()
+        .filter(|wtx| !known.contains(&wtx.tx_node.txid))
+        .map(|wtx| {
+            let (sent, received) = wallet.sent_and_received(&wtx.tx_node.tx);
+            NewTx {
+                txid: wtx.tx_node.txid.to_string(),
+                net_sats: received.to_sat() as i64 - sent.to_sat() as i64,
+                confirmed: wtx.chain_position.is_confirmed(),
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn sort_summaries(txs: &mut [TxSummary]) {
     txs.sort_by(|a, b| {
         let key = |t: &TxSummary| match t.status {
