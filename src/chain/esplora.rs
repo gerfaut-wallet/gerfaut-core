@@ -26,15 +26,19 @@ const TIMEOUT_SECS: u64 = 20;
 /// Onion endpoints get more room: Tor circuits are slow to build.
 const TOR_TIMEOUT_SECS: u64 = 60;
 
-pub(crate) fn client(url: &str) -> Result<AsyncClient, esplora_client::Error> {
+/// A client for one instance. `proxy` is the Tor SOCKS proxy the caller
+/// resolved for onion hosts; an onion URL without one is refused here,
+/// before anything could look the name up.
+pub(crate) fn client(url: &str, proxy: Option<&str>) -> Result<AsyncClient, String> {
     let mut builder = Builder::new(url).timeout(TIMEOUT_SECS);
     if crate::chain::is_onion(url) {
+        let proxy = proxy.ok_or_else(|| crate::chain::tor::no_route(url))?;
         // socks5h: the proxy resolves the name; .onion never touches DNS.
         builder = builder
-            .proxy(&format!("socks5h://{}", crate::chain::TOR_SOCKS_PROXY))
+            .proxy(&format!("socks5h://{proxy}"))
             .timeout(TOR_TIMEOUT_SECS);
     }
-    builder.build_async()
+    builder.build_async().map_err(|e| e.to_string())
 }
 
 pub(crate) async fn full_scan(

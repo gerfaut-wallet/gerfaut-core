@@ -96,14 +96,16 @@ impl BackendConfig {
     }
 }
 
-/// Local Tor SOCKS proxy, the default of both the Tor daemon and the
-/// Tor Browser bundle's expert bundle.
-pub const TOR_SOCKS_PROXY: &str = "127.0.0.1:9050";
-
 /// Whether a backend URL points at a Tor hidden service. Onion hosts
-/// are routed through the local Tor proxy automatically.
+/// are routed through the Tor proxy [`tor`] resolves, never looked up.
 pub(crate) fn is_onion(url: &str) -> bool {
     host_of(url).is_some_and(|host| host.ends_with(".onion"))
+}
+
+/// Whether reaching this list means going through Tor. The manager asks
+/// before resolving a route, so clearnet-only syncs never touch Tor.
+pub(crate) fn needs_tor(endpoints: &[Endpoint]) -> bool {
+    endpoints.iter().any(Endpoint::is_onion)
 }
 
 /// Extracts the host part of a URL-ish string, without any userinfo.
@@ -123,12 +125,19 @@ pub(crate) enum Endpoint {
 }
 
 impl Endpoint {
-    pub(crate) fn label(&self) -> String {
-        let url = match self {
+    fn url(&self) -> &str {
+        match self {
             Endpoint::Esplora(url) => url.as_str(),
             Endpoint::Electrum(target) => target.url.as_str(),
-        };
-        host_of(url).unwrap_or_else(|| "backend".to_owned())
+        }
+    }
+
+    pub(crate) fn label(&self) -> String {
+        host_of(self.url()).unwrap_or_else(|| "backend".to_owned())
+    }
+
+    pub(crate) fn is_onion(&self) -> bool {
+        is_onion(self.url())
     }
 }
 
@@ -201,21 +210,25 @@ pub(crate) enum EngineResponse {
 
 /// Runs one sync attempt against one endpoint. The error is a plain
 /// string: the caller owns retry logic and error wrapping.
+///
+/// `proxy`, here and below, is the Tor SOCKS proxy the caller resolved
+/// for this operation; `None` when no endpoint of the list is an onion.
 pub(crate) async fn sync_engine(
     endpoint: &Endpoint,
     request: EngineRequest,
     stop_gap: u32,
+    proxy: Option<&str>,
 ) -> Result<EngineResponse, String> {
     match (endpoint, request) {
         (Endpoint::Esplora(url), EngineRequest::Full(request)) => {
-            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            let client = esplora::client(url, proxy)?;
             esplora::full_scan(&client, request, stop_gap)
                 .await
                 .map(EngineResponse::Full)
                 .map_err(|e| e.to_string())
         }
         (Endpoint::Esplora(url), EngineRequest::Incremental(request)) => {
-            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            let client = esplora::client(url, proxy)?;
             esplora::sync(&client, request)
                 .await
                 .map(EngineResponse::Incremental)
@@ -223,8 +236,9 @@ pub(crate) async fn sync_engine(
         }
         (Endpoint::Electrum(target), EngineRequest::Full(request)) => {
             let target = target.clone();
+            let proxy = proxy.map(str::to_owned);
             tokio::task::spawn_blocking(move || {
-                electrum::full_scan_blocking(&target, request, stop_gap)
+                electrum::full_scan_blocking(&target, request, stop_gap, proxy.as_deref())
             })
             .await
             .map_err(|e| e.to_string())?
@@ -232,10 +246,13 @@ pub(crate) async fn sync_engine(
         }
         (Endpoint::Electrum(target), EngineRequest::Incremental(request)) => {
             let target = target.clone();
-            tokio::task::spawn_blocking(move || electrum::sync_blocking(&target, request))
-                .await
-                .map_err(|e| e.to_string())?
-                .map(EngineResponse::Incremental)
+            let proxy = proxy.map(str::to_owned);
+            tokio::task::spawn_blocking(move || {
+                electrum::sync_blocking(&target, request, proxy.as_deref())
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map(EngineResponse::Incremental)
         }
     }
 }
@@ -248,10 +265,11 @@ pub(crate) async fn fetch_address_state(
     endpoint: &Endpoint,
     address: &str,
     network: Network,
+    proxy: Option<&str>,
 ) -> Result<AddressWatchState, String> {
     match endpoint {
         Endpoint::Esplora(url) => {
-            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            let client = esplora::client(url, proxy)?;
             esplora::fetch_address_state(&client, address, network).await
         }
         Endpoint::Electrum(_) => Err("single-address wallets need an Esplora backend for now; \
@@ -262,19 +280,26 @@ pub(crate) async fn fetch_address_state(
 
 /// Hands a signed transaction to one endpoint. Returns the host that
 /// accepted it; the node's refusal comes back as the error text.
-pub(crate) async fn broadcast(endpoint: &Endpoint, tx: &Transaction) -> Result<(), String> {
+pub(crate) async fn broadcast(
+    endpoint: &Endpoint,
+    tx: &Transaction,
+    proxy: Option<&str>,
+) -> Result<(), String> {
     match endpoint {
         Endpoint::Esplora(url) => {
-            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            let client = esplora::client(url, proxy)?;
             esplora::broadcast(&client, tx).await
         }
         Endpoint::Electrum(target) => {
             let target = target.clone();
             let tx = tx.clone();
-            tokio::task::spawn_blocking(move || electrum::broadcast_blocking(&target, &tx))
-                .await
-                .map_err(|e| e.to_string())?
-                .map(|_| ())
+            let proxy = proxy.map(str::to_owned);
+            tokio::task::spawn_blocking(move || {
+                electrum::broadcast_blocking(&target, &tx, proxy.as_deref())
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|_| ())
         }
     }
 }
@@ -342,10 +367,11 @@ pub(crate) struct PrevoutFacts {
 pub(crate) async fn fetch_prevout(
     endpoint: &Endpoint,
     outpoint: OutPoint,
+    proxy: Option<&str>,
 ) -> Result<PrevoutFacts, String> {
     match endpoint {
         Endpoint::Esplora(url) => {
-            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            let client = esplora::client(url, proxy)?;
             let facts = esplora::fetch_prevout(&client, outpoint).await?;
             Ok(PrevoutFacts {
                 txout: facts.txout,
@@ -354,8 +380,9 @@ pub(crate) async fn fetch_prevout(
         }
         Endpoint::Electrum(target) => {
             let target = target.clone();
+            let proxy = proxy.map(str::to_owned);
             let txout = tokio::task::spawn_blocking(move || {
-                electrum::fetch_prevout_blocking(&target, outpoint)
+                electrum::fetch_prevout_blocking(&target, outpoint, proxy.as_deref())
             })
             .await
             .map_err(|e| e.to_string())??;
@@ -376,10 +403,11 @@ pub(crate) async fn tx_standing(
     endpoint: &Endpoint,
     txid: Txid,
     script: ScriptBuf,
+    proxy: Option<&str>,
 ) -> Result<TxStanding, String> {
     match endpoint {
         Endpoint::Esplora(url) => {
-            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            let client = esplora::client(url, proxy)?;
             let standing = esplora::tx_standing(&client, &txid).await?;
             Ok(TxStanding {
                 found: standing.found,
@@ -392,8 +420,9 @@ pub(crate) async fn tx_standing(
         }
         Endpoint::Electrum(target) => {
             let target = target.clone();
+            let proxy = proxy.map(str::to_owned);
             let (found, block_height, tip_height) = tokio::task::spawn_blocking(move || {
-                electrum::tx_standing_blocking(&target, &txid, &script)
+                electrum::tx_standing_blocking(&target, &txid, &script, proxy.as_deref())
             })
             .await
             .map_err(|e| e.to_string())??;
@@ -412,10 +441,11 @@ pub(crate) async fn fetch_address_history(
     address: &str,
     network: Network,
     from: &str,
+    proxy: Option<&str>,
 ) -> Result<esplora::HistoryRound, String> {
     match endpoint {
         Endpoint::Esplora(url) => {
-            let client = esplora::client(url).map_err(|e| e.to_string())?;
+            let client = esplora::client(url, proxy)?;
             esplora::fetch_address_history(&client, address, network, from).await
         }
         Endpoint::Electrum(_) => Err("single-address wallets need an Esplora backend for now;              switch the backend or import a descriptor"

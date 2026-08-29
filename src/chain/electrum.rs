@@ -123,7 +123,10 @@ enum Transport {
     Crate(Client),
 }
 
-fn connect(target: &Target) -> Result<Transport, ConnectError> {
+/// Opens the connection. `proxy` is the Tor SOCKS proxy the caller
+/// resolved for onion servers; an onion address without one is refused
+/// before anything could look the name up.
+fn connect(target: &Target, proxy: Option<&str>) -> Result<Transport, ConnectError> {
     let (tls_wanted, host, port) = parse(&target.url).map_err(ConnectError::Io)?;
 
     // Tor: the .onion address is the server's public key, and the
@@ -131,8 +134,10 @@ fn connect(target: &Target) -> Result<Transport, ConnectError> {
     // encryption inside an encrypted tunnel and authenticates nothing,
     // so it is not what is trusted here — the address is.
     if crate::chain::is_onion(&target.url) {
+        let proxy =
+            proxy.ok_or_else(|| ConnectError::Io(crate::chain::tor::no_route(&target.url)))?;
         let config = Config::builder()
-            .socks5(Some(Socks5Config::new(crate::chain::TOR_SOCKS_PROXY)))
+            .socks5(Some(Socks5Config::new(proxy)))
             .timeout(Some(TOR_TIMEOUT))
             .validate_domain(false)
             .build();
@@ -172,8 +177,8 @@ fn negotiate(raw: &RawClient<ElectrumSslStream>) -> Result<(), ConnectError> {
 /// Runs one operation against a connected client, whichever transport
 /// carries it: the same code over two concrete types.
 macro_rules! on_client {
-    ($target:expr, |$client:ident| $body:expr) => {
-        match connect($target).map_err(|e| e.to_string())? {
+    ($target:expr, $proxy:expr, |$client:ident| $body:expr) => {
+        match connect($target, $proxy).map_err(|e| e.to_string())? {
             Transport::Pinned(raw) => {
                 let $client = BdkElectrumClient::new(raw);
                 $body
@@ -204,8 +209,9 @@ pub(crate) fn full_scan_blocking(
     target: &Target,
     request: FullScanRequest<KeychainKind>,
     stop_gap: u32,
+    proxy: Option<&str>,
 ) -> Result<FullScanResponse<KeychainKind>, String> {
-    on_client!(target, |client| client
+    on_client!(target, proxy, |client| client
         .full_scan(request, stop_gap as usize, BATCH_SIZE, true)
         .map_err(|e| e.to_string()))
 }
@@ -213,16 +219,21 @@ pub(crate) fn full_scan_blocking(
 pub(crate) fn sync_blocking(
     target: &Target,
     request: SyncRequest<(KeychainKind, u32)>,
+    proxy: Option<&str>,
 ) -> Result<SyncResponse, String> {
-    on_client!(target, |client| client
+    on_client!(target, proxy, |client| client
         .sync(request, BATCH_SIZE, true)
         .map_err(|e| e.to_string()))
 }
 
 // --- broadcast ------------------------------------------------------------
 
-pub(crate) fn broadcast_blocking(target: &Target, tx: &Transaction) -> Result<Txid, String> {
-    on_client!(target, |client| client
+pub(crate) fn broadcast_blocking(
+    target: &Target,
+    tx: &Transaction,
+    proxy: Option<&str>,
+) -> Result<Txid, String> {
+    on_client!(target, proxy, |client| client
         .inner
         .transaction_broadcast(tx)
         .map_err(|e| broadcast_error(&e)))
@@ -251,9 +262,11 @@ fn broadcast_error(error: &electrum_client::Error) -> String {
 pub(crate) fn fetch_prevout_blocking(
     target: &Target,
     outpoint: OutPoint,
+    proxy: Option<&str>,
 ) -> Result<Option<TxOut>, String> {
     on_client!(
         target,
+        proxy,
         |client| match client.inner.transaction_get(&outpoint.txid) {
             Ok(tx) => Ok(tx.output.get(outpoint.vout as usize).cloned()),
             Err(electrum_client::Error::Protocol(_)) => Ok(None),
@@ -269,8 +282,9 @@ pub(crate) fn tx_standing_blocking(
     target: &Target,
     txid: &Txid,
     script: &ScriptBuf,
+    proxy: Option<&str>,
 ) -> Result<(bool, Option<u32>, u32), String> {
-    on_client!(target, |client| {
+    on_client!(target, proxy, |client| {
         let tip = client
             .inner
             .block_headers_subscribe()
@@ -363,7 +377,7 @@ mod tests {
         let pizza: Txid = "a1075db55d416d3ca199f55b6084e2115b9345e16c5cf302fc80e9d5fbf5d48d"
             .parse()
             .unwrap();
-        let txout = fetch_prevout_blocking(&accepted, OutPoint::new(pizza, 0))
+        let txout = fetch_prevout_blocking(&accepted, OutPoint::new(pizza, 0), None)
             .expect("an accepted certificate carries Electrum traffic")
             .expect("the server knows that transaction");
         assert_eq!(txout.value.to_sat(), 1_000_000_000_000);

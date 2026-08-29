@@ -344,7 +344,7 @@ mod tests {
                 if server.protocol != ServerProtocol::Esplora {
                     continue;
                 }
-                let client = crate::chain::esplora::client(&server.url).unwrap();
+                let client = crate::chain::esplora::client(&server.url, None).unwrap();
                 match client.get_height().await {
                     Ok(height) => {
                         reached += 1;

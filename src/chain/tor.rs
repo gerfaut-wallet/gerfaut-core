@@ -277,6 +277,15 @@ pub fn parse_socks_address(value: &str) -> CoreResult<String> {
     }
 }
 
+/// What a backend reports when handed an onion host and no proxy. The
+/// manager resolves a route before any onion operation, so this is a
+/// bug when it shows; it must still never turn into a lookup of the
+/// onion name.
+pub(crate) fn no_route(url: &str) -> String {
+    let host = super::host_of(url).unwrap_or_else(|| url.to_owned());
+    CoreError::Tor(format!("no Tor proxy to reach {host} through")).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -516,5 +525,48 @@ mod tests {
         assert_eq!(status.socks_proxy, "127.0.0.1:9150");
         assert_eq!(status.embedded_available, cfg!(feature = "embedded-tor"));
         assert!(!status.bootstrapped);
+    }
+
+    #[test]
+    fn a_missing_route_is_a_tor_error_naming_the_host() {
+        let detail = no_route("http://abc.onion/api");
+        assert!(detail.starts_with("tor: "), "{detail}");
+        assert!(detail.contains("abc.onion"), "{detail}");
+    }
+
+    /// Live. Bootstraps the embedded client for real and reads the tip
+    /// height of a public onion Esplora through its proxy, the way a
+    /// sync would. Ignored: it needs the network, and a first bootstrap
+    /// takes up to a minute.
+    #[cfg(feature = "embedded-tor")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "bootstraps Tor and talks to an onion service"]
+    async fn the_embedded_client_reaches_an_onion_esplora() {
+        const MEMPOOL_ONION: &str =
+            "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api";
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings(TorMode::Embedded, None);
+        let route = resolve(&settings, dir.path())
+            .await
+            .expect("the embedded client bootstraps");
+        assert_eq!(route.via, TorVia::Embedded);
+        assert!(route.socks.starts_with("127.0.0.1:"));
+
+        let client = crate::chain::esplora::client(MEMPOOL_ONION, Some(&route.socks)).unwrap();
+        let height = client
+            .get_height()
+            .await
+            .expect("the onion Esplora answers over Tor");
+        assert!(height > 900_000, "{height}");
+
+        let after = status(&settings).await;
+        assert!(after.running && after.bootstrapped);
+        assert_eq!(after.bootstrap_percent, 100);
+        assert_eq!(after.via, Some(TorVia::Embedded));
+        assert_eq!(after.socks, Some(route.socks.clone()));
+        assert!(std::fs::read_dir(dir.path().join("tor").join("cache")).is_ok());
+
+        // A second resolution reuses the running client.
+        assert_eq!(resolve(&settings, dir.path()).await.unwrap(), route);
     }
 }

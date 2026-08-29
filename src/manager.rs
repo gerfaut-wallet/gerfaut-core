@@ -24,6 +24,7 @@ use crate::backup::{
 use crate::broadcast::{
     self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, TxPreview, WalletRef,
 };
+use crate::chain::tor::{self, TorSettings};
 use crate::chain::{
     self, BackendConfig, CertificateReport, CertificateStatus, Endpoint, EngineRequest,
     EngineResponse,
@@ -63,6 +64,9 @@ struct ManagerState {
     payload: VaultPayload,
     /// Loaded BDK engines, keyed by wallet id. Lazily populated.
     engines: HashMap<String, bdk_wallet::Wallet>,
+    /// Where the vault lives, and where the embedded Tor client keeps
+    /// its state.
+    data_dir: PathBuf,
 }
 
 impl ManagerState {
@@ -94,13 +98,14 @@ fn now_secs() -> u64 {
 impl WalletManager {
     /// Opens (or creates) the vault at `data_dir/gerfaut.vault`.
     pub fn open(data_dir: impl Into<PathBuf>, key: VaultKey) -> CoreResult<Self> {
-        let path = data_dir.into().join(VAULT_FILE);
-        let (vault, payload) = Vault::open_or_create(path, key)?;
+        let data_dir = data_dir.into();
+        let (vault, payload) = Vault::open_or_create(data_dir.join(VAULT_FILE), key)?;
         Ok(WalletManager {
             state: Mutex::new(ManagerState {
                 vault,
                 payload,
                 engines: HashMap::new(),
+                data_dir,
             }),
             attempts: Mutex::new(LockAttempts::default()),
         })
@@ -536,14 +541,21 @@ impl WalletManager {
             let preferred = endpoints.remove(position);
             endpoints.insert(0, preferred);
         }
+        let proxy = self.tor_proxy_for(&endpoints).await?;
 
         match &meta.kind {
             WalletKind::Descriptors { .. } => {
-                self.sync_descriptor_wallet(&meta, &endpoints, started, from_scratch)
+                self.sync_descriptor_wallet(
+                    &meta,
+                    &endpoints,
+                    proxy.as_deref(),
+                    started,
+                    from_scratch,
+                )
                     .await
             }
             WalletKind::SingleAddress { address } => {
-                self.sync_address_wallet(&meta, address, &endpoints, started)
+                self.sync_address_wallet(&meta, address, &endpoints, proxy.as_deref(), started)
                     .await
             }
         }
@@ -553,6 +565,7 @@ impl WalletManager {
         &self,
         meta: &WalletMeta,
         endpoints: &[Endpoint],
+        proxy: Option<&str>,
         started: Instant,
         from_scratch: bool,
     ) -> CoreResult<SyncReport> {
@@ -577,7 +590,7 @@ impl WalletManager {
                 (request, known)
             };
 
-            match chain::sync_engine(endpoint, request, meta.gap_limit).await {
+            match chain::sync_engine(endpoint, request, meta.gap_limit, proxy).await {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(response) => {
                     let mut state = self.state.lock().await;
@@ -624,11 +637,12 @@ impl WalletManager {
         meta: &WalletMeta,
         address: &str,
         endpoints: &[Endpoint],
+        proxy: Option<&str>,
         started: Instant,
     ) -> CoreResult<SyncReport> {
         let mut attempts: Vec<String> = Vec::new();
         for endpoint in endpoints {
-            match chain::fetch_address_state(endpoint, address, meta.network).await {
+            match chain::fetch_address_state(endpoint, address, meta.network, proxy).await {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(mut watch) => {
                     let mut state = self.state.lock().await;
@@ -702,10 +716,19 @@ impl WalletManager {
             return Ok(0);
         };
         let endpoints = chain::endpoints(&config, meta.network, &certs)?;
+        let proxy = self.tor_proxy_for(&endpoints).await?;
 
         let mut attempts: Vec<String> = Vec::new();
         for endpoint in &endpoints {
-            match chain::fetch_address_history(endpoint, address, meta.network, &cursor).await {
+            match chain::fetch_address_history(
+                endpoint,
+                address,
+                meta.network,
+                &cursor,
+                proxy.as_deref(),
+            )
+            .await
+            {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(round) => {
                     let mut state = self.state.lock().await;
@@ -852,7 +875,10 @@ impl WalletManager {
             .filter(|&i| decoded.inputs[i].prevout.is_none() && input_facts[i].prevout.is_none())
             .collect();
         let needs_chain = !unresolved.is_empty() || input_facts.iter().any(|f| f.spent.is_none());
-        if needs_chain && let Ok(endpoints) = chain::endpoints(&config, network, &certs) {
+        if needs_chain
+            && let Ok(endpoints) = chain::endpoints(&config, network, &certs)
+            && let Ok(proxy) = self.tor_proxy_for(&endpoints).await
+        {
             for endpoint in &endpoints {
                 let mut answered = false;
                 for (i, facts) in input_facts.iter_mut().enumerate() {
@@ -860,7 +886,7 @@ impl WalletManager {
                     if !wanted {
                         continue;
                     }
-                    match chain::fetch_prevout(endpoint, outpoints[i]).await {
+                    match chain::fetch_prevout(endpoint, outpoints[i], proxy.as_deref()).await {
                         Ok(chain_facts) => {
                             answered = true;
                             if unresolved.contains(&i) {
@@ -910,9 +936,10 @@ impl WalletManager {
         }
         let (config, certs) = self.state.lock().await.chain_setup(network);
         let endpoints = chain::endpoints(&config, network, &certs)?;
+        let proxy = self.tor_proxy_for(&endpoints).await?;
         let mut refusals: Vec<(String, String)> = Vec::new();
         for endpoint in &endpoints {
-            match chain::broadcast(endpoint, &decoded.tx).await {
+            match chain::broadcast(endpoint, &decoded.tx, proxy.as_deref()).await {
                 Ok(()) => {
                     return Ok(BroadcastReport {
                         txid: decoded.tx.compute_txid().to_string(),
@@ -947,9 +974,10 @@ impl WalletManager {
             })?;
         let (config, certs) = self.state.lock().await.chain_setup(network);
         let endpoints = chain::endpoints(&config, network, &certs)?;
+        let proxy = self.tor_proxy_for(&endpoints).await?;
         let mut attempts: Vec<String> = Vec::new();
         for endpoint in &endpoints {
-            match chain::tx_standing(endpoint, txid, script.clone()).await {
+            match chain::tx_standing(endpoint, txid, script.clone(), proxy.as_deref()).await {
                 Ok(standing) => {
                     let confirmations = standing
                         .block_height
@@ -1337,6 +1365,27 @@ impl WalletManager {
             skipped,
             settings_applied,
         })
+
+    // --- tor -----------------------------------------------------------
+
+    /// The proxy to hand the chain layer for these endpoints: a Tor
+    /// route when at least one host is an onion, nothing otherwise. A
+    /// clearnet-only list never probes for Tor, let alone starts it.
+    /// The lock is released before resolving: a first bootstrap takes
+    /// a while, and reads must not wait on it.
+    async fn tor_proxy_for(&self, endpoints: &[Endpoint]) -> CoreResult<Option<String>> {
+        if !chain::needs_tor(endpoints) {
+            return Ok(None);
+        }
+        let (settings, data_dir) = self.tor_setup().await;
+        let route = tor::resolve(&settings, &data_dir).await?;
+        Ok(Some(route.socks))
+    }
+
+    /// What resolving a route needs from the state, copied out.
+    async fn tor_setup(&self) -> (TorSettings, PathBuf) {
+        let state = self.state.lock().await;
+        (state.payload.settings.tor.clone(), state.data_dir.clone())
     }
 }
 
