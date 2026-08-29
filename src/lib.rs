@@ -8,6 +8,7 @@
 //! seeds, or sign transactions, and there never will be. Inputs containing
 //! private key material are rejected at the parsing boundary.
 
+pub mod backup;
 pub mod broadcast;
 pub mod chain;
 pub mod error;

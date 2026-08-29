@@ -20,7 +20,9 @@ use ciborium::Value;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
+use crate::backup::BACKUP_PREFIX;
 use crate::error::{CoreError, CoreResult};
+use crate::store::cipher::BACKUP_MAGIC;
 
 /// Envelope recognized around a scanned frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +163,14 @@ fn ur_message_to_text(ur_type: &str, bytes: &[u8]) -> CoreResult<String> {
             let Value::Bytes(raw) = value else {
                 return Err(qr_error("ur:bytes does not hold a byte string"));
             };
+            // A Gerfaut backup travels as raw file bytes; it comes out in
+            // the text form the restore screen accepts.
+            if raw.starts_with(BACKUP_MAGIC) {
+                return Ok(format!(
+                    "{BACKUP_PREFIX}{}",
+                    data_encoding::BASE64.encode(&raw)
+                ));
+            }
             String::from_utf8(raw).map_err(|_| qr_error("ur:bytes is not text"))
         }
         "crypto-output" => {
