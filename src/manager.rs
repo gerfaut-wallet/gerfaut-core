@@ -1087,8 +1087,14 @@ impl WalletManager {
 
     /// How long the app may stay in the background before locking:
     /// `Some(0)` at once, `None` only at launch and on request.
-    pub async fn set_auto_lock(&self, secs: Option<u32>) -> CoreResult<()> {
-        self.existing_lock().await?;
+    ///
+    /// Guarded by the secret in place, like every other change to the
+    /// lock: `None` turns off the only protection that outlives the
+    /// session, and someone holding the unlocked app must not be able
+    /// to do that quietly.
+    pub async fn set_auto_lock(&self, secs: Option<u32>, current: &str) -> CoreResult<()> {
+        let existing = self.existing_lock().await?;
+        self.require_current(&existing, Some(current)).await?;
         let mut state = self.state.lock().await;
         if let Some(lock) = &mut state.payload.settings.app_lock {
             lock.auto_lock_secs = secs;
@@ -1100,8 +1106,13 @@ impl WalletManager {
     /// Whether the platform's biometric prompt may stand in for the
     /// secret. Recorded here so both apps read one setting; the prompt
     /// itself is the platform's.
-    pub async fn set_biometric_unlock(&self, enabled: bool) -> CoreResult<()> {
-        self.existing_lock().await?;
+    ///
+    /// Guarded by the secret in place: whoever has their own finger
+    /// enrolled on this phone must not be able to turn their own
+    /// fingerprint into a key to this vault.
+    pub async fn set_biometric_unlock(&self, enabled: bool, current: &str) -> CoreResult<()> {
+        let existing = self.existing_lock().await?;
+        self.require_current(&existing, Some(current)).await?;
         let mut state = self.state.lock().await;
         if let Some(lock) = &mut state.payload.settings.app_lock {
             lock.biometric = enabled;
@@ -1834,14 +1845,19 @@ mod tests {
     async fn app_lock_timing_and_biometric_need_a_lock() {
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(dir.path()).await;
-        assert!(manager.set_auto_lock(Some(300)).await.is_err());
-        assert!(manager.set_biometric_unlock(true).await.is_err());
+        assert!(manager.set_auto_lock(Some(300), "1234").await.is_err());
+        assert!(manager.set_biometric_unlock(true, "1234").await.is_err());
         manager
             .set_app_lock(LockKind::Pin, "1234", None)
             .await
             .unwrap();
-        manager.set_auto_lock(None).await.unwrap();
-        manager.set_biometric_unlock(true).await.unwrap();
+        // Both are guarded by the secret in place: a wrong one changes
+        // nothing, the right one goes through.
+        assert!(manager.set_auto_lock(None, "0000").await.is_err());
+        assert!(manager.set_biometric_unlock(true, "0000").await.is_err());
+        assert_eq!(manager.app_lock().await.unwrap().auto_lock_secs, Some(60));
+        manager.set_auto_lock(None, "1234").await.unwrap();
+        manager.set_biometric_unlock(true, "1234").await.unwrap();
         let lock = manager.app_lock().await.unwrap();
         assert_eq!(lock.auto_lock_secs, None);
         assert!(lock.biometric);
