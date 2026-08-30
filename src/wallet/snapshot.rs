@@ -76,6 +76,15 @@ pub struct TxIo {
     /// Decoded OP_RETURN payload, for data-carrying outputs.
     #[serde(default)]
     pub op_return: Option<OpReturnData>,
+    /// For an input, the transaction of the output it spends. The
+    /// outpoint is what names an input on the chain: the diagram shows
+    /// it truncated, and an address alone cannot stand for it because
+    /// the same address may be spent from twice.
+    #[serde(default)]
+    pub prev_txid: Option<String>,
+    /// For an input, the index of the output it spends.
+    #[serde(default)]
+    pub prev_vout: Option<u32>,
 }
 
 /// Full transaction detail.

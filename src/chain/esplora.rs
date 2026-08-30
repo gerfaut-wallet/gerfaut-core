@@ -223,8 +223,12 @@ fn to_address_tx(
                 address: script_address(&prevout.scriptpubkey, network),
                 value_sats: Some(prevout.value),
                 is_mine: prevout.scriptpubkey == *our_script,
+                prev_txid: Some(vin.txid.to_string()),
+                prev_vout: Some(vin.vout),
                 ..TxIo::default()
             },
+            // A coinbase input spends nothing, and Esplora sends no
+            // prevout with it: the outpoint would be all zeroes.
             None => TxIo::default(),
         })
         .collect();
@@ -237,6 +241,7 @@ fn to_address_tx(
             is_mine: vout.scriptpubkey == *our_script,
             change: false,
             op_return: tx_extras::op_return_of(&vout.scriptpubkey),
+            ..TxIo::default()
         })
         .collect();
     // A coinbase transaction has no fee; Esplora reports 0.

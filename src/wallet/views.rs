@@ -135,6 +135,8 @@ pub(crate) fn tx_detail(
                 address: previous.and_then(|p| address_of(&p.script_pubkey, network)),
                 value_sats: previous.map(|p| p.value.to_sat()),
                 is_mine: previous.is_some_and(|p| wallet.is_mine(p.script_pubkey.clone())),
+                prev_txid: Some(txin.previous_output.txid.to_string()),
+                prev_vout: Some(txin.previous_output.vout),
                 ..TxIo::default()
             }
         })
@@ -151,6 +153,7 @@ pub(crate) fn tx_detail(
                 Some((KeychainKind::Internal, _))
             ),
             op_return: tx_extras::op_return_of(&txout.script_pubkey),
+            ..TxIo::default()
         })
         .collect();
 
