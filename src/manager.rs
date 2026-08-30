@@ -2377,6 +2377,93 @@ mod tests {
         );
     }
 
+    /// The whole crossing, the way it actually happens: a desktop with
+    /// a few wallets shows the animated code, a phone reads it frame by
+    /// frame, and the phone already watches one of those wallets.
+    ///
+    /// The wallet already there must come back as such and be skipped,
+    /// never added a second time — the vault would otherwise end up
+    /// with two records for one descriptor, syncing the same addresses
+    /// twice and counting the same coins twice.
+    #[tokio::test]
+    async fn a_scanned_backup_never_doubles_a_wallet_already_watched() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let (source, _, _) = seeded(source_dir.path()).await;
+        let bundle = source
+            .export_backup(&BackupOptions::default(), BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        assert_eq!(bundle.wallet_count, 2);
+
+        // The phone already watches the address, under a name of its
+        // own and with its own id.
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = manager(target_dir.path()).await;
+        let mine = target
+            .add_wallet(
+                "Already here",
+                &parse_input(ADDRESS).unwrap(),
+                Network::Signet,
+            )
+            .await
+            .unwrap();
+
+        // The camera reads the loop one frame at a time, joining it
+        // wherever it happens to be.
+        let frames = &bundle.frames;
+        let mut seen: Vec<String> = Vec::new();
+        let start = frames.len() / 2;
+        let text = loop {
+            assert!(
+                seen.len() < frames.len(),
+                "one turn of the loop should be enough"
+            );
+            seen.push(frames[(start + seen.len()) % frames.len()].clone());
+            let progress = crate::input::qr::assemble(&seen).unwrap();
+            assert_eq!(progress.received as usize, seen.len());
+            if let Some(text) = progress.text {
+                assert!(progress.complete);
+                break text;
+            }
+        };
+
+        let preview = target.preview_backup(&text, BACKUP_PASSWORD).await.unwrap();
+        let watched: Vec<_> = preview
+            .wallets
+            .iter()
+            .map(|w| (w.name.as_str(), w.already_watched))
+            .collect();
+        assert_eq!(watched, vec![("Cold", false), ("Watch", true)]);
+
+        // Restoring everything anyway: the one already here is counted
+        // as skipped, and the name it carries on this device stands.
+        let report = target
+            .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+            .await
+            .unwrap();
+        assert_eq!(report.added.len(), 1);
+        assert_eq!(report.added[0].name, "Cold");
+        assert_eq!(report.skipped, 1);
+
+        let wallets = target.list_wallets(None).await;
+        assert_eq!(wallets.len(), 2);
+        assert_eq!(
+            wallets.iter().filter(|w| w.kind == mine.kind).count(),
+            1,
+            "the address is watched once, not twice"
+        );
+        assert!(wallets.iter().any(|w| w.name == "Already here"));
+
+        // And a second crossing changes nothing at all.
+        let again = target
+            .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+            .await
+            .unwrap();
+        assert!(again.added.is_empty());
+        assert_eq!(again.skipped, 2);
+        assert_eq!(target.list_wallets(None).await.len(), 2);
+    }
+
     #[tokio::test]
     async fn backup_needs_its_password_and_scans_as_a_qr() {
         let source_dir = tempfile::tempdir().unwrap();
