@@ -82,8 +82,22 @@ fn split_host_port(rest: &str) -> Result<(String, Option<u16>), CoreError> {
         }
         None => match rest.rsplit_once(':') {
             // More than one colon and no brackets: a bare IPv6 literal,
-            // which has no room left for a port.
-            Some((head, _)) if head.contains(':') => (rest.to_owned(), None),
+            // which has no room left for a port — but only if it reads
+            // like one. `host.example:50002:50003` also has two colons,
+            // and swallowing it whole would save an address that can
+            // never connect and say nothing about why.
+            Some((head, _)) if head.contains(':') => {
+                if !rest
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+                {
+                    return Err(reject(format!(
+                        "{rest} has more than one colon and is not an IPv6 address; \
+                         bracket it as [address]:port if it is"
+                    )));
+                }
+                (rest.to_owned(), None)
+            }
             Some((host, port)) => (host.to_owned(), Some(port_of(port)?)),
             None => (rest.to_owned(), None),
         },
@@ -196,8 +210,14 @@ pub fn parse_backend(text: &str) -> CoreResult<ScannedBackend> {
     // The Electrum one-liner: `host:port:s` (TLS) or `host:port:t`
     // (plain TCP), the form every Electrum client has read since the
     // start and the one node dashboards print in their QR codes.
+    //
+    // Only a letter is a flag. A one-character *digit* is a port, or the
+    // last group of a bare IPv6 literal — `2001:db8::1` and
+    // `host.example:5` both end in one character and neither is a
+    // connection type.
     if let Some((head, flag)) = text.rsplit_once(':')
         && flag.len() == 1
+        && flag.chars().all(|c| c.is_ascii_alphabetic())
     {
         let tls = match flag.to_ascii_lowercase().as_str() {
             "s" => true,
@@ -220,11 +240,15 @@ pub fn parse_backend(text: &str) -> CoreResult<ScannedBackend> {
     }
     // Nothing said whether the socket is encrypted. The port answers
     // when it is one of the conventional ones; otherwise TLS, the way
-    // every Electrum client has always read a bare address.
+    // every Electrum client has always read a bare address — except on
+    // an onion, where the address is already the server's identity and
+    // the electrs and Fulcrum instances node distributions ship listen
+    // in the clear on 50001. Defaulting a scanned onion to TLS fills the
+    // form with something that cannot connect.
     let tls = match port {
         Some(p) if PLAIN_PORTS.contains(&p) => false,
         Some(p) if TLS_PORTS.contains(&p) => true,
-        _ => true,
+        _ => !host.to_ascii_lowercase().ends_with(".onion"),
     };
     Ok(electrum(host, port, tls))
 }
@@ -294,6 +318,47 @@ mod tests {
         // has always assumed.
         assert!(ok("node.example.org:57010").tls);
         assert_eq!(ok("node.example.org").url, "ssl://node.example.org:50002");
+    }
+
+    /// A one-character tail is only a connection flag when it is a
+    /// letter. A digit there is a port, or the last group of a bare
+    /// IPv6 literal — reading either as `s`/`t` refused an address that
+    /// was perfectly good, with a message about Electrum transports.
+    #[test]
+    fn a_single_digit_tail_is_not_a_connection_flag() {
+        let bare = ok("2001:db8::1");
+        assert_eq!(bare.host, "2001:db8::1");
+        assert_eq!(bare.url, "ssl://[2001:db8::1]:50002");
+
+        let short_port = ok("node.example.org:5");
+        assert_eq!(short_port.port, Some(5));
+    }
+
+    /// Two colons and no brackets is an IPv6 literal or it is nothing.
+    /// Swallowing `host:50002:50003` whole saved a host that could never
+    /// connect and said nothing about why.
+    #[test]
+    fn a_second_colon_that_is_not_ipv6_is_refused_with_a_reason() {
+        let error = parse_backend("ssl://host.example:50002:50003").expect_err("refused");
+        assert!(error.to_string().contains("bracket it"), "{error}");
+        assert!(parse_backend("host.example:50002:50003").is_err());
+    }
+
+    /// An onion address is already the server's identity, and the
+    /// electrs and Fulcrum instances node distributions ship listen in
+    /// the clear. Filling the form with TLS gives an address that
+    /// cannot connect.
+    #[test]
+    fn a_bare_onion_is_read_as_plain_tcp() {
+        let onion = ok("gerfautexample123456.onion");
+        assert!(onion.onion);
+        assert!(!onion.tls);
+        assert_eq!(onion.url, "tcp://gerfautexample123456.onion:50001");
+
+        // An explicit port still rules, either way.
+        assert!(ok("gerfautexample123456.onion:50002").tls);
+        // And a clearnet host with nothing said is still TLS.
+        assert!(ok("node.example.org").tls);
     }
 
     #[test]
