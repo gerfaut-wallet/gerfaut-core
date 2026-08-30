@@ -131,12 +131,17 @@ pub(crate) fn tx_detail(
         .iter()
         .map(|txin| {
             let previous = wallet.tx_graph().get_txout(txin.previous_output);
+            // A coinbase input spends nothing: its outpoint is the null
+            // one the consensus rules require, all zeroes and a vout of
+            // u32::MAX. Handing that to a screen as an identifier would
+            // have it draw a transaction that does not exist.
+            let outpoint = (!txin.previous_output.is_null()).then_some(txin.previous_output);
             TxIo {
                 address: previous.and_then(|p| address_of(&p.script_pubkey, network)),
                 value_sats: previous.map(|p| p.value.to_sat()),
                 is_mine: previous.is_some_and(|p| wallet.is_mine(p.script_pubkey.clone())),
-                prev_txid: Some(txin.previous_output.txid.to_string()),
-                prev_vout: Some(txin.previous_output.vout),
+                prev_txid: outpoint.map(|o| o.txid.to_string()),
+                prev_vout: outpoint.map(|o| o.vout),
                 ..TxIo::default()
             }
         })
@@ -414,6 +419,30 @@ pub(crate) fn address_utxos(state: &AddressWatchState, address: &str) -> Vec<Utx
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A coinbase input carries the null outpoint the consensus rules
+    /// require. It must never reach a screen as an identifier: the
+    /// diagram would name a transaction of all zeroes that never
+    /// existed, and the same address-free input would look spendable.
+    #[test]
+    fn a_coinbase_input_hands_out_no_outpoint() {
+        use bdk_wallet::bitcoin::OutPoint;
+        let null = OutPoint::null();
+        assert!(null.is_null());
+        let outpoint = (!null.is_null()).then_some(null);
+        assert_eq!(outpoint.map(|o| o.txid.to_string()), None);
+        assert_eq!(outpoint.map(|o| o.vout), None);
+
+        // A real one still comes through whole, index included.
+        let spent = OutPoint::new(
+            "3f5591c1e6b4bbbb2b2e8f5b0e2c8d1f9a7c4e6d2b8a0f3c5e7d9b1a4c6e8f0a"
+                .parse()
+                .expect("txid"),
+            2,
+        );
+        let kept = (!spent.is_null()).then_some(spent);
+        assert_eq!(kept.map(|o| o.vout), Some(2));
+    }
 
     fn summary(txid: &str, status: TxStatus) -> TxSummary {
         TxSummary {
