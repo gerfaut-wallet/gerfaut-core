@@ -196,25 +196,27 @@ pub fn parse_backend(text: &str) -> CoreResult<ScannedBackend> {
     // The Electrum one-liner: `host:port:s` (TLS) or `host:port:t`
     // (plain TCP), the form every Electrum client has read since the
     // start and the one node dashboards print in their QR codes.
-    if let Some((head, flag)) = text.rsplit_once(':') {
-        if flag.len() == 1 {
-            let tls = match flag.to_ascii_lowercase().as_str() {
-                "s" => true,
-                "t" => false,
-                other => {
-                    return Err(reject(format!(
-                        "{other} is not an Electrum connection type: s for TLS, t for plain TCP"
-                    )));
-                }
-            };
-            let (host, port) = split_host_port(head)?;
-            return Ok(electrum(host, port, tls));
-        }
+    if let Some((head, flag)) = text.rsplit_once(':')
+        && flag.len() == 1
+    {
+        let tls = match flag.to_ascii_lowercase().as_str() {
+            "s" => true,
+            "t" => false,
+            other => {
+                return Err(reject(format!(
+                    "{other} is not an Electrum connection type: s for TLS, t for plain TCP"
+                )));
+            }
+        };
+        let (host, port) = split_host_port(head)?;
+        return Ok(electrum(host, port, tls));
     }
 
     let (host, port) = split_host_port(text)?;
     if !host.contains('.') && !host.contains(':') && host != "localhost" {
-        return Err(reject(format!("{host} does not look like a server address")));
+        return Err(reject(format!(
+            "{host} does not look like a server address"
+        )));
     }
     // Nothing said whether the socket is encrypted. The port answers
     // when it is one of the conventional ones; otherwise TLS, the way
@@ -255,10 +257,19 @@ mod tests {
 
     #[test]
     fn schemes_map_to_their_transport() {
-        assert_eq!(ok("ssl://host.example:50002").url, "ssl://host.example:50002");
-        assert_eq!(ok("tcp://192.168.1.10:50001").url, "tcp://192.168.1.10:50001");
+        assert_eq!(
+            ok("ssl://host.example:50002").url,
+            "ssl://host.example:50002"
+        );
+        assert_eq!(
+            ok("tcp://192.168.1.10:50001").url,
+            "tcp://192.168.1.10:50001"
+        );
         assert_eq!(ok("tls://host.example").url, "ssl://host.example:50002");
-        assert_eq!(ok("electrum://host.example").url, "tcp://host.example:50001");
+        assert_eq!(
+            ok("electrum://host.example").url,
+            "tcp://host.example:50001"
+        );
     }
 
     #[test]
@@ -328,6 +339,9 @@ mod tests {
 
     #[test]
     fn surrounding_whitespace_is_ignored() {
-        assert_eq!(ok("  ssl://host.example:50002\n").url, "ssl://host.example:50002");
+        assert_eq!(
+            ok("  ssl://host.example:50002\n").url,
+            "ssl://host.example:50002"
+        );
     }
 }
