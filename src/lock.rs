@@ -37,15 +37,16 @@ pub struct LockSecret {
 }
 
 /// The lock as the vault keeps it. The apps get a copy with `secret`
-/// blanked: they need the kind and the timing, never the hash.
+/// blanked: they need the kind, never the hash.
+///
+/// When the lock comes back is not a setting: the secret is asked when
+/// the app opens, and again once it has been away — the desktop ends
+/// its session by closing, the phone by going to the background. A
+/// delay to choose between only ever asked the user to guess how long
+/// their own screen is safe for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppLock {
     pub kind: LockKind,
-    /// Seconds in the background (or idle) before the app locks itself
-    /// again. `Some(0)` locks the moment it leaves the screen; `None`
-    /// only locks at launch and on request.
-    #[serde(default = "default_auto_lock")]
-    pub auto_lock_secs: Option<u32>,
     /// Whether the platform's biometric prompt may stand in for the
     /// secret. The core never sees a biometric: the app asks the OS,
     /// and only skips the secret when the OS says yes.
@@ -53,14 +54,6 @@ pub struct AppLock {
     pub biometric: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<LockSecret>,
-}
-
-/// One minute: long enough to switch apps and come back, short enough
-/// that a phone left on a table locks before anyone picks it up.
-pub const DEFAULT_AUTO_LOCK_SECS: u32 = 60;
-
-fn default_auto_lock() -> Option<u32> {
-    Some(DEFAULT_AUTO_LOCK_SECS)
 }
 
 /// Outcome of an unlock attempt.
@@ -308,7 +301,6 @@ mod tests {
     fn app_lock_serde_keeps_the_secret_only_when_present() {
         let lock = AppLock {
             kind: LockKind::Pin,
-            auto_lock_secs: Some(60),
             biometric: true,
             secret: Some(hash_secret("1234").unwrap()),
         };
@@ -317,15 +309,18 @@ mod tests {
         let back: AppLock = serde_json::from_str(&json).unwrap();
         assert_eq!(back, lock);
 
-        // A redacted copy serializes without the field, and an older
-        // record without timing fields still reads.
+        // A redacted copy serializes without the field.
         let redacted = AppLock {
             secret: None,
             ..lock
         };
         assert!(!serde_json::to_string(&redacted).unwrap().contains("secret"));
-        let old: AppLock = serde_json::from_str(r#"{"kind":"password"}"#).unwrap();
-        assert_eq!(old.auto_lock_secs, Some(DEFAULT_AUTO_LOCK_SECS));
+        // A record written before the delay was dropped still reads:
+        // the field it carries is simply no longer anyone's business.
+        let old: AppLock =
+            serde_json::from_str(r#"{"kind":"password","auto_lock_secs":900}"#).unwrap();
+        assert_eq!(old.kind, LockKind::Password);
         assert!(!old.biometric);
+        assert!(old.secret.is_none());
     }
 }
