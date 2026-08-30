@@ -1,5 +1,6 @@
 //! Chain data sources: backend configuration and synchronization.
 
+pub mod connect;
 pub(crate) mod electrum;
 pub(crate) mod esplora;
 pub mod public;
