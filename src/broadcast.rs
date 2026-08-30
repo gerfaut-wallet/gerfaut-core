@@ -97,7 +97,7 @@ pub struct TxOutputPreview {
 
 /// A caution the person should read before broadcasting. Never blocks:
 /// the transaction is theirs, the preview only makes it legible.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TxWarningKind {
     /// Some inputs carry no signature: the network will refuse it.
@@ -120,11 +120,63 @@ pub enum TxWarningKind {
     SpendsWatched,
 }
 
+/// How loudly a caution should be read.
+///
+/// One question decides it, and the core answers it once so the two
+/// applications cannot drift into two tables: **can the person lose
+/// funds or lose privacy?** Anything else is worth reading, not worth
+/// the most expensive colour of the system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxSeverity {
+    /// Funds or privacy are at stake.
+    Alert,
+    /// Worth reading; nothing is at risk.
+    Info,
+}
+
+impl TxWarningKind {
+    /// The tone this caution is read in.
+    pub fn severity(self) -> TxSeverity {
+        match self {
+            // Believing a transaction went out when it cannot is how a
+            // person ships goods against a payment that never lands.
+            TxWarningKind::Unsigned | TxWarningKind::InputSpent => TxSeverity::Alert,
+            // A fee far above what the chain asks, or eating a large
+            // share of the inputs, is money gone the moment it is sent.
+            TxWarningKind::HighFeeRate | TxWarningKind::HighFeeShare => TxSeverity::Alert,
+            // Nothing here costs anything: an input the backend has not
+            // indexed, a time lock, a fee that could not be computed, an
+            // output under the dust threshold, a coin of a watched
+            // wallet being spent. All of them are worth reading.
+            TxWarningKind::InputUnknown
+            | TxWarningKind::Locked
+            | TxWarningKind::FeeUnknown
+            | TxWarningKind::DustOutput
+            | TxWarningKind::SpendsWatched => TxSeverity::Info,
+        }
+    }
+}
+
 /// A caution with its human-readable text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxWarning {
     pub kind: TxWarningKind,
     pub message: String,
+    /// The tone to read it in. Derived from `kind`; carried on the wire
+    /// so a screen never has to decide, and a kind added later cannot
+    /// fall through a hand-written table into an untoned panel.
+    pub severity: TxSeverity,
+}
+
+impl TxWarning {
+    fn new(kind: TxWarningKind, message: impl Into<String>) -> Self {
+        TxWarning {
+            severity: kind.severity(),
+            kind,
+            message: message.into(),
+        }
+    }
 }
 
 /// Everything shown before broadcasting.
@@ -425,59 +477,59 @@ pub fn build_preview(
     let mut warnings = Vec::new();
     let unsigned = inputs.iter().filter(|i| !i.signed).count();
     if unsigned > 0 {
-        warnings.push(TxWarning {
-            kind: TxWarningKind::Unsigned,
-            message: format!(
+        warnings.push(TxWarning::new(
+            TxWarningKind::Unsigned,
+            format!(
                 "{unsigned} of {} inputs carry no signature: the network will refuse this \
                  transaction. It has to go back to the signer.",
                 inputs.len()
             ),
-        });
+        ));
     }
     for (i, facts) in input_facts.iter().enumerate() {
         if facts.unknown {
-            warnings.push(TxWarning {
-                kind: TxWarningKind::InputUnknown,
-                message: format!(
+            warnings.push(TxWarning::new(
+                TxWarningKind::InputUnknown,
+                format!(
                     "Input {i} was not found on {network}: the transaction may belong to \
                      another network, or spend a coin this backend does not know."
                 ),
-            });
+            ));
         } else if facts.spent == Some(true) {
-            warnings.push(TxWarning {
-                kind: TxWarningKind::InputSpent,
-                message: format!(
+            warnings.push(TxWarning::new(
+                TxWarningKind::InputSpent,
+                format!(
                     "Input {i} is already spent. Either this transaction was broadcast \
                      before, or another one took the coin."
                 ),
-            });
+            ));
         }
     }
     match (fee_sats, fee_rate_sat_vb, in_total) {
-        (None, _, _) => warnings.push(TxWarning {
-            kind: TxWarningKind::FeeUnknown,
-            message: "The fee is unknown: the value of at least one input could not be \
+        (None, _, _) => warnings.push(TxWarning::new(
+            TxWarningKind::FeeUnknown,
+            "The fee is unknown: the value of at least one input could not be \
                       established."
                 .to_owned(),
-        }),
+        )),
         (Some(fee), Some(rate), Some(total)) => {
             if rate > HIGH_FEE_RATE_SAT_VB {
-                warnings.push(TxWarning {
-                    kind: TxWarningKind::HighFeeRate,
-                    message: format!(
+                warnings.push(TxWarning::new(
+                    TxWarningKind::HighFeeRate,
+                    format!(
                         "The fee rate is {rate:.0} sat/vB, far above what the chain asks for. \
                          A wrong unit in the signing software is the usual cause."
                     ),
-                });
+                ));
             }
             if total > 0 && fee as f64 / total as f64 > HIGH_FEE_SHARE {
-                warnings.push(TxWarning {
-                    kind: TxWarningKind::HighFeeShare,
-                    message: format!(
+                warnings.push(TxWarning::new(
+                    TxWarningKind::HighFeeShare,
+                    format!(
                         "The fee takes {:.0}% of what the inputs bring.",
                         100.0 * fee as f64 / total as f64
                     ),
-                });
+                ));
             }
         }
         _ => {}
@@ -489,29 +541,29 @@ pub fn build_preview(
         u64::from(locktime) > now_secs
     };
     if locked {
-        warnings.push(TxWarning {
-            kind: TxWarningKind::Locked,
-            message: if tx.lock_time.is_block_height() {
+        warnings.push(TxWarning::new(
+            TxWarningKind::Locked,
+            if tx.lock_time.is_block_height() {
                 format!(
                     "Time-locked until block {locktime}: the network will not accept it before."
                 )
             } else {
                 "Time-locked until a later date: the network will not accept it before.".to_owned()
             },
-        });
+        ));
     }
     let dust = outputs
         .iter()
         .filter(|o| o.op_return.is_none() && o.value_sats < 546)
         .count();
     if dust > 0 {
-        warnings.push(TxWarning {
-            kind: TxWarningKind::DustOutput,
-            message: format!(
+        warnings.push(TxWarning::new(
+            TxWarningKind::DustOutput,
+            format!(
                 "{dust} output{} below 546 sats: most nodes refuse dust.",
                 if dust == 1 { "" } else { "s" }
             ),
-        });
+        ));
     }
     let watched: Vec<&str> = inputs
         .iter()
@@ -520,10 +572,10 @@ pub fn build_preview(
         .into_iter()
         .collect();
     if !watched.is_empty() {
-        warnings.push(TxWarning {
-            kind: TxWarningKind::SpendsWatched,
-            message: format!("Spends coins of {}.", watched.join(", ")),
-        });
+        warnings.push(TxWarning::new(
+            TxWarningKind::SpendsWatched,
+            format!("Spends coins of {}.", watched.join(", ")),
+        ));
     }
 
     let ready = decoded.ready;
@@ -560,6 +612,45 @@ pub fn sats(amount: Amount) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every kind is named here on purpose: adding one to the enum must
+    /// break this test rather than fall silently into a tone. Red is a
+    /// budget — it has to stay spendable the day it matters.
+    #[test]
+    fn every_caution_has_a_tone_and_only_four_are_red() {
+        use TxWarningKind::*;
+        let table = [
+            (Unsigned, TxSeverity::Alert),
+            (InputSpent, TxSeverity::Alert),
+            (HighFeeRate, TxSeverity::Alert),
+            (HighFeeShare, TxSeverity::Alert),
+            (InputUnknown, TxSeverity::Info),
+            (Locked, TxSeverity::Info),
+            (FeeUnknown, TxSeverity::Info),
+            (DustOutput, TxSeverity::Info),
+            (SpendsWatched, TxSeverity::Info),
+        ];
+        for (kind, expected) in table {
+            assert_eq!(kind.severity(), expected, "{kind:?}");
+        }
+        let red = table
+            .iter()
+            .filter(|(_, s)| *s == TxSeverity::Alert)
+            .count();
+        assert_eq!(red, 4, "red widened without a decision");
+    }
+
+    /// The tone travels with the caution: a screen reads it, never
+    /// derives it.
+    #[test]
+    fn a_caution_carries_the_tone_of_its_kind() {
+        let warning = TxWarning::new(TxWarningKind::Locked, "a time lock");
+        assert_eq!(warning.severity, TxSeverity::Info);
+        assert_eq!(
+            TxWarning::new(TxWarningKind::Unsigned, "not signed").severity,
+            TxSeverity::Alert
+        );
+    }
     use bdk_wallet::bitcoin::hashes::Hash;
     use bdk_wallet::bitcoin::{Sequence, TxIn, Txid, WPubkeyHash, Witness, absolute, transaction};
 
