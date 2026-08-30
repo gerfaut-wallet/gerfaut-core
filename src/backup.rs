@@ -546,6 +546,14 @@ mod tests {
             assert_eq!(progress.text.as_deref(), Some(expected.as_str()));
         }
 
+        // And what a camera actually reads assembles the same way. Both
+        // screens draw the frames in upper case, so that — not the form
+        // the encoder returned — is the text a scan hands to the core.
+        let shouted: Vec<String> = frames.iter().map(|f| f.to_uppercase()).collect();
+        let progress = assemble(&shouted).unwrap();
+        assert!(progress.complete);
+        assert_eq!(progress.text.as_deref(), Some(expected.as_str()));
+
         // And what came out is the backup that went in.
         let restored = open(&decode_source(&expected).unwrap(), PASSWORD).unwrap();
         assert_eq!(restored.wallets.len(), 10);
