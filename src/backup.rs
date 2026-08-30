@@ -254,10 +254,17 @@ pub fn decode_source(source: &str) -> CoreResult<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Frames of the animated QR carrying `bytes`: `ur:bytes` parts, the
-/// pure fragments first, then as many fountain mixes, so a receiver
-/// joining the loop at any frame still completes. Bytes that fit one
-/// fragment make a single, static frame.
+/// Frames of the animated QR carrying `bytes`: one `ur:bytes` part per
+/// fragment of the message, and nothing else. Bytes that fit a single
+/// fragment make one static frame.
+///
+/// No fountain mixes ride along. They earn their keep when the sender
+/// speaks once and cannot repeat itself; here the frames loop on
+/// screen until the scan is done, so a receiver joining at any frame
+/// has every fragment within one turn of the loop. Sending the mixes
+/// as well doubled that turn and made the progress dishonest: the
+/// scanner would climb to nine of ten, then sit there for seconds
+/// while frame after frame resolved nothing.
 pub fn frames(bytes: &[u8]) -> Vec<String> {
     let mut message = Vec::with_capacity(bytes.len() + 8);
     ciborium::into_writer(&Value::Bytes(bytes.to_vec()), &mut message)
@@ -267,7 +274,7 @@ pub fn frames(bytes: &[u8]) -> Vec<String> {
     }
     let mut encoder = ur::ur::Encoder::bytes(&message, MAX_FRAGMENT_LEN)
         .expect("the message is not empty and the fragment length is not zero");
-    (0..2 * encoder.fragment_count())
+    (0..encoder.fragment_count())
         .map(|_| {
             encoder
                 .next_part()
@@ -280,7 +287,7 @@ pub fn frames(bytes: &[u8]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::input::ScriptKind;
-    use crate::input::qr::assemble;
+    use crate::input::qr::{QrFormat, assemble};
 
     const PASSWORD: &str = "correct horse battery staple";
     /// Public two-path key from the BDK documentation.
@@ -472,6 +479,79 @@ mod tests {
         );
     }
 
+    /// A wallet list the size of a real one, scanned the way a phone
+    /// scans it: joining the loop wherever it happens to be, assembling
+    /// again after every new frame.
+    ///
+    /// Two things are guarded. One turn of the loop is enough, whatever
+    /// frame it started on — nobody should have to hold a phone up for
+    /// a second pass. And the count only ever climbs by one, because a
+    /// progress bar that jumps from five to nine and then stalls reads
+    /// as a scanner that has crashed.
+    #[test]
+    fn a_phone_completes_within_one_turn_of_the_loop() {
+        let mut payload = payload();
+        let template = payload.wallets[0].clone();
+        payload.wallets = (0..10)
+            .map(|i| {
+                let mut wallet = template.clone();
+                wallet.name = format!("Wallet number {i}");
+                wallet.kind = WalletKind::Descriptors {
+                    external: format!("wpkh([{i:08x}/84'/0'/{i}']{TPUB}/0/*)#checksum"),
+                    internal: Some(format!("wpkh([{i:08x}/84'/0'/{i}']{TPUB}/1/*)#checksum")),
+                    script: ScriptKind::Segwit,
+                };
+                // Labels weigh what real ones weigh: a vault of ten
+                // wallets is not ten copies of one, and the compressor
+                // must not be handed a list that folds to nothing.
+                wallet.labels = (0..6)
+                    .map(|l| {
+                        (
+                            format!("addr:bc1q{i}{l}{}", "x7k29fq3".repeat(3)),
+                            format!("label {i}-{l} {}", "note-text-here ".repeat(2)),
+                        )
+                    })
+                    .collect();
+                wallet
+            })
+            .collect();
+
+        let sealed = seal(&payload, PASSWORD).unwrap();
+        let frames = frames(&sealed);
+        assert!(
+            frames.len() >= 8,
+            "the fixture should span a real animation: {} frames",
+            frames.len()
+        );
+        let expected = format!("{BACKUP_PREFIX}{}", data_encoding::BASE64.encode(&sealed));
+
+        for start in [0, 1, frames.len() / 2, frames.len() - 1] {
+            let mut collected: Vec<String> = Vec::new();
+            let mut last = 0;
+            for step in 0..frames.len() {
+                collected.push(frames[(start + step) % frames.len()].clone());
+                let progress = assemble(&collected).unwrap();
+                assert_eq!(progress.format, QrFormat::Ur);
+                assert_eq!(progress.total as usize, frames.len());
+                assert_eq!(
+                    progress.received,
+                    last + 1,
+                    "frame {step} from {start} resolved {} fragments, not one",
+                    progress.received as i64 - last as i64
+                );
+                last = progress.received;
+                assert_eq!(progress.complete, step + 1 == frames.len());
+            }
+            let progress = assemble(&collected).unwrap();
+            assert_eq!(progress.text.as_deref(), Some(expected.as_str()));
+        }
+
+        // And what came out is the backup that went in.
+        let restored = open(&decode_source(&expected).unwrap(), PASSWORD).unwrap();
+        assert_eq!(restored.wallets.len(), 10);
+        assert_eq!(restored, payload);
+    }
+
     #[test]
     fn frames_assemble_from_any_starting_point() {
         let sealed = seal(&payload(), PASSWORD).unwrap();
@@ -485,7 +565,7 @@ mod tests {
             .and_then(|(_, total)| total.parse::<usize>().ok())
             .expect("multi-part header");
         assert!(parts > 1, "the sealed bytes span several fragments");
-        assert_eq!(frames.len(), 2 * parts, "pure fragments, then mixes");
+        assert_eq!(frames.len(), parts, "one frame per fragment, no mixes");
         assert!(frames.iter().all(|f| f.starts_with("ur:bytes/")));
 
         let progress = assemble(&frames).unwrap();
