@@ -185,18 +185,29 @@ fn describe_request(error: &reqwest::Error, budget: Budget) -> String {
     }
     if error.is_connect() {
         // The TLS library's own error type, however deep it is wrapped.
-        if any_cause(error, &mut |cause| cause.is::<rustls::Error>()) {
-            return "TLS handshake failed".to_owned();
+        // Its words are the ones to keep: which certificate check
+        // failed, or what came back in place of a handshake.
+        if let Some(cause) = find_cause(error, &mut |cause| cause.is::<rustls::Error>()) {
+            return format!("TLS handshake failed: {cause}");
         }
         // The connector names the step that failed; the resolver's own
         // words hang below it and vary by platform.
-        if any_cause(error, &mut |cause| cause.to_string() == "dns error") {
+        if find_cause(error, &mut |cause| cause.to_string() == "dns error").is_some() {
             return "host not found".to_owned();
         }
-        if any_cause(error, &mut |cause| {
+        // The proxy step names itself too, and the SOCKS client's own
+        // words hang below it: a refusal, or a handshake cut short.
+        if let Some(cause) = find_cause(error, &mut |cause| {
             cause.to_string().contains("socks proxy")
         }) {
-            return "could not connect through Tor".to_owned();
+            return match cause.source() {
+                Some(reason) => {
+                    let reason = reason.to_string();
+                    let reason = reason.strip_prefix("SOCKS error: ").unwrap_or(&reason);
+                    format!("could not connect through Tor: {reason}")
+                }
+                None => "could not connect through Tor".to_owned(),
+            };
         }
         return "could not connect".to_owned();
     }
@@ -206,26 +217,26 @@ fn describe_request(error: &reqwest::Error, budget: Budget) -> String {
     "request failed".to_owned()
 }
 
-/// Whether `matches` holds for the error, anything in its `source`
-/// chain, or anything an `io::Error` along the way wraps: an
-/// `io::Error` reports the source of what it wraps, not the wrapped
-/// error itself, so a plain walk would step over it.
-fn any_cause(
-    error: &(dyn std::error::Error + 'static),
+/// The first error for which `matches` holds, among the error itself,
+/// its `source` chain, and whatever an `io::Error` along the way
+/// wraps: an `io::Error` reports the source of what it wraps, not the
+/// wrapped error itself, so a plain walk would step over it.
+fn find_cause<'e>(
+    error: &'e (dyn std::error::Error + 'static),
     matches: &mut dyn FnMut(&(dyn std::error::Error + 'static)) -> bool,
-) -> bool {
+) -> Option<&'e (dyn std::error::Error + 'static)> {
     if matches(error) {
-        return true;
+        return Some(error);
     }
     if let Some(io) = error.downcast_ref::<std::io::Error>()
         && let Some(inner) = io.get_ref()
-        && any_cause(inner, matches)
+        && let Some(found) = find_cause(inner, matches)
     {
-        return true;
+        return Some(found);
     }
     error
         .source()
-        .is_some_and(|source| any_cause(source, matches))
+        .and_then(|source| find_cause(source, matches))
 }
 
 /// One round of address history: the transactions fetched and, when
@@ -572,6 +583,7 @@ mod error_tests {
     use std::net::Ipv4Addr;
 
     use bdk_wallet::bitcoin::hashes::Hash;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::*;
@@ -671,6 +683,64 @@ mod error_tests {
         let client = build("http://esplora.invalid", None, PATIENT).unwrap();
         let error = client.get_height().await.unwrap_err();
         assert_eq!(client.describe(&error), "host not found");
+    }
+
+    /// A server that answers the handshake with something that is not
+    /// TLS: the library's own words say what came back.
+    #[tokio::test]
+    async fn a_tls_failure_keeps_the_reason() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                // The whole ClientHello is read first, its length from
+                // the record header: a socket dropped with unread bytes
+                // resets the connection, and the client would report
+                // the reset rather than what was sent back.
+                let mut header = [0u8; 5];
+                if stream.read_exact(&mut header).await.is_err() {
+                    continue;
+                }
+                let mut hello = vec![0u8; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+                let _ = stream.read_exact(&mut hello).await;
+                let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+                // Held until the client has read its answer and gone.
+                let mut rest = [0u8; 1];
+                let _ = stream.read(&mut rest).await;
+            }
+        });
+        let client = build(&format!("https://{address}"), None, PATIENT).unwrap();
+        let error = client.get_height().await.unwrap_err();
+        let described = client.describe(&error);
+        assert!(
+            described.starts_with("TLS handshake failed: received corrupt message"),
+            "{described}"
+        );
+    }
+
+    /// A proxy that turns the handshake down: the SOCKS client's own
+    /// words say why, without its "SOCKS error" preamble.
+    #[tokio::test]
+    async fn a_socks_refusal_keeps_the_reason() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut greeting = [0u8; 64];
+                let _ = stream.read(&mut greeting).await;
+                // No acceptable authentication method, RFC 1928.
+                let _ = stream.write_all(&[5, 0xFF]).await;
+                let mut rest = [0u8; 1];
+                let _ = stream.read(&mut rest).await;
+            }
+        });
+        let onion = "http://gerfautexample000000000000000000000000000000000000000.onion/api";
+        let client = build(onion, Some(&proxy.to_string()), PATIENT).unwrap();
+        let error = client.get_height().await.unwrap_err();
+        assert_eq!(
+            client.describe(&error),
+            "could not connect through Tor: server does not support user/pass authentication"
+        );
     }
 
     #[test]
