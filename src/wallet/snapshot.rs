@@ -32,6 +32,14 @@ pub struct BalanceSnapshot {
     pub immature: u64,
     /// Sum of everything above.
     pub total: u64,
+    /// Signed sum of the transactions not yet in a block: the part of
+    /// `total` still arriving (positive), or what has left it without
+    /// the chain having taken it yet (negative). `None` once everything
+    /// is settled. Read from the transactions, not from the two pending
+    /// buckets above: a spend that returns no change leaves both at
+    /// zero while the total has already dropped.
+    #[serde(default)]
+    pub pending_net_sats: Option<i64>,
 }
 
 /// Confirmation status of a transaction.

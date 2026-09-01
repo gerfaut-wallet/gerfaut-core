@@ -35,7 +35,27 @@ pub(crate) fn balance(wallet: &bdk_wallet::Wallet) -> BalanceSnapshot {
         untrusted_pending: balance.untrusted_pending.to_sat(),
         immature: balance.immature.to_sat(),
         total: balance.total().to_sat(),
+        pending_net_sats: pending_net(
+            wallet
+                .transactions()
+                .filter(|wtx| matches!(wtx.chain_position, ChainPosition::Unconfirmed { .. }))
+                .map(|wtx| net_of(wallet, &wtx.tx_node.tx)),
+        ),
     }
+}
+
+/// What a transaction did to the wallet, in sats: what came in less
+/// what went out, the fee included on the way out.
+fn net_of(wallet: &bdk_wallet::Wallet, tx: &bdk_wallet::bitcoin::Transaction) -> i64 {
+    let (sent, received) = wallet.sent_and_received(tx);
+    received.to_sat() as i64 - sent.to_sat() as i64
+}
+
+/// The signed sum of what is still out of a block, or `None` when
+/// nothing is. The figure and the fact travel as one value: a spend
+/// that happens to net to zero is still pending, and still shows.
+fn pending_net(nets: impl Iterator<Item = i64>) -> Option<i64> {
+    nets.fold(None, |sum, net| Some(sum.unwrap_or(0) + net))
 }
 
 pub(crate) fn tip_height(wallet: &bdk_wallet::Wallet) -> u32 {
@@ -58,11 +78,10 @@ pub(crate) fn tx_summaries(wallet: &bdk_wallet::Wallet) -> Vec<TxSummary> {
     let mut txs: Vec<TxSummary> = wallet
         .transactions()
         .map(|wtx| {
-            let (sent, received) = wallet.sent_and_received(&wtx.tx_node.tx);
             let status = status_of(&wtx.chain_position);
             TxSummary {
                 txid: wtx.tx_node.txid.to_string(),
-                net_sats: received.to_sat() as i64 - sent.to_sat() as i64,
+                net_sats: net_of(wallet, &wtx.tx_node.tx),
                 fee_sats: wallet
                     .calculate_fee(&wtx.tx_node.tx)
                     .ok()
@@ -329,6 +348,13 @@ pub(crate) fn address_balance(state: &AddressWatchState) -> BalanceSnapshot {
         untrusted_pending: pending_funded,
         immature: 0,
         total: confirmed_funded + pending_funded,
+        pending_net_sats: pending_net(
+            state
+                .txs
+                .iter()
+                .filter(|tx| tx.height.is_none())
+                .map(|tx| tx.net_sats),
+        ),
     }
 }
 
@@ -509,6 +535,83 @@ mod tests {
         let balance = address_balance(&state);
         assert_eq!(balance.confirmed, 1000);
         assert_eq!(balance.untrusted_pending, 500);
+        assert_eq!(balance.total, 1500);
+        assert_eq!(balance.pending_net_sats, None, "no transaction listed");
+    }
+
+    fn address_tx(txid: &str, net_sats: i64, height: Option<u32>) -> AddressTx {
+        AddressTx {
+            txid: txid.into(),
+            net_sats,
+            fee_sats: None,
+            height,
+            timestamp: None,
+            vsize: 0,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            extras: None,
+        }
+    }
+
+    /// The pending line under a balance reads the transactions, not the
+    /// pending buckets: a spend that returns no change leaves both
+    /// buckets at zero while the total has already dropped, and the
+    /// buckets can only ever say "plus".
+    #[test]
+    fn address_balance_nets_what_is_still_out_of_a_block() {
+        let settled = AddressWatchState {
+            txs: vec![address_tx("aa", 100_000, Some(10))],
+            ..Default::default()
+        };
+        assert_eq!(address_balance(&settled).pending_net_sats, None);
+
+        let arriving = AddressWatchState {
+            txs: vec![
+                address_tx("bb", 50_000, None),
+                address_tx("aa", 100_000, Some(10)),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(address_balance(&arriving).pending_net_sats, Some(50_000));
+
+        // A sweep leaves nothing behind: no change, no pending bucket.
+        let leaving = AddressWatchState {
+            txs: vec![
+                address_tx("cc", -100_000, None),
+                address_tx("aa", 100_000, Some(10)),
+            ],
+            ..Default::default()
+        };
+        let balance = address_balance(&leaving);
+        assert_eq!(balance.untrusted_pending, 0);
+        assert_eq!(balance.pending_net_sats, Some(-100_000));
+
+        // Both at once: one figure, the net of the two.
+        let both = AddressWatchState {
+            txs: vec![
+                address_tx("bb", 50_000, None),
+                address_tx("cc", -31_000, None),
+                address_tx("aa", 100_000, Some(10)),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(address_balance(&both).pending_net_sats, Some(19_000));
+    }
+
+    #[test]
+    fn a_pending_spend_that_nets_to_nothing_is_still_pending() {
+        assert_eq!(pending_net(std::iter::empty()), None);
+        assert_eq!(pending_net([0].into_iter()), Some(0));
+        assert_eq!(pending_net([700, -700].into_iter()), Some(0));
+    }
+
+    /// Vaults written before the field existed still open: the cached
+    /// balance of every wallet is stored in them.
+    #[test]
+    fn a_balance_saved_without_the_pending_net_still_loads() {
+        let old = r#"{"confirmed":1500,"trusted_pending":0,"untrusted_pending":0,"immature":0,"total":1500}"#;
+        let balance: BalanceSnapshot = serde_json::from_str(old).expect("old balance");
+        assert_eq!(balance.pending_net_sats, None);
         assert_eq!(balance.total, 1500);
     }
 }
