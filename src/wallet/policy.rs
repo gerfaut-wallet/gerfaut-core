@@ -1053,7 +1053,10 @@ fn numbered(base: &str, count: usize) -> String {
 // --- wording -------------------------------------------------------------
 
 /// One sentence for a branch: who, then the absolute locks, then the
-/// relative ones. "Key B, once a coin has waited 52,560 blocks".
+/// relative ones. "Key B, once a coin has waited 52,560 blocks". The
+/// phrases come in lower case and the sentence is capitalized once,
+/// here, so that a group inside it reads as part of it: "Key A and any
+/// 2 of 3 keys".
 fn summary(condition: &Condition, book: &KeyBook) -> String {
     let parts: Vec<&Condition> = match condition {
         Condition::Thresh { k, n, items } if k == n => items.iter().collect(),
@@ -1096,8 +1099,10 @@ fn summary(condition: &Condition, book: &KeyBook) -> String {
     text
 }
 
-/// A threshold as a noun phrase: "Any 2 of 3 keys", "Keys A and B",
-/// "Any 2 of: Key A, Key B, a coin having waited 100 blocks".
+/// A threshold as a noun phrase, in lower case but for the key labels:
+/// "any 2 of 3 keys", "Keys A and B", "either Key B or a coin having
+/// waited 100 blocks", "any 2 of: Key A, Key B, a coin having waited
+/// 100 blocks".
 fn group_phrase(condition: &Condition, book: &KeyBook) -> String {
     let Condition::Thresh { k, n, items } = condition else {
         return noun(condition, book);
@@ -1117,15 +1122,17 @@ fn group_phrase(condition: &Condition, book: &KeyBook) -> String {
             return key_list(&labels);
         }
         if *k == 1 {
-            return format!("Any of {n} keys");
+            return format!("any of {n} keys");
         }
-        return format!("Any {k} of {n} keys");
+        return format!("any {k} of {n} keys");
     }
     let nouns: Vec<String> = items.iter().map(|item| noun(item, book)).collect();
     if k == n {
         join_and(nouns)
+    } else if *k == 1 {
+        format!("either {}", join_or(nouns))
     } else {
-        format!("Any {k} of: {}", nouns.join(", "))
+        format!("any {k} of: {}", nouns.join(", "))
     }
 }
 
@@ -1187,12 +1194,21 @@ fn key_list(labels: &[&str]) -> String {
 
 /// "a", "a and b", "a, b and c".
 fn join_and(items: Vec<String>) -> String {
+    join_with(items, "and")
+}
+
+/// "a", "a or b", "a, b or c".
+fn join_or(items: Vec<String>) -> String {
+    join_with(items, "or")
+}
+
+fn join_with(items: Vec<String>, conjunction: &str) -> String {
     match items.len() {
         0 => String::new(),
         1 => items.into_iter().next().unwrap_or_default(),
         n => {
             let (head, last) = items.split_at(n - 1);
-            format!("{} and {}", head.join(", "), last[0])
+            format!("{} {conjunction} {}", head.join(", "), last[0])
         }
     }
 }
@@ -1285,6 +1301,7 @@ mod tests {
     const A: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
     const B: &str = "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw";
     const C: &str = "xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ";
+    const D: &str = "xpub6D4BDPcP2GT577Vvch3R8wDkScZWzQzMMUm3PWbmWvVJrZwQY4VUNgqFJPMM3No2dFDFGTsxxpG5uJh7n7epu4trkrX7x7DogT5Uv6fcLW5";
     /// The signet fixture the manager tests use, origin included.
     const TPUB: &str = "[9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
 
@@ -1819,6 +1836,38 @@ mod tests {
     }
 
     #[test]
+    fn a_group_inside_a_sentence_reads_in_lower_case() {
+        let descriptor =
+            format!("wsh(and_v(v:pk({A}/0/*),thresh(2,pk({B}/0/*),s:pk({C}/0/*),s:pk({D}/0/*))))");
+        let snapshot = wsh(&descriptor, Vec::new());
+        assert_eq!(snapshot.branches[0].summary, "Key A and any 2 of 3 keys");
+
+        // One of a mixed pair is "either ... or ...".
+        let descriptor = format!("wsh(and_v(v:pk({A}/0/*),or_i(pk({B}/0/*),older(100))))");
+        let snapshot = wsh(&descriptor, Vec::new());
+        assert_eq!(
+            snapshot.branches[0].summary,
+            "Key A and either Key B or a coin having waited 100 blocks"
+        );
+
+        // Past two, the list takes its "or" before the last item.
+        let descriptor =
+            format!("wsh(and_v(v:pk({A}/0/*),or_i(or_i(pk({B}/0/*),pk({C}/0/*)),older(100))))");
+        let snapshot = wsh(&descriptor, Vec::new());
+        assert_eq!(
+            snapshot.branches[0].summary,
+            "Key A and either Key B, Key C or a coin having waited 100 blocks"
+        );
+
+        // A group that opens the sentence keeps its capital.
+        let descriptor = format!(
+            "wsh(or_i(and_v(v:pk({A}/0/*),older(100)),thresh(2,pk({B}/0/*),s:pk({C}/0/*),s:pk({D}/0/*))))"
+        );
+        let snapshot = wsh(&descriptor, Vec::new());
+        assert_eq!(snapshot.branches[1].summary, "Any 2 of 3 keys");
+    }
+
+    #[test]
     fn keys_joined_in_an_and_read_as_a_list() {
         let descriptor = format!("wsh(and_v(v:pk({A}/0/*),and_v(v:pk({B}/0/*),pk({C}/0/*))))");
         let snapshot = wsh(&descriptor, Vec::new());
@@ -1920,6 +1969,11 @@ mod tests {
         assert_eq!(
             join_and(vec!["a".into(), "b".into(), "c".into()]),
             "a, b and c"
+        );
+        assert_eq!(join_or(vec!["a".into(), "b".into()]), "a or b");
+        assert_eq!(
+            join_or(vec!["a".into(), "b".into(), "c".into()]),
+            "a, b or c"
         );
     }
 }
