@@ -27,8 +27,8 @@ const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(90);
 
 /// What is kept for the life of the process.
 struct Embedded {
-    /// Where the proxy listens.
-    socks: String,
+    /// Where the proxy listens and what it asks for.
+    access: socks::Access,
     /// Dropping the client would tear down the circuits behind the
     /// listener; it is held for that reason alone.
     _client: Arc<TorClient<TokioRustlsRuntime>>,
@@ -38,13 +38,13 @@ struct Embedded {
 /// the next caller starts it again rather than inheriting the failure.
 static CLIENT: OnceCell<Embedded> = OnceCell::const_new();
 
-/// The proxy address of the running client, starting it if needed.
+/// How to reach the running client's proxy, starting it if needed.
 /// Concurrent callers wait for the same start.
-pub(super) async fn socks_address(data_dir: &Path) -> CoreResult<String> {
+pub(super) async fn socks_access(data_dir: &Path) -> CoreResult<socks::Access> {
     CLIENT
         .get_or_try_init(|| start(data_dir))
         .await
-        .map(|embedded| embedded.socks.clone())
+        .map(|embedded| embedded.access.clone())
 }
 
 async fn start(data_dir: &Path) -> CoreResult<Embedded> {
@@ -117,9 +117,15 @@ async fn bootstrap(data_dir: &Path) -> CoreResult<Embedded> {
             async move { client.connect((host, port)).await.map_err(io::Error::other) }
         }
     };
-    tokio::spawn(socks::serve(listener, connect));
+    // Fresh for every start: nothing outside this process ever holds
+    // them, and a restart owes nothing to the previous run.
+    let credentials = socks::Credentials::random();
+    tokio::spawn(socks::serve(listener, credentials.clone(), connect));
     Ok(Embedded {
-        socks: address.to_string(),
+        access: socks::Access {
+            address: address.to_string(),
+            credentials,
+        },
         _client: client,
     })
 }

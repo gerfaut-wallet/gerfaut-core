@@ -9,7 +9,9 @@
 //!
 //! The embedded client is arti, the Tor Project's Rust implementation,
 //! started lazily and kept for the life of the process behind a loopback
-//! SOCKS5 listener ([`socks`]) on a port the system picks.
+//! SOCKS5 listener ([`socks`]) on a port the system picks, guarded by
+//! credentials drawn for the process: loopback is shared by every app on
+//! Android, and this proxy carries this wallet's traffic only.
 
 #[cfg(feature = "embedded-tor")]
 mod embedded;
@@ -83,9 +85,45 @@ pub enum TorVia {
 /// A SOCKS5 proxy ready to carry onion traffic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TorRoute {
-    /// `host:port` of the proxy.
+    /// `host:port` of the proxy: what a settings screen may show.
     pub socks: String,
     pub via: TorVia,
+    /// What the embedded proxy asks a client for. Kept out of the
+    /// serialized form, so the apps never see or show them; the chain
+    /// layer gets them through [`TorRoute::proxy`].
+    #[serde(skip)]
+    credentials: Option<socks::Credentials>,
+}
+
+impl TorRoute {
+    /// The proxy as the chain layer takes it: `user:password@host:port`
+    /// when the proxy asks for credentials, `host:port` otherwise. Never
+    /// for display; [`Self::socks`] is.
+    pub(crate) fn proxy(&self) -> String {
+        match &self.credentials {
+            Some(credentials) => format!(
+                "{}:{}@{}",
+                credentials.username(),
+                credentials.password(),
+                self.socks
+            ),
+            None => self.socks.clone(),
+        }
+    }
+}
+
+/// Splits a proxy string the chain layer was handed into its
+/// credentials, if any, and its `host:port`. The inverse of
+/// [`TorRoute::proxy`], for the client that takes them apart rather than
+/// as a URL.
+pub(crate) fn split_proxy(proxy: &str) -> (Option<(&str, &str)>, &str) {
+    match proxy.rsplit_once('@') {
+        Some((userinfo, address)) => match userinfo.split_once(':') {
+            Some((username, password)) => (Some((username, password)), address),
+            None => (Some((userinfo, "")), address),
+        },
+        None => (None, proxy),
+    }
 }
 
 /// What a settings screen shows about Tor.
@@ -151,7 +189,7 @@ fn update(change: impl FnOnce(&mut Progress)) {
 /// to be reached.
 pub async fn resolve(settings: &TorSettings, data_dir: &Path) -> CoreResult<TorRoute> {
     #[cfg(feature = "embedded-tor")]
-    let embedded = Some(async || embedded::socks_address(data_dir).await);
+    let embedded = Some(async || embedded::socks_access(data_dir).await);
     #[cfg(not(feature = "embedded-tor"))]
     let embedded = {
         let _ = data_dir;
@@ -166,24 +204,26 @@ pub async fn resolve(settings: &TorSettings, data_dir: &Path) -> CoreResult<TorR
 
 /// The type of a starter this build does not have.
 #[cfg(not(feature = "embedded-tor"))]
-type NoEmbedded = fn() -> std::future::Ready<CoreResult<String>>;
+type NoEmbedded = fn() -> std::future::Ready<CoreResult<socks::Access>>;
 
 /// The policy on its own: `probe` says whether a proxy answers at an
-/// address, `embedded` starts the built-in client and returns its
-/// proxy address, or is `None` in a build without one.
+/// address, `embedded` starts the built-in client and returns how to
+/// reach its proxy, or is `None` in a build without one.
 async fn resolve_with(
     settings: &TorSettings,
     probe: impl AsyncFn(&str) -> bool,
-    embedded: Option<impl AsyncFnOnce() -> CoreResult<String>>,
+    embedded: Option<impl AsyncFnOnce() -> CoreResult<socks::Access>>,
 ) -> CoreResult<TorRoute> {
     let system = settings.system_socks();
     let via_system = || TorRoute {
         socks: system.to_owned(),
         via: TorVia::System,
+        credentials: None,
     };
-    let via_embedded = |socks| TorRoute {
-        socks,
+    let via_embedded = |access: socks::Access| TorRoute {
+        socks: access.address,
         via: TorVia::Embedded,
+        credentials: Some(access.credentials),
     };
     match settings.mode {
         TorMode::System => {
@@ -329,14 +369,17 @@ mod tests {
 
     /// A starter that records being called and hands out a fixed
     /// address; the real one is never run by these tests.
-    fn starter(called: &Cell<bool>) -> Option<impl AsyncFnOnce() -> CoreResult<String>> {
+    fn starter(called: &Cell<bool>) -> Option<impl AsyncFnOnce() -> CoreResult<socks::Access>> {
         Some(async || {
             called.set(true);
-            Ok("127.0.0.1:1".to_owned())
+            Ok(socks::Access {
+                address: "127.0.0.1:1".to_owned(),
+                credentials: socks::Credentials::new("user", "pass"),
+            })
         })
     }
 
-    const NO_STARTER: Option<fn() -> Ready<CoreResult<String>>> = None;
+    const NO_STARTER: Option<fn() -> Ready<CoreResult<socks::Access>>> = None;
 
     #[tokio::test]
     async fn the_probe_says_no_quickly_on_a_closed_port() {
@@ -375,9 +418,12 @@ mod tests {
             route,
             TorRoute {
                 socks: "127.0.0.1:9150".to_owned(),
-                via: TorVia::System
+                via: TorVia::System,
+                credentials: None,
             }
         );
+        // A system proxy takes no credentials: the string is the address.
+        assert_eq!(route.proxy(), "127.0.0.1:9150");
         assert!(!called.get(), "the embedded client stays off");
     }
 
@@ -394,6 +440,39 @@ mod tests {
         assert_eq!(route.via, TorVia::Embedded);
         assert_eq!(route.socks, "127.0.0.1:1");
         assert!(called.get());
+    }
+
+    /// The embedded proxy's credentials reach the chain layer and
+    /// nothing else: not the serialized route the apps receive, not a
+    /// debug print, not the address shown in the settings.
+    #[tokio::test]
+    async fn the_embedded_credentials_never_leave_the_process() {
+        let called = Cell::new(false);
+        let route = resolve_with(
+            &settings(TorMode::Embedded, None),
+            async |_: &str| false,
+            starter(&called),
+        )
+        .await
+        .unwrap();
+        assert_eq!(route.proxy(), "user:pass@127.0.0.1:1");
+        assert_eq!(route.socks, "127.0.0.1:1");
+        let json = serde_json::to_string(&route).unwrap();
+        assert_eq!(json, r#"{"socks":"127.0.0.1:1","via":"embedded"}"#);
+        let shown = format!("{route:?}");
+        assert!(!shown.contains("pass"), "{shown}");
+        // What the apps send back reads without the field.
+        let back: TorRoute = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.socks, route.socks);
+        assert_eq!(back.proxy(), "127.0.0.1:1");
+
+        // And the chain layer takes the string apart again.
+        assert_eq!(
+            split_proxy("user:pass@127.0.0.1:1"),
+            (Some(("user", "pass")), "127.0.0.1:1")
+        );
+        assert_eq!(split_proxy("127.0.0.1:9050"), (None, "127.0.0.1:9050"));
+        assert_eq!(split_proxy("[::1]:9050"), (None, "[::1]:9050"));
     }
 
     #[tokio::test]
@@ -552,7 +631,7 @@ mod tests {
         assert_eq!(route.via, TorVia::Embedded);
         assert!(route.socks.starts_with("127.0.0.1:"));
 
-        let client = crate::chain::esplora::client(MEMPOOL_ONION, Some(&route.socks)).unwrap();
+        let client = crate::chain::esplora::client(MEMPOOL_ONION, Some(&route.proxy())).unwrap();
         let height = client
             .get_height()
             .await

@@ -138,8 +138,17 @@ fn connect(target: &Target, proxy: Option<&str>) -> Result<Transport, ConnectErr
     if crate::chain::is_onion(&target.url) {
         let proxy =
             proxy.ok_or_else(|| ConnectError::Io(crate::chain::tor::no_route(&target.url)))?;
+        // The embedded proxy asks for credentials; this client takes
+        // them apart from the address rather than as a URL.
+        let (credentials, address) = crate::chain::tor::split_proxy(proxy);
+        let socks5 = match credentials {
+            Some((username, password)) => {
+                Socks5Config::with_credentials(address, username.to_owned(), password.to_owned())
+            }
+            None => Socks5Config::new(address),
+        };
         let config = Config::builder()
-            .socks5(Some(Socks5Config::new(proxy)))
+            .socks5(Some(socks5))
             .timeout(Some(TOR_TIMEOUT))
             .validate_domain(false)
             .build();

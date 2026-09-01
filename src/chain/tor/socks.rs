@@ -1,22 +1,40 @@
 //! The smallest SOCKS5 server that satisfies `reqwest` (`socks5h://`)
-//! and `electrum-client`: no authentication, `CONNECT` only, the target
-//! given as a domain name, an IPv4 or an IPv6 address. It listens on
-//! loopback only and hands every stream to the connect function it is
-//! given, which is where Tor comes in. Names are passed through as
-//! spelled and never resolved here: an onion name has nowhere to be
-//! resolved but inside Tor.
+//! and `electrum-client`: username/password authentication (RFC 1929),
+//! `CONNECT` only, the target given as a domain name, an IPv4 or an
+//! IPv6 address. It listens on loopback only and hands every stream to
+//! the connect function it is given, which is where Tor comes in. Names
+//! are passed through as spelled and never resolved here: an onion name
+//! has nowhere to be resolved but inside Tor.
+//!
+//! Loopback is not private everywhere. On Android every app holding the
+//! INTERNET permission shares it, and a proxy that took anyone's
+//! `CONNECT` would carry anyone's traffic through this wallet's Tor
+//! client. So each process draws its own [`Credentials`], and a client
+//! that does not present them gets nothing, not even a refusal it can
+//! learn from.
 
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use rand::distr::{Alphanumeric, SampleString};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 pub(crate) const VERSION: u8 = 5;
+/// The "no authentication" method: what a system Tor answers the probe
+/// with, never what this server accepts.
 pub(crate) const NO_AUTH: u8 = 0;
+/// The username/password method, RFC 1929.
+const USER_PASS: u8 = 2;
 const NO_ACCEPTABLE_METHODS: u8 = 0xFF;
+/// The one version of the username/password subnegotiation.
+const AUTH_VERSION: u8 = 1;
+const AUTH_SUCCEEDED: u8 = 0;
+const AUTH_FAILED: u8 = 1;
 const CMD_CONNECT: u8 = 1;
 const ATYP_IPV4: u8 = 1;
 const ATYP_DOMAIN: u8 = 3;
@@ -31,6 +49,72 @@ const REPLY_CONNECTION_REFUSED: u8 = 5;
 const REPLY_COMMAND_NOT_SUPPORTED: u8 = 7;
 const REPLY_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 8;
 
+/// What a client must present to use the proxy. Drawn at random for the
+/// process, handed to the HTTP and Electrum clients in memory, and
+/// never written, shown or logged: the `Debug` form says nothing.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Credentials {
+    username: String,
+    password: String,
+}
+
+/// Length of each credential, in characters. Alphanumeric, so they ride
+/// in a proxy URL without escaping; 32 of them is about 190 bits, well
+/// past what a neighbour on loopback could try.
+const CREDENTIAL_CHARS: usize = 32;
+
+impl Credentials {
+    /// Fresh credentials from the process CSPRNG.
+    pub(crate) fn random() -> Self {
+        let mut rng = rand::rng();
+        Credentials {
+            username: Alphanumeric.sample_string(&mut rng, CREDENTIAL_CHARS),
+            password: Alphanumeric.sample_string(&mut rng, CREDENTIAL_CHARS),
+        }
+    }
+
+    /// Known credentials, for tests that play both sides.
+    #[cfg(test)]
+    pub(crate) fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Credentials {
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+
+    pub(crate) fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub(crate) fn password(&self) -> &str {
+        &self.password
+    }
+
+    /// Whether a client presented exactly these, compared in constant
+    /// time over both fields whatever their lengths.
+    fn accept(&self, username: &[u8], password: &[u8]) -> bool {
+        let same_username = username.len() == self.username.len()
+            && bool::from(username.ct_eq(self.username.as_bytes()));
+        let same_password = password.len() == self.password.len()
+            && bool::from(password.ct_eq(self.password.as_bytes()));
+        same_username & same_password
+    }
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Credentials(redacted)")
+    }
+}
+
+/// Where a proxy listens and what it asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Access {
+    /// `host:port`.
+    pub address: String,
+    pub credentials: Credentials,
+}
+
 /// Listens on loopback, on a port the system picks: nothing to clash
 /// with, nothing reachable from outside the machine.
 pub(crate) async fn bind() -> io::Result<(TcpListener, SocketAddr)> {
@@ -40,8 +124,9 @@ pub(crate) async fn bind() -> io::Result<(TcpListener, SocketAddr)> {
 }
 
 /// Accepts connections for as long as the task lives, one session per
-/// connection. `connect` opens the upstream side of each `CONNECT`.
-pub(crate) async fn serve<C, F, U>(listener: TcpListener, connect: C)
+/// connection. `credentials` are what every client must present;
+/// `connect` opens the upstream side of each `CONNECT`.
+pub(crate) async fn serve<C, F, U>(listener: TcpListener, credentials: Credentials, connect: C)
 where
     C: Fn(String, u16) -> F + Clone + Send + 'static,
     F: Future<Output = io::Result<U>> + Send + 'static,
@@ -58,18 +143,24 @@ where
             }
         };
         let connect = connect.clone();
+        let credentials = credentials.clone();
         // A session's failure is the client's to notice: it got the
         // reply code, and the proxy has nothing to add.
         tokio::spawn(async move {
-            let _ = session(stream, connect).await;
+            let _ = session(stream, &credentials, connect).await;
         });
     }
 }
 
-/// One session: method negotiation, the request, the reply, then bytes
-/// both ways until either side closes. Every refusal is answered with
-/// the reply code the protocol has for it before the stream is dropped.
-pub(crate) async fn session<S, C, F, U>(mut stream: S, connect: C) -> io::Result<()>
+/// One session: method negotiation, the credentials, the request, the
+/// reply, then bytes both ways until either side closes. Every refusal
+/// is answered with the reply code the protocol has for it before the
+/// stream is dropped.
+pub(crate) async fn session<S, C, F, U>(
+    mut stream: S,
+    credentials: &Credentials,
+    connect: C,
+) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     C: FnOnce(String, u16) -> F,
@@ -84,11 +175,38 @@ where
     }
     let mut methods = vec![0u8; method_count as usize];
     stream.read_exact(&mut methods).await?;
-    if !methods.contains(&NO_AUTH) {
+    // Username/password only: a client that offers nothing but "no
+    // authentication" is not one of ours.
+    if !methods.contains(&USER_PASS) {
         stream.write_all(&[VERSION, NO_ACCEPTABLE_METHODS]).await?;
-        return Err(invalid("the client offers no method this proxy speaks"));
+        return Err(invalid(
+            "the client offers no authentication this proxy accepts",
+        ));
     }
-    stream.write_all(&[VERSION, NO_AUTH]).await?;
+    stream.write_all(&[VERSION, USER_PASS]).await?;
+
+    // RFC 1929: the version, then the username and the password, each
+    // behind its own length byte.
+    let mut head = [0u8; 2];
+    stream.read_exact(&mut head).await?;
+    let [auth_version, username_len] = head;
+    if auth_version != AUTH_VERSION {
+        stream.write_all(&[AUTH_VERSION, AUTH_FAILED]).await?;
+        return Err(invalid("not a username/password request"));
+    }
+    let mut username = vec![0u8; username_len as usize];
+    stream.read_exact(&mut username).await?;
+    let mut password_len = [0u8; 1];
+    stream.read_exact(&mut password_len).await?;
+    let mut password = vec![0u8; password_len[0] as usize];
+    stream.read_exact(&mut password).await?;
+    if !credentials.accept(&username, &password) {
+        // The failure code, then the stream is dropped: RFC 1929
+        // section 2 has the server close the connection.
+        stream.write_all(&[AUTH_VERSION, AUTH_FAILED]).await?;
+        return Err(invalid("wrong proxy credentials"));
+    }
+    stream.write_all(&[AUTH_VERSION, AUTH_SUCCEEDED]).await?;
 
     let mut head = [0u8; 4];
     stream.read_exact(&mut head).await?;
@@ -192,6 +310,11 @@ mod tests {
         address
     }
 
+    /// The credentials every proxy under test expects.
+    fn credentials() -> Credentials {
+        Credentials::new("gerfaut-test-user", "gerfaut-test-pass")
+    }
+
     /// The proxy under test, on loopback, with the connect function
     /// injected: the same accept loop the embedded client runs.
     async fn proxy<C, F, U>(connect: C) -> SocketAddr
@@ -201,8 +324,17 @@ mod tests {
         U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (listener, address) = bind().await.unwrap();
-        tokio::spawn(serve(listener, connect));
+        tokio::spawn(serve(listener, credentials(), connect));
         address
+    }
+
+    /// The RFC 1929 request for a username and a password.
+    fn auth_request(username: &str, password: &str) -> Vec<u8> {
+        let mut request = vec![AUTH_VERSION, username.len() as u8];
+        request.extend_from_slice(username.as_bytes());
+        request.push(password.len() as u8);
+        request.extend_from_slice(password.as_bytes());
+        request
     }
 
     /// A proxy that connects everything to an echo server and records
@@ -219,13 +351,24 @@ mod tests {
         .await
     }
 
-    /// Connects and negotiates "no authentication".
+    /// Connects, offers both methods the way `reqwest` does, and
+    /// presents the right credentials.
     async fn greet(proxy: SocketAddr) -> TcpStream {
         let mut stream = TcpStream::connect(proxy).await.unwrap();
-        stream.write_all(&[VERSION, 1, NO_AUTH]).await.unwrap();
+        stream
+            .write_all(&[VERSION, 2, NO_AUTH, USER_PASS])
+            .await
+            .unwrap();
         let mut answer = [0u8; 2];
         stream.read_exact(&mut answer).await.unwrap();
-        assert_eq!(answer, [VERSION, NO_AUTH]);
+        assert_eq!(answer, [VERSION, USER_PASS]);
+        let expected = credentials();
+        stream
+            .write_all(&auth_request(expected.username(), expected.password()))
+            .await
+            .unwrap();
+        stream.read_exact(&mut answer).await.unwrap();
+        assert_eq!(answer, [AUTH_VERSION, AUTH_SUCCEEDED]);
         stream
     }
 
@@ -322,15 +465,160 @@ mod tests {
         assert_eq!(reply[1], REPLY_ADDRESS_TYPE_NOT_SUPPORTED);
     }
 
+    /// Another app on the same loopback, or a scanner: it offers "no
+    /// authentication", the only method an open proxy would take, and
+    /// is told there is nothing here for it.
     #[tokio::test]
-    async fn a_client_that_insists_on_authentication_is_turned_away() {
-        let proxy = echo_proxy(Arc::new(Mutex::new(Vec::new()))).await;
+    async fn a_client_that_offers_no_authentication_is_turned_away() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let proxy = echo_proxy(seen.clone()).await;
         let mut stream = TcpStream::connect(proxy).await.unwrap();
-        // Username/password only.
-        stream.write_all(&[VERSION, 1, 2]).await.unwrap();
+        stream.write_all(&[VERSION, 1, NO_AUTH]).await.unwrap();
         let mut answer = [0u8; 2];
         stream.read_exact(&mut answer).await.unwrap();
         assert_eq!(answer, [VERSION, NO_ACCEPTABLE_METHODS]);
+        // The proxy closed the stream after the refusal.
+        let mut rest = [0u8; 1];
+        assert_eq!(stream.read(&mut rest).await.unwrap(), 0);
+        assert!(seen.lock().unwrap().is_empty(), "nothing is connected");
+    }
+
+    #[tokio::test]
+    async fn wrong_credentials_are_refused_and_the_stream_closed() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let proxy = echo_proxy(seen.clone()).await;
+        for (username, password) in [
+            ("gerfaut-test-user", "not-the-password"),
+            ("someone-else", "gerfaut-test-pass"),
+            ("", ""),
+            ("gerfaut-test-user", "gerfaut-test-pass-and-more"),
+        ] {
+            let mut stream = TcpStream::connect(proxy).await.unwrap();
+            stream.write_all(&[VERSION, 1, USER_PASS]).await.unwrap();
+            let mut answer = [0u8; 2];
+            stream.read_exact(&mut answer).await.unwrap();
+            assert_eq!(answer, [VERSION, USER_PASS]);
+            stream
+                .write_all(&auth_request(username, password))
+                .await
+                .unwrap();
+            stream.read_exact(&mut answer).await.unwrap();
+            assert_eq!(
+                answer,
+                [AUTH_VERSION, AUTH_FAILED],
+                "{username:?}/{password:?}"
+            );
+            let mut rest = [0u8; 1];
+            assert_eq!(
+                stream.read(&mut rest).await.unwrap(),
+                0,
+                "closed after the refusal"
+            );
+        }
+        assert!(seen.lock().unwrap().is_empty(), "nothing is connected");
+
+        // A subnegotiation of a version nobody wrote is refused too. The
+        // refusal comes as soon as the version is read: only the head
+        // is sent, so nothing unread makes the close a reset.
+        let mut stream = TcpStream::connect(proxy).await.unwrap();
+        stream.write_all(&[VERSION, 1, USER_PASS]).await.unwrap();
+        let mut answer = [0u8; 2];
+        stream.read_exact(&mut answer).await.unwrap();
+        stream.write_all(&[7, 1]).await.unwrap();
+        stream.read_exact(&mut answer).await.unwrap();
+        assert_eq!(answer, [AUTH_VERSION, AUTH_FAILED]);
+    }
+
+    /// `reqwest`, which the Esplora backend runs on, reads the
+    /// credentials out of a `socks5h://user:pass@host:port` URL and
+    /// presents them: the whole path, greeting to relayed response.
+    /// Without them the same client gets nowhere.
+    #[tokio::test]
+    async fn reqwest_presents_the_credentials_from_the_proxy_url() {
+        // An upstream speaking just enough HTTP for one request.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let proxy = {
+            let seen = seen.clone();
+            proxy(move |host, port| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push((host, port));
+                    TcpStream::connect(upstream).await
+                }
+            })
+            .await
+        };
+        let http = |proxy_url: String| {
+            reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(proxy_url).unwrap())
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap()
+        };
+
+        let expected = credentials();
+        let with_credentials = http(format!(
+            "socks5h://{}:{}@{proxy}",
+            expected.username(),
+            expected.password()
+        ));
+        let body = with_credentials
+            .get("http://gerfaut.onion/ping")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "ok");
+        // The name went through unresolved, to the port HTTP implies.
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[("gerfaut.onion".to_owned(), 80)]
+        );
+
+        let without = http(format!("socks5h://{proxy}"));
+        assert!(
+            without
+                .get("http://gerfaut.onion/ping")
+                .send()
+                .await
+                .is_err()
+        );
+        let wrong = http(format!("socks5h://{}:nope@{proxy}", expected.username()));
+        assert!(wrong.get("http://gerfaut.onion/ping").send().await.is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1, "nothing else was connected");
+    }
+
+    #[test]
+    fn random_credentials_are_long_alphanumeric_and_never_shown() {
+        let a = Credentials::random();
+        let b = Credentials::random();
+        for text in [a.username(), a.password(), b.username(), b.password()] {
+            assert_eq!(text.len(), CREDENTIAL_CHARS);
+            assert!(text.chars().all(|c| c.is_ascii_alphanumeric()), "{text}");
+        }
+        assert_ne!(a, b);
+        assert_ne!(a.username(), a.password());
+        let shown = format!("{a:?}");
+        assert!(!shown.contains(a.username()) && !shown.contains(a.password()));
+        assert!(a.accept(a.username().as_bytes(), a.password().as_bytes()));
+        assert!(!a.accept(b.username().as_bytes(), a.password().as_bytes()));
     }
 
     #[tokio::test]
@@ -365,13 +653,24 @@ mod tests {
         // The session logic on its own, over an in-memory pipe.
         let (mut client, server) = tokio::io::duplex(256);
         let (mut upstream_end, upstream) = tokio::io::duplex(256);
-        let session = tokio::spawn(session(server, move |host, port| async move {
-            assert_eq!((host.as_str(), port), ("pipe.onion", 50001));
-            Ok::<_, io::Error>(upstream)
-        }));
-        client.write_all(&[VERSION, 1, NO_AUTH]).await.unwrap();
+        let expected = credentials();
+        let session = tokio::spawn(async move {
+            session(server, &expected, move |host, port| async move {
+                assert_eq!((host.as_str(), port), ("pipe.onion", 50001));
+                Ok::<_, io::Error>(upstream)
+            })
+            .await
+        });
+        client.write_all(&[VERSION, 1, USER_PASS]).await.unwrap();
         let mut answer = [0u8; 2];
         client.read_exact(&mut answer).await.unwrap();
+        assert_eq!(answer, [VERSION, USER_PASS]);
+        client
+            .write_all(&auth_request("gerfaut-test-user", "gerfaut-test-pass"))
+            .await
+            .unwrap();
+        client.read_exact(&mut answer).await.unwrap();
+        assert_eq!(answer, [AUTH_VERSION, AUTH_SUCCEEDED]);
         let mut request = vec![VERSION, CMD_CONNECT, 0];
         request.extend_from_slice(&domain("pipe.onion"));
         request.extend_from_slice(&50001u16.to_be_bytes());

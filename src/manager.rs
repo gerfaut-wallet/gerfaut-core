@@ -1481,7 +1481,7 @@ impl WalletManager {
         }
         let (settings, data_dir) = self.tor_setup().await;
         let route = tor::resolve(&settings, &data_dir).await?;
-        Ok(Some(route.socks))
+        Ok(Some(route.proxy()))
     }
 
     /// Fee estimates for a network, through the same route the chain
