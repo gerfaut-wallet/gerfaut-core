@@ -59,8 +59,10 @@ pub struct PolicyInput<'a> {
     pub script: ScriptKind,
     /// The wallet's unspent outputs: relative locks count from them.
     pub coins: Vec<Coin>,
-    /// Chain tip height at the last sync.
-    pub tip_height: u32,
+    /// Chain tip height at the last sync; `None` before the first one.
+    /// Height locks are then of unknown distance, rather than measured
+    /// from a tip of zero.
+    pub tip_height: Option<u32>,
     /// Wall clock, unix seconds.
     pub now_unix: u64,
 }
@@ -191,7 +193,9 @@ pub enum TimelockRef {
 }
 
 /// What still separates a lock from opening. Block figures come with
-/// their ten-minute estimate; a time figure has no block count.
+/// their ten-minute estimate; a time figure has no block count. All
+/// three are `None` when the distance cannot be measured, the wallet
+/// never having synced: locked, for an unknown time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Remaining {
     pub remaining_blocks: Option<u32>,
@@ -293,7 +297,9 @@ pub struct PolicySnapshot {
     pub policy: String,
     pub keys: Vec<PolicyKey>,
     pub branches: Vec<PolicyBranch>,
-    pub tip_height: u32,
+    /// The tip the height locks were measured against; `None` before
+    /// the first sync, when they cannot be.
+    pub tip_height: Option<u32>,
     /// When the snapshot was computed, unix seconds.
     pub computed_at: u64,
     pub time_basis: TimeBasis,
@@ -373,7 +379,7 @@ pub fn analyze(input: PolicyInput<'_>) -> CoreResult<PolicySnapshot> {
 /// branches. The script type is what the address itself tells.
 pub fn address_snapshot(
     address: &str,
-    tip_height: u32,
+    tip_height: Option<u32>,
     coins: u32,
     now_unix: u64,
 ) -> PolicySnapshot {
@@ -654,9 +660,10 @@ fn render(policy: &Semantic, book: &KeyBook) -> String {
 
 // --- timelocks -----------------------------------------------------------
 
-/// The chain as the analysis sees it.
+/// The chain as the analysis sees it: the tip, `None` before the first
+/// sync, and the wall clock.
 struct Clock {
-    tip: u32,
+    tip: Option<u32>,
     now: u64,
 }
 
@@ -679,8 +686,10 @@ impl Lock {
     /// relative one by its full duration.
     fn magnitude(self, clock: &Clock) -> u64 {
         match self {
+            // Before the first sync, from a tip of zero: a rank among
+            // locks, never a figure shown.
             Lock::Absolute(AbsoluteLock::Height { height }) => {
-                u64::from(height.saturating_sub(clock.tip)) * BLOCK_SECONDS
+                u64::from(height.saturating_sub(clock.tip.unwrap_or(0))) * BLOCK_SECONDS
             }
             Lock::Absolute(AbsoluteLock::Time { unix }) => unix.saturating_sub(clock.now),
             Lock::Relative(RelativeLock::Blocks { blocks }) => u64::from(blocks) * BLOCK_SECONDS,
@@ -707,12 +716,16 @@ impl Remaining {
         }
     }
 
-    fn seconds_left(&self) -> u64 {
-        self.remaining_seconds.unwrap_or(0)
+    /// Known figures rank by their seconds, an unknown one after them.
+    fn rank(&self) -> (u8, u64) {
+        match self.remaining_seconds {
+            Some(seconds) => (0, seconds),
+            None => (1, 0),
+        }
     }
 
     fn sooner(self, other: Remaining) -> Remaining {
-        if other.seconds_left() < self.seconds_left() {
+        if other.rank() < self.rank() {
             other
         } else {
             self
@@ -726,13 +739,18 @@ impl AbsoluteLock {
     fn remaining(self, clock: &Clock) -> Option<Remaining> {
         match self {
             AbsoluteLock::Height { height } => {
+                // Before the first sync the distance is unknown, not
+                // the whole height.
+                let Some(tip) = clock.tip else {
+                    return Some(Remaining::default());
+                };
                 // A transaction locked to height H is final in block
                 // H + 1 and later. With the tip at H, the next block
                 // can carry the spend: the lock is open at the tip.
-                if clock.tip >= height {
+                if tip >= height {
                     return None;
                 }
-                Some(Remaining::blocks(height - clock.tip, clock.now))
+                Some(Remaining::blocks(height - tip, clock.now))
             }
             AbsoluteLock::Time { unix } => {
                 // Judged against the wall clock; the chain's median
@@ -762,10 +780,15 @@ impl RelativeLock {
         };
         match self {
             RelativeLock::Blocks { blocks } => {
+                // No coin exists before the first sync; asked about one
+                // all the same, its count is unknown.
+                let Some(tip) = clock.tip else {
+                    return CoinLock::Locked(Remaining::default());
+                };
                 // A coin confirmed at height h has waited tip - h + 1
                 // blocks by the next block, the first one a spend could
                 // land in.
-                let waited = clock.tip.saturating_sub(height).saturating_add(1);
+                let waited = tip.saturating_sub(height).saturating_add(1);
                 if waited >= blocks {
                     CoinLock::Unlocked
                 } else {
@@ -870,10 +893,13 @@ impl Estimate {
     fn rank(self) -> (u8, u64) {
         match self {
             Estimate::Open => (0, 0),
-            Estimate::Later(remaining) => (1, remaining.seconds_left()),
-            Estimate::Waiting => (2, 0),
-            Estimate::NoCoins => (3, 0),
-            Estimate::Never => (4, 0),
+            Estimate::Later(remaining) => {
+                let (unknown, seconds) = remaining.rank();
+                (1 + unknown, seconds)
+            }
+            Estimate::Waiting => (3, 0),
+            Estimate::NoCoins => (4, 0),
+            Estimate::Never => (5, 0),
         }
     }
 }
@@ -1428,7 +1454,7 @@ mod tests {
             external_descriptor: descriptor,
             script,
             coins,
-            tip_height: TIP,
+            tip_height: Some(TIP),
             now_unix: NOW,
         })
         .expect("policy")
@@ -1448,7 +1474,7 @@ mod tests {
         assert_eq!(snapshot.policy, "pk(Key A)");
         assert!(!snapshot.has_timelocks);
         assert_eq!(snapshot.coins, 0);
-        assert_eq!(snapshot.tip_height, TIP);
+        assert_eq!(snapshot.tip_height, Some(TIP));
         assert_eq!(snapshot.computed_at, NOW);
         assert_eq!(snapshot.time_basis, TimeBasis::WallClock);
 
@@ -1735,7 +1761,7 @@ mod tests {
             external_descriptor: &descriptor,
             script: ScriptKind::WitnessScript,
             coins: Vec::new(),
-            tip_height: 899_999,
+            tip_height: Some(899_999),
             now_unix: NOW,
         })
         .unwrap();
@@ -1791,7 +1817,7 @@ mod tests {
             external_descriptor: &descriptor,
             script: ScriptKind::WitnessScript,
             coins: Vec::new(),
-            tip_height: 900_000,
+            tip_height: Some(900_000),
             now_unix: NOW,
         })
         .unwrap();
@@ -1827,7 +1853,7 @@ mod tests {
             external_descriptor: &descriptor,
             script: ScriptKind::WitnessScript,
             coins: Vec::new(),
-            tip_height: TIP,
+            tip_height: Some(TIP),
             now_unix: unix,
         })
         .unwrap();
@@ -2060,7 +2086,7 @@ mod tests {
             external_descriptor: &descriptor,
             script: ScriptKind::WitnessScript,
             coins: vec![coin("cc:0", Some(899_999), Some(NOW - 600))],
-            tip_height: 900_000,
+            tip_height: Some(900_000),
             now_unix: NOW,
         })
         .unwrap();
@@ -2160,7 +2186,7 @@ mod tests {
             external_descriptor: "wsh(nothing)",
             script: ScriptKind::WitnessScript,
             coins: Vec::new(),
-            tip_height: TIP,
+            tip_height: Some(TIP),
             now_unix: NOW,
         });
         assert!(matches!(
@@ -2179,7 +2205,7 @@ mod tests {
                 external_descriptor: &mixed,
                 script: ScriptKind::WitnessScript,
                 coins: Vec::new(),
-                tip_height: TIP,
+                tip_height: Some(TIP),
                 now_unix: NOW,
             })
             .is_err()
@@ -2209,9 +2235,88 @@ mod tests {
         assert_eq!(back, snapshot);
     }
 
+    /// Before the first sync there is no tip: a height lock is locked
+    /// for an unknown time, not for the whole height.
+    #[test]
+    fn before_the_first_sync_a_height_lock_has_no_measure() {
+        let unsynced = |descriptor: &str, coins: Vec<Coin>| {
+            analyze(PolicyInput {
+                external_descriptor: descriptor,
+                script: ScriptKind::WitnessScript,
+                coins,
+                tip_height: None,
+                now_unix: NOW,
+            })
+            .unwrap()
+        };
+        let snapshot = unsynced(
+            &format!("wsh(and_v(v:pk({A}/0/*),after(900000)))"),
+            Vec::new(),
+        );
+        assert_eq!(snapshot.tip_height, None);
+        let branch = &snapshot.branches[0];
+        assert!(!branch.spendable_now);
+        assert_eq!(
+            branch.state,
+            BranchState::Locked {
+                until: Remaining::default()
+            }
+        );
+        assert_eq!(
+            branch.timelocks[0].state,
+            LockState::Locked {
+                until: Remaining::default()
+            }
+        );
+        assert_eq!(branch.role, BranchRole::Primary);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains(r#""tip_height":null"#), "{json}");
+        assert!(
+            json.contains(
+                r#""until":{"remaining_blocks":null,"remaining_seconds":null,"unlocks_at_unix":null}"#
+            ),
+            "{json}"
+        );
+
+        // A time lock reads the clock, which needs no sync.
+        let unix = 1_900_000_000u64;
+        let snapshot = unsynced(
+            &format!("wsh(and_v(v:pk({A}/0/*),after({unix})))"),
+            Vec::new(),
+        );
+        assert_eq!(
+            snapshot.branches[0].state,
+            BranchState::Locked {
+                until: Remaining::seconds(unix - NOW, unix)
+            }
+        );
+
+        // Keys need no tip, and a relative lock has no coin to count
+        // from before a sync anyway.
+        let snapshot = unsynced(&liana(), Vec::new());
+        assert!(snapshot.branches[0].spendable_now);
+        assert_eq!(snapshot.branches[1].state, BranchState::NoCoins);
+        // Handed a coin all the same, the count is unknown too.
+        let snapshot = unsynced(&liana(), vec![coin("aa:0", Some(700_000), Some(NOW - 600))]);
+        assert_eq!(
+            snapshot.branches[1].state,
+            BranchState::PerCoin {
+                unlocked: 0,
+                waiting: 0,
+                locked: 1,
+                next: Some(Remaining::default()),
+            }
+        );
+    }
+
     #[test]
     fn a_watched_address_has_nothing_to_read() {
-        let snapshot = address_snapshot("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", 42, 1, NOW);
+        let snapshot = address_snapshot(
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            Some(42),
+            1,
+            NOW,
+        );
         assert_eq!(snapshot.kind, PolicyKind::Address);
         assert_eq!(snapshot.script, ScriptKind::Segwit);
         assert_eq!(snapshot.policy, "address");
@@ -2221,7 +2326,7 @@ mod tests {
         );
         assert!(snapshot.keys.is_empty());
         assert!(snapshot.branches.is_empty());
-        assert_eq!(snapshot.tip_height, 42);
+        assert_eq!(snapshot.tip_height, Some(42));
         assert_eq!(snapshot.coins, 1);
         assert!(!snapshot.has_timelocks);
     }

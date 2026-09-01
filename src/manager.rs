@@ -439,6 +439,10 @@ impl WalletManager {
     pub async fn policy(&self, id: &str) -> CoreResult<PolicySnapshot> {
         let mut state = self.state.lock().await;
         let record = find_record(&state.payload, id)?.clone();
+        // Before the first sync the engine's tip is zero, which would
+        // put every height lock the whole chain away: no tip is given
+        // until one has been seen.
+        let synced = record.meta.last_sync.is_some();
         match &record.meta.kind {
             WalletKind::Descriptors {
                 external, script, ..
@@ -448,19 +452,16 @@ impl WalletManager {
                     external_descriptor: external,
                     script: *script,
                     coins: views::coins(engine),
-                    tip_height: views::tip_height(engine),
+                    tip_height: synced.then(|| views::tip_height(engine)),
                     now_unix: now_secs(),
                 })
             }
             WalletKind::SingleAddress { address } => {
-                let (tip_height, coins) = record
-                    .address_state
-                    .as_ref()
-                    .map_or((0, 0), |watch| (watch.tip_height, watch.utxos.len() as u32));
+                let watch = record.address_state.clone().unwrap_or_default();
                 Ok(policy::address_snapshot(
                     address,
-                    tip_height,
-                    coins,
+                    synced.then_some(watch.tip_height),
+                    watch.utxos.len() as u32,
                     now_secs(),
                 ))
             }
@@ -2031,7 +2032,10 @@ mod tests {
         assert_eq!(snapshot.branches.len(), 1);
         assert!(snapshot.branches[0].spendable_now);
         assert_eq!(snapshot.coins, 0);
-        assert_eq!(snapshot.tip_height, 0);
+        assert_eq!(
+            snapshot.tip_height, None,
+            "never synced: no tip to measure from"
+        );
         assert!(matches!(
             manager.policy("nope").await,
             Err(CoreError::WalletNotFound(_))
