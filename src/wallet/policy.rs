@@ -9,12 +9,20 @@
 //! and the wallet's coins. Pure: no I/O and no engine; the manager
 //! hands it what it needs.
 //!
+//! A branch is read through its thresholds. A threshold is met with the
+//! k-th soonest of its items, so an "and" waits for its last lock, an
+//! "or" for its first, and `thresh(3, A, B, older(N1), older(N2))` for
+//! the nearer of its two locks. Everything said about a branch comes
+//! out of that one reading: whether it is open, when it opens, and
+//! which of its locks hold it back.
+//!
 //! Times are approximate by nature. A block lock is converted at ten
 //! minutes a block, and a time lock is compared with the wall clock
 //! while the chain judges it by the median time of the last eleven
 //! blocks, which lags the clock by up to a couple of hours. Every
 //! snapshot says so through its `time_basis`.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -219,8 +227,10 @@ pub enum LockState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timelock {
     pub lock: TimelockRef,
-    /// False when the lock sits under a threshold that can be met
-    /// without it: it then never holds the branch back.
+    /// Whether the lock holds the branch back: whether meeting it, and
+    /// it alone, would bring the branch nearer to open. False for a lock
+    /// under a threshold that can be met without it, which is listed
+    /// but never holds the branch back.
     pub required: bool,
     pub state: LockState,
 }
@@ -230,19 +240,21 @@ pub struct Timelock {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BranchState {
     SpendableNow,
-    /// Only absolute locks, and the chain has not passed them all.
+    /// Absolute locks alone hold the branch back, and the chain has not
+    /// passed them: the coins have no say.
     Locked {
         until: Remaining,
     },
-    /// At least one relative lock: a coin is unlocked once every lock
-    /// of the branch is met for it.
+    /// A relative lock has a say: a coin is unlocked once the branch's
+    /// condition holds for it, `waiting` coins are not confirmed yet,
+    /// and `next` is the locked coin that opens first.
     PerCoin {
         unlocked: u32,
         waiting: u32,
         locked: u32,
         next: Option<Remaining>,
     },
-    /// A relative lock with no coin to count from.
+    /// A relative lock has a say, and there is no coin to count from.
     NoCoins,
     /// The branch needs a hash preimage; keys and locks say nothing
     /// about whether one is at hand.
@@ -325,7 +337,7 @@ pub fn analyze(input: PolicyInput<'_>) -> CoreResult<PolicySnapshot> {
         .into_iter()
         .map(|branch| draft(branch, &book, &input.coins, &clock))
         .collect::<CoreResult<Vec<Draft>>>()?;
-    let roles = assign_roles(&drafts, &clock);
+    let roles = assign_roles(&drafts);
     let branches: Vec<PolicyBranch> = drafts
         .into_iter()
         .zip(roles)
@@ -699,14 +711,6 @@ impl Remaining {
         self.remaining_seconds.unwrap_or(0)
     }
 
-    fn later(self, other: Remaining) -> Remaining {
-        if other.seconds_left() > self.seconds_left() {
-            other
-        } else {
-            self
-        }
-    }
-
     fn sooner(self, other: Remaining) -> Remaining {
         if other.seconds_left() < self.seconds_left() {
             other
@@ -842,71 +846,202 @@ fn lock_state(lock: Lock, coins: &[Coin], clock: &Clock) -> LockState {
     }
 }
 
-/// The state of a branch from the locks it cannot do without.
-fn branch_state(
-    required: &[Lock],
-    needs_preimage: bool,
-    coins: &[Coin],
-    clock: &Clock,
-) -> BranchState {
-    if needs_preimage {
-        return BranchState::NeedsPreimage;
-    }
-    let absolute: Vec<AbsoluteLock> = required
-        .iter()
-        .filter_map(|lock| match lock {
-            Lock::Absolute(lock) => Some(*lock),
-            Lock::Relative(_) => None,
-        })
-        .collect();
-    let relative: Vec<RelativeLock> = required
-        .iter()
-        .filter_map(|lock| match lock {
-            Lock::Relative(lock) => Some(*lock),
-            Lock::Absolute(_) => None,
-        })
-        .collect();
+// --- evaluation ----------------------------------------------------------
 
-    if relative.is_empty() {
-        // The branch opens when its last absolute lock does.
-        let until = absolute
-            .iter()
-            .filter_map(|lock| lock.remaining(clock))
-            .reduce(Remaining::later);
-        return match until {
-            None => BranchState::SpendableNow,
-            Some(until) => BranchState::Locked { until },
+/// When a condition can be met, as far as the analysis can tell, from
+/// the soonest to the never. A threshold is met with the k-th soonest
+/// of its items, so the order is the whole rule.
+#[derive(Debug, Clone, Copy)]
+enum Estimate {
+    /// Met now.
+    Open,
+    /// Met later, by this much.
+    Later(Remaining),
+    /// A relative lock on a coin not confirmed yet: the count has not
+    /// started, and the figure is anyone's guess.
+    Waiting,
+    /// A relative lock with no coin to count from.
+    NoCoins,
+    /// A hash preimage: nothing the chain or the coins can tell.
+    Never,
+}
+
+impl Estimate {
+    fn rank(self) -> (u8, u64) {
+        match self {
+            Estimate::Open => (0, 0),
+            Estimate::Later(remaining) => (1, remaining.seconds_left()),
+            Estimate::Waiting => (2, 0),
+            Estimate::NoCoins => (3, 0),
+            Estimate::Never => (4, 0),
+        }
+    }
+}
+
+impl PartialEq for Estimate {
+    fn eq(&self, other: &Self) -> bool {
+        self.rank() == other.rank()
+    }
+}
+
+impl Eq for Estimate {}
+
+impl PartialOrd for Estimate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Estimate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+/// A condition folded to one value, by the rule every reading of a
+/// branch follows: a threshold takes the k-th smallest of its items, so
+/// an "and" answers with its last item, an "or" with its first, and
+/// `thresh(3, A, B, older(N1), older(N2))` with the nearer of its two
+/// locks once the keys are counted. `leaf` values the leaves, in the
+/// order the policy names them.
+fn fold<T: Ord + Copy>(condition: &Condition, leaf: &mut impl FnMut(&Condition) -> T) -> T {
+    let Condition::Thresh { k, items, .. } = condition else {
+        return leaf(condition);
+    };
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        values.push(fold(item, leaf));
+    }
+    values.sort();
+    let index = (*k as usize)
+        .saturating_sub(1)
+        .min(values.len().saturating_sub(1));
+    // Miniscript writes no empty threshold; met with one all the same,
+    // the leaf function answers for it.
+    values
+        .get(index)
+        .copied()
+        .unwrap_or_else(|| leaf(condition))
+}
+
+/// How a reading of a branch values the locks it meets.
+enum Lens<'a> {
+    /// Every lock pending, by an unknown amount: the shape of the
+    /// branch, whatever the chain says.
+    Shape,
+    /// Absolute locks against the clock; relative ones as given, there
+    /// being no coin to count them from.
+    NoCoin(Estimate),
+    /// Absolute locks against the clock; relative ones on this coin.
+    Coin(&'a Coin),
+}
+
+/// What `condition` still needs before it can be met, seen through
+/// `lens`. `met` names one lock by its position among the branch's
+/// locks, to be counted as met whatever it says: that is how a lock is
+/// found to hold the branch back, or not.
+fn estimate(condition: &Condition, lens: &Lens<'_>, clock: &Clock, met: Option<usize>) -> Estimate {
+    let mut position = 0usize;
+    fold(condition, &mut |leaf| {
+        let lock = match leaf {
+            Condition::Key { .. } => return Estimate::Open,
+            Condition::Preimage { .. } => return Estimate::Never,
+            // An empty threshold asks for nothing.
+            Condition::Thresh { .. } => return Estimate::Open,
+            Condition::After { lock } => Lock::Absolute(*lock),
+            Condition::Older { lock } => Lock::Relative(*lock),
         };
+        let index = position;
+        position += 1;
+        if met == Some(index) {
+            return Estimate::Open;
+        }
+        match (lens, lock) {
+            (Lens::Shape, _) => Estimate::Later(Remaining::default()),
+            (_, Lock::Absolute(lock)) => match lock.remaining(clock) {
+                None => Estimate::Open,
+                Some(remaining) => Estimate::Later(remaining),
+            },
+            (Lens::NoCoin(estimate), Lock::Relative(_)) => *estimate,
+            (Lens::Coin(coin), Lock::Relative(lock)) => match lock.on_coin(coin, clock) {
+                CoinLock::Unlocked => Estimate::Open,
+                CoinLock::Waiting => Estimate::Waiting,
+                CoinLock::Locked(remaining) => Estimate::Later(remaining),
+            },
+        }
+    })
+}
+
+/// The locks of a condition, in the order the policy names them: the
+/// order [`estimate`] counts positions in.
+fn collect_locks(condition: &Condition, into: &mut Vec<Lock>) {
+    match condition {
+        Condition::After { lock } => into.push(Lock::Absolute(*lock)),
+        Condition::Older { lock } => into.push(Lock::Relative(*lock)),
+        Condition::Thresh { items, .. } => {
+            for item in items {
+                collect_locks(item, into);
+            }
+        }
+        Condition::Key { .. } | Condition::Preimage { .. } => {}
+    }
+}
+
+/// Whether the lock at `position` holds the branch back: whether the
+/// branch would stand nearer to open, chain aside, were that lock alone
+/// met. A lock under a threshold that can be met without it is listed,
+/// but never holds the branch back.
+fn holds_back(condition: &Condition, position: usize, clock: &Clock) -> bool {
+    estimate(condition, &Lens::Shape, clock, Some(position))
+        != estimate(condition, &Lens::Shape, clock, None)
+}
+
+fn has_key(condition: &Condition) -> bool {
+    match condition {
+        Condition::Key { .. } => true,
+        Condition::Thresh { items, .. } => items.iter().any(has_key),
+        Condition::After { .. } | Condition::Older { .. } | Condition::Preimage { .. } => false,
+    }
+}
+
+/// How far off a branch is, in seconds, its thresholds' rule applied to
+/// the distance of each lock: a rank for the roles, not a figure to
+/// show.
+fn distance(condition: &Condition, clock: &Clock) -> u64 {
+    fold(condition, &mut |leaf| match leaf {
+        Condition::Key { .. } | Condition::Thresh { .. } => 0,
+        Condition::After { lock } => Lock::Absolute(*lock).magnitude(clock),
+        Condition::Older { lock } => Lock::Relative(*lock).magnitude(clock),
+        Condition::Preimage { .. } => u64::MAX,
+    })
+}
+
+/// The state of a branch: what its condition still needs, the coins
+/// counted where they have a say.
+fn branch_state(condition: &Condition, coins: &[Coin], clock: &Clock) -> BranchState {
+    // Two readings with no coin, the relative locks taken as the worst
+    // they can be, then as the best. Every coin falls between the two,
+    // so when they agree the coins have no say and the answer is theirs.
+    let worst = estimate(condition, &Lens::NoCoin(Estimate::NoCoins), clock, None);
+    let best = estimate(condition, &Lens::NoCoin(Estimate::Open), clock, None);
+    match worst {
+        Estimate::Never => return BranchState::NeedsPreimage,
+        Estimate::Open => return BranchState::SpendableNow,
+        Estimate::Later(until) if best == worst => return BranchState::Locked { until },
+        _ => {}
     }
     if coins.is_empty() {
         return BranchState::NoCoins;
     }
-
     let mut tally = Tally::default();
     for coin in coins {
-        let mut worst = absolute
-            .iter()
-            .filter_map(|lock| lock.remaining(clock))
-            .reduce(Remaining::later);
-        let mut waiting = false;
-        for lock in &relative {
-            match lock.on_coin(coin, clock) {
-                CoinLock::Unlocked => {}
-                CoinLock::Waiting => waiting = true,
-                CoinLock::Locked(remaining) => {
-                    worst = Some(match worst {
-                        Some(worst) => worst.later(remaining),
-                        None => remaining,
-                    });
-                }
-            }
-        }
-        tally.add(if waiting {
-            CoinLock::Waiting
-        } else if let Some(worst) = worst {
-            CoinLock::Locked(worst)
-        } else {
-            CoinLock::Unlocked
+        tally.add(match estimate(condition, &Lens::Coin(coin), clock, None) {
+            Estimate::Open => CoinLock::Unlocked,
+            Estimate::Later(remaining) => CoinLock::Locked(remaining),
+            // Neither comes out of a reading over a coin once the two
+            // readings above have had their say; counted as waiting
+            // rather than trusted.
+            Estimate::Waiting | Estimate::NoCoins | Estimate::Never => CoinLock::Waiting,
         });
     }
     BranchState::PerCoin {
@@ -919,108 +1054,67 @@ fn branch_state(
 
 // --- branches ------------------------------------------------------------
 
-/// What a walk over one branch found.
-#[derive(Default)]
-struct Scan {
-    /// Every lock, with whether the branch cannot be spent without it.
-    locks: Vec<(Lock, bool)>,
-    has_key: bool,
-    /// A hash the branch cannot be spent without.
-    needs_preimage: bool,
-}
-
-/// Walks a branch. A lock under a threshold that can be met without it
-/// (`k < n`) is optional: it is listed, but it never holds the branch
-/// back. This is a sound simplification, not a full satisfiability
-/// analysis: `thresh(2, A, B, older(N))` is open to A and B today, and
-/// that is what the state says.
-fn scan_locks(policy: &Semantic, required: bool, scan: &mut Scan) {
-    match policy {
-        Policy::Key(_) => scan.has_key = true,
-        Policy::After(lock) => scan.locks.push((Lock::Absolute(absolute(*lock)), required)),
-        Policy::Older(lock) => scan.locks.push((Lock::Relative(relative(*lock)), required)),
-        Policy::Sha256(_) | Policy::Hash256(_) | Policy::Ripemd160(_) | Policy::Hash160(_) => {
-            scan.needs_preimage |= required;
-        }
-        Policy::Thresh(thresh) => {
-            let required = required && thresh.k() == thresh.n();
-            for sub in thresh.iter() {
-                scan_locks(sub.as_ref(), required, scan);
-            }
-        }
-        Policy::Trivial | Policy::Unsatisfiable => {}
-    }
-}
-
 struct Draft {
     condition: Condition,
     timelocks: Vec<Timelock>,
-    required: Vec<Lock>,
-    has_key: bool,
-    needs_preimage: bool,
     state: BranchState,
+    has_key: bool,
+    /// How far off the branch is, in seconds, when a lock holds it
+    /// back; `None` when none does.
+    distance: Option<u64>,
 }
 
 fn draft(policy: &Semantic, book: &KeyBook, coins: &[Coin], clock: &Clock) -> CoreResult<Draft> {
-    let mut scan = Scan::default();
-    scan_locks(policy, true, &mut scan);
-    let required: Vec<Lock> = scan
-        .locks
+    let condition = condition(policy, book)?;
+    let mut locks = Vec::new();
+    collect_locks(&condition, &mut locks);
+    let timelocks: Vec<Timelock> = locks
         .iter()
-        .filter(|(_, required)| *required)
-        .map(|(lock, _)| *lock)
-        .collect();
-    let timelocks = scan
-        .locks
-        .iter()
-        .map(|(lock, required)| Timelock {
+        .enumerate()
+        .map(|(position, lock)| Timelock {
             lock: lock.reference(),
-            required: *required,
+            required: holds_back(&condition, position, clock),
             state: lock_state(*lock, coins, clock),
         })
         .collect();
+    let distance = timelocks
+        .iter()
+        .any(|lock| lock.required)
+        .then(|| distance(&condition, clock));
     Ok(Draft {
-        condition: condition(policy, book)?,
+        state: branch_state(&condition, coins, clock),
+        has_key: has_key(&condition),
         timelocks,
-        state: branch_state(&required, scan.needs_preimage, coins, clock),
-        required,
-        has_key: scan.has_key,
-        needs_preimage: scan.needs_preimage,
+        distance,
+        condition,
     })
 }
 
 /// Roles and labels, one per draft, in the drafts' order.
 ///
-/// Branches with no required lock are primary. Those with one rank by
-/// how far off their farthest lock is: the nearest is the recovery
-/// path, the next the emergency one, the rest "Recovery 3" and on.
-/// When every path waits, the nearest one is the wallet's only way to
-/// spend: it is the primary path, and the ranks shift down by one. A
-/// branch with no key, or one that needs a hash preimage, is set apart
-/// as "other".
-fn assign_roles(drafts: &[Draft], clock: &Clock) -> Vec<(BranchRole, String)> {
+/// Branches no lock holds back are primary. Those a lock holds back
+/// rank by how far off they are: the nearest is the recovery path, the
+/// next the emergency one, the rest "Recovery 3" and on. When every
+/// path waits, the nearest one is the wallet's only way to spend: it is
+/// the primary path, and the ranks shift down by one. A branch with no
+/// key, or one that needs a hash preimage, is set apart as "other".
+fn assign_roles(drafts: &[Draft]) -> Vec<(BranchRole, String)> {
     let mut roles: Vec<Option<(BranchRole, String)>> = vec![None; drafts.len()];
     let mut primaries = 0usize;
     let mut others = 0usize;
     let mut timed: Vec<(usize, u64)> = Vec::new();
     for (index, draft) in drafts.iter().enumerate() {
-        if !draft.has_key || draft.needs_preimage {
+        if !draft.has_key || matches!(draft.state, BranchState::NeedsPreimage) {
             others += 1;
             roles[index] = Some((BranchRole::Other, numbered("Other", others)));
-        } else if draft.required.is_empty() {
+        } else if let Some(distance) = draft.distance {
+            timed.push((index, distance));
+        } else {
             roles[index] = Some((BranchRole::Primary, lettered("Primary", primaries)));
             primaries += 1;
-        } else {
-            let magnitude = draft
-                .required
-                .iter()
-                .map(|lock| lock.magnitude(clock))
-                .max()
-                .unwrap_or(0);
-            timed.push((index, magnitude));
         }
     }
-    timed.sort_by_key(|(_, magnitude)| *magnitude);
+    timed.sort_by_key(|(_, distance)| *distance);
     let mut timed = timed.into_iter().map(|(index, _)| index);
     if primaries == 0
         && let Some(index) = timed.next()
@@ -1884,6 +1978,138 @@ mod tests {
         assert_eq!(
             branch.summary,
             "Any 2 of: Key A, Key B, a coin having waited 100 blocks"
+        );
+
+        // Nor does a coin that has not waited: two keys are enough.
+        let young = wsh(&descriptor, vec![coin("aa:0", Some(TIP), Some(NOW))]);
+        assert_eq!(young.branches[0].state, BranchState::SpendableNow);
+        assert_eq!(
+            young.branches[0].timelocks[0].state,
+            LockState::PerCoin {
+                unlocked: 0,
+                waiting: 0,
+                locked: 1,
+                next: Some(Remaining::blocks(99, NOW)),
+            }
+        );
+    }
+
+    /// A lock the branch can only be met through holds it back, even
+    /// under a threshold that could be met without it.
+    #[test]
+    fn a_lock_behind_an_or_holds_the_branch_back() {
+        let descriptor = format!("wsh(and_v(v:pk({A}/0/*),or_i(after(900000),older(100))))");
+        let snapshot = wsh(
+            &descriptor,
+            vec![
+                // Waited 100,001 blocks: the relative lock is met.
+                coin("aa:0", Some(700_000), Some(NOW - 60_000_000)),
+                // Waited 51 blocks: 49 to go, sooner than block 900,000.
+                coin("bb:0", Some(799_950), Some(NOW - 30_600)),
+            ],
+        );
+        assert_eq!(
+            snapshot.policy,
+            "and(pk(Key A),or(after(900000),older(100)))"
+        );
+        let [branch] = snapshot.branches.as_slice() else {
+            panic!("one branch, got {:?}", snapshot.branches);
+        };
+        assert_eq!(
+            branch.summary,
+            "Key A and either block 900,000 reached or a coin having waited 100 blocks"
+        );
+        assert_eq!(branch.role, BranchRole::Primary, "the only way to spend");
+        assert!(!branch.spendable_now);
+        let next = Remaining::blocks(49, NOW);
+        assert_eq!(
+            branch.state,
+            BranchState::PerCoin {
+                unlocked: 1,
+                waiting: 0,
+                locked: 1,
+                next: Some(next),
+            }
+        );
+        // Both locks hold the branch back: meeting either would open it.
+        assert_eq!(branch.timelocks.len(), 2);
+        assert!(branch.timelocks.iter().all(|lock| lock.required));
+        assert_eq!(
+            branch.timelocks[0].state,
+            LockState::Locked {
+                until: Remaining::blocks(100_000, NOW)
+            }
+        );
+        assert_eq!(
+            branch.timelocks[1].state,
+            LockState::PerCoin {
+                unlocked: 1,
+                waiting: 0,
+                locked: 1,
+                next: Some(next),
+            }
+        );
+
+        // With no coin to count from, the branch waits for one.
+        let empty = wsh(&descriptor, Vec::new());
+        assert_eq!(empty.branches[0].state, BranchState::NoCoins);
+
+        // Once the chain has passed the absolute lock, the branch is
+        // open whatever the coins have waited.
+        let open = analyze(PolicyInput {
+            external_descriptor: &descriptor,
+            script: ScriptKind::WitnessScript,
+            coins: vec![coin("cc:0", Some(899_999), Some(NOW - 600))],
+            tip_height: 900_000,
+            now_unix: NOW,
+        })
+        .unwrap();
+        assert_eq!(open.branches[0].state, BranchState::SpendableNow);
+        assert!(open.branches[0].spendable_now);
+        assert_eq!(open.branches[0].timelocks[0].state, LockState::Unlocked);
+    }
+
+    /// Two locks under one threshold: a coin opens the branch at the
+    /// nearer of the two, not the farther, and not at once.
+    #[test]
+    fn a_threshold_opens_with_its_kth_soonest_item() {
+        let descriptor =
+            format!("wsh(thresh(3,pk({A}/0/*),s:pk({B}/0/*),sln:older(100),sln:older(200)))");
+        let snapshot = wsh(
+            &descriptor,
+            vec![
+                // Waited 151 blocks: the nearer lock is met, and enough.
+                coin("aa:0", Some(799_850), Some(NOW - 90_600)),
+                // Waited 21 blocks: 79 to the nearer lock.
+                coin("bb:0", Some(799_980), Some(NOW - 12_600)),
+            ],
+        );
+        assert_eq!(
+            snapshot.policy,
+            "thresh(3,pk(Key A),pk(Key B),older(100),older(200))"
+        );
+        let branch = &snapshot.branches[0];
+        assert_eq!(
+            branch.summary,
+            "Any 3 of: Key A, Key B, a coin having waited 100 blocks, a coin having waited 200 blocks"
+        );
+        assert!(!branch.spendable_now);
+        assert_eq!(
+            branch.state,
+            BranchState::PerCoin {
+                unlocked: 1,
+                waiting: 0,
+                locked: 1,
+                next: Some(Remaining::blocks(79, NOW)),
+            }
+        );
+        assert!(
+            branch.timelocks.iter().all(|lock| lock.required),
+            "either lock would open the branch"
+        );
+        assert_eq!(
+            wsh(&descriptor, Vec::new()).branches[0].state,
+            BranchState::NoCoins
         );
     }
 
