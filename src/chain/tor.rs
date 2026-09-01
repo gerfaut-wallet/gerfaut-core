@@ -37,6 +37,16 @@ pub const DEFAULT_SYSTEM_SOCKS: &str = "127.0.0.1:9050";
 /// Whether this build carries the embedded client.
 pub const EMBEDDED_AVAILABLE: bool = cfg!(feature = "embedded-tor");
 
+/// Whether a proxy answering on loopback may be taken for the system's
+/// Tor without being asked for. On a desktop, loopback belongs to the
+/// machine's user: whatever listens at 127.0.0.1:9050 is Tor because
+/// they started it. On Android every app holding the INTERNET permission
+/// can bind that port and answer the greeting, so nothing found there
+/// is trusted on its own: `Auto` goes straight to the built-in client,
+/// and the system proxy carries traffic only when the user chose it by
+/// name in the settings.
+pub const TRUST_LOOPBACK_SOCKS: bool = !cfg!(target_os = "android");
+
 /// How long the system proxy gets to answer the greeting. A proxy on
 /// loopback answers within a millisecond; the budget only bounds what
 /// a dead port costs, once per onion operation.
@@ -48,7 +58,9 @@ const PROBE_BUDGET: Duration = Duration::from_millis(300);
 pub enum TorMode {
     /// The system proxy when it answers, the embedded client otherwise.
     /// Users who run their own Tor keep their own guards and circuits;
-    /// everyone else gets Tor without installing anything.
+    /// everyone else gets Tor without installing anything. Where
+    /// loopback is shared ([`TRUST_LOOPBACK_SOCKS`] is false) the system
+    /// proxy is not even looked for, and this is the embedded client.
     #[default]
     Auto,
     /// The system proxy only; the embedded client is never started.
@@ -144,6 +156,10 @@ pub struct TorStatus {
     /// Why the embedded client's last start failed, until the next one.
     pub error: Option<String>,
     pub embedded_available: bool,
+    /// Whether `Auto` may use a proxy found on loopback
+    /// ([`TRUST_LOOPBACK_SOCKS`]). False on Android, where the System
+    /// option is worth a word of caution: any app can answer there.
+    pub system_socks_trusted: bool,
 }
 
 /// The last route taken, for the settings screen to name. Process-wide,
@@ -195,7 +211,7 @@ pub async fn resolve(settings: &TorSettings, data_dir: &Path) -> CoreResult<TorR
         let _ = data_dir;
         None::<NoEmbedded>
     };
-    let route = resolve_with(settings, probe, embedded).await?;
+    let route = resolve_with(settings, TRUST_LOOPBACK_SOCKS, probe, embedded).await?;
     if let Ok(mut last) = LAST_ROUTE.lock() {
         *last = Some(route.clone());
     }
@@ -206,11 +222,13 @@ pub async fn resolve(settings: &TorSettings, data_dir: &Path) -> CoreResult<TorR
 #[cfg(not(feature = "embedded-tor"))]
 type NoEmbedded = fn() -> std::future::Ready<CoreResult<socks::Access>>;
 
-/// The policy on its own: `probe` says whether a proxy answers at an
-/// address, `embedded` starts the built-in client and returns how to
-/// reach its proxy, or is `None` in a build without one.
+/// The policy on its own: `trust_loopback_socks` says whether `Auto` may
+/// take a proxy found on loopback for Tor, `probe` says whether a proxy
+/// answers at an address, `embedded` starts the built-in client and
+/// returns how to reach its proxy, or is `None` in a build without one.
 async fn resolve_with(
     settings: &TorSettings,
+    trust_loopback_socks: bool,
     probe: impl AsyncFn(&str) -> bool,
     embedded: Option<impl AsyncFnOnce() -> CoreResult<socks::Access>>,
 ) -> CoreResult<TorRoute> {
@@ -237,14 +255,20 @@ async fn resolve_with(
             }
         }
         TorMode::Auto => {
-            if probe(system).await {
+            // Where loopback is shared, a proxy found there is anyone's:
+            // it is not probed, let alone used, unless chosen by name.
+            if trust_loopback_socks && probe(system).await {
                 return Ok(via_system());
             }
             match embedded {
                 Some(start) => start().await.map(via_embedded),
-                None => Err(CoreError::Tor(format!(
+                None if trust_loopback_socks => Err(CoreError::Tor(format!(
                     "Tor is not running on this device ({system} does not answer) and this \
                      build has no built-in Tor"
+                ))),
+                None => Err(CoreError::Tor(format!(
+                    "this build has no built-in Tor; to use a Tor app running on this device, \
+                     choose it in the settings ({system})"
                 ))),
             }
         }
@@ -293,6 +317,7 @@ pub async fn status(settings: &TorSettings) -> TorStatus {
         bootstrap_percent: embedded.percent,
         error: embedded.error,
         embedded_available: EMBEDDED_AVAILABLE,
+        system_socks_trusted: TRUST_LOOPBACK_SOCKS,
     }
 }
 
@@ -409,6 +434,7 @@ mod tests {
         let called = Cell::new(false);
         let route = resolve_with(
             &settings(TorMode::Auto, Some("127.0.0.1:9150")),
+            true,
             async |address: &str| address == "127.0.0.1:9150",
             starter(&called),
         )
@@ -432,6 +458,7 @@ mod tests {
         let called = Cell::new(false);
         let route = resolve_with(
             &settings(TorMode::Auto, None),
+            true,
             async |_: &str| false,
             starter(&called),
         )
@@ -450,6 +477,7 @@ mod tests {
         let called = Cell::new(false);
         let route = resolve_with(
             &settings(TorMode::Embedded, None),
+            true,
             async |_: &str| false,
             starter(&called),
         )
@@ -479,6 +507,7 @@ mod tests {
     async fn auto_without_an_embedded_client_says_what_is_missing() {
         let error = resolve_with(
             &settings(TorMode::Auto, None),
+            true,
             async |_: &str| false,
             NO_STARTER,
         )
@@ -498,6 +527,7 @@ mod tests {
         let called = Cell::new(false);
         let error = resolve_with(
             &settings(TorMode::System, Some("localhost:9050")),
+            true,
             async |_: &str| false,
             starter(&called),
         )
@@ -508,6 +538,7 @@ mod tests {
 
         let route = resolve_with(
             &settings(TorMode::System, None),
+            true,
             async |_: &str| true,
             starter(&called),
         )
@@ -518,12 +549,84 @@ mod tests {
         assert!(!called.get());
     }
 
+    /// Android: loopback is every app's. `Auto` does not ask what is
+    /// listening there, and goes straight to the built-in client.
+    #[tokio::test]
+    async fn auto_on_a_shared_loopback_never_probes() {
+        let probed = Cell::new(false);
+        let called = Cell::new(false);
+        let route = resolve_with(
+            &settings(TorMode::Auto, None),
+            false,
+            async |_: &str| {
+                probed.set(true);
+                true
+            },
+            starter(&called),
+        )
+        .await
+        .unwrap();
+        assert_eq!(route.via, TorVia::Embedded);
+        assert!(!probed.get(), "whatever answers on loopback is not asked");
+        assert!(called.get());
+
+        // Without a built-in client there is no automatic route at all;
+        // the error points at the explicit choice.
+        let error = resolve_with(
+            &settings(TorMode::Auto, None),
+            false,
+            async |_: &str| {
+                probed.set(true);
+                true
+            },
+            NO_STARTER,
+        )
+        .await
+        .unwrap_err();
+        match error {
+            CoreError::Tor(detail) => {
+                assert!(detail.contains("settings"), "{detail}");
+                assert!(detail.contains("no built-in Tor"), "{detail}");
+            }
+            other => panic!("expected a tor error, got {other:?}"),
+        }
+        assert!(!probed.get());
+    }
+
+    /// The explicit choice stands wherever it is made: `System` probes
+    /// the proxy the user named, shared loopback or not.
+    #[tokio::test]
+    async fn system_still_probes_on_a_shared_loopback() {
+        let probed = Cell::new(false);
+        let called = Cell::new(false);
+        let route = resolve_with(
+            &settings(TorMode::System, Some("127.0.0.1:9050")),
+            false,
+            async |address: &str| {
+                probed.set(true);
+                address == "127.0.0.1:9050"
+            },
+            starter(&called),
+        )
+        .await
+        .unwrap();
+        assert_eq!(route.via, TorVia::System);
+        assert!(probed.get());
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn loopback_is_trusted_everywhere_but_android() {
+        assert_eq!(TRUST_LOOPBACK_SOCKS, !cfg!(target_os = "android"));
+    }
+
     #[tokio::test]
     async fn embedded_never_probes() {
         let probed = Cell::new(false);
         let called = Cell::new(false);
         let route = resolve_with(
             &settings(TorMode::Embedded, None),
+            true,
             async |_: &str| {
                 probed.set(true);
                 true
@@ -538,6 +641,7 @@ mod tests {
 
         let error = resolve_with(
             &settings(TorMode::Embedded, None),
+            true,
             async |_: &str| true,
             NO_STARTER,
         )
@@ -603,6 +707,7 @@ mod tests {
         assert_eq!(status.mode, TorMode::System);
         assert_eq!(status.socks_proxy, "127.0.0.1:9150");
         assert_eq!(status.embedded_available, cfg!(feature = "embedded-tor"));
+        assert_eq!(status.system_socks_trusted, TRUST_LOOPBACK_SOCKS);
         assert!(!status.bootstrapped);
     }
 

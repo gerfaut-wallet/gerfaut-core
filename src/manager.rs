@@ -2815,6 +2815,7 @@ mod tests {
         assert_eq!(status.mode, TorMode::Embedded);
         assert_eq!(status.socks_proxy, "127.0.0.1:9150");
         assert_eq!(status.embedded_available, cfg!(feature = "embedded-tor"));
+        assert_eq!(status.system_socks_trusted, tor::TRUST_LOOPBACK_SOCKS);
 
         // Blank means the default.
         manager
