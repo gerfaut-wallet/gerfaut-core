@@ -6,9 +6,12 @@
 //! an unlocked phone rather than the one who extracted the file. The
 //! secret itself is never stored: only an Argon2id hash under its own
 //! salt, compared in constant time, and guesses slow down after a few
-//! failures so that a short PIN cannot be tried a thousand times.
+//! failures so that a short PIN cannot be tried a thousand times. The
+//! failure count is mirrored in a small file beside the vault, so that
+//! quitting and relaunching the app between guesses buys nothing.
 
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::Argon2;
 use rand::RngCore;
@@ -84,16 +87,80 @@ pub fn delay_after(failures: u32) -> Duration {
     Duration::from_secs((FIRST_DELAY_SECS << doublings).min(MAX_DELAY_SECS))
 }
 
-/// In-memory record of recent failures. Lives with the manager, never
-/// in the vault: a restart resets it, which is fine because a restart
-/// costs the attacker more than the delay did.
+/// Record of recent failures. It lives with the manager, never in the
+/// vault, and is mirrored in a small file beside it: without the file a
+/// restart would hand out three free attempts again, and a script that
+/// relaunches the app between salvos would try every PIN with no delay
+/// at all. In memory the block is an `Instant`, precise and deaf to
+/// clock changes; the file stores wall-clock seconds, the only clock
+/// that survives a restart.
+///
+/// The file holds a count and a time, nothing derived from the secret,
+/// so it is not sensitive: reading it tells an attacker how many
+/// guesses they made. Losing it costs at most a few free attempts.
 #[derive(Debug, Default)]
 pub struct LockAttempts {
     failures: u32,
     blocked_until: Option<Instant>,
+    /// Where the record is mirrored; `None` keeps it in memory only.
+    path: Option<PathBuf>,
+}
+
+/// The record as the sidecar file stores it.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct StoredAttempts {
+    #[serde(default)]
+    failures: u32,
+    #[serde(default)]
+    blocked_until_unix: Option<u64>,
 }
 
 impl LockAttempts {
+    /// The record mirrored at `path`, read back if the file is there. A
+    /// missing or unreadable file is an empty record: the lock must open
+    /// for its owner whatever happened to a file that is not the vault.
+    pub fn load(path: PathBuf) -> Self {
+        let stored = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<StoredAttempts>(&bytes).ok())
+            .unwrap_or_default();
+        let mut attempts = Self::restore(stored, unix_now(), Instant::now());
+        attempts.path = Some(path);
+        attempts
+    }
+
+    /// Turns a stored record back into a live one. The block is what the
+    /// file says minus the time that passed, with saturating arithmetic:
+    /// a clock set back must not shorten it, and a time far in the
+    /// future, whether from a clock jump or a doctored file, blocks no
+    /// longer than the longest delay ever handed out.
+    fn restore(stored: StoredAttempts, now_unix: u64, now: Instant) -> Self {
+        let blocked_until = stored.blocked_until_unix.and_then(|until| {
+            let remaining = until.saturating_sub(now_unix).min(MAX_DELAY_SECS);
+            (remaining > 0).then(|| now + Duration::from_secs(remaining))
+        });
+        LockAttempts {
+            failures: stored.failures,
+            blocked_until,
+            path: None,
+        }
+    }
+
+    /// The record as the file stores it, the block converted to
+    /// wall-clock seconds and rounded up so a restart never rounds it
+    /// down.
+    fn stored(&self, now_unix: u64, now: Instant) -> StoredAttempts {
+        StoredAttempts {
+            failures: self.failures,
+            blocked_until_unix: self
+                .blocked_until
+                .filter(|until| *until > now)
+                .map(|until| {
+                    now_unix + until.duration_since(now).as_millis().div_ceil(1000) as u64
+                }),
+        }
+    }
+
     /// Seconds still to wait, zero when an attempt may be made.
     pub fn retry_after(&self, now: Instant) -> u32 {
         match self.blocked_until {
@@ -108,9 +175,10 @@ impl LockAttempts {
 
     /// Records a failed attempt and starts the matching delay.
     pub fn fail(&mut self, now: Instant) -> LockVerdict {
-        self.failures += 1;
+        self.failures = self.failures.saturating_add(1);
         let delay = delay_after(self.failures);
         self.blocked_until = (delay > Duration::ZERO).then(|| now + delay);
+        self.mirror();
         LockVerdict {
             unlocked: false,
             failures: self.failures,
@@ -121,12 +189,56 @@ impl LockAttempts {
     pub fn succeed(&mut self) -> LockVerdict {
         self.failures = 0;
         self.blocked_until = None;
+        self.forget();
         LockVerdict {
             unlocked: true,
             failures: 0,
             retry_after_secs: 0,
         }
     }
+
+    /// Writes the record to its file, whole or not at all: a new file
+    /// beside it, then a rename, the way the vault is saved. Best
+    /// effort, since a verdict has no room for a disk error: the record
+    /// in memory keeps counting either way, and the file is only what
+    /// carries it across a restart.
+    fn mirror(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        let stored = self.stored(unix_now(), Instant::now());
+        let _ = write_whole(path, &stored);
+    }
+
+    /// Removes the file: a success ends the count.
+    fn forget(&self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn write_whole(path: &Path, stored: &StoredAttempts) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(stored).map_err(std::io::Error::other)?;
+    // Not `with_extension`: that would land on the same name the vault
+    // uses for its own temporary file, and the two are written under
+    // different locks.
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 /// Checks that a secret is acceptable for its kind, before it is ever
@@ -295,6 +407,120 @@ mod tests {
         assert!(verdict.unlocked);
         assert_eq!(attempts.failures(), 0);
         assert_eq!(attempts.retry_after(now), 0);
+    }
+
+    #[test]
+    fn a_stored_block_is_read_back_minus_the_time_that_passed() {
+        let now = Instant::now();
+        let stored = StoredAttempts {
+            failures: 4,
+            blocked_until_unix: Some(1_000_010),
+        };
+        let attempts = LockAttempts::restore(stored, 1_000_000, now);
+        assert_eq!(attempts.failures(), 4);
+        assert_eq!(attempts.retry_after(now), 10);
+        assert_eq!(attempts.retry_after(now + Duration::from_secs(11)), 0);
+
+        // A block that ended while the app was closed is over.
+        let over = StoredAttempts {
+            failures: 3,
+            blocked_until_unix: Some(999_000),
+        };
+        assert_eq!(
+            LockAttempts::restore(over, 1_000_000, now).retry_after(now),
+            0
+        );
+
+        // The count alone, no block: the next failure is the fourth.
+        let counted = StoredAttempts {
+            failures: 3,
+            blocked_until_unix: None,
+        };
+        let mut attempts = LockAttempts::restore(counted, 1_000_000, now);
+        assert_eq!(attempts.fail(now).failures, 4);
+        assert_eq!(attempts.retry_after(now), 10);
+    }
+
+    #[test]
+    fn a_clock_set_back_never_shortens_a_block_nor_stretches_it_past_the_cap() {
+        let now = Instant::now();
+        // Written at 1_000_000 with 10 s to go; the clock now says an
+        // hour earlier. Saturating: the block is not over, and it is not
+        // an hour long either.
+        let skewed = StoredAttempts {
+            failures: 4,
+            blocked_until_unix: Some(1_000_010),
+        };
+        let attempts = LockAttempts::restore(skewed, 996_400, now);
+        assert_eq!(attempts.retry_after(now), MAX_DELAY_SECS as u32);
+
+        // A time no schedule could have produced is capped the same way.
+        let doctored = StoredAttempts {
+            failures: 4,
+            blocked_until_unix: Some(u64::MAX),
+        };
+        let attempts = LockAttempts::restore(doctored, 1_000_000, now);
+        assert_eq!(attempts.retry_after(now), MAX_DELAY_SECS as u32);
+        // And the count cannot overflow a doctored value either.
+        let mut attempts = LockAttempts::restore(
+            StoredAttempts {
+                failures: u32::MAX,
+                blocked_until_unix: None,
+            },
+            1_000_000,
+            now,
+        );
+        assert_eq!(attempts.fail(now).failures, u32::MAX);
+    }
+
+    #[test]
+    fn the_stored_form_rounds_the_block_up() {
+        let now = Instant::now();
+        let mut attempts = LockAttempts::default();
+        for _ in 0..3 {
+            attempts.fail(now);
+        }
+        // 5 s from `now`, asked 1.5 s later: 3.5 s left, stored as 4.
+        let stored = attempts.stored(1_000_000, now + Duration::from_millis(1500));
+        assert_eq!(stored.failures, 3);
+        assert_eq!(stored.blocked_until_unix, Some(1_000_004));
+        // Over: nothing to store but the count.
+        let stored = attempts.stored(1_000_000, now + Duration::from_secs(6));
+        assert_eq!(stored.blocked_until_unix, None);
+        let json = serde_json::to_string(&stored).unwrap();
+        assert_eq!(json, r#"{"failures":3,"blocked_until_unix":null}"#);
+    }
+
+    #[test]
+    fn the_record_survives_in_its_file_and_a_success_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.attempts");
+        let now = Instant::now();
+
+        let mut attempts = LockAttempts::load(path.clone());
+        assert_eq!(attempts.failures(), 0, "no file, nothing counted");
+        attempts.fail(now);
+        attempts.fail(now);
+        attempts.fail(now);
+        assert!(path.exists());
+        assert!(!dir.path().join("gerfaut.attempts.tmp").exists());
+
+        // Another process, later: the block is still on.
+        let again = LockAttempts::load(path.clone());
+        assert_eq!(again.failures(), 3);
+        let wait = again.retry_after(Instant::now());
+        assert!((4..=5).contains(&wait), "{wait}");
+
+        let mut again = again;
+        again.succeed();
+        assert!(!path.exists(), "a success ends the count");
+        assert_eq!(LockAttempts::load(path.clone()).failures(), 0);
+
+        // A file that is not the record reads as none.
+        std::fs::write(&path, b"{not json").unwrap();
+        assert_eq!(LockAttempts::load(path.clone()).failures(), 0);
+        std::fs::write(&path, r#"{"failures":"three"}"#).unwrap();
+        assert_eq!(LockAttempts::load(path).failures(), 0);
     }
 
     #[test]

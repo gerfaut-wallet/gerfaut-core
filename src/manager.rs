@@ -45,6 +45,9 @@ use crate::wallet::{AddressTx, AddressWatchState};
 
 /// Vault file name inside the data directory.
 const VAULT_FILE: &str = "gerfaut.vault";
+/// The failed unlock attempts, beside the vault: a count and a time,
+/// nothing secret, kept so a restart does not reset the delays.
+const ATTEMPTS_FILE: &str = "gerfaut.attempts";
 
 /// Outcome of syncing every wallet of a workspace.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,10 +100,12 @@ fn now_secs() -> u64 {
 }
 
 impl WalletManager {
-    /// Opens (or creates) the vault at `data_dir/gerfaut.vault`.
+    /// Opens (or creates) the vault at `data_dir/gerfaut.vault`, and
+    /// reads back the unlock attempts recorded beside it.
     pub fn open(data_dir: impl Into<PathBuf>, key: VaultKey) -> CoreResult<Self> {
         let data_dir = data_dir.into();
         let (vault, payload) = Vault::open_or_create(data_dir.join(VAULT_FILE), key)?;
+        let attempts = LockAttempts::load(data_dir.join(ATTEMPTS_FILE));
         Ok(WalletManager {
             state: Mutex::new(ManagerState {
                 vault,
@@ -108,7 +113,7 @@ impl WalletManager {
                 engines: HashMap::new(),
                 data_dir,
             }),
-            attempts: Mutex::new(LockAttempts::default()),
+            attempts: Mutex::new(attempts),
         })
     }
 
@@ -1853,6 +1858,82 @@ mod tests {
         assert!(!verdict.unlocked);
         assert!(verdict.retry_after_secs > 0);
         assert!(manager.clear_app_lock("1234").await.is_err());
+    }
+
+    /// Quitting and relaunching the app is the obvious way around a
+    /// delay, and the one a script would take: the count and the block
+    /// must come back with the vault.
+    #[tokio::test]
+    async fn app_lock_delay_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let attempts_file = dir.path().join(ATTEMPTS_FILE);
+        let manager = manager(dir.path()).await;
+        manager
+            .set_app_lock(LockKind::Pin, "1234", None)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            assert!(!manager.verify_app_lock("0000").await.unwrap().unlocked);
+        }
+        assert!(attempts_file.exists());
+        drop(manager);
+
+        // The right PIN, straight after relaunching: still not looked at.
+        let reopened = WalletManager::open(dir.path(), key()).unwrap();
+        let verdict = reopened.verify_app_lock("1234").await.unwrap();
+        assert!(!verdict.unlocked);
+        assert_eq!(verdict.failures, 3);
+        assert!(verdict.retry_after_secs > 0, "{verdict:?}");
+        drop(reopened);
+
+        // Two failures carry no delay yet, but they are counted: the
+        // first guess after a relaunch is the third, not the first.
+        let dir = tempfile::tempdir().unwrap();
+        let counted = WalletManager::open(dir.path(), key()).unwrap();
+        counted
+            .set_app_lock(LockKind::Pin, "1234", None)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            counted.verify_app_lock("0000").await.unwrap();
+        }
+        drop(counted);
+        let reopened = WalletManager::open(dir.path(), key()).unwrap();
+        let verdict = reopened.verify_app_lock("0000").await.unwrap();
+        assert_eq!(verdict.failures, 3);
+        assert!(verdict.retry_after_secs >= 4);
+        drop(reopened);
+
+        // A success clears the record, file included.
+        let dir = tempfile::tempdir().unwrap();
+        let attempts_file = dir.path().join(ATTEMPTS_FILE);
+        let cleared = WalletManager::open(dir.path(), key()).unwrap();
+        cleared
+            .set_app_lock(LockKind::Pin, "1234", None)
+            .await
+            .unwrap();
+        cleared.verify_app_lock("0000").await.unwrap();
+        assert!(attempts_file.exists());
+        assert!(cleared.verify_app_lock("1234").await.unwrap().unlocked);
+        assert!(!attempts_file.exists());
+    }
+
+    /// The record is a convenience for the delays, not part of the
+    /// vault: a file that cannot be read must never lock the owner out.
+    #[tokio::test]
+    async fn a_corrupt_attempts_file_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        manager
+            .set_app_lock(LockKind::Pin, "1234", None)
+            .await
+            .unwrap();
+        drop(manager);
+        std::fs::write(dir.path().join(ATTEMPTS_FILE), b"\x00\xff not a record").unwrap();
+        let reopened = WalletManager::open(dir.path(), key()).unwrap();
+        let verdict = reopened.verify_app_lock("1234").await.unwrap();
+        assert!(verdict.unlocked);
+        assert_eq!(verdict.failures, 0);
     }
 
     #[tokio::test]
