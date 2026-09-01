@@ -82,6 +82,22 @@ impl ManagerState {
             self.payload.settings.electrum_certs.clone(),
         )
     }
+
+    /// Applies `change` to a copy of the payload, saves that copy, and
+    /// only then makes it the state. A save that fails leaves memory as
+    /// it was: the error the caller reports is then the whole truth, and
+    /// no later save, made for something else, quietly commits a change
+    /// nobody was told about.
+    fn commit<T>(
+        &mut self,
+        change: impl FnOnce(&mut VaultPayload) -> CoreResult<T>,
+    ) -> CoreResult<T> {
+        let mut next = self.payload.clone();
+        let value = change(&mut next)?;
+        self.vault.save(&next)?;
+        self.payload = next;
+        Ok(value)
+    }
 }
 
 /// The facade. Cheap to share behind an `Arc`.
@@ -130,17 +146,17 @@ impl WalletManager {
     }
 
     pub async fn set_active_network(&self, network: Network) -> CoreResult<()> {
-        let mut state = self.state.lock().await;
-        state.payload.settings.active_network = network;
-        state.vault.save(&state.payload)?;
-        Ok(())
+        self.state.lock().await.commit(|payload| {
+            payload.settings.active_network = network;
+            Ok(())
+        })
     }
 
     pub async fn set_backend(&self, network: Network, config: BackendConfig) -> CoreResult<()> {
-        let mut state = self.state.lock().await;
-        state.payload.settings.backends.insert(network, config);
-        state.vault.save(&state.payload)?;
-        Ok(())
+        self.state.lock().await.commit(|payload| {
+            payload.settings.backends.insert(network, config);
+            Ok(())
+        })
     }
 
     // --- Electrum certificates ------------------------------------------
@@ -198,23 +214,22 @@ impl WalletManager {
             });
         }
         let host = chain::electrum::certificate_key(url);
-        let mut state = self.state.lock().await;
-        state
-            .payload
-            .settings
-            .electrum_certs
-            .insert(host, fingerprint.to_ascii_uppercase());
-        state.vault.save(&state.payload)?;
-        Ok(())
+        self.state.lock().await.commit(|payload| {
+            payload
+                .settings
+                .electrum_certs
+                .insert(host, fingerprint.to_ascii_uppercase());
+            Ok(())
+        })
     }
 
     /// Drops an accepted certificate: the next connection to that host
     /// asks again.
     pub async fn forget_certificate(&self, host: &str) -> CoreResult<()> {
-        let mut state = self.state.lock().await;
-        state.payload.settings.electrum_certs.remove(host);
-        state.vault.save(&state.payload)?;
-        Ok(())
+        self.state.lock().await.commit(|payload| {
+            payload.settings.electrum_certs.remove(host);
+            Ok(())
+        })
     }
 
     /// Sets the gap limit shared by every wallet. Takes effect on the
@@ -227,19 +242,19 @@ impl WalletManager {
                 detail: "must be between 1 and 500".to_owned(),
             });
         }
-        let mut state = self.state.lock().await;
-        state.payload.settings.gap_limit = gap_limit;
-        state.vault.save(&state.payload)?;
-        Ok(())
+        self.state.lock().await.commit(|payload| {
+            payload.settings.gap_limit = gap_limit;
+            Ok(())
+        })
     }
 
     /// Stores one small app preference (theme, hidden balances, ...) in
     /// the encrypted vault.
     pub async fn set_app_pref(&self, key: String, value: String) -> CoreResult<()> {
-        let mut state = self.state.lock().await;
-        state.payload.settings.app_prefs.insert(key, value);
-        state.vault.save(&state.payload)?;
-        Ok(())
+        self.state.lock().await.commit(|payload| {
+            payload.settings.app_prefs.insert(key, value);
+            Ok(())
+        })
     }
 
     // --- wallet lifecycle ---------------------------------------------
@@ -317,11 +332,13 @@ impl WalletManager {
             state.payload.settings.gap_limit,
         );
         let (record, engine) = build_record(meta.clone())?;
+        state.commit(|payload| {
+            payload.wallets.push(record);
+            Ok(())
+        })?;
         if let Some(engine) = engine {
             state.engines.insert(meta.id.clone(), engine);
         }
-        state.payload.wallets.push(record);
-        state.vault.save(&state.payload)?;
         Ok(meta)
     }
 
@@ -333,22 +350,23 @@ impl WalletManager {
                 detail: "a wallet needs a name".to_owned(),
             });
         }
-        let mut state = self.state.lock().await;
-        let record = find_record_mut(&mut state.payload, id)?;
-        record.meta.name = name.to_owned();
-        state.vault.save(&state.payload)?;
-        Ok(())
+        self.state.lock().await.commit(|payload| {
+            find_record_mut(payload, id)?.meta.name = name.to_owned();
+            Ok(())
+        })
     }
 
     pub async fn remove_wallet(&self, id: &str) -> CoreResult<()> {
         let mut state = self.state.lock().await;
-        let before = state.payload.wallets.len();
-        state.payload.wallets.retain(|record| record.meta.id != id);
-        if state.payload.wallets.len() == before {
-            return Err(CoreError::WalletNotFound(id.to_owned()));
-        }
+        state.commit(|payload| {
+            let before = payload.wallets.len();
+            payload.wallets.retain(|record| record.meta.id != id);
+            if payload.wallets.len() == before {
+                return Err(CoreError::WalletNotFound(id.to_owned()));
+            }
+            Ok(())
+        })?;
         state.engines.remove(id);
-        state.vault.save(&state.payload)?;
         Ok(())
     }
 
@@ -1092,15 +1110,15 @@ impl WalletManager {
             self.require_current(existing, current).await?;
         }
         let stored = lock::hash_secret(secret)?;
-        let mut state = self.state.lock().await;
-        let previous = state.payload.settings.app_lock.take();
-        state.payload.settings.app_lock = Some(AppLock {
-            kind,
-            biometric: previous.as_ref().is_some_and(|p| p.biometric),
-            secret: Some(stored),
-        });
-        state.vault.save(&state.payload)?;
-        Ok(())
+        self.state.lock().await.commit(|payload| {
+            let previous = payload.settings.app_lock.take();
+            payload.settings.app_lock = Some(AppLock {
+                kind,
+                biometric: previous.as_ref().is_some_and(|p| p.biometric),
+                secret: Some(stored),
+            });
+            Ok(())
+        })
     }
 
     /// Removes the lock. The current secret is required, for the same
@@ -1108,10 +1126,10 @@ impl WalletManager {
     pub async fn clear_app_lock(&self, current: &str) -> CoreResult<()> {
         let existing = self.existing_lock().await?;
         self.require_current(&existing, Some(current)).await?;
-        let mut state = self.state.lock().await;
-        state.payload.settings.app_lock = None;
-        state.vault.save(&state.payload)?;
-        Ok(())
+        self.state.lock().await.commit(|payload| {
+            payload.settings.app_lock = None;
+            Ok(())
+        })
     }
 
     /// Tries a secret against the lock. Failures are counted and, past
@@ -1132,12 +1150,12 @@ impl WalletManager {
     pub async fn set_biometric_unlock(&self, enabled: bool, current: &str) -> CoreResult<()> {
         let existing = self.existing_lock().await?;
         self.require_current(&existing, Some(current)).await?;
-        let mut state = self.state.lock().await;
-        if let Some(lock) = &mut state.payload.settings.app_lock {
-            lock.biometric = enabled;
-        }
-        state.vault.save(&state.payload)?;
-        Ok(())
+        self.state.lock().await.commit(|payload| {
+            if let Some(lock) = &mut payload.settings.app_lock {
+                lock.biometric = enabled;
+            }
+            Ok(())
+        })
     }
 
     async fn existing_lock(&self) -> CoreResult<AppLock> {
@@ -1362,42 +1380,50 @@ impl WalletManager {
             pending.push(build_record(meta)?);
         }
 
-        if settings_applied {
-            let settings = &mut state.payload.settings;
-            if let Some(backends) = &payload.backends {
-                settings.backends.extend(
-                    backends
-                        .iter()
-                        .map(|(network, config)| (*network, config.clone())),
-                );
-            }
-            if let Some(certs) = &payload.electrum_certs {
-                for (host, fingerprint) in certs {
-                    // The same check an acceptance made by hand goes
-                    // through: a backup must not be able to pin what the
-                    // dialog would have refused, nor a fingerprint shaped
-                    // so that no real certificate can ever match it and
-                    // the host becomes permanently unreachable.
-                    if !chain::tls::is_fingerprint(fingerprint) {
-                        continue;
-                    }
-                    settings
-                        .electrum_certs
-                        .entry(host.clone())
-                        .or_insert_with(|| fingerprint.to_ascii_uppercase());
-                }
-            }
-            settings.gap_limit = gap_limit;
-        }
+        // The vault changes as a whole or not at all, and the engines
+        // are kept only once it has: a save that fails must not leave
+        // wallets on screen that the disk never received.
         let mut added = Vec::with_capacity(pending.len());
-        for (record, engine) in pending {
-            if let Some(engine) = engine {
-                state.engines.insert(record.meta.id.clone(), engine);
+        let mut engines = Vec::new();
+        state.commit(|next| {
+            if settings_applied {
+                let settings = &mut next.settings;
+                if let Some(backends) = &payload.backends {
+                    settings.backends.extend(
+                        backends
+                            .iter()
+                            .map(|(network, config)| (*network, config.clone())),
+                    );
+                }
+                if let Some(certs) = &payload.electrum_certs {
+                    for (host, fingerprint) in certs {
+                        // The same check an acceptance made by hand goes
+                        // through: a backup must not be able to pin what
+                        // the dialog would have refused, nor a fingerprint
+                        // shaped so that no real certificate can ever
+                        // match it and the host becomes permanently
+                        // unreachable.
+                        if !chain::tls::is_fingerprint(fingerprint) {
+                            continue;
+                        }
+                        settings
+                            .electrum_certs
+                            .entry(host.clone())
+                            .or_insert_with(|| fingerprint.to_ascii_uppercase());
+                    }
+                }
+                settings.gap_limit = gap_limit;
             }
-            added.push(record.meta.clone());
-            state.payload.wallets.push(record);
-        }
-        state.vault.save(&state.payload)?;
+            for (record, engine) in pending {
+                if let Some(engine) = engine {
+                    engines.push((record.meta.id.clone(), engine));
+                }
+                added.push(record.meta.clone());
+                next.wallets.push(record);
+            }
+            Ok(())
+        })?;
+        state.engines.extend(engines);
         Ok(ImportReport {
             added,
             skipped,
@@ -1425,13 +1451,13 @@ impl WalletManager {
             .filter(|value| !value.is_empty())
             .map(tor::parse_socks_address)
             .transpose()?;
-        let mut state = self.state.lock().await;
-        state.payload.settings.tor = TorSettings {
-            mode: settings.mode,
-            socks_proxy,
-        };
-        state.vault.save(&state.payload)?;
-        Ok(())
+        self.state.lock().await.commit(|payload| {
+            payload.settings.tor = TorSettings {
+                mode: settings.mode,
+                socks_proxy,
+            };
+            Ok(())
+        })
     }
 
     /// Reaches Tor now, the way the settings say, so a settings screen
@@ -2682,6 +2708,94 @@ mod tests {
             parse_input(&text),
             Err(CoreError::InvalidInput { kind: "backup", .. })
         ));
+    }
+
+    /// A save that fails must leave the vault in memory exactly as it
+    /// was. Otherwise the screen shows wallets the disk never received,
+    /// and the next save, made for anything else, commits an import the
+    /// user was told had failed.
+    #[tokio::test]
+    async fn a_failed_save_changes_nothing_in_memory() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let (source, _, _) = seeded(source_dir.path()).await;
+        source.set_gap_limit(50).await.unwrap();
+        let bundle = source
+            .export_backup(
+                &BackupOptions {
+                    wallet_ids: None,
+                    include_settings: true,
+                },
+                BACKUP_PASSWORD,
+            )
+            .await
+            .unwrap();
+        let everything = ImportChoices {
+            indexes: None,
+            apply_settings: true,
+        };
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = manager(target_dir.path()).await;
+        // The vault is written to a temporary file first and renamed
+        // into place; a directory under that name makes every save fail
+        // before the vault itself is touched.
+        let blocker = target_dir.path().join("gerfaut.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+
+        let error = target
+            .import_backup(&bundle.data, BACKUP_PASSWORD, &everything)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CoreError::Vault(crate::error::VaultError::Io(_))),
+            "{error}"
+        );
+        assert!(target.list_wallets(None).await.is_empty());
+        assert_eq!(target.settings().await.gap_limit, 20);
+        assert!(
+            target
+                .preview_backup(&bundle.data, BACKUP_PASSWORD)
+                .await
+                .unwrap()
+                .wallets
+                .iter()
+                .all(|w| !w.already_watched)
+        );
+        assert!(
+            target
+                .add_wallet("Cold", &parse_input(MULTIPATH).unwrap(), Network::Signet)
+                .await
+                .is_err()
+        );
+        assert!(target.list_wallets(None).await.is_empty());
+        assert!(target.set_gap_limit(30).await.is_err());
+        assert_eq!(target.settings().await.gap_limit, 20);
+
+        // The disk back: the same import goes through whole, and a
+        // fresh open finds exactly what the report said.
+        std::fs::remove_dir(&blocker).unwrap();
+        let report = target
+            .import_backup(&bundle.data, BACKUP_PASSWORD, &everything)
+            .await
+            .unwrap();
+        assert_eq!(report.added.len(), 2);
+        assert_eq!(target.settings().await.gap_limit, 50);
+        let cold = report.added[0].id.clone();
+
+        // Renaming and removing are held to the same rule.
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(target.rename_wallet(&cold, "Renamed").await.is_err());
+        assert!(target.remove_wallet(&cold).await.is_err());
+        let wallets = target.list_wallets(None).await;
+        assert_eq!(wallets.len(), 2);
+        assert_eq!(wallets[0].name, "Cold");
+        assert!(target.wallet_snapshot(&cold).await.is_ok());
+        std::fs::remove_dir(&blocker).unwrap();
+
+        drop(target);
+        let reopened = WalletManager::open(target_dir.path(), key()).unwrap();
+        assert_eq!(reopened.list_wallets(None).await.len(), 2);
+        assert_eq!(reopened.settings().await.gap_limit, 50);
     }
 
     #[tokio::test]
