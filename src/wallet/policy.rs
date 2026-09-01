@@ -413,27 +413,35 @@ fn parse_descriptor(text: &str) -> CoreResult<Descriptor<DescriptorPublicKey>> {
 }
 
 /// The top-level alternatives: the items of an outer "or", flattened,
-/// or the whole policy when it has none.
+/// or the whole policy when it has none. An "or" of plain keys stays
+/// whole: a 1-of-n multisig, however the descriptor spells it, is one
+/// way to spend, open to any of its keys, not one way per key.
 fn disjuncts(policy: &Semantic) -> Vec<&Semantic> {
     match policy {
-        Policy::Thresh(thresh) if thresh.k() == 1 && thresh.n() > 1 => thresh
-            .iter()
-            .flat_map(|sub| disjuncts(sub.as_ref()))
-            .collect(),
+        Policy::Thresh(thresh) if thresh.k() == 1 && thresh.n() > 1 && !is_multisig(policy) => {
+            thresh
+                .iter()
+                .flat_map(|sub| disjuncts(sub.as_ref()))
+                .collect()
+        }
         other => vec![other],
+    }
+}
+
+/// A threshold of plain keys, nothing else under it.
+fn is_multisig(policy: &Semantic) -> bool {
+    match policy {
+        Policy::Thresh(thresh) => thresh
+            .iter()
+            .all(|sub| matches!(sub.as_ref(), Policy::Key(_))),
+        _ => false,
     }
 }
 
 fn kind_of(policy: &Semantic) -> PolicyKind {
     match policy {
         Policy::Key(_) => PolicyKind::SingleKey,
-        Policy::Thresh(thresh)
-            if thresh
-                .iter()
-                .all(|sub| matches!(sub.as_ref(), Policy::Key(_))) =>
-        {
-            PolicyKind::Multisig
-        }
+        multisig if is_multisig(multisig) => PolicyKind::Multisig,
         _ => PolicyKind::Miniscript,
     }
 }
@@ -1410,6 +1418,50 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn a_one_of_n_multisig_is_one_branch() {
+        let snapshot = wsh(
+            &format!("wsh(sortedmulti(1,{A}/0/*,{B}/0/*,{C}/0/*))"),
+            Vec::new(),
+        );
+        assert_eq!(snapshot.kind, PolicyKind::Multisig);
+        assert_eq!(snapshot.policy, "or(pk(Key A),pk(Key B),pk(Key C))");
+        assert_eq!(snapshot.branches.len(), 1, "one way to spend, any key");
+        let branch = &snapshot.branches[0];
+        assert_eq!(branch.summary, "Any of 3 keys");
+        assert_eq!(branch.role, BranchRole::Primary);
+        assert_eq!(branch.label, "Primary");
+        assert!(branch.spendable_now);
+        assert_eq!(
+            branch.condition,
+            Condition::Thresh {
+                k: 1,
+                n: 3,
+                items: vec![
+                    Condition::Key {
+                        key_id: "k0".into()
+                    },
+                    Condition::Key {
+                        key_id: "k1".into()
+                    },
+                    Condition::Key {
+                        key_id: "k2".into()
+                    },
+                ],
+            }
+        );
+
+        // A taproot tree of single keys around a single internal key
+        // says the same thing, and reads the same.
+        let descriptor = format!("tr({A}/0/*,{{pk({B}/0/*),pk({C}/0/*)}})");
+        let snapshot = analyze_with(&descriptor, ScriptKind::Taproot, Vec::new());
+        assert_eq!(snapshot.kind, PolicyKind::Multisig);
+        assert_eq!(snapshot.policy, "or(pk(Key A),pk(Key B),pk(Key C))");
+        assert_eq!(snapshot.branches.len(), 1);
+        assert_eq!(snapshot.branches[0].summary, "Any of 3 keys");
+        assert!(snapshot.branches[0].spendable_now);
     }
 
     #[test]
