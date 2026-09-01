@@ -198,11 +198,13 @@ fn update(change: impl FnOnce(&mut Progress)) {
 
 /// The proxy to reach onion hosts through, per the settings.
 ///
-/// `Auto` and `System` probe the system proxy; `Auto` falls back to the
-/// embedded client, `System` refuses. `Embedded` never probes and starts
-/// the client if it is not running: up to about 90 seconds on a first
-/// run, a few on later ones. Call it only when an onion host is about
-/// to be reached.
+/// `System` probes the system proxy and refuses when nothing answers.
+/// `Auto` probes it too where loopback is trusted
+/// ([`TRUST_LOOPBACK_SOCKS`]) and falls back to the embedded client;
+/// where it is not, `Auto` is the embedded client. `Embedded` never
+/// probes and starts the client if it is not running: up to about 90
+/// seconds on a first run, a few on later ones. Call it only when an
+/// onion host is about to be reached.
 pub async fn resolve(settings: &TorSettings, data_dir: &Path) -> CoreResult<TorRoute> {
     #[cfg(feature = "embedded-tor")]
     let embedded = Some(async || embedded::socks_access(data_dir).await);
