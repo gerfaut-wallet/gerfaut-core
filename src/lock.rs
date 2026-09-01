@@ -8,7 +8,8 @@
 //! salt, compared in constant time, and guesses slow down after a few
 //! failures so that a short PIN cannot be tried a thousand times. The
 //! failure count is mirrored in a small file beside the vault, so that
-//! quitting and relaunching the app between guesses buys nothing.
+//! quitting and relaunching the app between guesses buys nothing, and
+//! moving the clock forward buys a shorter wait, never a free guess.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -93,11 +94,14 @@ pub fn delay_after(failures: u32) -> Duration {
 /// relaunches the app between salvos would try every PIN with no delay
 /// at all. In memory the block is an `Instant`, precise and deaf to
 /// clock changes; the file stores wall-clock seconds, the only clock
-/// that survives a restart.
+/// that survives a restart, and the one a person can move.
 ///
 /// The file holds a count and a time, nothing derived from the secret,
 /// so it is not sensitive: reading it tells an attacker how many
-/// guesses they made. Losing it costs at most a few free attempts.
+/// guesses they made. Deleting it hands the free attempts back and
+/// drops whatever delay had built up: the record slows a script down,
+/// it does not stop one that also deletes files, and the strength of
+/// the secret has to do the rest.
 #[derive(Debug, Default)]
 pub struct LockAttempts {
     failures: u32,
@@ -133,10 +137,16 @@ impl LockAttempts {
     /// file says minus the time that passed, with saturating arithmetic:
     /// a clock set back must not shorten it, and a time far in the
     /// future, whether from a clock jump or a doctored file, blocks no
-    /// longer than the longest delay ever handed out.
+    /// longer than the longest delay ever handed out. A block that reads
+    /// as over is re-armed for the first delay all the same: the file
+    /// cannot tell an app that stayed closed from a clock moved forward
+    /// to end the block, and the first delay costs the owner little.
     fn restore(stored: StoredAttempts, now_unix: u64, now: Instant) -> Self {
         let blocked_until = stored.blocked_until_unix.and_then(|until| {
-            let remaining = until.saturating_sub(now_unix).min(MAX_DELAY_SECS);
+            let mut remaining = until.saturating_sub(now_unix).min(MAX_DELAY_SECS);
+            if stored.failures >= FREE_ATTEMPTS {
+                remaining = remaining.max(FIRST_DELAY_SECS);
+            }
             (remaining > 0).then(|| now + Duration::from_secs(remaining))
         });
         LockAttempts {
@@ -421,14 +431,16 @@ mod tests {
         assert_eq!(attempts.retry_after(now), 10);
         assert_eq!(attempts.retry_after(now + Duration::from_secs(11)), 0);
 
-        // A block that ended while the app was closed is over.
+        // A block that ended while the app was closed is re-armed for
+        // the first delay: the file cannot tell a closed app from a
+        // clock moved forward.
         let over = StoredAttempts {
             failures: 3,
             blocked_until_unix: Some(999_000),
         };
         assert_eq!(
             LockAttempts::restore(over, 1_000_000, now).retry_after(now),
-            0
+            FIRST_DELAY_SECS as u32
         );
 
         // The count alone, no block: the next failure is the fourth.
@@ -471,6 +483,42 @@ mod tests {
             now,
         );
         assert_eq!(attempts.fail(now).failures, u32::MAX);
+    }
+
+    #[test]
+    fn a_clock_moved_forward_does_not_end_a_stored_block() {
+        let now = Instant::now();
+        // Written with five minutes to go; the clock now says a day
+        // later. The block is not over: it is the first delay again,
+        // and the count stays, so the next failure earns the longest.
+        let jumped = StoredAttempts {
+            failures: 9,
+            blocked_until_unix: Some(1_000_300),
+        };
+        let attempts = LockAttempts::restore(jumped, 1_086_400, now);
+        assert_eq!(attempts.retry_after(now), FIRST_DELAY_SECS as u32);
+        assert_eq!(attempts.failures(), 9);
+
+        // A block with more than the first delay left keeps what it has.
+        let running = StoredAttempts {
+            failures: 5,
+            blocked_until_unix: Some(1_000_020),
+        };
+        assert_eq!(
+            LockAttempts::restore(running, 1_000_000, now).retry_after(now),
+            20
+        );
+
+        // Below the free attempts no block is ever handed out: a file
+        // that carries one anyway is read as written.
+        let doctored = StoredAttempts {
+            failures: 1,
+            blocked_until_unix: Some(999_000),
+        };
+        assert_eq!(
+            LockAttempts::restore(doctored, 1_000_000, now).retry_after(now),
+            0
+        );
     }
 
     #[test]
