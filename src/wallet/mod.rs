@@ -2,6 +2,7 @@
 //! state of single-address wallets.
 
 pub mod meta;
+pub mod policy;
 pub mod snapshot;
 pub mod tx_extras;
 pub mod views;
