@@ -198,11 +198,7 @@ pub enum LockState {
     /// An absolute lock the chain has passed.
     Unlocked,
     /// An absolute lock still ahead.
-    Locked {
-        remaining_blocks: Option<u32>,
-        remaining_seconds: Option<u64>,
-        unlocks_at_unix: Option<u64>,
-    },
+    Locked { until: Remaining },
     /// A relative lock, counted coin by coin. `waiting` coins are not
     /// confirmed yet, so their count has not started; `next` is the
     /// locked coin that opens first.
@@ -809,11 +805,7 @@ fn lock_state(lock: Lock, coins: &[Coin], clock: &Clock) -> LockState {
     match lock {
         Lock::Absolute(lock) => match lock.remaining(clock) {
             None => LockState::Unlocked,
-            Some(remaining) => LockState::Locked {
-                remaining_blocks: remaining.remaining_blocks,
-                remaining_seconds: remaining.remaining_seconds,
-                unlocks_at_unix: remaining.unlocks_at_unix,
-            },
+            Some(until) => LockState::Locked { until },
         },
         Lock::Relative(lock) => {
             if coins.is_empty() {
@@ -1600,10 +1592,20 @@ mod tests {
         assert_eq!(
             branch.timelocks[0].state,
             LockState::Locked {
-                remaining_blocks: Some(1),
-                remaining_seconds: Some(600),
-                unlocks_at_unix: Some(NOW + 600),
+                until: Remaining {
+                    remaining_blocks: Some(1),
+                    remaining_seconds: Some(600),
+                    unlocks_at_unix: Some(NOW + 600),
+                }
             }
+        );
+        // The lock's remaining time is one value, as the branch's is.
+        let json = serde_json::to_string(&branch.timelocks[0]).unwrap();
+        assert!(
+            json.contains(
+                r#""state":{"kind":"locked","until":{"remaining_blocks":1,"remaining_seconds":600,"unlocks_at_unix":1750000600}}"#
+            ),
+            "{json}"
         );
         assert_eq!(
             branch.condition,
