@@ -991,10 +991,13 @@ fn draft(policy: &Semantic, book: &KeyBook, coins: &[Coin], clock: &Clock) -> Co
 
 /// Roles and labels, one per draft, in the drafts' order.
 ///
-/// Branches with no required lock are primary; those with one rank by
+/// Branches with no required lock are primary. Those with one rank by
 /// how far off their farthest lock is: the nearest is the recovery
-/// path, the next the emergency one. A branch with no key, or one that
-/// needs a hash preimage, is set apart as "other".
+/// path, the next the emergency one, the rest "Recovery 3" and on.
+/// When every path waits, the nearest one is the wallet's only way to
+/// spend: it is the primary path, and the ranks shift down by one. A
+/// branch with no key, or one that needs a hash preimage, is set apart
+/// as "other".
 fn assign_roles(drafts: &[Draft], clock: &Clock) -> Vec<(BranchRole, String)> {
     let mut roles: Vec<Option<(BranchRole, String)>> = vec![None; drafts.len()];
     let mut primaries = 0usize;
@@ -1018,7 +1021,13 @@ fn assign_roles(drafts: &[Draft], clock: &Clock) -> Vec<(BranchRole, String)> {
         }
     }
     timed.sort_by_key(|(_, magnitude)| *magnitude);
-    for (rank, (index, _)) in timed.into_iter().enumerate() {
+    let mut timed = timed.into_iter().map(|(index, _)| index);
+    if primaries == 0
+        && let Some(index) = timed.next()
+    {
+        roles[index] = Some((BranchRole::Primary, "Primary".to_owned()));
+    }
+    for (rank, index) in timed.enumerate() {
         roles[index] = Some(match rank {
             0 => (BranchRole::Recovery, "Recovery".to_owned()),
             1 => (BranchRole::Emergency, "Emergency".to_owned()),
@@ -1518,6 +1527,52 @@ mod tests {
         );
     }
 
+    /// A wallet whose every path waits still has a way to spend: the
+    /// nearest one is its primary path, lock and all.
+    #[test]
+    fn the_only_way_to_spend_is_primary_even_when_it_waits() {
+        let descriptor = format!("wsh(and_v(v:pk({A}/0/*),after(900000)))");
+        let snapshot = wsh(&descriptor, Vec::new());
+        assert_eq!(snapshot.branches.len(), 1);
+        let branch = &snapshot.branches[0];
+        assert_eq!(branch.role, BranchRole::Primary);
+        assert_eq!(branch.label, "Primary");
+        assert_eq!(branch.summary, "Key A after block 900,000");
+        assert_eq!(branch.timelocks.len(), 1);
+        assert!(branch.timelocks[0].required);
+        assert!(matches!(branch.state, BranchState::Locked { .. }));
+    }
+
+    #[test]
+    fn without_a_free_path_the_nearest_lock_leads() {
+        // Longest first: the nearest lock must lead whatever the text says.
+        let descriptor = format!(
+            "wsh(or_i(and_v(v:pk({A}/0/*),older(52560)),and_v(v:pk({B}/0/*),older(4320))))"
+        );
+        let snapshot = wsh(&descriptor, Vec::new());
+        let roles: Vec<(BranchRole, &str, &str)> = snapshot
+            .branches
+            .iter()
+            .map(|b| (b.role, b.label.as_str(), b.summary.as_str()))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (
+                    BranchRole::Recovery,
+                    "Recovery",
+                    "Key A, once a coin has waited 52,560 blocks"
+                ),
+                (
+                    BranchRole::Primary,
+                    "Primary",
+                    "Key B, once a coin has waited 4,320 blocks"
+                ),
+            ]
+        );
+        assert!(!snapshot.branches[1].spendable_now, "primary, yet it waits");
+    }
+
     #[test]
     fn an_absolute_height_lock_opens_at_the_tip() {
         let descriptor = format!("wsh(and_v(v:pk({A}/0/*),after(900000)))");
@@ -1531,7 +1586,7 @@ mod tests {
         .unwrap();
         let branch = &locked.branches[0];
         assert_eq!(branch.summary, "Key A after block 900,000");
-        assert_eq!(branch.role, BranchRole::Recovery);
+        assert_eq!(branch.role, BranchRole::Primary);
         assert_eq!(
             branch.state,
             BranchState::Locked {
