@@ -49,6 +49,12 @@ const REPLY_CONNECTION_REFUSED: u8 = 5;
 const REPLY_COMMAND_NOT_SUPPORTED: u8 = 7;
 const REPLY_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 8;
 
+/// How long a client has to get from its greeting to its request. A
+/// client of ours sends them back to back; a neighbour on loopback that
+/// connects and says nothing, or stops halfway, would otherwise hold a
+/// task for as long as it keeps the socket open.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// What a client must present to use the proxy. Drawn at random for the
 /// process, handed to the HTTP and Electrum clients in memory, and
 /// never written, shown or logged: the `Debug` form says nothing.
@@ -132,6 +138,20 @@ where
     F: Future<Output = io::Result<U>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    serve_within(listener, credentials, connect, HANDSHAKE_TIMEOUT).await
+}
+
+/// [`serve`] with the handshake budget given, so a test can shorten it.
+async fn serve_within<C, F, U>(
+    listener: TcpListener,
+    credentials: Credentials,
+    connect: C,
+    handshake_timeout: Duration,
+) where
+    C: Fn(String, u16) -> F + Clone + Send + 'static,
+    F: Future<Output = io::Result<U>> + Send + 'static,
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -147,25 +167,17 @@ where
         // A session's failure is the client's to notice: it got the
         // reply code, and the proxy has nothing to add.
         tokio::spawn(async move {
-            let _ = session(stream, &credentials, connect).await;
+            let _ = session(stream, &credentials, connect, handshake_timeout).await;
         });
     }
 }
 
-/// One session: method negotiation, the credentials, the request, the
-/// reply, then bytes both ways until either side closes. Every refusal
-/// is answered with the reply code the protocol has for it before the
-/// stream is dropped.
-pub(crate) async fn session<S, C, F, U>(
-    mut stream: S,
-    credentials: &Credentials,
-    connect: C,
-) -> io::Result<()>
+/// The handshake: method negotiation, the credentials, then the request
+/// down to its target. Every refusal is answered with the reply code
+/// the protocol has for it before the stream is dropped.
+async fn handshake<S>(stream: &mut S, credentials: &Credentials) -> io::Result<(String, u16)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    C: FnOnce(String, u16) -> F,
-    F: Future<Output = io::Result<U>>,
-    U: AsyncRead + AsyncWrite + Unpin,
 {
     let mut greeting = [0u8; 2];
     stream.read_exact(&mut greeting).await?;
@@ -212,7 +224,7 @@ where
     stream.read_exact(&mut head).await?;
     let [version, command, _reserved, address_type] = head;
     if version != VERSION {
-        reply(&mut stream, REPLY_GENERAL_FAILURE).await?;
+        reply(stream, REPLY_GENERAL_FAILURE).await?;
         return Err(invalid("not a SOCKS5 request"));
     }
     let host = match address_type {
@@ -229,7 +241,7 @@ where
             match String::from_utf8(name) {
                 Ok(name) => name,
                 Err(_) => {
-                    reply(&mut stream, REPLY_GENERAL_FAILURE).await?;
+                    reply(stream, REPLY_GENERAL_FAILURE).await?;
                     return Err(invalid("the host name is not text"));
                 }
             }
@@ -240,7 +252,7 @@ where
             Ipv6Addr::from(octets).to_string()
         }
         _ => {
-            reply(&mut stream, REPLY_ADDRESS_TYPE_NOT_SUPPORTED).await?;
+            reply(stream, REPLY_ADDRESS_TYPE_NOT_SUPPORTED).await?;
             return Err(invalid("unknown address type"));
         }
     };
@@ -248,9 +260,36 @@ where
     stream.read_exact(&mut port).await?;
     let port = u16::from_be_bytes(port);
     if command != CMD_CONNECT {
-        reply(&mut stream, REPLY_COMMAND_NOT_SUPPORTED).await?;
+        reply(stream, REPLY_COMMAND_NOT_SUPPORTED).await?;
         return Err(invalid("only CONNECT is supported"));
     }
+    Ok((host, port))
+}
+
+/// One session: the handshake, given `handshake_timeout` to complete,
+/// then the upstream connection, the reply, and bytes both ways until
+/// either side closes. A client that runs out of time is dropped
+/// without a word, the way one with the wrong credentials is.
+pub(crate) async fn session<S, C, F, U>(
+    mut stream: S,
+    credentials: &Credentials,
+    connect: C,
+    handshake_timeout: Duration,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    C: FnOnce(String, u16) -> F,
+    F: Future<Output = io::Result<U>>,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let (host, port) = tokio::time::timeout(handshake_timeout, handshake(&mut stream, credentials))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the client did not finish its handshake in time",
+            )
+        })??;
 
     let mut upstream = match connect(host, port).await {
         Ok(upstream) => upstream,
@@ -648,6 +687,42 @@ mod tests {
         assert_eq!(reply[1], REPLY_GENERAL_FAILURE);
     }
 
+    /// A neighbour that connects and says nothing, or greets and then
+    /// falls silent, is dropped once its time is up rather than kept on
+    /// a task for as long as it holds the socket.
+    #[tokio::test]
+    async fn a_silent_client_is_dropped_once_its_time_is_up() {
+        let (listener, address) = bind().await.unwrap();
+        tokio::spawn(serve_within(
+            listener,
+            credentials(),
+            |_host: String, _port: u16| async {
+                Err::<TcpStream, _>(io::Error::other("nothing to connect for"))
+            },
+            Duration::from_millis(200),
+        ));
+        let closed = |read: &io::Result<usize>| matches!(read, Ok(0) | Err(_));
+
+        // Not a byte sent.
+        let mut silent = TcpStream::connect(address).await.unwrap();
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut byte))
+            .await
+            .expect("the proxy closes the stream instead of waiting");
+        assert!(closed(&read), "{read:?}");
+
+        // Greeted, then nothing where the credentials should follow.
+        let mut halfway = TcpStream::connect(address).await.unwrap();
+        halfway.write_all(&[VERSION, 1, USER_PASS]).await.unwrap();
+        let mut answer = [0u8; 2];
+        halfway.read_exact(&mut answer).await.unwrap();
+        assert_eq!(answer, [VERSION, USER_PASS]);
+        let read = tokio::time::timeout(Duration::from_secs(5), halfway.read(&mut byte))
+            .await
+            .expect("the proxy closes the stream instead of waiting");
+        assert!(closed(&read), "{read:?}");
+    }
+
     #[tokio::test]
     async fn a_session_over_any_stream_is_the_same_protocol() {
         // The session logic on its own, over an in-memory pipe.
@@ -655,10 +730,15 @@ mod tests {
         let (mut upstream_end, upstream) = tokio::io::duplex(256);
         let expected = credentials();
         let session = tokio::spawn(async move {
-            session(server, &expected, move |host, port| async move {
-                assert_eq!((host.as_str(), port), ("pipe.onion", 50001));
-                Ok::<_, io::Error>(upstream)
-            })
+            session(
+                server,
+                &expected,
+                move |host, port| async move {
+                    assert_eq!((host.as_str(), port), ("pipe.onion", 50001));
+                    Ok::<_, io::Error>(upstream)
+                },
+                HANDSHAKE_TIMEOUT,
+            )
             .await
         });
         client.write_all(&[VERSION, 1, USER_PASS]).await.unwrap();
