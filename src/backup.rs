@@ -47,9 +47,15 @@ pub const MAX_BACKUP_PAYLOAD: usize = 16 * 1024 * 1024;
 /// Shortest accepted password, after trimming.
 const MIN_PASSWORD_CHARS: usize = 8;
 
-/// Longest fragment of an animated QR, in bytes: small enough for a
-/// phone camera to catch every frame at arm's length.
-const MAX_FRAGMENT_LEN: usize = 100;
+/// Longest fragment of an animated QR, in bytes. The trade-off is
+/// density against readability: a denser frame means fewer frames and
+/// a shorter loop, a sparser one is caught more surely by a phone
+/// camera at arm's length. A 160-byte fragment makes a `ur:bytes` frame
+/// of about 370 characters, a version-12 code at medium error
+/// correction; at 100 bytes a backup of ten wallets ran to dozens of
+/// frames, each shown for 200 ms, and a scan took several turns of the
+/// loop more often than one.
+const MAX_FRAGMENT_LEN: usize = 160;
 
 /// One wallet as a backup carries it: identity and labels, no chain
 /// state.
@@ -519,7 +525,7 @@ mod tests {
         let sealed = seal(&payload, PASSWORD).unwrap();
         let frames = frames(&sealed);
         assert!(
-            frames.len() >= 8,
+            frames.len() >= 5,
             "the fixture should span a real animation: {} frames",
             frames.len()
         );
@@ -606,6 +612,35 @@ mod tests {
             progress.text.unwrap(),
             format!("{BACKUP_PREFIX}{}", data_encoding::BASE64.encode(&bytes))
         );
+    }
+
+    /// The frame count follows the fragment size: a payload the size of
+    /// a real backup makes the number of frames the constant promises,
+    /// each of a size a phone camera reads, and anything that fits one
+    /// fragment is still a single static frame.
+    #[test]
+    fn frames_are_as_dense_as_the_fragment_size_says() {
+        // Three kilobytes wrap in three CBOR bytes: 3003 bytes to split.
+        let mut payload = BACKUP_MAGIC.to_vec();
+        payload.resize(3000, 0x5a);
+        let frames = frames(&payload);
+        assert_eq!(frames.len(), 3003_usize.div_ceil(MAX_FRAGMENT_LEN));
+        assert_eq!(frames.len(), 19);
+        // A version-12 QR code at medium error correction holds 419
+        // alphanumeric characters; every frame must fit one.
+        let longest = frames.iter().map(String::len).max().unwrap();
+        assert!(longest <= 419, "{longest} characters");
+        let progress = assemble(&frames).unwrap();
+        assert!(progress.complete);
+        assert_eq!(
+            progress.text.unwrap(),
+            format!("{BACKUP_PREFIX}{}", data_encoding::BASE64.encode(&payload))
+        );
+
+        // Right at the edge: 158 bytes plus a two-byte CBOR header fill
+        // one fragment exactly, one byte more takes two frames.
+        assert_eq!(super::frames(&[1u8; MAX_FRAGMENT_LEN - 2]).len(), 1);
+        assert_eq!(super::frames(&[1u8; MAX_FRAGMENT_LEN - 1]).len(), 2);
     }
 
     #[test]
