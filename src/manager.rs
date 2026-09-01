@@ -36,6 +36,7 @@ use crate::lock::{self, AppLock, LockAttempts, LockKind, LockVerdict};
 use crate::network::Network;
 use crate::store::{Settings, Vault, VaultKey, VaultPayload, WalletRecord};
 use crate::wallet::meta::{CachedTotals, SyncStamp, WalletKind, WalletMeta};
+use crate::wallet::policy::{self, PolicySnapshot};
 use crate::wallet::snapshot::{
     AddressEntry, AddressList, NewTx, SyncReport, TxDetail, UtxoInfo, WalletSnapshot,
 };
@@ -405,6 +406,40 @@ impl WalletManager {
             WalletKind::SingleAddress { address } => {
                 let watch = record.address_state.clone().unwrap_or_default();
                 Ok(views::address_utxos(&watch, address))
+            }
+        }
+    }
+
+    /// The wallet's spending policy: its keys, its branches, and where
+    /// every timelock stands against the tip and the coins. A watched
+    /// address has no descriptor to read.
+    pub async fn policy(&self, id: &str) -> CoreResult<PolicySnapshot> {
+        let mut state = self.state.lock().await;
+        let record = find_record(&state.payload, id)?.clone();
+        match &record.meta.kind {
+            WalletKind::Descriptors {
+                external, script, ..
+            } => {
+                let engine = ensure_engine(&mut state, id)?;
+                policy::analyze(policy::PolicyInput {
+                    external_descriptor: external,
+                    script: *script,
+                    coins: views::coins(engine),
+                    tip_height: views::tip_height(engine),
+                    now_unix: now_secs(),
+                })
+            }
+            WalletKind::SingleAddress { address } => {
+                let (tip_height, coins) = record
+                    .address_state
+                    .as_ref()
+                    .map_or((0, 0), |watch| (watch.tip_height, watch.utxos.len() as u32));
+                Ok(policy::address_snapshot(
+                    address,
+                    tip_height,
+                    coins,
+                    now_secs(),
+                ))
             }
         }
     }
@@ -1868,6 +1903,53 @@ mod tests {
         assert_eq!(snapshot.balance.total, 0);
         assert!(snapshot.txs.is_empty());
         assert_eq!(snapshot.tip_height, 0);
+    }
+
+    #[tokio::test]
+    async fn policy_of_a_descriptor_wallet_reads_its_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input(MULTIPATH).unwrap();
+        let meta = manager
+            .add_wallet("Signet cold", &parsed, Network::Signet)
+            .await
+            .unwrap();
+
+        let snapshot = manager.policy(&meta.id).await.unwrap();
+        assert_eq!(snapshot.kind, policy::PolicyKind::SingleKey);
+        assert_eq!(snapshot.script, crate::input::ScriptKind::Segwit);
+        assert_eq!(snapshot.keys.len(), 1);
+        assert_eq!(snapshot.keys[0].fingerprint.as_deref(), Some("9a6a2580"));
+        assert_eq!(snapshot.keys[0].origin_path.as_deref(), Some("m/84'/1'/0'"));
+        assert_eq!(snapshot.branches.len(), 1);
+        assert!(snapshot.branches[0].spendable_now);
+        assert_eq!(snapshot.coins, 0);
+        assert_eq!(snapshot.tip_height, 0);
+        assert!(matches!(
+            manager.policy("nope").await,
+            Err(CoreError::WalletNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn policy_of_a_watched_address_has_no_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let address = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+        let parsed = parse_input(address).unwrap();
+        let meta = manager
+            .add_wallet("Watched address", &parsed, Network::Signet)
+            .await
+            .unwrap();
+
+        let snapshot = manager.policy(&meta.id).await.unwrap();
+        assert_eq!(snapshot.kind, policy::PolicyKind::Address);
+        assert_eq!(snapshot.script, crate::input::ScriptKind::Segwit);
+        assert_eq!(snapshot.descriptor, address);
+        assert_eq!(snapshot.policy, "address");
+        assert!(snapshot.keys.is_empty());
+        assert!(snapshot.branches.is_empty());
+        assert!(!snapshot.has_timelocks);
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ use bdk_wallet::chain::ChainPosition;
 
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
+use crate::wallet::policy::Coin;
 use crate::wallet::snapshot::{
     AddressEntry, AddressList, AddressRow, BalanceSnapshot, Keychain, NewTx, TxDetail, TxIo,
     TxStatus, TxSummary, UtxoInfo,
@@ -226,6 +227,28 @@ pub(crate) fn utxos(wallet: &bdk_wallet::Wallet, network: Network) -> Vec<UtxoIn
     let _ = tip; // confirmations live in `status`; tip kept for future use
     utxos.sort_by_key(|utxo| std::cmp::Reverse(utxo.value_sats));
     utxos
+}
+
+/// The unspent outputs reduced to what the policy analysis counts
+/// relative locks from: where and when each one confirmed.
+pub(crate) fn coins(wallet: &bdk_wallet::Wallet) -> Vec<Coin> {
+    wallet
+        .list_unspent()
+        .map(|output| {
+            let (height, timestamp) = match &output.chain_position {
+                ChainPosition::Confirmed { anchor, .. } => {
+                    (Some(anchor.block_id.height), Some(anchor.confirmation_time))
+                }
+                ChainPosition::Unconfirmed { .. } => (None, None),
+            };
+            Coin {
+                outpoint: output.outpoint.to_string(),
+                value_sats: output.txout.value.to_sat(),
+                height,
+                timestamp,
+            }
+        })
+        .collect()
 }
 
 /// Rows shown per keychain on the address page before truncation: an
