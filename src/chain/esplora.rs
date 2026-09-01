@@ -1,7 +1,10 @@
 //! Esplora backend: descriptor wallet sync and single-address tracking.
 
+use std::ops::Deref;
+use std::time::Duration;
+
 use bdk_esplora::EsploraAsyncExt;
-use bdk_esplora::esplora_client::{self, AsyncClient, Builder};
+use bdk_esplora::esplora_client::{self, AsyncClient};
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::address::Address;
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
@@ -19,43 +22,207 @@ const PARALLEL_REQUESTS: usize = 4;
 /// [`fetch_address_history`], so nothing stays out of reach.
 pub(crate) const HISTORY_PAGES_PER_ROUND: usize = 40;
 
-/// Socket timeout, seconds. Bounded so that an unreachable instance
-/// fails fast and the caller's fallback to the next endpoint actually
-/// happens within a tolerable delay.
-const TIMEOUT_SECS: u64 = 20;
-/// Onion endpoints get more room: Tor circuits are slow to build.
-const TOR_TIMEOUT_SECS: u64 = 60;
+/// How long opening a connection may take: the TCP handshake and the
+/// TLS one. A dead host fails here, fast enough for the fallback to the
+/// next endpoint to happen within a tolerable delay.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a whole request may take, connection included. One budget
+/// for both used to cut blockstream.info off at twenty seconds on an
+/// address with a few hundred transactions, which it needs longer than
+/// that to answer; a slow answer is not a dead host.
+const TIMEOUT: Duration = Duration::from_secs(60);
+/// Onion endpoints get more room: a Tor circuit is slow to build, and
+/// carries less once built.
+const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const TOR_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The two budgets a client was built with. A timeout is described by
+/// the one that ran out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Budget {
+    connect: Duration,
+    total: Duration,
+}
+
+/// A client for one instance, with its budgets kept beside it. It
+/// dereferences to the underlying client for every request, and turns
+/// the errors those return into sentences.
+#[derive(Debug)]
+pub(crate) struct Client {
+    inner: AsyncClient,
+    budget: Budget,
+}
+
+impl Deref for Client {
+    type Target = AsyncClient;
+
+    fn deref(&self) -> &AsyncClient {
+        &self.inner
+    }
+}
+
+impl Client {
+    /// The error as a sentence the sync report can show.
+    fn describe(&self, error: &esplora_client::Error) -> String {
+        describe(error, self.budget)
+    }
+}
 
 /// A client for one instance. `proxy` is the Tor SOCKS proxy the caller
 /// resolved for onion hosts; an onion URL without one is refused here,
 /// before anything could look the name up.
-pub(crate) fn client(url: &str, proxy: Option<&str>) -> Result<AsyncClient, String> {
-    let mut builder = Builder::new(url).timeout(TIMEOUT_SECS);
+pub(crate) fn client(url: &str, proxy: Option<&str>) -> Result<Client, String> {
+    let budget = if crate::chain::is_onion(url) {
+        Budget {
+            connect: TOR_CONNECT_TIMEOUT,
+            total: TOR_TIMEOUT,
+        }
+    } else {
+        Budget {
+            connect: CONNECT_TIMEOUT,
+            total: TIMEOUT,
+        }
+    };
+    build(url, proxy, budget)
+}
+
+/// The HTTP client is built here rather than through the crate's own
+/// builder, which knows one timeout: connecting and answering are two
+/// different waits, and a host that is down must not get the budget of
+/// a host that is slow.
+fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(budget.connect)
+        .timeout(budget.total);
     if crate::chain::is_onion(url) {
         let proxy = proxy.ok_or_else(|| crate::chain::tor::no_route(url))?;
         // socks5h: the proxy resolves the name; .onion never touches DNS.
-        builder = builder
-            .proxy(&format!("socks5h://{proxy}"))
-            .timeout(TOR_TIMEOUT_SECS);
+        let proxy = reqwest::Proxy::all(format!("socks5h://{proxy}"))
+            .map_err(|e| format!("invalid Tor proxy address: {e}"))?;
+        builder = builder.proxy(proxy);
     }
-    builder.build_async().map_err(|e| e.to_string())
+    let http = builder
+        .build()
+        .map_err(|e| format!("could not set up the HTTP client: {e}"))?;
+    Ok(Client {
+        inner: AsyncClient::from_client(url.to_owned(), http),
+        budget,
+    })
 }
 
 pub(crate) async fn full_scan(
-    client: &AsyncClient,
+    client: &Client,
     request: FullScanRequest<KeychainKind>,
     stop_gap: u32,
-) -> Result<FullScanResponse<KeychainKind>, Box<esplora_client::Error>> {
+) -> Result<FullScanResponse<KeychainKind>, String> {
     client
+        .inner
         .full_scan(request, stop_gap as usize, PARALLEL_REQUESTS)
         .await
+        .map_err(|e| client.describe(&e))
 }
 
 pub(crate) async fn sync(
-    client: &AsyncClient,
+    client: &Client,
     request: SyncRequest<(KeychainKind, u32)>,
-) -> Result<SyncResponse, Box<esplora_client::Error>> {
-    client.sync(request, PARALLEL_REQUESTS).await
+) -> Result<SyncResponse, String> {
+    client
+        .inner
+        .sync(request, PARALLEL_REQUESTS)
+        .await
+        .map_err(|e| client.describe(&e))
+}
+
+// --- errors ---------------------------------------------------------------
+
+/// The error as a sentence a person can act on. The crate's own
+/// `Display` is its `Debug`: `Reqwest(reqwest::Error { kind: Request,
+/// source: TimedOut })` is what reached the sync report until now.
+fn describe(error: &esplora_client::Error, budget: Budget) -> String {
+    use esplora_client::Error;
+    match error {
+        Error::Reqwest(error) => describe_request(error, budget),
+        Error::HttpResponse { status, message: _ } => describe_status(*status),
+        Error::TransactionNotFound(_) => "transaction not found".to_owned(),
+        Error::HeaderHeightNotFound(_) | Error::HeaderHashNotFound(_) => {
+            "block not found".to_owned()
+        }
+        Error::InvalidHttpHeaderName(_) | Error::InvalidHttpHeaderValue(_) => {
+            "invalid request header".to_owned()
+        }
+        // A number, a status code, hex or consensus bytes that do not
+        // parse, a body that is not what the endpoint promised: the
+        // server answered, with something else.
+        _ => "unexpected response".to_owned(),
+    }
+}
+
+fn describe_status(status: u16) -> String {
+    let reason = match status {
+        400 => "bad request",
+        401 | 403 => "access refused",
+        404 => "not found",
+        429 => "rate limited",
+        500..=599 => "server error",
+        _ => "unexpected status",
+    };
+    format!("HTTP {status}: {reason}")
+}
+
+/// What went wrong on the way to the server, by asking the error and
+/// what it wraps rather than reading their text: `reqwest` says only
+/// "error sending request", the cause sits several layers below.
+fn describe_request(error: &reqwest::Error, budget: Budget) -> String {
+    if error.is_timeout() {
+        return if error.is_connect() {
+            format!("could not connect within {} s", budget.connect.as_secs())
+        } else {
+            format!("timed out after {} s", budget.total.as_secs())
+        };
+    }
+    if error.is_connect() {
+        // The TLS library's own error type, however deep it is wrapped.
+        if any_cause(error, &mut |cause| cause.is::<rustls::Error>()) {
+            return "TLS handshake failed".to_owned();
+        }
+        // The connector names the step that failed; the resolver's own
+        // words hang below it and vary by platform.
+        if any_cause(error, &mut |cause| cause.to_string() == "dns error") {
+            return "host not found".to_owned();
+        }
+        if any_cause(error, &mut |cause| {
+            cause.to_string().contains("socks proxy")
+        }) {
+            return "could not connect through Tor".to_owned();
+        }
+        return "could not connect".to_owned();
+    }
+    if error.is_body() || error.is_decode() {
+        return "unexpected response".to_owned();
+    }
+    "request failed".to_owned()
+}
+
+/// Whether `matches` holds for the error, anything in its `source`
+/// chain, or anything an `io::Error` along the way wraps: an
+/// `io::Error` reports the source of what it wraps, not the wrapped
+/// error itself, so a plain walk would step over it.
+fn any_cause(
+    error: &(dyn std::error::Error + 'static),
+    matches: &mut dyn FnMut(&(dyn std::error::Error + 'static)) -> bool,
+) -> bool {
+    if matches(error) {
+        return true;
+    }
+    if let Some(io) = error.downcast_ref::<std::io::Error>()
+        && let Some(inner) = io.get_ref()
+        && any_cause(inner, matches)
+    {
+        return true;
+    }
+    error
+        .source()
+        .is_some_and(|source| any_cause(source, matches))
 }
 
 /// One round of address history: the transactions fetched and, when
@@ -69,18 +236,18 @@ pub(crate) struct HistoryRound {
 
 /// Fetches the complete state of a single watched address.
 pub(crate) async fn fetch_address_state(
-    client: &AsyncClient,
+    client: &Client,
     address: &str,
     network: Network,
 ) -> Result<AddressWatchState, String> {
     let address = parse_address(address, network)?;
     let our_script = address.script_pubkey();
 
-    let tip_height = client.get_height().await.map_err(|e| e.to_string())?;
+    let tip_height = client.get_height().await.map_err(|e| client.describe(&e))?;
     let stats = client
         .get_address_stats(&address)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| client.describe(&e))?;
 
     let round = history_round(
         client,
@@ -95,7 +262,7 @@ pub(crate) async fn fetch_address_state(
     let utxos = client
         .get_address_utxos(&address)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| client.describe(&e))?
         .into_iter()
         .map(|utxo| AddressUtxo {
             txid: utxo.txid.to_string(),
@@ -121,7 +288,7 @@ pub(crate) async fn fetch_address_state(
 /// `from`. Used by "load older transactions": the balance and the UTXO
 /// set already cover the full history, only the list grows.
 pub(crate) async fn fetch_address_history(
-    client: &AsyncClient,
+    client: &Client,
     address: &str,
     network: Network,
     from: &str,
@@ -145,7 +312,7 @@ fn parse_address(address: &str, network: Network) -> Result<Address, String> {
 /// Pages through the address history from `from` (newest first when
 /// `None`), at most [`HISTORY_PAGES_PER_ROUND`] pages.
 async fn history_round(
-    client: &AsyncClient,
+    client: &Client,
     address: &Address,
     our_script: &bdk_wallet::bitcoin::ScriptBuf,
     network: Network,
@@ -155,7 +322,7 @@ async fn history_round(
     let mut raw_txs = client
         .get_address_txs(address, from)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| client.describe(&e))?;
     let mut cursor: Option<String> = None;
     let mut pages = 1usize;
     loop {
@@ -181,7 +348,7 @@ async fn history_round(
         let page = client
             .get_address_txs(address, Some(last_seen))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| client.describe(&e))?;
         pages += 1;
         if page.is_empty() {
             break;
@@ -288,21 +455,25 @@ fn script_address(script: &bdk_wallet::bitcoin::ScriptBuf, network: Network) -> 
 /// Hands a signed transaction to the network through this instance.
 /// The instance's own node validates it; its refusal comes back as the
 /// message, verbatim, which is the most useful thing to show.
-pub(crate) async fn broadcast(client: &AsyncClient, tx: &Transaction) -> Result<(), String> {
-    client.broadcast(tx).await.map_err(|e| broadcast_error(&e))
+pub(crate) async fn broadcast(client: &Client, tx: &Transaction) -> Result<(), String> {
+    client
+        .inner
+        .broadcast(tx)
+        .await
+        .map_err(|e| broadcast_error(client, &e))
 }
 
 /// Esplora wraps the node's refusal in an HTTP error whose body is the
 /// reason, in one of two spellings:
 /// `sendrawtransaction RPC error: {"code":-26,"message":"..."}` (the
 /// mempool instances) or `sendrawtransaction RPC error -26: ...`
-/// (blockstream.info). Keep the message, drop the wrapping.
-fn broadcast_error(error: &esplora_client::Error) -> String {
-    let text = match error {
-        esplora_client::Error::HttpResponse { message, .. } => message.clone(),
-        other => other.to_string(),
-    };
-    node_message(&text)
+/// (blockstream.info). Keep the message, drop the wrapping. Anything
+/// else is a failure to reach the node, described as such.
+fn broadcast_error(client: &Client, error: &esplora_client::Error) -> String {
+    match error {
+        esplora_client::Error::HttpResponse { message, .. } => node_message(message),
+        other => client.describe(other),
+    }
 }
 
 /// The reason inside a `sendrawtransaction` refusal, whichever way the
@@ -335,13 +506,13 @@ pub(crate) struct PrevoutFacts {
 /// Fetches a previous output. `None` in `txout` means the backend does
 /// not know the transaction at all.
 pub(crate) async fn fetch_prevout(
-    client: &AsyncClient,
+    client: &Client,
     outpoint: OutPoint,
 ) -> Result<PrevoutFacts, String> {
     let tx = client
         .get_tx(&outpoint.txid)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| client.describe(&e))?;
     let Some(tx) = tx else {
         return Ok(PrevoutFacts {
             txout: None,
@@ -366,12 +537,12 @@ pub(crate) struct TxStanding {
     pub tip_height: u32,
 }
 
-pub(crate) async fn tx_standing(client: &AsyncClient, txid: &Txid) -> Result<TxStanding, String> {
-    let tip_height = client.get_height().await.map_err(|e| e.to_string())?;
+pub(crate) async fn tx_standing(client: &Client, txid: &Txid) -> Result<TxStanding, String> {
+    let tip_height = client.get_height().await.map_err(|e| client.describe(&e))?;
     let found = client
         .get_tx_info(txid)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| client.describe(&e))?
         .is_some();
     if !found {
         return Ok(TxStanding {
@@ -384,13 +555,140 @@ pub(crate) async fn tx_standing(client: &AsyncClient, txid: &Txid) -> Result<TxS
     let status = client
         .get_tx_status(txid)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| client.describe(&e))?;
     Ok(TxStanding {
         found: true,
         confirmed: status.confirmed,
         block_height: status.block_height,
         tip_height,
     })
+}
+
+#[cfg(test)]
+mod error_tests {
+    use std::net::Ipv4Addr;
+
+    use bdk_wallet::bitcoin::hashes::Hash;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// Budgets short enough to test: the connection has five seconds,
+    /// the whole request one.
+    const BUDGET: Budget = Budget {
+        connect: Duration::from_secs(5),
+        total: Duration::from_secs(1),
+    };
+    /// Budgets that let a connection fail on its own terms: Windows
+    /// takes a second or two to give up on a closed loopback port, and
+    /// a name lookup can take as long to come back empty.
+    const PATIENT: Budget = Budget {
+        connect: Duration::from_secs(15),
+        total: Duration::from_secs(30),
+    };
+
+    #[test]
+    fn a_status_is_a_code_and_a_reason() {
+        let status = |status| {
+            describe(
+                &esplora_client::Error::HttpResponse {
+                    status,
+                    message: "<html><body>a page nobody should see</body></html>".to_owned(),
+                },
+                BUDGET,
+            )
+        };
+        assert_eq!(status(429), "HTTP 429: rate limited");
+        assert_eq!(status(503), "HTTP 503: server error");
+        assert_eq!(status(500), "HTTP 500: server error");
+        assert_eq!(status(404), "HTTP 404: not found");
+        assert_eq!(status(400), "HTTP 400: bad request");
+        assert_eq!(status(403), "HTTP 403: access refused");
+        assert_eq!(status(418), "HTTP 418: unexpected status");
+    }
+
+    #[test]
+    fn the_other_variants_read_as_sentences() {
+        use esplora_client::Error;
+        assert_eq!(
+            describe(&Error::TransactionNotFound(Txid::all_zeros()), BUDGET),
+            "transaction not found"
+        );
+        assert_eq!(
+            describe(&Error::HeaderHeightNotFound(7), BUDGET),
+            "block not found"
+        );
+        assert_eq!(
+            describe(&Error::InvalidResponse, BUDGET),
+            "unexpected response"
+        );
+        assert_eq!(
+            describe(&Error::Parsing("x".parse::<u32>().unwrap_err()), BUDGET),
+            "unexpected response"
+        );
+        // And none of them is the debug form the crate displays.
+        assert!(!describe(&Error::InvalidResponse, BUDGET).contains("InvalidResponse"));
+    }
+
+    /// A server that accepts the connection and never answers: the
+    /// request budget runs out, and the message says by how much.
+    #[tokio::test]
+    async fn a_server_that_never_answers_is_a_timeout_with_its_budget() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Held open, never written to.
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let client = build(&format!("http://{address}"), None, BUDGET).unwrap();
+        let error = client.get_height().await.unwrap_err();
+        assert!(
+            matches!(error, esplora_client::Error::Reqwest(_)),
+            "{error:?}"
+        );
+        assert_eq!(client.describe(&error), "timed out after 1 s");
+    }
+
+    #[tokio::test]
+    async fn a_closed_port_is_a_failure_to_connect() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
+        let error = client.get_height().await.unwrap_err();
+        assert_eq!(client.describe(&error), "could not connect");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_host_is_said_to_be_one() {
+        // `.invalid` is reserved never to resolve, whatever the resolver.
+        let client = build("http://esplora.invalid", None, PATIENT).unwrap();
+        let error = client.get_height().await.unwrap_err();
+        assert_eq!(client.describe(&error), "host not found");
+    }
+
+    #[test]
+    fn budgets_follow_the_kind_of_host() {
+        assert_eq!(
+            client("https://mempool.space/api", None).unwrap().budget,
+            Budget {
+                connect: CONNECT_TIMEOUT,
+                total: TIMEOUT,
+            }
+        );
+        let onion = "http://gerfautexample000000000000000000000000000000000000000.onion/api";
+        assert!(client(onion, None).unwrap_err().starts_with("tor: "));
+        assert_eq!(
+            client(onion, Some("127.0.0.1:9050")).unwrap().budget,
+            Budget {
+                connect: TOR_CONNECT_TIMEOUT,
+                total: TOR_TIMEOUT,
+            }
+        );
+    }
 }
 
 #[cfg(test)]

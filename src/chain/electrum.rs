@@ -8,6 +8,8 @@
 //! goes through Gerfaut's own verifier: a public authority, or the
 //! fingerprint the user accepted for that host.
 
+use std::time::Duration;
+
 use bdk_electrum::BdkElectrumClient;
 use bdk_electrum::electrum_client::raw_client::{ElectrumSslStream, RawClient};
 use bdk_electrum::electrum_client::{self, Client, Config, ElectrumApi, Param, Socks5Config};
@@ -21,9 +23,9 @@ use super::tls::{self, ConnectError, Verdict};
 const BATCH_SIZE: usize = 10;
 /// Socket timeout. Without it a stalled server blocks the sync forever
 /// inside `spawn_blocking`, with no way to cancel.
-const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const TIMEOUT: Duration = Duration::from_secs(20);
 /// Onion endpoints get more room: Tor circuits are slow to build.
-const TOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const TOR_TIMEOUT: Duration = Duration::from_secs(60);
 /// Name Gerfaut announces in `server.version`.
 const CLIENT_NAME: &str = "gerfaut";
 /// Protocol version asked for, as an exact range. `electrum-client`
@@ -143,14 +145,14 @@ fn connect(target: &Target, proxy: Option<&str>) -> Result<Transport, ConnectErr
             .build();
         return Client::from_config(&target.url, config)
             .map(Transport::Crate)
-            .map_err(|e| ConnectError::Io(e.to_string()));
+            .map_err(|e| ConnectError::Io(describe(&e, TOR_TIMEOUT)));
     }
 
     if !tls_wanted {
         let config = Config::builder().timeout(Some(TIMEOUT)).build();
         return Client::from_config(&target.url, config)
             .map(Transport::Crate)
-            .map_err(|e| ConnectError::Io(e.to_string()));
+            .map_err(|e| ConnectError::Io(describe(&e, TIMEOUT)));
     }
 
     let stream = tls::connect(&host, port, target.pin.as_deref(), TIMEOUT)?;
@@ -171,7 +173,7 @@ fn negotiate(raw: &RawClient<ElectrumSslStream>) -> Result<(), ConnectError> {
         ],
     )
     .map(|_| ())
-    .map_err(|e| ConnectError::Io(e.to_string()))
+    .map_err(|e| ConnectError::Io(describe(&e, TIMEOUT)))
 }
 
 /// Runs one operation against a connected client, whichever transport
@@ -213,7 +215,7 @@ pub(crate) fn full_scan_blocking(
 ) -> Result<FullScanResponse<KeychainKind>, String> {
     on_client!(target, proxy, |client| client
         .full_scan(request, stop_gap as usize, BATCH_SIZE, true)
-        .map_err(|e| e.to_string()))
+        .map_err(failed(target)))
 }
 
 pub(crate) fn sync_blocking(
@@ -223,7 +225,95 @@ pub(crate) fn sync_blocking(
 ) -> Result<SyncResponse, String> {
     on_client!(target, proxy, |client| client
         .sync(request, BATCH_SIZE, true)
-        .map_err(|e| e.to_string()))
+        .map_err(failed(target)))
+}
+
+// --- errors ---------------------------------------------------------------
+
+/// The budget a server gets: onion hosts the longer one.
+fn timeout_for(target: &Target) -> Duration {
+    if crate::chain::is_onion(&target.url) {
+        TOR_TIMEOUT
+    } else {
+        TIMEOUT
+    }
+}
+
+/// The error of a call to `target`, as a sentence.
+fn failed(target: &Target) -> impl Fn(electrum_client::Error) -> String {
+    let timeout = timeout_for(target);
+    move |error| describe(&error, timeout)
+}
+
+/// The error as a sentence a person can act on. The crate reports every
+/// failed call as "made one or multiple attempts, all errored" over a
+/// bulleted list, and an I/O failure in the operating system's words,
+/// error number included.
+fn describe(error: &electrum_client::Error, timeout: Duration) -> String {
+    use electrum_client::Error;
+    match error {
+        // The client is left at its default of one attempt, so the list
+        // holds the one failure; the last entry is the freshest anyway.
+        Error::AllAttemptsErrored(errors) => match errors.last() {
+            Some(inner) => describe(inner, timeout),
+            None => "request failed".to_owned(),
+        },
+        Error::IOError(io) => describe_io(io, timeout),
+        Error::SharedIOError(io) => describe_io(io, timeout),
+        Error::Protocol(value) => {
+            let message = value
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map_or_else(|| value.to_string(), str::to_owned);
+            format!("the server refused the request: {message}")
+        }
+        Error::Message(text) => text.clone(),
+        Error::InvalidDNSNameError(host) => format!("{host} is not a valid TLS host name"),
+        Error::CouldNotCreateConnection(_) => "TLS handshake failed".to_owned(),
+        Error::JSON(_) | Error::Hex(_) | Error::Bitcoin(_) | Error::InvalidResponse(_) => {
+            "unexpected response".to_owned()
+        }
+        _ => "request failed".to_owned(),
+    }
+}
+
+fn describe_io(error: &std::io::Error, timeout: Duration) -> String {
+    use std::io::ErrorKind;
+    match error.kind() {
+        // A socket read timeout is `WouldBlock` on Unix and `TimedOut`
+        // on Windows.
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => {
+            format!("timed out after {} s", timeout.as_secs())
+        }
+        ErrorKind::ConnectionRefused
+        | ErrorKind::HostUnreachable
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::NetworkDown => "could not connect".to_owned(),
+        ErrorKind::ConnectionReset
+        | ErrorKind::ConnectionAborted
+        | ErrorKind::BrokenPipe
+        | ErrorKind::UnexpectedEof
+        | ErrorKind::NotConnected => "the connection was closed".to_owned(),
+        _ => {
+            // Name resolution has no kind of its own, and each platform
+            // words it differently.
+            let text = error.to_string();
+            let lower = text.to_ascii_lowercase();
+            if [
+                "lookup",
+                "host is known",
+                "name or service",
+                "nodename nor servname",
+            ]
+            .iter()
+            .any(|phrase| lower.contains(phrase))
+            {
+                "host not found".to_owned()
+            } else {
+                format!("connection failed: {text}")
+            }
+        }
+    }
 }
 
 // --- broadcast ------------------------------------------------------------
@@ -236,12 +326,13 @@ pub(crate) fn broadcast_blocking(
     on_client!(target, proxy, |client| client
         .inner
         .transaction_broadcast(tx)
-        .map_err(|e| broadcast_error(&e)))
+        .map_err(|e| broadcast_error(target, &e)))
 }
 
 /// Electrum returns the node's refusal as a protocol error whose
-/// message is the reason; keep that.
-fn broadcast_error(error: &electrum_client::Error) -> String {
+/// message is the reason; keep that. Anything else is a failure to
+/// reach the node, described as such.
+fn broadcast_error(target: &Target, error: &electrum_client::Error) -> String {
     match error {
         electrum_client::Error::Protocol(value) => {
             let text = value
@@ -251,7 +342,7 @@ fn broadcast_error(error: &electrum_client::Error) -> String {
                 .unwrap_or_else(|| value.to_string());
             crate::chain::esplora::node_message(&text)
         }
-        other => other.to_string(),
+        other => describe(other, timeout_for(target)),
     }
 }
 
@@ -270,7 +361,7 @@ pub(crate) fn fetch_prevout_blocking(
         |client| match client.inner.transaction_get(&outpoint.txid) {
             Ok(tx) => Ok(tx.output.get(outpoint.vout as usize).cloned()),
             Err(electrum_client::Error::Protocol(_)) => Ok(None),
-            Err(error) => Err(error.to_string()),
+            Err(error) => Err(failed(target)(error)),
         }
     )
 }
@@ -288,12 +379,12 @@ pub(crate) fn tx_standing_blocking(
         let tip = client
             .inner
             .block_headers_subscribe()
-            .map_err(|e| e.to_string())?
+            .map_err(failed(target))?
             .height as u32;
         let history = client
             .inner
             .script_get_history(script)
-            .map_err(|e| e.to_string())?;
+            .map_err(failed(target))?;
         let entry = history.iter().find(|entry| entry.tx_hash == *txid);
         Ok(match entry {
             None => (false, None, tip),
@@ -391,6 +482,51 @@ mod tests {
             }
             other => panic!("a changed certificate must be refused, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn errors_read_as_sentences_not_as_the_crate_spells_them() {
+        use electrum_client::Error;
+        let refused = Error::IOError(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert_eq!(describe(&refused, TIMEOUT), "could not connect");
+        // Every call the crate's client makes is reported as a list of
+        // attempts; the sentence is the failure inside.
+        let attempts = Error::AllAttemptsErrored(vec![Error::IOError(std::io::Error::from(
+            std::io::ErrorKind::TimedOut,
+        ))]);
+        assert_eq!(describe(&attempts, TIMEOUT), "timed out after 20 s");
+        assert_eq!(describe(&attempts, TOR_TIMEOUT), "timed out after 60 s");
+        let unix_read_timeout =
+            Error::IOError(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        assert_eq!(
+            describe(&unix_read_timeout, TIMEOUT),
+            "timed out after 20 s"
+        );
+        let lookup = Error::IOError(std::io::Error::other(
+            "failed to lookup address information: Name or service not known",
+        ));
+        assert_eq!(describe(&lookup, TIMEOUT), "host not found");
+        let refusal = Error::Protocol(serde_json::json!({
+            "code": 1,
+            "message": "unknown method"
+        }));
+        assert_eq!(
+            describe(&refusal, TIMEOUT),
+            "the server refused the request: unknown method"
+        );
+        let garbled = Error::JSON(serde_json::from_str::<u32>("x").unwrap_err());
+        assert_eq!(describe(&garbled, TIMEOUT), "unexpected response");
+        assert_eq!(
+            timeout_for(&Target::new(
+                "tcp://gerfautexample000000000000000000000000000000000000000.onion:50001",
+                None
+            )),
+            TOR_TIMEOUT
+        );
+        assert_eq!(
+            timeout_for(&Target::new("ssl://electrum.example:50002", None)),
+            TIMEOUT
+        );
     }
 
     #[test]

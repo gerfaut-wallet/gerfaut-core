@@ -226,14 +226,12 @@ pub(crate) async fn sync_engine(
             esplora::full_scan(&client, request, stop_gap)
                 .await
                 .map(EngineResponse::Full)
-                .map_err(|e| e.to_string())
         }
         (Endpoint::Esplora(url), EngineRequest::Incremental(request)) => {
             let client = esplora::client(url, proxy)?;
             esplora::sync(&client, request)
                 .await
                 .map(EngineResponse::Incremental)
-                .map_err(|e| e.to_string())
         }
         (Endpoint::Electrum(target), EngineRequest::Full(request)) => {
             let target = target.clone();
