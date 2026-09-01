@@ -314,12 +314,11 @@ pub struct PolicySnapshot {
 ///
 /// Fails when the descriptor does not parse, when miniscript cannot
 /// lift it to a policy, or when the policy lets anyone or no one spend.
+/// A taproot descriptor built on the internal key BIP 341 offers as one
+/// nobody holds is read through its tree alone.
 pub fn analyze(input: PolicyInput<'_>) -> CoreResult<PolicySnapshot> {
     let descriptor = parse_descriptor(input.external_descriptor)?;
-    let policy = descriptor
-        .lift()
-        .map_err(|e| CoreError::Descriptor(format!("the policy cannot be read: {e}")))?
-        .normalized();
+    let policy = lift(&descriptor)?.normalized();
     match policy {
         Policy::Trivial => {
             return Err(CoreError::Descriptor(
@@ -428,6 +427,43 @@ fn parse_descriptor(text: &str) -> CoreResult<Descriptor<DescriptorPublicKey>> {
         .into_iter()
         .next()
         .ok_or_else(|| invalid("multipath descriptor without a path".to_owned()))
+}
+
+/// The x-only point BIP 341 offers as an internal key nobody holds, for
+/// a taproot output meant to be spent through its script tree alone. A
+/// descriptor built on it has no key path to speak of: the point is
+/// left out of the keys, and its branch out of the branches.
+const UNSPENDABLE_INTERNAL_KEY: &str =
+    "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+
+/// The semantic policy of a descriptor, a taproot one around the
+/// unspendable point read through its tree alone. Such a descriptor
+/// with no tree lets no one spend, and says so.
+fn lift(descriptor: &Descriptor<DescriptorPublicKey>) -> CoreResult<Semantic> {
+    let unreadable = |e: bdk_wallet::miniscript::Error| {
+        CoreError::Descriptor(format!("the policy cannot be read: {e}"))
+    };
+    if let Descriptor::Tr(tr) = descriptor
+        && is_unspendable(tr.internal_key())
+    {
+        return match tr.tap_tree() {
+            Some(tree) => tree.lift().map_err(unreadable),
+            None => Ok(Policy::Unsatisfiable),
+        };
+    }
+    descriptor.lift().map_err(unreadable)
+}
+
+/// Whether a key is the BIP 341 unspendable point, written x-only or
+/// with the even-parity prefix of a full key.
+fn is_unspendable(key: &DescriptorPublicKey) -> bool {
+    let DescriptorPublicKey::Single(single) = key else {
+        return false;
+    };
+    match single.key {
+        SinglePubKey::XOnly(key) => key.to_string() == UNSPENDABLE_INTERNAL_KEY,
+        SinglePubKey::FullKey(key) => key.to_string() == format!("02{UNSPENDABLE_INTERNAL_KEY}"),
+    }
 }
 
 /// The top-level alternatives: the items of an outer "or", flattened,
@@ -1931,6 +1967,58 @@ mod tests {
         assert_eq!(snapshot.keys[0].fingerprint, Some("3442193e".into()));
         assert_eq!(snapshot.keys[1].fingerprint, Some("5c1bd648".into()));
         assert_eq!(snapshot.keys[0].origin_path, None);
+    }
+
+    /// A taproot output meant to be spent through its tree alone names
+    /// the BIP 341 point nobody holds as its internal key: it is no key
+    /// of the wallet, and no way to spend.
+    #[test]
+    fn the_unspendable_internal_key_is_left_out() {
+        let descriptor = format!(
+            "tr({UNSPENDABLE_INTERNAL_KEY},{{pk({B}/0/*),and_v(v:pk({C}/0/*),older(144))}})"
+        );
+        let snapshot = analyze_with(&descriptor, ScriptKind::Taproot, Vec::new());
+        assert_eq!(snapshot.kind, PolicyKind::Miniscript);
+        assert_eq!(snapshot.policy, "or(pk(Key A),and(pk(Key B),older(144)))");
+        assert_eq!(snapshot.keys.len(), 2, "the point is nobody's key");
+        assert_eq!(snapshot.keys[0].fingerprint, Some("5c1bd648".into()));
+        let roles: Vec<(BranchRole, &str, &str)> = snapshot
+            .branches
+            .iter()
+            .map(|b| (b.role, b.label.as_str(), b.summary.as_str()))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (BranchRole::Primary, "Primary", "Key A"),
+                (
+                    BranchRole::Recovery,
+                    "Recovery",
+                    "Key B, once a coin has waited 144 blocks"
+                ),
+            ]
+        );
+
+        // Around single keys alone, the tree is a plain multisig.
+        let descriptor = format!("tr({UNSPENDABLE_INTERNAL_KEY},{{pk({B}/0/*),pk({C}/0/*)}})");
+        let snapshot = analyze_with(&descriptor, ScriptKind::Taproot, Vec::new());
+        assert_eq!(snapshot.kind, PolicyKind::Multisig);
+        assert_eq!(snapshot.branches.len(), 1);
+        assert_eq!(snapshot.branches[0].summary, "Any of 2 keys");
+
+        // With no tree, nobody can spend at all.
+        let descriptor = format!("tr({UNSPENDABLE_INTERNAL_KEY})");
+        let refused = analyze(PolicyInput {
+            external_descriptor: &descriptor,
+            script: ScriptKind::Taproot,
+            coins: Vec::new(),
+            tip_height: Some(TIP),
+            now_unix: NOW,
+        });
+        assert!(
+            matches!(refused, Err(CoreError::Descriptor(ref detail)) if detail.contains("no one")),
+            "{refused:?}"
+        );
     }
 
     #[test]
