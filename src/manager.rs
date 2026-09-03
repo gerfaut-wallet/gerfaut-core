@@ -2280,7 +2280,10 @@ mod tests {
         ));
 
         let manager = WalletManager::open(dir.path(), key()).unwrap();
-        assert_eq!(manager.list_wallets(None).await[0].icon, WalletIcon::Snowflake);
+        assert_eq!(
+            manager.list_wallets(None).await[0].icon,
+            WalletIcon::Snowflake
+        );
     }
 
     #[tokio::test]
@@ -2291,7 +2294,10 @@ mod tests {
         for (name, input) in [
             ("A", MULTIPATH),
             ("B", ADDRESS),
-            ("C", "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7"),
+            (
+                "C",
+                "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7",
+            ),
         ] {
             let parsed = parse_input(input).unwrap();
             let meta = manager
@@ -2316,7 +2322,10 @@ mod tests {
             .reorder_wallets(&[ids[0].clone(), ids[0].clone()])
             .await
             .unwrap_err();
-        assert!(matches!(refused, CoreError::InvalidInput { .. }), "{refused}");
+        assert!(
+            matches!(refused, CoreError::InvalidInput { .. }),
+            "{refused}"
+        );
         assert!(matches!(
             manager.reorder_wallets(&["nope".to_owned()]).await,
             Err(CoreError::WalletNotFound(_))
@@ -3022,5 +3031,4 @@ mod tests {
             report.failures[0].message
         );
     }
-
 }

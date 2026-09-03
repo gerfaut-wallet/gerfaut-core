@@ -72,7 +72,6 @@ impl BackendConfig {
             }
         }
     }
-
 }
 
 /// Whether a backend URL points at a Tor hidden service. Onion hosts
