@@ -203,7 +203,7 @@ impl Vault {
 mod tests {
     use super::*;
     use crate::input::{RecognizedKind, ScriptKind};
-    use crate::wallet::meta::{CachedTotals, DEFAULT_GAP_LIMIT, WalletKind};
+    use crate::wallet::meta::{CachedTotals, DEFAULT_GAP_LIMIT, WalletIcon, WalletKind};
 
     fn key() -> VaultKey {
         VaultKey::Raw([42u8; 32])
@@ -213,6 +213,7 @@ mod tests {
         WalletMeta {
             id: "0000-test".to_owned(),
             name: "Cold storage".to_owned(),
+            icon: WalletIcon::default(),
             network: Network::Signet,
             kind: WalletKind::Descriptors {
                 external: "wpkh(xpub.../0/*)#checksum".to_owned(),

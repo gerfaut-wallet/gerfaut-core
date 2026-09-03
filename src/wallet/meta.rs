@@ -47,6 +47,42 @@ pub struct CachedTotals {
     pub tx_count: u32,
 }
 
+/// The glyph a wallet shows next to its name, chosen by the user. The
+/// names are Lucide's, the set is fixed so both apps draw the same
+/// icon for the same value; a vault written before icons existed reads
+/// as the generic wallet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalletIcon {
+    #[default]
+    Wallet,
+    /// A single signing key.
+    Key,
+    /// Several keys guarding the coins: multisig, a vault policy.
+    Shield,
+    /// A watched address.
+    MapPin,
+    /// Cold storage.
+    Snowflake,
+    /// A treasury, a company's coins.
+    Landmark,
+    /// Savings.
+    PiggyBank,
+}
+
+impl WalletIcon {
+    /// Every icon, in the order the pickers show them.
+    pub const ALL: [WalletIcon; 7] = [
+        WalletIcon::Wallet,
+        WalletIcon::Key,
+        WalletIcon::Shield,
+        WalletIcon::MapPin,
+        WalletIcon::Snowflake,
+        WalletIcon::Landmark,
+        WalletIcon::PiggyBank,
+    ];
+}
+
 /// A wallet's stored identity. Everything here is metadata: chain state
 /// lives in the wallet record next to it.
 ///
@@ -58,6 +94,10 @@ pub struct WalletMeta {
     /// Stable unique id (UUID v4).
     pub id: String,
     pub name: String,
+    /// The glyph shown next to the name; the generic wallet unless the
+    /// user picked another.
+    #[serde(default)]
+    pub icon: WalletIcon,
     pub network: Network,
     pub kind: WalletKind,
     /// What the import classifier recognized, kept for display.

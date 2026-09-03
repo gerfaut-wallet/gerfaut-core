@@ -35,7 +35,7 @@ use crate::input::{ParsedInput, ParsedPayload, RecognizedKind};
 use crate::lock::{self, AppLock, LockAttempts, LockKind, LockVerdict};
 use crate::network::Network;
 use crate::store::{Settings, Vault, VaultKey, VaultPayload, WalletRecord};
-use crate::wallet::meta::{CachedTotals, SyncStamp, WalletKind, WalletMeta};
+use crate::wallet::meta::{CachedTotals, SyncStamp, WalletIcon, WalletKind, WalletMeta};
 use crate::wallet::policy::{self, PolicySnapshot};
 use crate::wallet::snapshot::{
     AddressEntry, AddressList, NewTx, SyncReport, TxDetail, UtxoInfo, WalletSnapshot,
@@ -352,6 +352,58 @@ impl WalletManager {
         }
         self.state.lock().await.commit(|payload| {
             find_record_mut(payload, id)?.meta.name = name.to_owned();
+            Ok(())
+        })
+    }
+
+    /// Changes the glyph a wallet shows next to its name.
+    pub async fn set_wallet_icon(&self, id: &str, icon: WalletIcon) -> CoreResult<()> {
+        self.state.lock().await.commit(|payload| {
+            find_record_mut(payload, id)?.meta.icon = icon;
+            Ok(())
+        })
+    }
+
+    /// Puts the named wallets in the given order. Only the slots those
+    /// wallets occupy are rearranged: a list shown for one network can
+    /// be reordered without moving the wallets of another. Every id must
+    /// name a wallet, and none may repeat.
+    pub async fn reorder_wallets(&self, ids: &[String]) -> CoreResult<()> {
+        self.state.lock().await.commit(|payload| {
+            let mut seen = std::collections::HashSet::with_capacity(ids.len());
+            for id in ids {
+                if !seen.insert(id.as_str()) {
+                    return Err(CoreError::InvalidInput {
+                        kind: "wallet order",
+                        detail: format!("wallet {id} is listed twice"),
+                    });
+                }
+                if !payload.wallets.iter().any(|record| &record.meta.id == id) {
+                    return Err(CoreError::WalletNotFound(id.clone()));
+                }
+            }
+            // Take the moving records out, keep every other record where
+            // it stands, and pour the movers back into the freed slots in
+            // the requested order.
+            let slots: Vec<usize> = payload
+                .wallets
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| seen.contains(record.meta.id.as_str()))
+                .map(|(index, _)| index)
+                .collect();
+            let mut movers: Vec<Option<WalletRecord>> = Vec::with_capacity(ids.len());
+            for id in ids {
+                let position = payload
+                    .wallets
+                    .iter()
+                    .position(|record| &record.meta.id == id)
+                    .expect("checked above");
+                movers.push(Some(payload.wallets[position].clone()));
+            }
+            for (slot, mover) in slots.into_iter().zip(movers.iter_mut()) {
+                payload.wallets[slot] = mover.take().expect("one mover per slot");
+            }
             Ok(())
         })
     }
@@ -1630,6 +1682,7 @@ fn fresh_meta(
     WalletMeta {
         id: uuid::Uuid::new_v4().to_string(),
         name: name.to_owned(),
+        icon: WalletIcon::default(),
         network,
         kind,
         recognized_as,
@@ -2205,6 +2258,72 @@ mod tests {
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         let wallets = manager.list_wallets(None).await;
         assert_eq!(wallets[0].name, "New name");
+    }
+
+    #[tokio::test]
+    async fn icon_defaults_to_the_wallet_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input(MULTIPATH).unwrap();
+        let meta = manager
+            .add_wallet("Cold", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        assert_eq!(meta.icon, WalletIcon::Wallet);
+        manager
+            .set_wallet_icon(&meta.id, WalletIcon::Snowflake)
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.set_wallet_icon("nope", WalletIcon::Key).await,
+            Err(CoreError::WalletNotFound(_))
+        ));
+
+        let manager = WalletManager::open(dir.path(), key()).unwrap();
+        assert_eq!(manager.list_wallets(None).await[0].icon, WalletIcon::Snowflake);
+    }
+
+    #[tokio::test]
+    async fn reorder_persists_and_leaves_the_rest_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let mut ids = Vec::new();
+        for (name, input) in [
+            ("A", MULTIPATH),
+            ("B", ADDRESS),
+            ("C", "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7"),
+        ] {
+            let parsed = parse_input(input).unwrap();
+            let meta = manager
+                .add_wallet(name, &parsed, Network::Signet)
+                .await
+                .unwrap();
+            ids.push(meta.id);
+        }
+        let names = |wallets: Vec<WalletMeta>| -> Vec<String> {
+            wallets.into_iter().map(|meta| meta.name).collect()
+        };
+
+        // Only two of the three are named: they swap, the third keeps
+        // its slot.
+        manager
+            .reorder_wallets(&[ids[2].clone(), ids[0].clone()])
+            .await
+            .unwrap();
+        assert_eq!(names(manager.list_wallets(None).await), ["C", "B", "A"]);
+
+        let refused = manager
+            .reorder_wallets(&[ids[0].clone(), ids[0].clone()])
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, CoreError::InvalidInput { .. }), "{refused}");
+        assert!(matches!(
+            manager.reorder_wallets(&["nope".to_owned()]).await,
+            Err(CoreError::WalletNotFound(_))
+        ));
+
+        let manager = WalletManager::open(dir.path(), key()).unwrap();
+        assert_eq!(names(manager.list_wallets(None).await), ["C", "B", "A"]);
     }
 
     #[tokio::test]
