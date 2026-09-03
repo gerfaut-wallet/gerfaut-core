@@ -9,14 +9,10 @@ license = "AGPL-3.0-only"
 publish = false
 
 [features]
-# No Tor client is built in by default: a consumer asks for one.
-#
-# The mobile app does, because a phone rarely runs a Tor daemon and
-# Orbot is a second app to install. The desktop does not: a machine
-# that wants .onion runs Tor or the Tor Browser already, and arti pulls
-# in `saturating-time`, whose limit search does not terminate when the
-# clock's resolution is coarser than a nanosecond — which is the case
-# on Windows. Turning it on there needs an upstream fix.
+# No Tor client is built in by default: a consumer asks for one. Both
+# apps do: a phone rarely runs a Tor daemon and Orbot is a second app
+# to install, and a desktop user should not have to install Tor to
+# read a .onion backend either.
 default = []
 # A Tor client built into the library, so .onion backends work on a
 # device with no Tor daemon. Off, .onion hosts still work through a
@@ -61,3 +57,12 @@ futures-util = { version = "0.3", default-features = false, optional = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# arti pulls in `saturating-time`, whose limit search never terminates
+# on a clock coarser than a nanosecond: Windows counts 100 ns intervals,
+# so adding 1 ns returns the same value and the loop takes that for
+# progress (arti #2678). The fork pins the three-line fix; drop it once
+# a release carries one. Every manifest that builds this crate needs the
+# same section: Cargo only honours [patch] in the root manifest.
+[patch.crates-io]
+saturating-time = { git = "https://github.com/gerfaut-wallet/saturating-time", rev = "7bef6ba00f3adaa6aff7e68966614c9d55bb60ec" }
