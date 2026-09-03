@@ -49,13 +49,12 @@ pub struct CachedTotals {
 
 /// The glyph a wallet shows next to its name, chosen by the user. The
 /// names are Lucide's, the set is fixed so both apps draw the same
-/// icon for the same value; a vault written before icons existed reads
-/// as the generic wallet.
+/// icon for the same value. A vault written before icons existed reads
+/// as the generic wallet, and so does a name this build does not know:
+/// a backup from a newer build must still open here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WalletIcon {
-    #[default]
-    Wallet,
     /// A single signing key.
     Key,
     /// Several keys guarding the coins: multisig, a vault policy.
@@ -68,19 +67,11 @@ pub enum WalletIcon {
     Landmark,
     /// Savings.
     PiggyBank,
-}
-
-impl WalletIcon {
-    /// Every icon, in the order the pickers show them.
-    pub const ALL: [WalletIcon; 7] = [
-        WalletIcon::Wallet,
-        WalletIcon::Key,
-        WalletIcon::Shield,
-        WalletIcon::MapPin,
-        WalletIcon::Snowflake,
-        WalletIcon::Landmark,
-        WalletIcon::PiggyBank,
-    ];
+    /// The generic wallet: the default, and what any unknown name
+    /// becomes (serde wants that catch-all declared last).
+    #[default]
+    #[serde(other)]
+    Wallet,
 }
 
 /// A wallet's stored identity. Everything here is metadata: chain state
@@ -123,4 +114,37 @@ pub struct WalletMeta {
 /// default gap: only a setting above it needs a new full scan.
 fn default_scan_gap() -> u32 {
     DEFAULT_GAP_LIMIT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icon_reads_snake_case_and_forgives_the_unknown() {
+        assert_eq!(
+            serde_json::to_string(&WalletIcon::PiggyBank).unwrap(),
+            "\"piggy_bank\""
+        );
+        assert_eq!(
+            serde_json::from_str::<WalletIcon>("\"map_pin\"").unwrap(),
+            WalletIcon::MapPin
+        );
+        // A name a newer build invented, or a vault from before icons
+        // existed, both read as the plain wallet rather than refusing
+        // the whole vault.
+        assert_eq!(
+            serde_json::from_str::<WalletIcon>("\"dragon\"").unwrap(),
+            WalletIcon::Wallet
+        );
+        #[derive(Deserialize)]
+        struct Holder {
+            #[serde(default)]
+            icon: WalletIcon,
+        }
+        assert_eq!(
+            serde_json::from_str::<Holder>("{}").unwrap().icon,
+            WalletIcon::Wallet
+        );
+    }
 }
