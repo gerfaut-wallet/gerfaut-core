@@ -1485,19 +1485,6 @@ impl WalletManager {
         Ok(Some(route.proxy()))
     }
 
-    /// Fee estimates for a network, through the same route the chain
-    /// takes: an onion backend must not have its name looked up here
-    /// when every other call is careful not to.
-    pub async fn fetch_fees(&self, network: Network) -> CoreResult<crate::fees::FeeEstimates> {
-        let (config, certs) = {
-            let state = self.state.lock().await;
-            state.chain_setup(network)
-        };
-        let endpoints = chain::endpoints(&config, network, &certs)?;
-        let proxy = self.tor_proxy_for(&endpoints).await?;
-        crate::fees::fetch_fees_for(network, &config, proxy.as_deref()).await
-    }
-
     /// What resolving a route needs from the state, copied out.
     async fn tor_setup(&self) -> (TorSettings, PathBuf) {
         let state = self.state.lock().await;
@@ -2917,34 +2904,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_onion_backend_never_has_its_fees_looked_up() {
-        // Every other call is careful to route an onion host through
-        // Tor; the fee card must not be the one that leaks the name.
-        let dir = tempfile::tempdir().unwrap();
-        let manager = manager(dir.path()).await;
-        manager
-            .set_backend(
-                Network::Signet,
-                BackendConfig::CustomEsplora {
-                    url: "http://gerfautexample000000000000000000000000000000000000000.onion"
-                        .to_owned(),
-                },
-            )
-            .await
-            .unwrap();
-        manager
-            .set_tor_settings(TorSettings {
-                mode: TorMode::System,
-                socks_proxy: Some("127.0.0.1:1".to_owned()),
-            })
-            .await
-            .unwrap();
-
-        let refused = manager.fetch_fees(Network::Signet).await.unwrap_err();
-        assert!(
-            matches!(refused, CoreError::Tor(_)),
-            "the route must be refused before the name is used: {refused}"
-        );
-    }
 }

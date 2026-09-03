@@ -73,28 +73,6 @@ impl BackendConfig {
         }
     }
 
-    /// The HTTP base fee estimates should come from, when this backend
-    /// speaks Esplora: the user's own node, or the public server they
-    /// picked. `None` means no preference, so the public rotation
-    /// answers.
-    pub(crate) fn fee_base(&self, network: Network) -> Option<&str> {
-        match self {
-            BackendConfig::Public { server } => server
-                .as_deref()
-                .and_then(|id| public::find(network, id))
-                .filter(|entry| entry.protocol() == public::ServerProtocol::Esplora)
-                .map(|entry| entry.url()),
-            BackendConfig::CustomEsplora { url } => Some(url.as_str()),
-            BackendConfig::CustomElectrum { .. } => None,
-        }
-    }
-
-    /// Whether fee estimates may fall back to the public servers. A
-    /// user running their own node asked for exactly one host: an empty
-    /// fee card beats a silent call to a public one.
-    pub(crate) fn fees_may_fall_back(&self) -> bool {
-        !matches!(self, BackendConfig::CustomEsplora { .. })
-    }
 }
 
 /// Whether a backend URL points at a Tor hidden service. Onion hosts
@@ -594,34 +572,5 @@ mod tests {
         );
         // A network without a public instance still says so.
         assert!(endpoints(&BackendConfig::default(), Network::Regtest, &none).is_err());
-    }
-
-    #[test]
-    fn fee_estimates_follow_the_backend() {
-        assert_eq!(BackendConfig::default().fee_base(Network::Mainnet), None);
-        assert_eq!(
-            BackendConfig::Public {
-                server: Some("mempool.emzy.de".to_owned())
-            }
-            .fee_base(Network::Mainnet),
-            Some("https://mempool.emzy.de/api")
-        );
-        // An Electrum server serves no HTTP fee endpoint.
-        assert_eq!(
-            BackendConfig::Public {
-                server: Some("electrum:blockstream.info".to_owned())
-            }
-            .fee_base(Network::Mainnet),
-            None
-        );
-        let own = BackendConfig::CustomEsplora {
-            url: "https://node.example.org/api".to_owned(),
-        };
-        assert_eq!(
-            own.fee_base(Network::Mainnet),
-            Some("https://node.example.org/api")
-        );
-        assert!(!own.fees_may_fall_back());
-        assert!(BackendConfig::default().fees_may_fall_back());
     }
 }
