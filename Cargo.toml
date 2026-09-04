@@ -57,6 +57,9 @@ futures-util = { version = "0.3", default-features = false, optional = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# So `tests/tls_provider.rs` can name the backend it expects. Already a
+# dependency above; this only makes it visible to the test crates.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # arti pulls in `saturating-time`, whose limit search never terminates
 # on a clock coarser than a nanosecond: Windows counts 100 ns intervals,

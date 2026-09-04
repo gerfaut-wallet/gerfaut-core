@@ -119,6 +119,12 @@ impl WalletManager {
     /// Opens (or creates) the vault at `data_dir/gerfaut.vault`, and
     /// reads back the unlock attempts recorded beside it.
     pub fn open(data_dir: impl Into<PathBuf>, key: VaultKey) -> CoreResult<Self> {
+        // Before anything here can open a socket. Two rustls backends
+        // are compiled in and the first one installed serves the whole
+        // process, so the choice is made in the open rather than won by
+        // whichever connection happens to go first. See
+        // `chain::tls::provider`.
+        crate::chain::tls::provider();
         let data_dir = data_dir.into();
         let (vault, payload) = Vault::open_or_create(data_dir.join(VAULT_FILE), key)?;
         let attempts = LockAttempts::load(data_dir.join(ATTEMPTS_FILE));

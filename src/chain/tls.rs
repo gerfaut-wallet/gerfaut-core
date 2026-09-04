@@ -130,6 +130,17 @@ pub fn is_fingerprint(value: &str) -> bool {
 
 /// The crypto provider this module, `electrum-client` and the embedded
 /// Tor client all use.
+///
+/// It is ring, and it is installed rather than inferred. `rustls` can
+/// carry two backends at once, and it does here: `electrum-client`'s
+/// `rustls` feature turns on `rustls/default`, which pulls `aws-lc-rs`
+/// into the tree even under `use-rustls-ring`. With both compiled in,
+/// `rustls` has no single obvious default, and the first caller to
+/// install one decides for the whole process — which is this function.
+/// `aws-lc-rs` is therefore built and linked without ever being asked
+/// to do anything: it costs compile time and binary weight, and nothing
+/// else. The fix belongs upstream, in the feature list of
+/// `rust-electrum-client`.
 pub(crate) fn provider() -> Arc<CryptoProvider> {
     // `electrum-client` installs the same ring provider the first time
     // it opens a TLS connection; installing it here first is harmless
