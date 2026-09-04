@@ -19,3 +19,18 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+
+  # Both apps ship with the Tor client compiled in, and nothing above
+  # builds that code. Checking it here keeps the shipped configuration
+  # honest without paying for a full arti test run on every push.
+  embedded-tor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: embedded-tor
+      - name: Lint with the Tor client built in
+        run: cargo clippy --all-targets --features embedded-tor -- -D warnings
