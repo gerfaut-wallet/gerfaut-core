@@ -28,6 +28,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # verifier; the same version and provider `bdk_electrum` pulls in.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
+# Ed25519 verification of premium licences and heartbeats; the version
+# rustls already pulls in, so nothing new is compiled.
+ring = "0.17"
 # Reads a certificate the way it was written: its fingerprint's
 # subject and expiry for the acceptance dialog, and its public key
 # when the certificate predates X.509 v3 and webpki declines it.
@@ -60,6 +63,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # So `tests/tls_provider.rs` can name the backend it expects. Already a
 # dependency above; this only makes it visible to the test crates.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Tests sign the licences they then verify. The library itself never
+# signs anything and does not depend on this.
+ed25519-dalek = "2"
 
 # arti pulls in `saturating-time`, whose limit search never terminates
 # on a clock coarser than a nanosecond: Windows counts 100 ns intervals,

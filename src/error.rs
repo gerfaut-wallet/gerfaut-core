@@ -65,6 +65,10 @@ pub enum CoreError {
     #[error("descriptor error: {0}")]
     Descriptor(String),
 
+    /// The premium server, or what it signed, said no.
+    #[error(transparent)]
+    Premium(#[from] PremiumError),
+
     /// Internal invariant violation. Indicates a bug in this crate.
     #[error("internal error: {0}")]
     Internal(String),
@@ -94,4 +98,22 @@ pub enum VaultError {
 
     #[error("key derivation failed: {0}")]
     Kdf(String),
+}
+
+/// Errors of the premium client and the licence checks, sorted by what
+/// the screen does about them.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PremiumError {
+    /// The certificate is malformed, or not signed by the licence key.
+    #[error("invalid licence certificate: {0}")]
+    InvalidCertificate(String),
+
+    /// The heartbeat is malformed, or not signed by the licence key.
+    #[error("invalid heartbeat: {0}")]
+    InvalidHeartbeat(String),
+
+    /// The heartbeat is genuine but its clock sits too far from this
+    /// device's: a replay, a stale cache, or a clock to fix.
+    #[error("the heartbeat is {skew} seconds off this device's clock")]
+    StaleHeartbeat { skew: i64 },
 }

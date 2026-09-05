@@ -18,6 +18,7 @@ pub mod input;
 pub mod lock;
 pub mod manager;
 pub mod network;
+pub mod premium;
 pub mod price;
 pub mod store;
 pub mod updates;
