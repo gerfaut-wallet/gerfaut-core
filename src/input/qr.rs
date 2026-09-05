@@ -465,6 +465,15 @@ fn hex(bytes: &[u8]) -> String {
 
 // --- BBQr ----------------------------------------------------------------
 
+/// Largest payload a compressed BBQr may inflate to: the cap of the
+/// broadcast page, the largest consumer of an assembled frame. Deflate
+/// reaches a thousand to one, so a frame of a few hundred kilobytes
+/// used to come out as hundreds of megabytes before the same cap
+/// refused it one step later. Nothing past it could ever be read, and
+/// every file type comes out at least as long as the bytes it holds:
+/// stopping the inflation here loses nothing.
+const MAX_INFLATED_LEN: usize = 4_000_000;
+
 /// Header of a BBQr frame: `B$` + encoding + file type + total + index.
 struct BbqrHeader {
     encoding: char,
@@ -543,9 +552,17 @@ fn assemble_bbqr(frames: &[&str]) -> CoreResult<QrProgress> {
         'Z' => {
             let compressed = decode_base32(&joined)?;
             let mut text = Vec::new();
+            // Bounded: one byte past the cap is enough to know the
+            // payload is over it, and the rest is never inflated.
             flate2::read::DeflateDecoder::new(&compressed[..])
+                .take(MAX_INFLATED_LEN as u64 + 1)
                 .read_to_end(&mut text)
                 .map_err(|e| qr_error(format!("invalid BBQr compressed payload: {e}")))?;
+            if text.len() > MAX_INFLATED_LEN {
+                return Err(qr_error(
+                    "this BBQr code expands to far more than any transaction or wallet",
+                ));
+            }
             text
         }
         other => return Err(qr_error(format!("unsupported BBQr encoding `{other}`"))),
@@ -874,6 +891,48 @@ mod tests {
         let mut frames = bbqr_frames(&descriptor, 2);
         frames.insert(1, "B$ZU0201\u{e9}".to_owned());
         assert_eq!(assemble(&frames).unwrap().text.unwrap(), descriptor);
+    }
+
+    /// Two hundred megabytes of zeroes deflate to a frame of a few
+    /// hundred kilobytes, small enough for the broadcast page to accept
+    /// it. It used to inflate whole before that page refused the
+    /// result; now the inflation stops one byte past the cap.
+    #[test]
+    fn a_bbqr_that_inflates_without_end_is_refused_before_it_does() {
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        let zeroes = vec![b'0'; 1 << 20];
+        for _ in 0..200 {
+            encoder.write_all(&zeroes).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+        let frame = format!(
+            "B$ZU0100{}",
+            data_encoding::BASE32_NOPAD.encode(&compressed)
+        );
+        assert!(frame.len() < 4_000_000, "{} bytes", frame.len());
+
+        let refused = assemble(std::slice::from_ref(&frame)).unwrap_err();
+        assert!(
+            refused.to_string().contains("expands to far more"),
+            "{refused}"
+        );
+        let refused = crate::broadcast::decode_transaction(&frame).unwrap_err();
+        assert!(
+            refused.to_string().contains("expands to far more"),
+            "{refused}"
+        );
+
+        // Right under the cap, the same encoding still opens.
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&vec![b'0'; MAX_INFLATED_LEN]).unwrap();
+        let frame = format!(
+            "B$ZU0100{}",
+            data_encoding::BASE32_NOPAD.encode(&encoder.finish().unwrap())
+        );
+        let opened = assemble(&[frame]).unwrap();
+        assert_eq!(opened.text.unwrap().len(), MAX_INFLATED_LEN);
     }
 
     /// BBQr binary types come out in their text form: a PSBT as base64,
