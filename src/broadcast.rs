@@ -67,8 +67,9 @@ pub struct WalletRef {
 pub struct TxInputPreview {
     pub txid: String,
     pub vout: u32,
-    /// Value of the output being spent, when known: from the PSBT, from
-    /// a watched wallet, or fetched from the backend.
+    /// Value of the output being spent, when known: from a watched
+    /// wallet or from the backend first, from the PSBT only when neither
+    /// knows the coin. What the PSBT declares is its author's word.
     pub value_sats: Option<u64>,
     /// Address of the output being spent, when known.
     pub address: Option<String>,
@@ -112,6 +113,9 @@ pub enum TxWarningKind {
     InputUnknown,
     /// An input was already spent, by this transaction or another.
     InputSpent,
+    /// The PSBT declares a coin other than the one the wallet or the
+    /// backend holds at that outpoint: another value, another script.
+    InputMismatch,
     /// The fee could not be computed: an input's value is unknown.
     FeeUnknown,
     /// An output below the dust threshold.
@@ -145,6 +149,11 @@ impl TxWarningKind {
             // A fee far above what the chain asks, or eating a large
             // share of the inputs, is money gone the moment it is sent.
             TxWarningKind::HighFeeRate | TxWarningKind::HighFeeShare => TxSeverity::Alert,
+            // A PSBT that declares a coin other than the one the chain
+            // holds hides what the transaction really costs: the fee it
+            // shows is whatever its author chose, and the signature is
+            // valid over the real one.
+            TxWarningKind::InputMismatch => TxSeverity::Alert,
             // Nothing here costs anything: an input the backend has not
             // indexed, a time lock, a fee that could not be computed, an
             // output under the dust threshold, a coin of a watched
@@ -436,7 +445,12 @@ pub fn build_preview(
         .enumerate()
         .map(|(i, input)| {
             let facts = input_facts.get(i).cloned().unwrap_or_default();
-            let prevout = decoded.inputs[i].prevout.clone().or(facts.prevout);
+            // What the wallet or the backend holds at that outpoint
+            // comes first: the PSBT's own word about the coin it spends
+            // is its author's, and a finalized input is never checked
+            // against anything. The PSBT fills in only where neither
+            // knows the coin.
+            let prevout = facts.prevout.or_else(|| decoded.inputs[i].prevout.clone());
             TxInputPreview {
                 txid: input.previous_output.txid.to_string(),
                 vout: input.previous_output.vout,
@@ -487,6 +501,34 @@ pub fn build_preview(
         ));
     }
     for (i, facts) in input_facts.iter().enumerate() {
+        // The PSBT and the chain disagree on the coin: a value or a
+        // script the signer was shown that is not the one being spent.
+        if let (Some(known), Some(claimed)) = (
+            facts.prevout.as_ref(),
+            decoded.inputs.get(i).and_then(|d| d.prevout.as_ref()),
+        ) && known != claimed
+        {
+            let source = facts
+                .wallet
+                .as_ref()
+                .map_or("the backend", |wallet| wallet.name.as_str());
+            let place = |prevout: &TxOut| {
+                address_of(&prevout.script_pubkey)
+                    .unwrap_or_else(|| format!("script {:x}", prevout.script_pubkey))
+            };
+            warnings.push(TxWarning::new(
+                TxWarningKind::InputMismatch,
+                format!(
+                    "Input {i} is not what the PSBT says: it declares {} sats on {}, but \
+                     {source} knows this coin as {} sats on {}. The fee shown goes by \
+                     {source}; whoever built this PSBT was handed a different coin.",
+                    claimed.value.to_sat(),
+                    place(claimed),
+                    known.value.to_sat(),
+                    place(known)
+                ),
+            ));
+        }
         if facts.unknown {
             warnings.push(TxWarning::new(
                 TxWarningKind::InputUnknown,
@@ -617,13 +659,14 @@ mod tests {
     /// break this test rather than fall silently into a tone. Red is a
     /// budget — it has to stay spendable the day it matters.
     #[test]
-    fn every_caution_has_a_tone_and_only_four_are_red() {
+    fn every_caution_has_a_tone_and_only_five_are_red() {
         use TxWarningKind::*;
         let table = [
             (Unsigned, TxSeverity::Alert),
             (InputSpent, TxSeverity::Alert),
             (HighFeeRate, TxSeverity::Alert),
             (HighFeeShare, TxSeverity::Alert),
+            (InputMismatch, TxSeverity::Alert),
             (InputUnknown, TxSeverity::Info),
             (Locked, TxSeverity::Info),
             (FeeUnknown, TxSeverity::Info),
@@ -637,7 +680,7 @@ mod tests {
             .iter()
             .filter(|(_, s)| *s == TxSeverity::Alert)
             .count();
-        assert_eq!(red, 4, "red widened without a decision");
+        assert_eq!(red, 5, "red widened without a decision");
     }
 
     /// The tone travels with the caution: a screen reads it, never
@@ -867,6 +910,321 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|w| w.kind == TxWarningKind::Locked)
+        );
+    }
+
+    // --- a PSBT that lies about the coin it spends ---------------------
+    //
+    // A finalized PSBT is what every signer hands a broadcaster, and a
+    // finalized input never meets the interpreter: whatever it declares
+    // about the coin is taken on its word. Regtest, a throwaway key, no
+    // network; the coin is worth REAL, the PSBT says CLAIMED.
+
+    use bdk_wallet::bitcoin::secp256k1::{Message, SecretKey};
+    use bdk_wallet::bitcoin::sighash::{EcdsaSighashType, SighashCache};
+    use bdk_wallet::bitcoin::{CompressedPublicKey, PublicKey, ecdsa};
+
+    /// What the coin is really worth, on chain and in the watched wallet.
+    const REAL: u64 = 100_000;
+    /// What the hostile PSBT claims it is worth.
+    const CLAIMED: u64 = 10_200;
+    /// What the transaction pays out: a real fee of 90 000 sats, a
+    /// claimed one of 200.
+    const PAID: u64 = 10_000;
+
+    fn throwaway_key() -> (SecretKey, CompressedPublicKey) {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let pk = CompressedPublicKey(bdk_wallet::bitcoin::secp256k1::PublicKey::from_secret_key(
+            &secp, &sk,
+        ));
+        (sk, pk)
+    }
+
+    /// The transaction that created the coin, with its true value.
+    fn funding(spk: &ScriptBuf) -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(REAL),
+                script_pubkey: spk.clone(),
+            }],
+        }
+    }
+
+    fn spend(prev: OutPoint) -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(PAID),
+                script_pubkey: p2wpkh(0x11),
+            }],
+        }
+    }
+
+    /// What the manager fills in when a watched wallet holds the coin.
+    fn wallet_facts(spk: &ScriptBuf) -> Vec<InputFacts> {
+        vec![InputFacts {
+            prevout: Some(TxOut {
+                value: Amount::from_sat(REAL),
+                script_pubkey: spk.clone(),
+            }),
+            wallet: Some(WalletRef {
+                id: "w1".into(),
+                name: "Cold storage".into(),
+            }),
+            spent: Some(false),
+            unknown: false,
+        }]
+    }
+
+    fn kinds(preview: &TxPreview) -> Vec<TxWarningKind> {
+        preview.warnings.iter().map(|w| w.kind).collect()
+    }
+
+    /// A P2WPKH spend signed over the REAL amount: the network accepts
+    /// it, with a 90 000 sat fee.
+    fn signed_p2wpkh() -> (
+        Transaction,
+        ScriptBuf,
+        ecdsa::Signature,
+        CompressedPublicKey,
+    ) {
+        let secp = Secp256k1::new();
+        let (sk, pk) = throwaway_key();
+        let spk = ScriptBuf::new_p2wpkh(&pk.wpubkey_hash());
+        let fund = funding(&spk);
+        let mut tx = spend(OutPoint::new(fund.compute_txid(), 0));
+        let sighash = SighashCache::new(&tx)
+            .p2wpkh_signature_hash(0, &spk, Amount::from_sat(REAL), EcdsaSighashType::All)
+            .unwrap();
+        let sig = ecdsa::Signature {
+            signature: secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &sk),
+            sighash_type: EcdsaSighashType::All,
+        };
+        tx.input[0].witness = Witness::p2wpkh(&sig, &pk.0);
+        (tx, spk, sig, pk)
+    }
+
+    fn lying_finalized_psbt() -> (Psbt, Transaction, ScriptBuf) {
+        let (tx, spk, _, _) = signed_p2wpkh();
+        let mut psbt = Psbt::from_unsigned_tx(spend(tx.input[0].previous_output)).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(CLAIMED),
+            script_pubkey: spk.clone(),
+        });
+        psbt.inputs[0].final_script_witness = Some(tx.input[0].witness.clone());
+        (psbt, tx, spk)
+    }
+
+    /// The wallet's knowledge wins over the PSBT's word: the real value
+    /// is shown, the real fee computed, both fee alerts fire, and the
+    /// disagreement itself is the loudest caution of all.
+    #[test]
+    fn a_finalized_psbt_cannot_talk_the_preview_out_of_what_the_wallet_knows() {
+        let (psbt, tx, spk) = lying_finalized_psbt();
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        assert!(decoded.ready, "a finalized input is accepted as signed");
+        assert_eq!(decoded.tx, tx, "the extracted tx is the network-valid one");
+
+        let preview = build_preview(
+            &decoded,
+            Network::Regtest,
+            &wallet_facts(&spk),
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(preview.inputs[0].value_sats, Some(REAL));
+        assert_eq!(
+            preview.inputs[0].wallet.as_ref().unwrap().name,
+            "Cold storage"
+        );
+        assert_eq!(
+            preview.fee_sats,
+            Some(REAL - PAID),
+            "the real fee: 90 000 sats"
+        );
+        let k = kinds(&preview);
+        assert!(k.contains(&TxWarningKind::InputMismatch), "{k:?}");
+        assert!(k.contains(&TxWarningKind::HighFeeRate), "{k:?}");
+        assert!(k.contains(&TxWarningKind::HighFeeShare), "{k:?}");
+        assert!(k.contains(&TxWarningKind::SpendsWatched), "{k:?}");
+        let mismatch = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InputMismatch)
+            .unwrap();
+        assert_eq!(mismatch.severity, TxSeverity::Alert);
+        assert!(
+            mismatch.message.contains("10200 sats"),
+            "{}",
+            mismatch.message
+        );
+        assert!(
+            mismatch.message.contains("100000 sats"),
+            "{}",
+            mismatch.message
+        );
+        assert!(
+            mismatch.message.contains("Cold storage"),
+            "{}",
+            mismatch.message
+        );
+
+        // The same bytes as a raw transaction read exactly the same.
+        let raw = decode_bytes_as_transaction(&encode::serialize(&tx)).unwrap();
+        let from_raw = build_preview(
+            &raw,
+            Network::Regtest,
+            &wallet_facts(&spk),
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(from_raw.fee_sats, preview.fee_sats);
+        assert_eq!(from_raw.inputs[0].value_sats, preview.inputs[0].value_sats);
+        assert!(!kinds(&from_raw).contains(&TxWarningKind::InputMismatch));
+    }
+
+    /// The signature really commits to the REAL amount: what the PSBT
+    /// carries is not garbage a node would refuse, it is a transaction
+    /// the network accepts with a 90 000 sat fee.
+    #[test]
+    fn the_lying_psbt_carries_a_signature_valid_over_the_real_amount() {
+        let secp = Secp256k1::verification_only();
+        let (tx, spk, sig, pk) = signed_p2wpkh();
+        let over = |amount: u64| {
+            let h = SighashCache::new(&tx)
+                .p2wpkh_signature_hash(0, &spk, Amount::from_sat(amount), EcdsaSighashType::All)
+                .unwrap();
+            secp.verify_ecdsa(
+                &Message::from_digest(h.to_byte_array()),
+                &sig.signature,
+                &pk.0,
+            )
+            .is_ok()
+        };
+        assert!(over(REAL));
+        assert!(!over(CLAIMED));
+    }
+
+    /// The word of a backend counts the same as a wallet's: a coin the
+    /// vault does not hold, that the chain describes otherwise than the
+    /// PSBT does, is flagged too, and a script that differs is as much
+    /// of a mismatch as a value.
+    #[test]
+    fn the_backend_word_counts_as_much_as_the_wallets() {
+        let (psbt, _, _) = lying_finalized_psbt();
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        let from_chain = vec![InputFacts {
+            prevout: Some(TxOut {
+                value: Amount::from_sat(CLAIMED),
+                script_pubkey: p2wpkh(0x44),
+            }),
+            wallet: None,
+            spent: Some(false),
+            unknown: false,
+        }];
+        let preview = build_preview(&decoded, Network::Regtest, &from_chain, &[], Some(100), 0);
+        let mismatch = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InputMismatch)
+            .expect("a script that differs is a mismatch");
+        assert!(
+            mismatch.message.contains("the backend"),
+            "{}",
+            mismatch.message
+        );
+        assert_eq!(
+            preview.inputs[0].address,
+            Address::from_script(&p2wpkh(0x44), Network::Regtest.to_bitcoin())
+                .ok()
+                .map(|a| a.to_string())
+        );
+    }
+
+    /// The honest path did not move: a PSBT whose word matches what
+    /// the wallet knows previews exactly as it always did, and a coin
+    /// nobody but the PSBT knows still reads its value from it.
+    #[test]
+    fn an_honest_psbt_previews_as_before() {
+        let (tx, spk, _, _) = signed_p2wpkh();
+        let mut psbt = Psbt::from_unsigned_tx(spend(tx.input[0].previous_output)).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(REAL),
+            script_pubkey: spk.clone(),
+        });
+        psbt.inputs[0].final_script_witness = Some(tx.input[0].witness.clone());
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+
+        let known = build_preview(
+            &decoded,
+            Network::Regtest,
+            &wallet_facts(&spk),
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(known.fee_sats, Some(REAL - PAID));
+        assert_eq!(
+            kinds(&known),
+            vec![
+                TxWarningKind::HighFeeRate,
+                TxWarningKind::HighFeeShare,
+                TxWarningKind::SpendsWatched
+            ]
+        );
+
+        let alone = build_preview(
+            &decoded,
+            Network::Regtest,
+            &[InputFacts::default()],
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(alone.inputs[0].value_sats, Some(REAL));
+        assert_eq!(alone.fee_sats, Some(REAL - PAID));
+        assert!(!kinds(&alone).contains(&TxWarningKind::InputMismatch));
+    }
+
+    /// Only a PSBT still carrying partial signatures meets the
+    /// interpreter, where a lie about the amount breaks the signature.
+    /// No signer hands a broadcaster a PSBT in that state, which is why
+    /// the preview cannot rely on it.
+    #[test]
+    fn an_unfinalized_segwit_psbt_that_lies_does_not_finalize() {
+        let (tx, spk, sig, pk) = signed_p2wpkh();
+        let mut psbt = Psbt::from_unsigned_tx(spend(tx.input[0].previous_output)).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(CLAIMED),
+            script_pubkey: spk.clone(),
+        });
+        psbt.inputs[0].partial_sigs.insert(PublicKey::from(pk), sig);
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        assert!(!decoded.ready, "the sighash covers the amount");
+        assert!(!decoded.inputs[0].signed);
+        psbt.inputs[0].witness_utxo.as_mut().unwrap().value = Amount::from_sat(REAL);
+        assert!(
+            decode_bytes_as_transaction(&psbt.serialize())
+                .unwrap()
+                .ready
         );
     }
 }

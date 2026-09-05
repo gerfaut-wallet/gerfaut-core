@@ -988,11 +988,12 @@ impl WalletManager {
 
         // What only the chain knows, outside the lock: the coins the
         // vault does not hold, and whether known coins are still
-        // unspent. One endpoint, the first that answers.
-        let unresolved: Vec<usize> = (0..outpoints.len())
-            .filter(|&i| decoded.inputs[i].prevout.is_none() && input_facts[i].prevout.is_none())
-            .collect();
-        let needs_chain = !unresolved.is_empty() || input_facts.iter().any(|f| f.spent.is_none());
+        // unspent. One endpoint, the first that answers. A coin the
+        // PSBT describes is asked about all the same: its word is its
+        // author's, and the preview confronts it with the chain's.
+        let needs_chain = input_facts
+            .iter()
+            .any(|f| f.prevout.is_none() || f.spent.is_none());
         if needs_chain
             && let Ok(endpoints) = chain::endpoints(&config, network, &certs)
             && let Ok(proxy) = self.tor_proxy_for(&endpoints).await
@@ -1000,14 +1001,14 @@ impl WalletManager {
             for endpoint in &endpoints {
                 let mut answered = false;
                 for (i, facts) in input_facts.iter_mut().enumerate() {
-                    let wanted = unresolved.contains(&i) || facts.spent.is_none();
+                    let wanted = facts.prevout.is_none() || facts.spent.is_none();
                     if !wanted {
                         continue;
                     }
                     match chain::fetch_prevout(endpoint, outpoints[i], proxy.as_deref()).await {
                         Ok(chain_facts) => {
                             answered = true;
-                            if unresolved.contains(&i) {
+                            if facts.prevout.is_none() {
                                 match chain_facts.txout {
                                     Some(txout) => facts.prevout = Some(txout),
                                     None => facts.unknown = true,
@@ -3092,5 +3093,137 @@ mod tests {
             "{}",
             report.failures[0].message
         );
+    }
+
+    /// An Esplora on loopback that knows exactly one transaction: it
+    /// serves its bytes and says its first output is unspent, and knows
+    /// nothing else. What a real backend would answer about a coin the
+    /// vault does not hold.
+    async fn esplora_knowing(tx: bdk_wallet::bitcoin::Transaction) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let txid = tx.compute_txid().to_string();
+        let raw = bdk_wallet::bitcoin::consensus::serialize(&tx);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let path = head.split_whitespace().nth(1).unwrap_or("");
+                let (status, kind, body): (&str, &str, Vec<u8>) =
+                    if path == format!("/api/tx/{txid}/raw") {
+                        ("200 OK", "application/octet-stream", raw.clone())
+                    } else if path == format!("/api/tx/{txid}/outspend/0") {
+                        ("200 OK", "application/json", br#"{"spent":false}"#.to_vec())
+                    } else {
+                        ("404 Not Found", "text/plain", b"not found".to_vec())
+                    };
+                let mut response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend(body);
+                let _ = stream.write_all(&response).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{address}/api")
+    }
+
+    /// A finalized PSBT spends a coin no watched wallet holds and
+    /// declares it worth a tenth of what it is. The backend is asked
+    /// all the same, and its answer, not the PSBT's, is what the
+    /// preview goes by: the real fee, and the disagreement in red.
+    #[tokio::test]
+    async fn a_psbt_lie_about_an_unwatched_coin_is_caught_by_the_backend() {
+        use crate::broadcast::{TxSeverity, TxWarningKind};
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::{
+            OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, Txid, WPubkeyHash, Witness,
+            absolute, transaction,
+        };
+
+        const REAL: u64 = 100_000;
+        const CLAIMED: u64 = 10_200;
+        const PAID: u64 = 10_000;
+        let spk = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x33; 20]));
+        let funding = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::all_zeros(), 0xffff_ffff),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(REAL),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        let spend = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(funding.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(PAID),
+                script_pubkey: ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x11; 20])),
+            }],
+        };
+        // Finalized: readiness is about presence, and a finalized input
+        // never meets the interpreter.
+        let mut witness = Witness::new();
+        witness.push([0x30; 71]);
+        witness.push([0x02; 33]);
+        let mut psbt = Psbt::from_unsigned_tx(spend).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(CLAIMED),
+            script_pubkey: spk,
+        });
+        psbt.inputs[0].final_script_witness = Some(witness);
+        let text = data_encoding::BASE64.encode(&psbt.serialize());
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        manager
+            .set_backend(
+                Network::Regtest,
+                BackendConfig::CustomEsplora {
+                    url: esplora_knowing(funding).await,
+                },
+            )
+            .await
+            .unwrap();
+        let preview = manager
+            .preview_transaction(&text, Network::Regtest)
+            .await
+            .unwrap();
+        assert!(preview.ready);
+        assert_eq!(preview.inputs[0].value_sats, Some(REAL));
+        assert_eq!(preview.fee_sats, Some(REAL - PAID));
+        let mismatch = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InputMismatch)
+            .expect("the backend's word contradicts the PSBT's");
+        assert_eq!(mismatch.severity, TxSeverity::Alert);
+        assert!(
+            mismatch.message.contains("the backend"),
+            "{}",
+            mismatch.message
+        );
+        let kinds: Vec<TxWarningKind> = preview.warnings.iter().map(|w| w.kind).collect();
+        assert!(kinds.contains(&TxWarningKind::HighFeeShare), "{kinds:?}");
+        assert!(!kinds.contains(&TxWarningKind::InputUnknown), "{kinds:?}");
     }
 }
