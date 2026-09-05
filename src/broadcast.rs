@@ -361,26 +361,35 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
             })
             .collect(),
     };
-    let inputs: Vec<DecodedInput> = psbt
-        .inputs
-        .iter()
-        .enumerate()
-        .map(|(index, input)| {
-            let final_present =
-                input.final_script_sig.is_some() || input.final_script_witness.is_some();
-            let prevout = input.witness_utxo.clone().or_else(|| {
-                let vout = psbt.unsigned_tx.input[index].previous_output.vout as usize;
-                input
-                    .non_witness_utxo
-                    .as_ref()
-                    .and_then(|prev| prev.output.get(vout).cloned())
-            });
-            DecodedInput {
-                signed: final_present && !unfinished.contains(&index),
-                prevout,
-            }
-        })
-        .collect();
+    let mut inputs = Vec::with_capacity(psbt.inputs.len());
+    for (index, input) in psbt.inputs.iter().enumerate() {
+        let outpoint = psbt.unsigned_tx.input[index].previous_output;
+        // A previous transaction that is not the one this input spends
+        // describes some other coin: whatever it says about the value
+        // is false by construction, and a legacy signature never covers
+        // the amount to contradict it. Refused as the malformed PSBT it
+        // is, rather than read for a value nothing vouches for.
+        if let Some(prev) = &input.non_witness_utxo
+            && prev.compute_txid() != outpoint.txid
+        {
+            return Err(tx_error(format!(
+                "invalid PSBT: input {index} carries a previous transaction that is not the \
+                 one it spends"
+            )));
+        }
+        let final_present =
+            input.final_script_sig.is_some() || input.final_script_witness.is_some();
+        let prevout = input.witness_utxo.clone().or_else(|| {
+            input
+                .non_witness_utxo
+                .as_ref()
+                .and_then(|prev| prev.output.get(outpoint.vout as usize).cloned())
+        });
+        inputs.push(DecodedInput {
+            signed: final_present && !unfinished.contains(&index),
+            prevout,
+        });
+    }
     let ready = inputs.iter().all(|input| input.signed);
     let tx = if ready {
         psbt.extract_tx_unchecked_fee_rate()
@@ -1202,6 +1211,62 @@ mod tests {
         assert_eq!(alone.inputs[0].value_sats, Some(REAL));
         assert_eq!(alone.fee_sats, Some(REAL - PAID));
         assert!(!kinds(&alone).contains(&TxWarningKind::InputMismatch));
+    }
+
+    /// A legacy input is described by the whole previous transaction,
+    /// and a legacy signature never covers the amount: a forged one, a
+    /// copy with the value changed, is a different transaction with a
+    /// different txid, and nothing on this path used to compare it with
+    /// the outpoint. The genuine one still reads as before.
+    #[test]
+    fn a_previous_transaction_that_is_not_the_one_spent_is_refused() {
+        let secp = Secp256k1::new();
+        let (sk, pk) = throwaway_key();
+        let spk = ScriptBuf::new_p2pkh(&pk.pubkey_hash());
+        let fund = funding(&spk);
+        let tx = spend(OutPoint::new(fund.compute_txid(), 0));
+        let sighash = SighashCache::new(&tx)
+            .legacy_signature_hash(0, &spk, EcdsaSighashType::All.to_u32())
+            .unwrap();
+        let sig = ecdsa::Signature {
+            signature: secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &sk),
+            sighash_type: EcdsaSighashType::All,
+        };
+        let mut forged = fund.clone();
+        forged.output[0].value = Amount::from_sat(CLAIMED);
+        assert_ne!(forged.compute_txid(), fund.compute_txid());
+
+        let mut psbt = Psbt::from_unsigned_tx(tx.clone()).unwrap();
+        psbt.inputs[0].non_witness_utxo = Some(forged);
+        psbt.inputs[0].partial_sigs.insert(PublicKey::from(pk), sig);
+        let error = decode_bytes_as_transaction(&psbt.serialize())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("previous transaction"), "{error}");
+        assert!(!looks_like_transaction(
+            &data_encoding::BASE64.encode(&psbt.serialize())
+        ));
+
+        // The genuine previous transaction: the input finalizes, and
+        // the preview reads the real value, in agreement with the
+        // wallet.
+        psbt.inputs[0].non_witness_utxo = Some(fund);
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        assert!(decoded.ready);
+        assert_eq!(
+            decoded.inputs[0].prevout.as_ref().unwrap().value.to_sat(),
+            REAL
+        );
+        let preview = build_preview(
+            &decoded,
+            Network::Regtest,
+            &wallet_facts(&spk),
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(preview.fee_sats, Some(REAL - PAID));
+        assert!(!kinds(&preview).contains(&TxWarningKind::InputMismatch));
     }
 
     /// Only a PSBT still carrying partial signatures meets the
