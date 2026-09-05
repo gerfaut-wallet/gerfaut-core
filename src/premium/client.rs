@@ -60,12 +60,11 @@ pub struct NodeHealth {
     pub verification_progress: f64,
 }
 
-/// The watching engine.
+/// The watching engine: where it stands, and nothing about what it
+/// watches. The counters it used to publish were a side channel on a
+/// route anyone can poll, and no screen ever read them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineHealth {
-    pub wallets: i64,
-    pub scripts: i64,
-    pub coins: i64,
     pub tip_height: Option<i64>,
     /// When the tip was last seen. Kept as the server sent it: the
     /// server writes a date type whose JSON form is not a unix time.
@@ -733,7 +732,7 @@ mod tests {
         // tuple of components; it must not break the decode.
         let mut public = stub(
             200,
-            r#"{"ok":true,"network":"bitcoin","node":{"headers":910000,"blocks":910000,"initial_block_download":false,"verification_progress":0.9999},"engine":{"wallets":3,"scripts":1200,"coins":41,"tip_height":910000,"tip_seen_at":[2026,248,12,0,0,0,0,0,0]},"now":1790000000}"#,
+            r#"{"ok":true,"network":"bitcoin","node":{"headers":910000,"blocks":910000,"initial_block_download":false,"verification_progress":0.9999},"engine":{"tip_height":910000,"tip_seen_at":[2026,248,12,0,0,0,0,0,0]},"now":1790000000}"#,
         )
         .await;
         let health = client(&public, None).health().await.unwrap();
@@ -750,6 +749,17 @@ mod tests {
         assert_eq!(header(&request, "authorization"), None);
         let _ = client(&public, Some("abcdefghijkmnpqr")).health().await;
         assert_eq!(header(&public.request().await, "authorization"), None);
+
+        // A server from before the counters were dropped still decodes:
+        // what it adds is ignored, what it lacks reads as unknown.
+        let older = stub(
+            200,
+            r#"{"ok":true,"network":"bitcoin","node":{"headers":1,"blocks":1,"initial_block_download":false,"verification_progress":1.0},"engine":{"wallets":3,"scripts":1200,"coins":41,"tip_height":null},"now":1790000000}"#,
+        )
+        .await;
+        let health = client(&older, None).health().await.unwrap();
+        assert_eq!(health.engine.tip_height, None);
+        assert_eq!(health.engine.tip_seen_at, None);
     }
 
     #[tokio::test]

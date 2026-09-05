@@ -57,7 +57,7 @@ async fn fake_api() -> (SocketAddr, mpsc::UnboundedReceiver<String>) {
             let mut buf = vec![0u8; 4096];
             let n = stream.read(&mut buf).await.unwrap_or(0);
             let _ = sender.send(String::from_utf8_lossy(&buf[..n]).into_owned());
-            let body = r#"{"ok":true,"network":"bitcoin","node":{"headers":1,"blocks":1,"initial_block_download":false,"verification_progress":1.0},"engine":{"wallets":0,"scripts":0,"coins":0,"tip_height":1},"now":1790000000}"#;
+            let body = r#"{"ok":true,"network":"bitcoin","node":{"headers":1,"blocks":1,"initial_block_download":false,"verification_progress":1.0},"engine":{"tip_height":1},"now":1790000000}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
                  Connection: close\r\n\r\n{body}",
