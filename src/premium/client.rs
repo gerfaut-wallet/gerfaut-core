@@ -151,6 +151,12 @@ pub struct Channel {
     pub link_code: Option<String>,
     #[serde(default)]
     pub link_url: Option<String>,
+    /// The name of what the channel is linked to, when the server has
+    /// one: the Telegram chat that sent the code. So the owner sees who
+    /// receives their alerts, not only that someone does. Absent for
+    /// the other kinds, and from a server that predates it.
+    #[serde(default)]
+    pub linked_name: Option<String>,
     pub enabled: bool,
     /// Unix seconds.
     pub created_at: i64,
@@ -245,6 +251,16 @@ struct ChannelBody<'a> {
     target: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     secret: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ConfirmBody<'a> {
+    code: &'a str,
+}
+
+#[derive(Deserialize)]
+struct DeletedBody {
+    deleted: bool,
 }
 
 // --- client ---------------------------------------------------------------
@@ -367,6 +383,23 @@ impl PremiumClient {
         })
     }
 
+    /// Deletes the account: the key, the wallets it watches, its
+    /// channels and its events, all at once. The server takes any key
+    /// it knows, paid time left or not: leaving is not something to
+    /// pay for. Confirmed by the server's own word, or not at all.
+    pub async fn delete_account(&self) -> CoreResult<()> {
+        let request = self.http.delete(self.url("/v1/account"));
+        let body = self.raw(self.authorized(request)?).await?;
+        let confirmed: DeletedBody = decode(&body)?;
+        if !confirmed.deleted {
+            return Err(PremiumError::UnexpectedResponse(
+                "the server did not confirm the deletion".to_owned(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     // --- wallets ------------------------------------------------------
 
     pub async fn wallets(&self) -> CoreResult<Vec<WalletWatch>> {
@@ -415,6 +448,20 @@ impl PremiumClient {
             target,
             secret,
         });
+        let body = self.raw(self.authorized(request)?).await?;
+        decode(&body)
+    }
+
+    /// Confirms a channel with the code the server sent to it: an
+    /// e-mail address is written to only once its owner typed the code
+    /// back. A wrong or expired code is [`PremiumError::Rejected`] in
+    /// the server's words, and the server stops answering after five
+    /// tries. The channel comes back as `GET /v1/channels` lists it.
+    pub async fn confirm_channel(&self, id: &str, code: &str) -> CoreResult<Channel> {
+        let request = self
+            .http
+            .post(self.url(&format!("/v1/channels/{id}/confirm")))
+            .json(&ConfirmBody { code });
         let body = self.raw(self.authorized(request)?).await?;
         decode(&body)
     }
@@ -781,22 +828,26 @@ mod tests {
 
         let stub_channels = stub(
             200,
-            r#"{"channels":[{"id":"0b4b1e1c-7d1e-4b6a-9d0e-1a2b3c4d5e6f","kind":"ntfy","target":"abc…xyz","linked":true,"link_code":null,"link_url":null,"enabled":true,"created_at":1789000000},{"id":"1c5c2f2d-8e2f-4c7b-8e1f-2b3c4d5e6f70","kind":"telegram","target":"","linked":false,"link_code":"0123456789ab","link_url":"https://t.me/GerfautAlertsBot","enabled":true,"created_at":1789000001},{"id":"2d6d3030-9f30-4d8c-9f20-3c4d5e6f7081","kind":"webhook","target":"https://hooks.example.org/gerfaut","linked":true,"link_code":null,"link_url":null,"enabled":false,"created_at":1789000002}]}"#,
+            r#"{"channels":[{"id":"0b4b1e1c-7d1e-4b6a-9d0e-1a2b3c4d5e6f","kind":"ntfy","target":"abc…xyz","linked":true,"link_code":null,"link_url":null,"linked_name":null,"enabled":true,"created_at":1789000000},{"id":"1c5c2f2d-8e2f-4c7b-8e1f-2b3c4d5e6f70","kind":"telegram","target":"","linked":false,"link_code":"0123456789ab","link_url":"https://t.me/GerfautAlertsBot","enabled":true,"created_at":1789000001},{"id":"2d6d3030-9f30-4d8c-9f20-3c4d5e6f7081","kind":"webhook","target":"https://hooks.example.org/gerfaut","linked":true,"link_code":null,"link_url":null,"enabled":false,"created_at":1789000002},{"id":"3e7e4141-a041-4e9d-a031-4d5e6f708192","kind":"telegram","target":"…4242","linked":true,"link_code":null,"link_url":null,"linked_name":"Alice","enabled":true,"created_at":1789000003}]}"#,
         )
         .await;
         let channels = client(&stub_channels, Some("abcdefghijkmnpqr"))
             .channels()
             .await
             .unwrap();
-        assert_eq!(channels.len(), 3);
+        assert_eq!(channels.len(), 4);
         assert_eq!(channels[0].kind, ChannelKind::Ntfy);
         assert!(channels[0].linked);
+        assert_eq!(channels[0].linked_name, None);
         assert_eq!(channels[1].kind, ChannelKind::Telegram);
         assert!(!channels[1].linked);
         assert_eq!(channels[1].link_code.as_deref(), Some("0123456789ab"));
+        // A server that does not send the name reads as no name.
+        assert_eq!(channels[1].linked_name, None);
         assert_eq!(channels[2].kind, ChannelKind::Webhook);
         assert_eq!(channels[2].target, "https://hooks.example.org/gerfaut");
         assert!(!channels[2].enabled);
+        assert_eq!(channels[3].linked_name.as_deref(), Some("Alice"));
     }
 
     #[tokio::test]
@@ -992,6 +1043,109 @@ mod tests {
                 .request()
                 .await
                 .starts_with("POST /v1/channels/x/test HTTP/1.1")
+        );
+    }
+
+    /// The code goes in the body, the channel comes back as the list
+    /// shows it, and a code the server refuses is refused in its words.
+    #[tokio::test]
+    async fn confirm_channel_sends_the_code_and_reads_the_channel_back() {
+        let mut confirmed = stub(
+            200,
+            r#"{"id":"4f8f5252-b152-4fae-b142-5e6f70819203","kind":"email","target":"a…@example.org","linked":true,"link_code":null,"link_url":null,"linked_name":null,"enabled":true,"created_at":1789000004}"#,
+        )
+        .await;
+        let channel = client(&confirmed, Some("abcdefghijkmnpqr"))
+            .confirm_channel("4f8f5252-b152-4fae-b142-5e6f70819203", "482913")
+            .await
+            .unwrap();
+        assert_eq!(channel.kind, ChannelKind::Email);
+        assert!(channel.linked);
+        let request = confirmed.request().await;
+        assert!(
+            request.starts_with(
+                "POST /v1/channels/4f8f5252-b152-4fae-b142-5e6f70819203/confirm HTTP/1.1"
+            ),
+            "{request}"
+        );
+        assert_eq!(
+            header(&request, "authorization"),
+            Some("Bearer abcdefghijkmnpqr")
+        );
+        assert_eq!(body_of(&request), r#"{"code":"482913"}"#);
+
+        let wrong = stub(400, r#"{"error":"wrong or expired code"}"#).await;
+        assert_eq!(
+            premium_error(
+                client(&wrong, Some("abcdefghijkmnpqr"))
+                    .confirm_channel("x", "000000")
+                    .await
+                    .unwrap_err()
+            ),
+            PremiumError::Rejected("wrong or expired code".to_owned())
+        );
+        let exhausted = stub(429, r#"{"error":"too many tries"}"#).await;
+        assert_eq!(
+            premium_error(
+                client(&exhausted, Some("abcdefghijkmnpqr"))
+                    .confirm_channel("x", "000000")
+                    .await
+                    .unwrap_err()
+            ),
+            PremiumError::Rejected("too many tries".to_owned())
+        );
+        // No key, no request.
+        let nobody = PremiumClient::new("http://127.0.0.1:9", None, None).unwrap();
+        assert_eq!(
+            premium_error(nobody.confirm_channel("x", "1").await.unwrap_err()),
+            PremiumError::NoKey
+        );
+    }
+
+    /// Deleting the account is one request with the key, taken on the
+    /// server's word alone: an answer that does not say `deleted` is
+    /// not a deletion.
+    #[tokio::test]
+    async fn delete_account_is_confirmed_by_the_server_or_not_at_all() {
+        let mut deleted = stub(200, r#"{"deleted":true}"#).await;
+        client(&deleted, Some("abcdefghijkmnpqr"))
+            .delete_account()
+            .await
+            .unwrap();
+        let request = deleted.request().await;
+        assert!(
+            request.starts_with("DELETE /v1/account HTTP/1.1"),
+            "{request}"
+        );
+        assert_eq!(
+            header(&request, "authorization"),
+            Some("Bearer abcdefghijkmnpqr")
+        );
+
+        let unconfirmed = stub(200, r#"{"deleted":false}"#).await;
+        assert!(matches!(
+            premium_error(
+                client(&unconfirmed, Some("abcdefghijkmnpqr"))
+                    .delete_account()
+                    .await
+                    .unwrap_err()
+            ),
+            PremiumError::UnexpectedResponse(_)
+        ));
+        let unknown = stub(401, r#"{"error":"unknown key"}"#).await;
+        assert_eq!(
+            premium_error(
+                client(&unknown, Some("abcdefghijkmnpqr"))
+                    .delete_account()
+                    .await
+                    .unwrap_err()
+            ),
+            PremiumError::UnknownKey
+        );
+        let nobody = PremiumClient::new("http://127.0.0.1:9", None, None).unwrap();
+        assert_eq!(
+            premium_error(nobody.delete_account().await.unwrap_err()),
+            PremiumError::NoKey
         );
     }
 
