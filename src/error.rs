@@ -104,6 +104,33 @@ pub enum VaultError {
 /// the screen does about them.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PremiumError {
+    /// The client has no account key, and the route needs one.
+    #[error("no premium key")]
+    NoKey,
+
+    /// The server does not know this key (HTTP 401).
+    #[error("the premium server does not know this key")]
+    UnknownKey,
+
+    /// The key exists but has no paid time left, and the route changes
+    /// what is watched (HTTP 403).
+    #[error("this key has no paid time left")]
+    NoPaidTime,
+
+    /// The server refused the request; the sentence is its own.
+    #[error("the premium server refused: {0}")]
+    Rejected(String),
+
+    /// The server could not be reached, or answered with a failure of
+    /// its own (HTTP 5xx).
+    #[error("the premium server is unreachable: {0}")]
+    Unreachable(String),
+
+    /// The server answered, with something other than what the route
+    /// promises.
+    #[error("unexpected answer from the premium server: {0}")]
+    UnexpectedResponse(String),
+
     /// The certificate is malformed, or not signed by the licence key.
     #[error("invalid licence certificate: {0}")]
     InvalidCertificate(String),

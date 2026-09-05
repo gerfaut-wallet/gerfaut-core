@@ -14,6 +14,11 @@
 //! descriptor the app already imported, and nothing here handles a key
 //! that could spend.
 
+pub mod client;
 pub mod licence;
 
+pub use client::{
+    Account, Channel, ChannelKind, Event, EventKind, Health, HeartbeatReport, Licence,
+    PremiumClient, WalletWatch,
+};
 pub use licence::{Claims, Heartbeat, LicenceState};

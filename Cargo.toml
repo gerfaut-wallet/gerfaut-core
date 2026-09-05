@@ -36,7 +36,9 @@ ring = "0.17"
 # when the certificate predates X.509 v3 and webpki declines it.
 x509-parser = { version = "0.18", default-features = false }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` keeps the exact text of the signed heartbeat: a signature
+# is over bytes, not over a value re-serialized this side.
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 chacha20poly1305 = "0.10"

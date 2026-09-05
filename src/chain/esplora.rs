@@ -183,6 +183,12 @@ fn describe_request(error: &reqwest::Error, budget: Budget) -> String {
             format!("timed out after {} s", budget.total.as_secs())
         };
     }
+    describe_failure(error)
+}
+
+/// The same, a timeout aside: what the budgets say about one is the
+/// caller's, the rest reads the same for every client of the crate.
+pub(crate) fn describe_failure(error: &reqwest::Error) -> String {
     if error.is_connect() {
         // The TLS library's own error type, however deep it is wrapped.
         // Its words are the ones to keep: which certificate check
