@@ -34,7 +34,7 @@ use crate::export::{ExportOptions, ExportResult};
 use crate::input::{ParsedInput, ParsedPayload, RecognizedKind};
 use crate::lock::{self, AppLock, LockAttempts, LockKind, LockVerdict};
 use crate::network::Network;
-use crate::premium::{PremiumClient, PremiumState};
+use crate::premium::{Channel, PremiumClient, PremiumState};
 use crate::store::{Settings, Vault, VaultKey, VaultPayload, WalletRecord};
 use crate::wallet::meta::{CachedTotals, SyncStamp, WalletIcon, WalletKind, WalletMeta};
 use crate::wallet::policy::{self, PolicySnapshot};
@@ -1619,6 +1619,37 @@ impl WalletManager {
             None
         };
         PremiumClient::new(base_url, key, proxy.as_deref())
+    }
+
+    /// Confirms a channel with the code the server sent to it, through
+    /// the client [`Self::premium_client`] builds: the same key, the
+    /// same route.
+    pub async fn premium_confirm_channel(
+        &self,
+        base_url: &str,
+        id: &str,
+        code: &str,
+    ) -> CoreResult<Channel> {
+        self.premium_client(base_url)
+            .await?
+            .confirm_channel(id, code)
+            .await
+    }
+
+    /// Deletes the account on the server, then forgets it here: the
+    /// key, the certificate, the consents, the dismissed banner. A key
+    /// with nothing behind it is not worth keeping, and the next key
+    /// entered starts from nothing. Nothing is forgotten unless the
+    /// server confirmed.
+    pub async fn premium_delete_account(&self, base_url: &str) -> CoreResult<()> {
+        self.premium_client(base_url)
+            .await?
+            .delete_account()
+            .await?;
+        self.state.lock().await.commit(|payload| {
+            payload.settings.premium = PremiumState::default();
+            Ok(())
+        })
     }
 
     /// Whether the backend of the active network is reached through
@@ -3289,6 +3320,113 @@ mod tests {
             }
         });
         format!("http://{address}/api")
+    }
+
+    /// A premium server on loopback that answers every request the
+    /// same way and hands each request head to the test.
+    async fn premium_answering(
+        status: u16,
+        body: &'static str,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let _ = sender.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let response = format!(
+                    "HTTP/1.1 {status} Stub\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{address}"), receiver)
+    }
+
+    /// The account the vault keeps: a key, a certificate, a consent, a
+    /// banner dismissed.
+    fn premium_account() -> PremiumState {
+        let mut premium = PremiumState {
+            key: Some("abcdefghijkmnpqr".to_owned()),
+            certificate: Some("not.checked.here".to_owned()),
+            acknowledged_offline_until: Some(1_800_000_000),
+            ..PremiumState::default()
+        };
+        premium.consent("w1", 1_790_000_000);
+        premium
+    }
+
+    /// Deleting the account is one request with the stored key, and the
+    /// vault forgets the account only once the server said it did.
+    #[tokio::test]
+    async fn premium_delete_account_forgets_the_account_once_the_server_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+
+        // No key: nothing to delete, and nothing is asked.
+        let (base_url, mut seen) = premium_answering(200, r#"{"deleted":true}"#).await;
+        let error = manager.premium_delete_account(&base_url).await.unwrap_err();
+        assert!(
+            matches!(error, CoreError::Premium(crate::error::PremiumError::NoKey)),
+            "{error}"
+        );
+        assert!(seen.try_recv().is_err());
+
+        manager.set_premium_state(premium_account()).await.unwrap();
+        manager.premium_delete_account(&base_url).await.unwrap();
+        let request = seen.recv().await.unwrap();
+        assert!(
+            request.starts_with("DELETE /v1/account HTTP/1.1"),
+            "{request}"
+        );
+        assert!(request.contains("Bearer abcdefghijkmnpqr"), "{request}");
+        assert_eq!(manager.premium_state().await, PremiumState::default());
+        // Forgotten on disk as well.
+        drop(manager);
+        let reopened = WalletManager::open(dir.path(), key()).unwrap();
+        assert_eq!(reopened.premium_state().await, PremiumState::default());
+
+        // The server did not confirm: the account stays.
+        let refusing = tempfile::tempdir().unwrap();
+        let kept = WalletManager::open(refusing.path(), key()).unwrap();
+        kept.set_premium_state(premium_account()).await.unwrap();
+        let (base_url, _) = premium_answering(503, r#"{"error":"node unreachable"}"#).await;
+        assert!(kept.premium_delete_account(&base_url).await.is_err());
+        assert_eq!(kept.premium_state().await, premium_account());
+    }
+
+    #[tokio::test]
+    async fn premium_confirm_channel_goes_through_the_stored_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        manager.set_premium_state(premium_account()).await.unwrap();
+        let (base_url, mut seen) = premium_answering(
+            200,
+            r#"{"id":"4f8f5252-b152-4fae-b142-5e6f70819203","kind":"email","target":"a…@example.org","linked":true,"link_code":null,"link_url":null,"linked_name":null,"enabled":true,"created_at":1789000004}"#,
+        )
+        .await;
+        let channel = manager
+            .premium_confirm_channel(&base_url, "4f8f5252-b152-4fae-b142-5e6f70819203", "482913")
+            .await
+            .unwrap();
+        assert!(channel.linked);
+        let request = seen.recv().await.unwrap();
+        assert!(
+            request.starts_with(
+                "POST /v1/channels/4f8f5252-b152-4fae-b142-5e6f70819203/confirm HTTP/1.1"
+            ),
+            "{request}"
+        );
+        assert!(request.contains("Bearer abcdefghijkmnpqr"), "{request}");
+        assert!(request.ends_with(r#"{"code":"482913"}"#), "{request}");
     }
 
     /// A finalized PSBT spends a coin no watched wallet holds and
