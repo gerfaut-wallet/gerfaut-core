@@ -1568,18 +1568,49 @@ impl WalletManager {
     }
 
     /// A client for the premium server at `base_url`, carrying the
-    /// stored key. An onion base URL goes through the Tor route the
-    /// settings lead to, resolved before the client exists; a clearnet
-    /// one never probes for Tor.
+    /// stored key.
+    ///
+    /// The client goes through Tor when the base URL is an onion, and
+    /// when the backend of the active network is one: a person who
+    /// reaches their own node through Tor chose not to show their
+    /// address, and the premium server is not where to show it after
+    /// all. The route is resolved before the client exists, and a Tor
+    /// that cannot be reached is a client that is not built: nothing
+    /// falls back to the clear. A clearnet backend with a clearnet base
+    /// URL never probes for Tor.
     pub async fn premium_client(&self, base_url: &str) -> CoreResult<PremiumClient> {
         let key = self.state.lock().await.payload.settings.premium.key.clone();
-        let proxy = if chain::is_onion(base_url) {
+        self.premium_client_with_key(base_url, key).await
+    }
+
+    /// [`Self::premium_client`] carrying `key` instead of the stored
+    /// one: for the licence check of a key just typed, before anything
+    /// is stored. The route is decided the same way.
+    pub async fn premium_client_with_key(
+        &self,
+        base_url: &str,
+        key: Option<String>,
+    ) -> CoreResult<PremiumClient> {
+        let proxy = if chain::is_onion(base_url) || self.backend_needs_tor().await {
             let (settings, data_dir) = self.tor_setup().await;
             Some(tor::resolve(&settings, &data_dir).await?.proxy())
         } else {
             None
         };
         PremiumClient::new(base_url, key, proxy.as_deref())
+    }
+
+    /// Whether the backend of the active network is reached through
+    /// Tor: the same question a sync asks, over the same endpoints.
+    async fn backend_needs_tor(&self) -> bool {
+        let (config, certs, network) = {
+            let state = self.state.lock().await;
+            let network = state.payload.settings.active_network;
+            let (config, certs) = state.chain_setup(network);
+            (config, certs, network)
+        };
+        chain::endpoints(&config, network, &certs)
+            .is_ok_and(|endpoints| chain::needs_tor(&endpoints))
     }
 }
 
