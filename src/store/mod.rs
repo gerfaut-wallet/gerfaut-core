@@ -19,6 +19,7 @@ use crate::chain::tor::TorSettings;
 use crate::error::VaultError;
 use crate::lock::AppLock;
 use crate::network::Network;
+use crate::premium::PremiumState;
 use crate::wallet::AddressWatchState;
 use crate::wallet::meta::WalletMeta;
 
@@ -74,6 +75,11 @@ pub struct Settings {
     /// existed read as the default, the system Tor first.
     #[serde(default)]
     pub tor: TorSettings,
+    /// The premium account: its key, its last certificate, and which
+    /// wallets the user agreed to send to the server. In the encrypted
+    /// file because the key is the account. Empty until one is entered.
+    #[serde(default)]
+    pub premium: PremiumState,
 }
 
 fn default_gap_limit() -> u32 {
@@ -90,6 +96,7 @@ impl Default for Settings {
             electrum_certs: BTreeMap::new(),
             app_lock: None,
             tor: TorSettings::default(),
+            premium: PremiumState::default(),
         }
     }
 }

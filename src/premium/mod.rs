@@ -16,9 +16,11 @@
 
 pub mod client;
 pub mod licence;
+pub mod state;
 
 pub use client::{
     Account, Channel, ChannelKind, Event, EventKind, Health, HeartbeatReport, Licence,
     PremiumClient, WalletWatch,
 };
 pub use licence::{Claims, Heartbeat, LicenceState};
+pub use state::{PremiumState, WatchedWallet};

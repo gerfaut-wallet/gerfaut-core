@@ -34,6 +34,7 @@ use crate::export::{ExportOptions, ExportResult};
 use crate::input::{ParsedInput, ParsedPayload, RecognizedKind};
 use crate::lock::{self, AppLock, LockAttempts, LockKind, LockVerdict};
 use crate::network::Network;
+use crate::premium::{PremiumClient, PremiumState};
 use crate::store::{Settings, Vault, VaultKey, VaultPayload, WalletRecord};
 use crate::wallet::meta::{CachedTotals, SyncStamp, WalletIcon, WalletKind, WalletMeta};
 use crate::wallet::policy::{self, PolicySnapshot};
@@ -1548,6 +1549,37 @@ impl WalletManager {
         let state = self.state.lock().await;
         (state.payload.settings.tor.clone(), state.data_dir.clone())
     }
+
+    // --- premium -------------------------------------------------------
+
+    /// The premium account as the vault keeps it.
+    pub async fn premium_state(&self) -> PremiumState {
+        self.state.lock().await.payload.settings.premium.clone()
+    }
+
+    /// Replaces the premium account state, whole: the apps read it,
+    /// change what they need, and hand it back.
+    pub async fn set_premium_state(&self, premium: PremiumState) -> CoreResult<()> {
+        self.state.lock().await.commit(|payload| {
+            payload.settings.premium = premium;
+            Ok(())
+        })
+    }
+
+    /// A client for the premium server at `base_url`, carrying the
+    /// stored key. An onion base URL goes through the Tor route the
+    /// settings lead to, resolved before the client exists; a clearnet
+    /// one never probes for Tor.
+    pub async fn premium_client(&self, base_url: &str) -> CoreResult<PremiumClient> {
+        let key = self.state.lock().await.payload.settings.premium.key.clone();
+        let proxy = if chain::is_onion(base_url) {
+            let (settings, data_dir) = self.tor_setup().await;
+            Some(tor::resolve(&settings, &data_dir).await?.proxy())
+        } else {
+            None
+        };
+        PremiumClient::new(base_url, key, proxy.as_deref())
+    }
 }
 
 // --- helpers -----------------------------------------------------------
@@ -2370,6 +2402,30 @@ mod tests {
             }
         );
         assert_eq!(settings.app_prefs.get("theme").unwrap(), "dark");
+    }
+
+    #[tokio::test]
+    async fn the_premium_state_lives_in_the_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        assert_eq!(manager.premium_state().await, PremiumState::default());
+        let mut premium = PremiumState {
+            key: Some("abcdefghijkmnpqr".to_owned()),
+            ..PremiumState::default()
+        };
+        premium.consent("w1", 100);
+        manager.set_premium_state(premium.clone()).await.unwrap();
+
+        let manager = WalletManager::open(dir.path(), key()).unwrap();
+        assert_eq!(manager.premium_state().await, premium);
+        // The client built from it carries the stored key, and a
+        // clearnet server needs no Tor.
+        let client = manager
+            .premium_client("https://api.example.org/")
+            .await
+            .unwrap();
+        assert_eq!(client.key(), Some("abcdefghijkmnpqr"));
+        assert_eq!(client.base_url(), "https://api.example.org");
     }
 
     #[test]
