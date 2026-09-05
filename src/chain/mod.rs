@@ -76,8 +76,21 @@ impl BackendConfig {
 
 /// Whether a backend URL points at a Tor hidden service. Onion hosts
 /// are routed through the Tor proxy [`tor`] resolves, never looked up.
+///
+/// Host names have no case, and a QR code prints them in capitals: an
+/// address read as `.ONION` is the same hidden service, and taking it
+/// for a clearnet host would hand its name to the resolver.
 pub(crate) fn is_onion(url: &str) -> bool {
-    host_of(url).is_some_and(|host| host.ends_with(".onion"))
+    host_of(url).is_some_and(|host| is_onion_host(&host))
+}
+
+/// Whether a bare host name is a hidden service, in whatever case it
+/// was spelled. Compared on bytes: the name may be anything a camera
+/// decoded, and a byte index into the middle of a character would panic.
+pub(crate) fn is_onion_host(host: &str) -> bool {
+    const SUFFIX: &[u8] = b".onion";
+    let bytes = host.as_bytes();
+    bytes.len() >= SUFFIX.len() && bytes[bytes.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
 }
 
 /// Whether reaching this list means going through Tor. The manager asks
@@ -432,6 +445,30 @@ pub(crate) async fn fetch_address_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hidden service is one whatever case its name was read in: a QR
+    /// code prints capitals, and a `.ONION` taken for a clearnet host
+    /// would be looked up and reached outside Tor.
+    #[test]
+    fn an_onion_host_is_one_in_any_case() {
+        const ONION: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz234567";
+        assert!(is_onion(&format!("tcp://{ONION}.onion:50001")));
+        assert!(is_onion(&format!(
+            "tcp://{}.ONION:50001",
+            ONION.to_ascii_uppercase()
+        )));
+        assert!(is_onion(&format!("http://{ONION}.Onion/api")));
+        assert!(!is_onion("ssl://electrum.example.org:50002"));
+        assert!(!is_onion("ssl://onion.example.org:50002"));
+        // Nothing a camera decodes may panic the check.
+        assert!(!is_onion_host("a\u{e9}\u{e9}\u{e9}\u{e9}"));
+        assert!(!is_onion_host("\u{e9}\u{e9}"));
+        assert!(is_onion_host("\u{e9}.onion"));
+        assert!(needs_tor(&[Endpoint::Electrum(electrum::Target::new(
+            format!("tcp://{}.ONION:50001", ONION.to_ascii_uppercase()),
+            None
+        ))]));
+    }
 
     #[test]
     fn labels_are_hosts_only() {

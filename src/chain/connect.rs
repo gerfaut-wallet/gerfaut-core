@@ -108,7 +108,11 @@ fn split_host_port(rest: &str) -> Result<(String, Option<u16>), CoreError> {
     if host.contains(char::is_whitespace) {
         return Err(reject("the address has a space in it"));
     }
-    Ok((host, port))
+    // Host names have no case, and a QR code prints them in capitals.
+    // The lower-case form is the one stored, so a `.ONION` read off a
+    // screen is the same hidden service to every later check, and an
+    // accepted certificate is keyed the same whatever the spelling.
+    Ok((host.to_ascii_lowercase(), port))
 }
 
 fn electrum(host: String, port: Option<u16>, tls: bool) -> ScannedBackend {
@@ -178,13 +182,22 @@ pub fn parse_backend(text: &str) -> CoreResult<ScannedBackend> {
         let rest = rest.trim_end_matches('/');
         return match scheme.to_ascii_lowercase().as_str() {
             "http" | "https" => {
-                let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+                let (authority, tail) = match rest.find(['/', '?', '#']) {
+                    Some(at) => rest.split_at(at),
+                    None => (rest, ""),
+                };
                 let (host, port) = split_host_port(authority)?;
-                let onion = host.to_ascii_lowercase().ends_with(".onion");
+                let onion = host.ends_with(".onion");
                 let tls = scheme.eq_ignore_ascii_case("https");
+                // The host goes into the URL in the case it is stored
+                // in; the path keeps its own, a server may care.
                 Ok(ScannedBackend {
                     kind: ScannedBackendKind::Esplora,
-                    url: format!("{}://{}", scheme.to_ascii_lowercase(), rest),
+                    url: format!(
+                        "{}://{}{tail}",
+                        scheme.to_ascii_lowercase(),
+                        authority.to_ascii_lowercase()
+                    ),
                     host,
                     port,
                     tls,
@@ -359,6 +372,39 @@ mod tests {
         assert!(ok("gerfautexample123456.onion:50002").tls);
         // And a clearnet host with nothing said is still TLS.
         assert!(ok("node.example.org").tls);
+    }
+
+    /// A node dashboard prints its onion address in a QR code, and a QR
+    /// code prints capitals. The address stored is the lower-case one,
+    /// so that everything downstream, the Tor check first, reads it as
+    /// the hidden service it is.
+    #[test]
+    fn a_host_read_in_capitals_is_stored_in_lower_case() {
+        const UPPER: &str =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDEFGHIJKLMNOPQRSTUVWXYZ234567.ONION";
+        let lower = UPPER.to_ascii_lowercase();
+
+        let bare = ok(UPPER);
+        assert!(bare.onion);
+        assert_eq!(bare.host, lower);
+        assert_eq!(bare.url, format!("tcp://{lower}:50001"));
+
+        let flagged = ok(&format!("{UPPER}:50001:T"));
+        assert_eq!(flagged.url, format!("tcp://{lower}:50001"));
+
+        let esplora = ok(&format!("HTTP://{UPPER}/Api/v1"));
+        assert!(esplora.onion);
+        assert_eq!(esplora.host, lower);
+        // The path keeps its case: a server may care about it.
+        assert_eq!(esplora.url, format!("http://{lower}/Api/v1"));
+
+        let clearnet = ok("SSL://Electrum.Example.ORG:50002");
+        assert!(!clearnet.onion);
+        assert_eq!(clearnet.url, "ssl://electrum.example.org:50002");
+        assert_eq!(
+            ok("https://Mempool.Example.org/api").host,
+            "mempool.example.org"
+        );
     }
 
     #[test]

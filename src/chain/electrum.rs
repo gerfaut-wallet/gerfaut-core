@@ -538,6 +538,30 @@ mod tests {
         );
     }
 
+    /// The inspection of an onion server is decided before any socket
+    /// exists, and in whatever case the address was stored: a `.ONION`
+    /// is a hidden service, not a plain TCP host to be looked up.
+    #[test]
+    fn an_onion_is_inspected_as_tor_in_any_case() {
+        const ONION: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz234567";
+        let shouted = format!("tcp://{}.ONION:50001", ONION.to_ascii_uppercase());
+        assert_eq!(
+            inspect_blocking(&Target::new(format!("tcp://{ONION}.onion:50001"), None)).unwrap(),
+            Inspection::Tor
+        );
+        assert_eq!(
+            inspect_blocking(&Target::new(shouted.clone(), None)).unwrap(),
+            Inspection::Tor
+        );
+        // And without a route, the connection is refused before the
+        // name could reach a resolver, whatever the case.
+        let error = connect(&Target::new(shouted, None), None)
+            .err()
+            .map(|e| e.to_string())
+            .expect("no route, no connection");
+        assert!(error.starts_with("tor: "), "{error}");
+    }
+
     #[test]
     fn the_trust_key_is_the_socket_scheme_and_path_stripped() {
         assert_eq!(
