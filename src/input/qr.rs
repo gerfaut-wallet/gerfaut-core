@@ -59,7 +59,17 @@ fn qr_error(detail: impl Into<String>) -> CoreError {
 /// True when a frame is an envelope this module can open.
 pub fn is_envelope(frame: &str) -> bool {
     let frame = frame.trim();
-    frame.len() >= 3 && (frame[..3].eq_ignore_ascii_case("ur:") || frame.starts_with("B$"))
+    is_ur(frame) || frame.starts_with("B$")
+}
+
+/// Whether a frame opens a UR, in either case. Read on bytes: a frame
+/// is whatever a camera decoded or a person pasted, and a byte index
+/// that lands inside a character would panic.
+fn is_ur(frame: &str) -> bool {
+    frame
+        .as_bytes()
+        .get(..3)
+        .is_some_and(|head| head.eq_ignore_ascii_case(b"ur:"))
 }
 
 /// Assembles the frames scanned so far. Frames may repeat and arrive in
@@ -74,7 +84,7 @@ pub fn assemble(frames: &[String]) -> CoreResult<QrProgress> {
     let Some(first) = frames.first() else {
         return Err(qr_error("no frame scanned yet"));
     };
-    if first[..first.len().min(3)].eq_ignore_ascii_case("ur:") {
+    if is_ur(first) {
         assemble_ur(&frames)
     } else if first.starts_with("B$") {
         assemble_bbqr(&frames)
@@ -464,6 +474,14 @@ struct BbqrHeader {
 }
 
 fn bbqr_header(frame: &str) -> CoreResult<(BbqrHeader, &str)> {
+    // A BBQr frame is ASCII by specification. The header is read by
+    // byte offsets, and one that lands inside a character would panic:
+    // anything else is refused here, before an offset is taken.
+    if !frame.is_ascii() {
+        return Err(qr_error(
+            "not a BBQr frame: it carries characters outside ASCII",
+        ));
+    }
     let bytes = frame.as_bytes();
     if !frame.starts_with("B$") || bytes.len() < 8 {
         return Err(qr_error("not a BBQr frame"));
@@ -799,6 +817,63 @@ mod tests {
         let full = assemble(&[frames[2].clone(), frames[0].clone(), frames[1].clone()]).unwrap();
         assert!(full.complete);
         assert_eq!(full.text.unwrap(), descriptor);
+    }
+
+    /// A frame is whatever a camera decoded or a person typed. Two
+    /// accented letters in the import field used to close the desktop
+    /// application: the envelope checks indexed bytes without looking
+    /// for a character boundary.
+    #[test]
+    fn text_that_is_not_ascii_is_refused_not_a_panic() {
+        let plain = [
+            "\u{e9}\u{e9}",
+            "\u{e9}\u{e9}\u{e9}",
+            "\u{e9} \u{e9}",
+            "\u{1f642}\u{1f642}",
+        ];
+        for text in plain {
+            assert!(!is_envelope(text), "{text:?}");
+            // Not an envelope: the frame is the material itself, and
+            // the classifier says what it makes of it.
+            let progress = assemble(&[text.to_owned()]).unwrap();
+            assert_eq!(progress.format, QrFormat::Plain);
+            assert_eq!(progress.text.as_deref(), Some(text));
+            assert!(crate::input::parse_input(text).is_err(), "{text:?}");
+            assert!(
+                crate::broadcast::decode_transaction(text).is_err(),
+                "{text:?}"
+            );
+        }
+        // An envelope whose header lands a byte offset inside a
+        // character: refused by name, on every path that opens one.
+        let envelopes = [
+            "B$ZUa\u{e9}000",
+            "B$ZU01a\u{e9}0",
+            "B$ZU0100\u{e9}",
+            "B$\u{e9}",
+            "ur:\u{e9}/\u{e9}",
+        ];
+        for text in envelopes {
+            assert!(is_envelope(text), "{text:?}");
+            let error = assemble(&[text.to_owned()]).unwrap_err();
+            assert!(
+                matches!(error, CoreError::InvalidInput { kind: "qr", .. }),
+                "{text:?}: {error}"
+            );
+            assert!(crate::input::parse_input(text).is_err(), "{text:?}");
+            assert!(
+                crate::broadcast::decode_transaction(text).is_err(),
+                "{text:?}"
+            );
+        }
+        // A damaged frame of an animated code is skipped, like any
+        // other: the camera will see the real one again.
+        let progress = assemble(&["UR:bytes/1-2/\u{e9}".to_owned()]).unwrap();
+        assert!(!progress.complete);
+        let descriptor = format!("wpkh({TPUB}/<0;1>/*)");
+        let mut frames = bbqr_frames(&descriptor, 2);
+        frames.insert(1, "B$ZU0201\u{e9}".to_owned());
+        assert_eq!(assemble(&frames).unwrap().text.unwrap(), descriptor);
     }
 
     /// BBQr binary types come out in their text form: a PSBT as base64,
