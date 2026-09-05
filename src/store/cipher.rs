@@ -32,8 +32,20 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const HEADER_LEN: usize = 8 + 1 + 1 + SALT_LEN + NONCE_LEN;
 
+/// The KDF byte names a profile, and the code fixes the parameters of
+/// each profile for good: a dependency bump changing library defaults
+/// must never lock existing files out.
 const KDF_RAW: u8 = 0;
+/// Argon2id, the OWASP profile: m=19456 KiB, t=2, p=1. Every vault
+/// sealed under a password, and every backup written before the
+/// heavier profile existed.
 const KDF_ARGON2ID: u8 = 1;
+/// Argon2id, the RFC 9106 profile: m=65536 KiB, t=3, p=1. What a backup
+/// is sealed under now. A backup is a file that travels and can be
+/// guessed at offline for as long as it exists, so its password gets
+/// the profile that costs a guess five times more; the vault, opened
+/// and saved at every change, keeps the lighter one.
+const KDF_ARGON2ID_64M: u8 = 2;
 
 /// Key material for the vault. Zeroized on drop.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -46,23 +58,27 @@ pub enum VaultKey {
 }
 
 impl VaultKey {
-    fn kdf_id(&self) -> u8 {
+    /// The profile a file of this `magic` is sealed under with this
+    /// key.
+    fn kdf_id(&self, magic: &[u8; 8]) -> u8 {
         match self {
             VaultKey::Raw(_) => KDF_RAW,
+            VaultKey::Password(_) if magic == BACKUP_MAGIC => KDF_ARGON2ID_64M,
             VaultKey::Password(_) => KDF_ARGON2ID,
         }
     }
 
-    /// Derives the 32-byte encryption key for a given salt.
-    ///
-    /// Argon2id parameters are pinned explicitly (OWASP profile:
-    /// m=19456 KiB, t=2, p=1): a dependency bump changing library
-    /// defaults must never lock existing vaults out.
-    fn derive(&self, salt: &[u8]) -> Result<[u8; 32], VaultError> {
+    /// Derives the 32-byte encryption key for a given salt, under the
+    /// profile the file's KDF byte names.
+    fn derive(&self, kdf: u8, salt: &[u8]) -> Result<[u8; 32], VaultError> {
         match self {
             VaultKey::Raw(key) => Ok(*key),
             VaultKey::Password(password) => {
-                let params = argon2::Params::new(19_456, 2, 1, Some(32))
+                let (m_cost, t_cost) = match kdf {
+                    KDF_ARGON2ID_64M => (65_536, 3),
+                    _ => (19_456, 2),
+                };
+                let params = argon2::Params::new(m_cost, t_cost, 1, Some(32))
                     .map_err(|e| VaultError::Kdf(e.to_string()))?;
                 let argon =
                     Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
@@ -92,14 +108,15 @@ pub fn seal_with(magic: &[u8; 8], plaintext: &[u8], key: &VaultKey) -> Result<Ve
     rand::rng().fill_bytes(&mut salt);
     rand::rng().fill_bytes(&mut nonce);
 
+    let kdf = key.kdf_id(magic);
     let mut header = Vec::with_capacity(HEADER_LEN);
     header.extend_from_slice(magic);
     header.push(VERSION);
-    header.push(key.kdf_id());
+    header.push(kdf);
     header.extend_from_slice(&salt);
     header.extend_from_slice(&nonce);
 
-    let mut derived = key.derive(&salt)?;
+    let mut derived = key.derive(kdf, &salt)?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
     let ciphertext = cipher
         .encrypt(
@@ -137,13 +154,22 @@ pub fn unseal_with(magic: &[u8; 8], file: &[u8], key: &VaultKey) -> Result<Vec<u
     if version != 1 && version != VERSION {
         return Err(VaultError::UnsupportedVersion(version));
     }
-    // The KDF byte is informative (it lets an app prompt for the right
-    // credential kind); decryption trusts the provided key.
+    // The KDF byte names the profile a password is derived under, and
+    // lets an app prompt for the right credential kind. Decryption still
+    // trusts the provided key: the byte is bound as associated data, so
+    // rewriting it to a lighter profile fails authentication rather than
+    // yielding a key to guess at.
+    let kdf = file[9];
+    if !matches!(kdf, KDF_RAW | KDF_ARGON2ID | KDF_ARGON2ID_64M) {
+        return Err(VaultError::CorruptedPayload(format!(
+            "unknown kdf id {kdf}"
+        )));
+    }
     let salt = &file[10..10 + SALT_LEN];
     let nonce = &file[10 + SALT_LEN..HEADER_LEN];
     let ciphertext = &file[HEADER_LEN..];
 
-    let mut derived = key.derive(salt)?;
+    let mut derived = key.derive(kdf, salt)?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
     let payload = Payload {
         msg: ciphertext,
@@ -169,7 +195,7 @@ pub fn kdf_kind(file: &[u8]) -> Result<VaultKdf, VaultError> {
     }
     match file[9] {
         KDF_RAW => Ok(VaultKdf::PlatformKey),
-        KDF_ARGON2ID => Ok(VaultKdf::Password),
+        KDF_ARGON2ID | KDF_ARGON2ID_64M => Ok(VaultKdf::Password),
         other => Err(VaultError::CorruptedPayload(format!(
             "unknown kdf id {other}"
         ))),
@@ -248,7 +274,7 @@ mod tests {
         let mut nonce = [0u8; NONCE_LEN];
         rand::rng().fill_bytes(&mut salt);
         rand::rng().fill_bytes(&mut nonce);
-        let mut derived = key.derive(&salt).unwrap();
+        let mut derived = key.derive(KDF_RAW, &salt).unwrap();
         let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
         let ciphertext = cipher
             .encrypt(XNonce::from_slice(&nonce), b"legacy payload".as_slice())
@@ -263,6 +289,95 @@ mod tests {
         file.extend_from_slice(&ciphertext);
 
         assert_eq!(unseal(&file, &key).unwrap(), b"legacy payload");
+    }
+
+    /// A file sealed under `kdf` with `key`, the way this build writes
+    /// one, whatever profile it would choose itself.
+    fn sealed_under(magic: &[u8; 8], kdf: u8, key: &VaultKey, plaintext: &[u8]) -> Vec<u8> {
+        let mut salt = [0u8; SALT_LEN];
+        let mut nonce = [0u8; NONCE_LEN];
+        rand::rng().fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut nonce);
+        let mut header = Vec::new();
+        header.extend_from_slice(magic);
+        header.push(VERSION);
+        header.push(kdf);
+        header.extend_from_slice(&salt);
+        header.extend_from_slice(&nonce);
+        let mut derived = key.derive(kdf, &salt).unwrap();
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &header,
+                },
+            )
+            .unwrap();
+        derived.zeroize();
+        header.extend_from_slice(&ciphertext);
+        header
+    }
+
+    /// A backup is sealed under the heavier profile, a vault under the
+    /// one every password vault was written with, and each opens under
+    /// the profile its own byte names.
+    #[test]
+    fn a_backup_gets_the_heavier_profile_and_a_vault_keeps_its_own() {
+        let key = VaultKey::Password("correct horse".to_owned());
+        let backup = seal_with(BACKUP_MAGIC, b"payload", &key).unwrap();
+        assert_eq!(backup[9], KDF_ARGON2ID_64M);
+        assert_eq!(
+            unseal_with(BACKUP_MAGIC, &backup, &key).unwrap(),
+            b"payload"
+        );
+        let vault = seal(b"payload", &key).unwrap();
+        assert_eq!(vault[9], KDF_ARGON2ID);
+        assert_eq!(unseal(&vault, &key).unwrap(), b"payload");
+        assert_eq!(kdf_kind(&vault).unwrap(), VaultKdf::Password);
+        // The platform key derives nothing, under either magic.
+        assert_eq!(
+            seal_with(BACKUP_MAGIC, b"p", &raw_key(7)).unwrap()[9],
+            KDF_RAW
+        );
+    }
+
+    /// Every backup written before the heavier profile existed carries
+    /// the first Argon2id byte, and must go on opening under the first
+    /// Argon2id parameters.
+    #[test]
+    fn a_backup_under_the_first_profile_still_opens() {
+        let key = VaultKey::Password("correct horse".to_owned());
+        let older = sealed_under(BACKUP_MAGIC, KDF_ARGON2ID, &key, b"older backup");
+        assert_eq!(
+            unseal_with(BACKUP_MAGIC, &older, &key).unwrap(),
+            b"older backup"
+        );
+        // And a vault written under the heavier byte, should one ever
+        // be, reads under it as well: the byte decides, not the magic.
+        let heavier = sealed_under(MAGIC, KDF_ARGON2ID_64M, &key, b"heavier vault");
+        assert_eq!(unseal(&heavier, &key).unwrap(), b"heavier vault");
+        assert_eq!(kdf_kind(&heavier).unwrap(), VaultKdf::Password);
+    }
+
+    /// The byte is bound as associated data: rewriting a backup to the
+    /// lighter profile does not hand out a lighter key to guess at, and
+    /// a profile this build does not know is named rather than tried.
+    #[test]
+    fn the_kdf_byte_cannot_be_downgraded_and_an_unknown_one_is_named() {
+        let key = VaultKey::Password("correct horse".to_owned());
+        let mut backup = seal_with(BACKUP_MAGIC, b"payload", &key).unwrap();
+        backup[9] = KDF_ARGON2ID;
+        assert!(matches!(
+            unseal_with(BACKUP_MAGIC, &backup, &key),
+            Err(VaultError::WrongKeyOrCorrupted)
+        ));
+        backup[9] = 9;
+        assert!(matches!(
+            unseal_with(BACKUP_MAGIC, &backup, &key),
+            Err(VaultError::CorruptedPayload(detail)) if detail.contains("unknown kdf id 9")
+        ));
     }
 
     #[test]
