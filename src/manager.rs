@@ -18,8 +18,8 @@ use std::str::FromStr;
 use bdk_wallet::bitcoin::{Address, Amount, TxOut};
 
 use crate::backup::{
-    self, BACKUP_VERSION, BackupBundle, BackupOptions, BackupPayload, BackupPreview, BackupWallet,
-    BackupWalletPreview, ImportChoices, ImportReport,
+    self, BACKUP_VERSION, BackupBackendPreview, BackupBundle, BackupOptions, BackupPayload,
+    BackupPreview, BackupWallet, BackupWalletPreview, ImportChoices, ImportReport,
 };
 use crate::broadcast::{
     self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, TxPreview, WalletRef,
@@ -1342,14 +1342,35 @@ impl WalletManager {
         })
     }
 
-    /// Reads a backup without touching the vault: what it holds, and
-    /// which of its wallets this vault already watches.
+    /// Reads a backup without touching the vault: what it holds, which
+    /// of its wallets this vault already watches, and what its settings
+    /// would put in place, spelled out so "apply node settings" is an
+    /// answer to a question the screen actually asked.
     pub async fn preview_backup(&self, source: &str, password: &str) -> CoreResult<BackupPreview> {
         let payload = backup::open(&backup::decode_source(source)?, password)?;
         let state = self.state.lock().await;
         Ok(BackupPreview {
             created_at: payload.created_at,
             has_settings: payload.has_settings(),
+            backends: payload
+                .backends
+                .iter()
+                .flatten()
+                .map(|(network, config)| BackupBackendPreview {
+                    network: *network,
+                    backend: config.label(*network),
+                })
+                .collect(),
+            // The hosts a restore would pin: the same check as the
+            // import, so the list shows what would land and nothing
+            // that would be dropped on the way.
+            electrum_hosts: payload
+                .electrum_certs
+                .iter()
+                .flatten()
+                .filter(|(_, fingerprint)| chain::tls::is_fingerprint(fingerprint))
+                .map(|(host, _)| host.clone())
+                .collect(),
             wallets: payload
                 .wallets
                 .iter()
@@ -2593,6 +2614,110 @@ mod tests {
             .await
             .unwrap();
         (manager, cold, watch)
+    }
+
+    /// A backup handed over by someone else, settings included: what
+    /// "apply node settings" would put in place is named in the
+    /// preview, host by host, before the person agrees to it. A backup
+    /// without settings names nothing.
+    #[tokio::test]
+    async fn the_preview_names_what_the_settings_would_apply() {
+        let wallet = BackupWallet {
+            name: "Friend's wallet".to_owned(),
+            network: Network::Signet,
+            kind: WalletKind::Descriptors {
+                external: "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)".to_owned(),
+                internal: None,
+                script: crate::input::ScriptKind::Segwit,
+            },
+            gap_limit: 20,
+            labels: Default::default(),
+            created_at: 1_755_000_000,
+        };
+        let with_settings = BackupPayload {
+            version: BACKUP_VERSION,
+            created_at: 1_756_000_000,
+            wallets: vec![wallet.clone()],
+            backends: Some(
+                [
+                    (
+                        Network::Signet,
+                        BackendConfig::CustomElectrum {
+                            url: "ssl://127.0.0.1:1".to_owned(),
+                        },
+                    ),
+                    (
+                        Network::Mainnet,
+                        BackendConfig::CustomEsplora {
+                            url: "https://user:pass@node.example.org:3002/api".to_owned(),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            electrum_certs: Some(
+                [
+                    ("127.0.0.1:1".to_owned(), fingerprint("AA")),
+                    // Not a fingerprint: the import would drop it, so
+                    // the preview does not promise it.
+                    ("bogus.example:50002".to_owned(), "nope".to_owned()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            gap_limit: Some(30),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let text =
+            data_encoding::BASE64.encode(&backup::seal(&with_settings, BACKUP_PASSWORD).unwrap());
+        let preview = manager
+            .preview_backup(&text, BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        assert!(preview.has_settings);
+        assert_eq!(
+            preview.backends,
+            vec![
+                BackupBackendPreview {
+                    network: Network::Mainnet,
+                    backend: "node.example.org".to_owned(),
+                },
+                BackupBackendPreview {
+                    network: Network::Signet,
+                    backend: "127.0.0.1".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(preview.electrum_hosts, vec!["127.0.0.1:1".to_owned()]);
+        // What the restore screen receives says it all, and never the
+        // credentials a URL may carry.
+        let json = serde_json::to_string(&preview).unwrap();
+        assert!(
+            json.contains(r#""backends":[{"network":"mainnet","backend":"node.example.org"}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""electrum_hosts":["127.0.0.1:1"]"#),
+            "{json}"
+        );
+        assert!(!json.contains("pass@"), "{json}");
+
+        let without = BackupPayload {
+            backends: None,
+            electrum_certs: None,
+            gap_limit: None,
+            ..with_settings
+        };
+        let text = data_encoding::BASE64.encode(&backup::seal(&without, BACKUP_PASSWORD).unwrap());
+        let preview = manager
+            .preview_backup(&text, BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        assert!(!preview.has_settings);
+        assert!(preview.backends.is_empty());
+        assert!(preview.electrum_hosts.is_empty());
     }
 
     #[tokio::test]

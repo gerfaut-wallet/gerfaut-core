@@ -121,6 +121,26 @@ pub struct BackupPreview {
     pub created_at: u64,
     pub wallets: Vec<BackupWalletPreview>,
     pub has_settings: bool,
+    /// The backends the settings would put in place, one per network,
+    /// named the way a sync report names them. What "apply node
+    /// settings" agrees to is spelled out here, not summed up as a
+    /// flag. Empty when the backup carries no settings.
+    #[serde(default)]
+    pub backends: Vec<BackupBackendPreview>,
+    /// The `host:port` of every Electrum certificate the settings would
+    /// accept, the ones a restore would pin. Empty when the backup
+    /// carries no settings.
+    #[serde(default)]
+    pub electrum_hosts: Vec<String>,
+}
+
+/// One backend a backup would put in place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupBackendPreview {
+    pub network: Network,
+    /// The host, as [`BackendConfig::label`] names it: never a full
+    /// URL, which may carry credentials.
+    pub backend: String,
 }
 
 /// One wallet of a backup, as the restore screen lists it.
