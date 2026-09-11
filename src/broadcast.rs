@@ -348,6 +348,31 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
     if psbt.unsigned_tx.input.is_empty() {
         return Err(tx_error("the PSBT spends nothing"));
     }
+    // Checked before the finalizer runs, which reads the spent output
+    // of a previous transaction by index without looking whether it
+    // exists. A previous transaction that is not the one this input
+    // spends describes some other coin: whatever it says about the
+    // value is false by construction, and a legacy signature never
+    // covers the amount to contradict it. Refused as the malformed
+    // PSBT it is, rather than read for a value nothing vouches for.
+    for (index, input) in psbt.inputs.iter().enumerate() {
+        let Some(prev) = &input.non_witness_utxo else {
+            continue;
+        };
+        let outpoint = psbt.unsigned_tx.input[index].previous_output;
+        if prev.compute_txid() != outpoint.txid {
+            return Err(tx_error(format!(
+                "invalid PSBT: input {index} carries a previous transaction that is not the \
+                 one it spends"
+            )));
+        }
+        if prev.output.len() <= outpoint.vout as usize {
+            return Err(tx_error(format!(
+                "invalid PSBT: input {index} spends an output its previous transaction does \
+                 not have"
+            )));
+        }
+    }
     let secp = Secp256k1::verification_only();
     // Inputs the finalizer could not complete are the unsigned ones;
     // the error list names them by index.
@@ -364,19 +389,6 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
     let mut inputs = Vec::with_capacity(psbt.inputs.len());
     for (index, input) in psbt.inputs.iter().enumerate() {
         let outpoint = psbt.unsigned_tx.input[index].previous_output;
-        // A previous transaction that is not the one this input spends
-        // describes some other coin: whatever it says about the value
-        // is false by construction, and a legacy signature never covers
-        // the amount to contradict it. Refused as the malformed PSBT it
-        // is, rather than read for a value nothing vouches for.
-        if let Some(prev) = &input.non_witness_utxo
-            && prev.compute_txid() != outpoint.txid
-        {
-            return Err(tx_error(format!(
-                "invalid PSBT: input {index} carries a previous transaction that is not the \
-                 one it spends"
-            )));
-        }
         let final_present =
             input.final_script_sig.is_some() || input.final_script_witness.is_some();
         let prevout = input.witness_utxo.clone().or_else(|| {
@@ -1267,6 +1279,29 @@ mod tests {
         );
         assert_eq!(preview.fee_sats, Some(REAL - PAID));
         assert!(!kinds(&preview).contains(&TxWarningKind::InputMismatch));
+    }
+
+    /// The finalizer reads the spent output of a previous transaction
+    /// by index without looking whether it exists: a PSBT whose input
+    /// points past the end of the transaction it carries used to panic
+    /// the decoder before any check ran. It is refused like any other
+    /// malformed PSBT.
+    #[test]
+    fn a_previous_transaction_without_the_spent_output_is_refused() {
+        let (_, pk) = throwaway_key();
+        let spk = ScriptBuf::new_p2pkh(&pk.pubkey_hash());
+        let fund = funding(&spk);
+        assert_eq!(fund.output.len(), 1);
+        let tx = spend(OutPoint::new(fund.compute_txid(), 1));
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].non_witness_utxo = Some(fund);
+        let error = decode_bytes_as_transaction(&psbt.serialize())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not have"), "{error}");
+        assert!(!looks_like_transaction(
+            &data_encoding::BASE64.encode(&psbt.serialize())
+        ));
     }
 
     /// Only a PSBT still carrying partial signatures meets the
