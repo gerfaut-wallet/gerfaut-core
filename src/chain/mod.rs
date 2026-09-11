@@ -100,9 +100,11 @@ pub(crate) fn needs_tor(endpoints: &[Endpoint]) -> bool {
 }
 
 /// Extracts the host part of a URL-ish string, without any userinfo.
+/// The host ends where the backend parser says it does: at the path,
+/// the query or the fragment, whichever comes first.
 pub(crate) fn host_of(url: &str) -> Option<String> {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let host_port = rest.split(['/', '?']).next()?;
+    let host_port = rest.split(['/', '?', '#']).next()?;
     let host = host_port.rsplit_once('@').map_or(host_port, |(_, h)| h);
     let host = host.split(':').next()?;
     (!host.is_empty()).then(|| host.to_owned())
@@ -468,6 +470,22 @@ mod tests {
             format!("tcp://{}.ONION:50001", ONION.to_ascii_uppercase()),
             None
         ))]));
+    }
+
+    /// A fragment glued to the name is not part of the host, and the
+    /// backend parser already reads it that way: an onion followed by
+    /// `#` must not be taken for a clearnet host and reached outside Tor.
+    #[test]
+    fn a_fragment_does_not_hide_an_onion_host() {
+        assert!(is_onion("http://abc.onion#frag"));
+        assert!(is_onion("http://abc.onion?q"));
+        assert_eq!(
+            host_of("http://abc.onion#frag").as_deref(),
+            Some("abc.onion")
+        );
+        assert!(needs_tor(&[Endpoint::Esplora(
+            "http://abc.onion#frag".to_owned()
+        )]));
     }
 
     #[test]
