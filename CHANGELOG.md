@@ -34,3 +34,13 @@ The first release: the library both Gerfaut apps are built on.
 - Encrypted local storage: XChaCha20-Poly1305 under an Argon2id key, an app
   lock that slows repeated attempts and survives a restart, and an encrypted
   backup file that doubles as the sync format between two devices.
+
+### Changed
+
+- Backup files are sealed under a heavier Argon2id profile than the vault
+  (64 MiB of memory, three passes): a backup travels, and whoever holds a
+  copy can guess at its password offline for as long as the file exists.
+  This version still opens backups written under the lighter profile, but
+  a build older than this one cannot open the files it writes. A backup
+  from a newer Gerfaut is now refused by name, with a message that says to
+  update, instead of being reported as a wrong password.
