@@ -43,7 +43,13 @@ Out of scope:
 
 ## Supported versions
 
-Gerfaut is pre-release. No version is supported yet; report findings against the `main` branch. A supported-versions table will be published with the first release.
+Only the newest release gets fixes. Gerfaut is at 0.1.0 and moves fast enough that backporting to an older tag would take time better spent on the fix itself.
+
+| Version | Supported |
+|---|---|
+| 0.1.x | Yes |
+
+Findings against `main` are welcome too, and are the fastest way to get something fixed before it ships.
 
 ## Safe harbor
 
