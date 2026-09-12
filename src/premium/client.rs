@@ -180,6 +180,16 @@ pub struct Channel {
     /// the other kinds, and from a server that predates it.
     #[serde(default)]
     pub linked_name: Option<String>,
+    /// Unix seconds when the channel was confirmed: the code typed back
+    /// for an address, the chat that answered the bot. `None` while one
+    /// waits, and for the kinds that need no confirmation — an ntfy
+    /// topic and a webhook are live from `created_at`.
+    #[serde(default)]
+    pub linked_at: Option<i64>,
+    /// False for a channel the server stopped delivering to. Only a
+    /// webhook is ever turned off, and only for pointing at a private or
+    /// local address; it still reads as linked, so a screen that says
+    /// nothing about this flag shows a channel that receives nothing.
     pub enabled: bool,
     /// Unix seconds.
     pub created_at: i64,
@@ -893,7 +903,7 @@ mod tests {
 
         let stub_channels = stub(
             200,
-            r#"{"channels":[{"id":"0b4b1e1c-7d1e-4b6a-9d0e-1a2b3c4d5e6f","kind":"ntfy","target":"abc…xyz","linked":true,"link_code":null,"link_url":null,"linked_name":null,"enabled":true,"created_at":1789000000},{"id":"1c5c2f2d-8e2f-4c7b-8e1f-2b3c4d5e6f70","kind":"telegram","target":"","linked":false,"link_code":"0123456789ab","link_url":"https://t.me/GerfautAlertsBot","enabled":true,"created_at":1789000001},{"id":"2d6d3030-9f30-4d8c-9f20-3c4d5e6f7081","kind":"webhook","target":"https://hooks.example.org/gerfaut","linked":true,"link_code":null,"link_url":null,"enabled":false,"created_at":1789000002},{"id":"3e7e4141-a041-4e9d-a031-4d5e6f708192","kind":"telegram","target":"…4242","linked":true,"link_code":null,"link_url":null,"linked_name":"Alice","enabled":true,"created_at":1789000003}]}"#,
+            r#"{"channels":[{"id":"0b4b1e1c-7d1e-4b6a-9d0e-1a2b3c4d5e6f","kind":"ntfy","target":"abc…xyz","linked":true,"link_code":null,"link_url":null,"linked_name":null,"linked_at":null,"enabled":true,"created_at":1789000000},{"id":"1c5c2f2d-8e2f-4c7b-8e1f-2b3c4d5e6f70","kind":"telegram","target":"","linked":false,"link_code":"0123456789ab","link_url":"https://t.me/GerfautAlertsBot","enabled":true,"created_at":1789000001},{"id":"2d6d3030-9f30-4d8c-9f20-3c4d5e6f7081","kind":"webhook","target":"https://hooks.example.org/gerfaut","linked":true,"link_code":null,"link_url":null,"enabled":false,"created_at":1789000002},{"id":"3e7e4141-a041-4e9d-a031-4d5e6f708192","kind":"telegram","target":"…4242","linked":true,"link_code":null,"link_url":null,"linked_name":"Alice","linked_at":1789000500,"enabled":true,"created_at":1789000003}]}"#,
         )
         .await;
         let channels = client(&stub_channels, Some("abcdefghijkmnpqr"))
@@ -913,6 +923,14 @@ mod tests {
         assert_eq!(channels[2].target, "https://hooks.example.org/gerfaut");
         assert!(!channels[2].enabled);
         assert_eq!(channels[3].linked_name.as_deref(), Some("Alice"));
+        assert_eq!(
+            channels[3].linked_at,
+            Some(1_789_000_500),
+            "the date the chat answered the bot"
+        );
+        assert_eq!(channels[0].linked_at, None, "a topic needs no confirming");
+        // A server that sends no date at all reads as no date.
+        assert_eq!(channels[1].linked_at, None);
     }
 
     /// A server from before the flag says nothing about the scan. The
