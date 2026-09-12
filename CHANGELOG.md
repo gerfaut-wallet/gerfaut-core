@@ -44,3 +44,23 @@ The first release: the library both Gerfaut apps are built on.
   a build older than this one cannot open the files it writes. A backup
   from a newer Gerfaut is now refused by name, with a message that says to
   update, instead of being reported as a wrong password.
+
+### Fixed
+
+- A descriptor written with SLIP-132 keys (`zpub`, `vpub`, `Zpub` and the
+  rest) is accepted the way a bare key already was: every key is rewritten
+  to `xpub` or `tpub`, the checksum is recomputed, and the import says so.
+- A PSBT input that carries its whole previous transaction takes the amount
+  from that transaction, the one its outpoint pins. A `witness_utxo` that
+  says otherwise never sets the amount shown and is called out on the
+  input, the way a coin the wallet knows differently already was.
+- Server addresses are read by the URL parser the HTTP client uses, so an
+  onion disguised with a backslash, a percent-encoded dot or a trailing dot
+  goes where the client would take it: through Tor when it is one, in the
+  clear when it is not. The host is stored in lower case; the userinfo
+  before an `@` keeps its own.
+- The ids the premium server hands out are percent-encoded before they go
+  into a URL path.
+- Switching a wallet off on the premium server withdraws the consent kept
+  for it once the server has nothing left under its id, so removing the
+  wallet later has nothing to tell the server.
