@@ -1682,12 +1682,15 @@ impl WalletManager {
     /// key, the certificate, the consents, the dismissed banner. A key
     /// with nothing behind it is not worth keeping, and the next key
     /// entered starts from nothing. Nothing is forgotten unless the
-    /// server confirmed.
+    /// server confirmed, or no longer knows the key at all: an account
+    /// deleted from another device, or purged, is as gone as one
+    /// deleted here, and keeping its key would only make every later
+    /// call fail. Any other refusal leaves the vault as it was.
     pub async fn premium_delete_account(&self, base_url: &str) -> CoreResult<()> {
-        self.premium_client(base_url)
-            .await?
-            .delete_account()
-            .await?;
+        match self.premium_client(base_url).await?.delete_account().await {
+            Ok(()) | Err(CoreError::Premium(PremiumError::UnknownKey)) => {}
+            Err(e) => return Err(e),
+        }
         self.state.lock().await.commit(|payload| {
             payload.settings.premium = PremiumState::default();
             Ok(())
@@ -3622,6 +3625,41 @@ mod tests {
         kept.set_premium_state(premium_account()).await.unwrap();
         let (base_url, _) = premium_answering(503, r#"{"error":"node unreachable"}"#).await;
         assert!(kept.premium_delete_account(&base_url).await.is_err());
+        assert_eq!(kept.premium_state().await, premium_account());
+    }
+
+    /// A key the server no longer knows, deleted from another device
+    /// or purged, is as gone as one deleted here: the vault forgets it
+    /// rather than keep a key that would fail every call from now on.
+    /// Any other refusal is not that, and the account stays.
+    #[tokio::test]
+    async fn premium_delete_account_forgets_a_key_the_server_no_longer_knows() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        manager.set_premium_state(premium_account()).await.unwrap();
+        let (base_url, mut seen) = premium_answering(401, r#"{"error":"unknown key"}"#).await;
+        manager.premium_delete_account(&base_url).await.unwrap();
+        let request = seen.recv().await.unwrap();
+        assert!(
+            request.starts_with("DELETE /v1/account HTTP/1.1"),
+            "{request}"
+        );
+        assert_eq!(manager.premium_state().await, PremiumState::default());
+        // Forgotten on disk as well.
+        drop(manager);
+        let reopened = WalletManager::open(dir.path(), key()).unwrap();
+        assert_eq!(reopened.premium_state().await, PremiumState::default());
+
+        // Refused for another reason: not gone, and kept.
+        let refusing = tempfile::tempdir().unwrap();
+        let kept = WalletManager::open(refusing.path(), key()).unwrap();
+        kept.set_premium_state(premium_account()).await.unwrap();
+        let (base_url, _) = premium_answering(404, r#"{"error":"no such route"}"#).await;
+        let error = kept.premium_delete_account(&base_url).await.unwrap_err();
+        assert!(
+            matches!(error, CoreError::Premium(PremiumError::Rejected(_))),
+            "{error}"
+        );
         assert_eq!(kept.premium_state().await, premium_account());
     }
 
