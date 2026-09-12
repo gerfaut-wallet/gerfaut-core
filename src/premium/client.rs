@@ -120,6 +120,12 @@ pub struct WalletWatch {
     /// Unix seconds when the first scan of the UTXO set finished; `None`
     /// while it runs.
     pub baseline_at: Option<i64>,
+    /// True while that scan is still to come: the coins already on the
+    /// addresses are not counted below yet. A server that predates the
+    /// flag does not send it, and [`PremiumClient::wallets`] reads it
+    /// from `baseline_at` then.
+    #[serde(default)]
+    pub baseline_pending: bool,
     pub baseline_height: Option<i64>,
     pub coins: u64,
     pub value_sats: u64,
@@ -406,12 +412,24 @@ impl PremiumClient {
         let body = self
             .raw(self.authorized(self.http.get(self.url("/v1/wallets")))?)
             .await?;
-        decode::<WalletsBody>(&body).map(|b| b.wallets)
+        let mut wallets = decode::<WalletsBody>(&body)?.wallets;
+        // A server that predates the flag leaves it false, which would
+        // read as a scan already done. The date it does send answers the
+        // same question, so it settles the ones that say nothing.
+        for wallet in &mut wallets {
+            wallet.baseline_pending = wallet.baseline_pending || wallet.baseline_at.is_none();
+        }
+        Ok(wallets)
     }
 
     /// Registers, or replaces, a wallet under the app's own `id`.
     /// `input` is the descriptor text as the app imported it; a single
     /// address is refused by the server for now.
+    ///
+    /// The answer is dropped: it repeats the request, plus the
+    /// `baseline_pending` flag that [`PremiumClient::wallets`] reports
+    /// for this wallet like any other. A screen that wants to say the
+    /// first scan is running reads the list it refreshes anyway.
     pub async fn put_wallet(&self, id: &str, name: &str, input: &str) -> CoreResult<()> {
         let request = self
             .http
@@ -813,7 +831,7 @@ mod tests {
     async fn wallets_and_channels_decode() {
         let stub_wallets = stub(
             200,
-            r#"{"wallets":[{"id":"w1","name":"Cold","script_kind":"p2wsh","watched_since":1789000000,"baseline_at":1789000100,"baseline_height":909000,"coins":3,"value_sats":150000000},{"id":"w2","name":"New","script_kind":"p2tr","watched_since":1790000000,"baseline_at":null,"baseline_height":null,"coins":0,"value_sats":0}]}"#,
+            r#"{"wallets":[{"id":"w1","name":"Cold","script_kind":"p2wsh","watched_since":1789000000,"baseline_at":1789000100,"baseline_pending":false,"baseline_height":909000,"coins":3,"value_sats":150000000},{"id":"w2","name":"New","script_kind":"p2tr","watched_since":1790000000,"baseline_at":null,"baseline_pending":true,"baseline_height":null,"coins":0,"value_sats":0}]}"#,
         )
         .await;
         let wallets = client(&stub_wallets, Some("abcdefghijkmnpqr"))
@@ -824,7 +842,12 @@ mod tests {
         assert_eq!(wallets[0].id, "w1");
         assert_eq!(wallets[0].baseline_height, Some(909_000));
         assert_eq!(wallets[0].value_sats, 150_000_000);
+        assert!(!wallets[0].baseline_pending, "that scan is done");
         assert_eq!(wallets[1].baseline_at, None);
+        assert!(
+            wallets[1].baseline_pending,
+            "the flag the server sends reaches the app"
+        );
 
         let stub_channels = stub(
             200,
@@ -848,6 +871,23 @@ mod tests {
         assert_eq!(channels[2].target, "https://hooks.example.org/gerfaut");
         assert!(!channels[2].enabled);
         assert_eq!(channels[3].linked_name.as_deref(), Some("Alice"));
+    }
+
+    /// A server from before the flag says nothing about the scan. The
+    /// date it does send must not read as a scan already done.
+    #[tokio::test]
+    async fn a_scan_still_to_run_is_read_from_the_date_when_the_flag_is_absent() {
+        let older = stub(
+            200,
+            r#"{"wallets":[{"id":"w1","name":"Cold","script_kind":"p2wsh","watched_since":1789000000,"baseline_at":null,"baseline_height":null,"coins":0,"value_sats":0},{"id":"w2","name":"Warm","script_kind":"p2tr","watched_since":1789000000,"baseline_at":1789000100,"baseline_height":909000,"coins":1,"value_sats":5000}]}"#,
+        )
+        .await;
+        let wallets = client(&older, Some("abcdefghijkmnpqr"))
+            .wallets()
+            .await
+            .unwrap();
+        assert!(wallets[0].baseline_pending, "no date means it is running");
+        assert!(!wallets[1].baseline_pending, "a date means it finished");
     }
 
     #[tokio::test]
