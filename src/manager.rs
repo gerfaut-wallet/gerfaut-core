@@ -1697,6 +1697,33 @@ impl WalletManager {
         })
     }
 
+    /// Tells the server to stop watching a wallet that stays on this
+    /// device: the switch in the settings turned off. The yes goes with
+    /// it once the server has nothing under that id: told, refused as
+    /// unknown (404 and the like), or a key it no longer knows. A wallet
+    /// the server does not watch needs no consent on file; one left
+    /// behind would have a later removal queue a message the server has
+    /// already heard, and the screens say the server is told when it
+    /// has nothing to hear. Switching the wallet back on asks the
+    /// question again, as it should: the descriptor leaves the device
+    /// only on a yes said for that sending. A server that cannot be
+    /// reached, or that refuses for lack of paid time, leaves
+    /// everything as it was: the wallet is still watched there, and
+    /// the yes still stands here.
+    pub async fn premium_unwatch_wallet(&self, base_url: &str, id: &str) -> CoreResult<()> {
+        match self.premium_client(base_url).await?.delete_wallet(id).await {
+            Ok(())
+            | Err(CoreError::Premium(PremiumError::Rejected(_) | PremiumError::UnknownKey)) => {}
+            Err(e) => return Err(e),
+        }
+        self.state.lock().await.commit(|payload| {
+            let premium = &mut payload.settings.premium;
+            premium.withdraw(id);
+            premium.unwatched(id);
+            Ok(())
+        })
+    }
+
     /// Tells the server about the wallets removed from this device
     /// since it last heard, one `DELETE` each in the order they went,
     /// through the client [`Self::premium_client`] builds. A wallet the
@@ -2619,27 +2646,21 @@ mod tests {
         assert_eq!(manager.premium_state().await.pending_unwatch, vec![meta.id]);
     }
 
-    #[tokio::test]
-    async fn the_flush_tells_the_server_and_keeps_what_it_could_not() {
+    /// A premium server that gives these answers in order, one
+    /// connection each, and hands the request line of each to the
+    /// test. After the last answer it is gone: the next connection is
+    /// refused.
+    async fn answering(
+        answers: Vec<String>,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // Two answers, then the server is gone: 200 for the first
-        // wallet, 404 for the second (already unknown, which is what we
-        // wanted), and a refused connection for the third.
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
-        let (sender, mut seen) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (sender, seen) = tokio::sync::mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
-            let refusal = r#"{"error":"no such wallet"}"#;
-            let answers = [
-                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_owned(),
-                format!(
-                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refusal}",
-                    refusal.len()
-                ),
-            ];
             for answer in answers {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut bytes = vec![0u8; 4096];
@@ -2653,6 +2674,27 @@ mod tests {
                 stream.write_all(answer.as_bytes()).await.unwrap();
             }
         });
+        (format!("http://{address}"), seen)
+    }
+
+    /// An HTTP answer with a JSON body, connection closed after it.
+    fn answer(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn the_flush_tells_the_server_and_keeps_what_it_could_not() {
+        // Two answers, then the server is gone: 200 for the first
+        // wallet, 404 for the second (already unknown, which is what we
+        // wanted), and a refused connection for the third.
+        let (base_url, mut seen) = answering(vec![
+            answer("200 OK", "{}"),
+            answer("404 Not Found", r#"{"error":"no such wallet"}"#),
+        ])
+        .await;
 
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(dir.path()).await;
@@ -2665,7 +2707,6 @@ mod tests {
         }
         manager.set_premium_state(premium).await.unwrap();
 
-        let base_url = format!("http://{address}");
         let outcome = manager.premium_flush_unwatch(&base_url).await;
         assert!(
             matches!(
@@ -2691,6 +2732,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(manager.premium_flush_unwatch(&base_url).await.unwrap(), 0);
+    }
+
+    /// Switching a wallet off withdraws the yes once the server has
+    /// nothing under its id: told, already unknown, or a key it no
+    /// longer knows. Removing the wallet after that queues nothing,
+    /// since the server has nothing to hear. A refusal for lack of
+    /// paid time, or a server that cannot be reached, leaves the yes
+    /// in place, and a removal still queues its message.
+    #[tokio::test]
+    async fn switching_a_wallet_off_withdraws_the_yes_once_the_server_has_heard() {
+        let (base_url, mut seen) = answering(vec![
+            answer("200 OK", "{}"),
+            answer("404 Not Found", r#"{"error":"no such wallet"}"#),
+            answer("401 Unauthorized", r#"{"error":"unknown key"}"#),
+            answer("403 Forbidden", r#"{"error":"no paid time"}"#),
+        ])
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input(MULTIPATH).unwrap();
+        let meta = manager
+            .add_wallet("Signet cold", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        let mut premium = PremiumState {
+            key: Some("abcdefghijkmnpqr".to_owned()),
+            ..PremiumState::default()
+        };
+        for id in [meta.id.as_str(), "w2", "w3", "w4", "w5"] {
+            premium.consent(id, 100);
+        }
+        manager.set_premium_state(premium).await.unwrap();
+
+        // Told: the yes goes, and the removal that follows has nothing
+        // to queue.
+        manager
+            .premium_unwatch_wallet(&base_url, &meta.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            seen.recv().await.unwrap(),
+            format!("DELETE /v1/wallets/{} HTTP/1.1", meta.id)
+        );
+        assert!(!manager.premium_state().await.is_consented(&meta.id));
+        manager.remove_wallet(&meta.id).await.unwrap();
+        let premium = manager.premium_state().await;
+        assert!(premium.pending_unwatch.is_empty(), "{premium:?}");
+        assert!(!premium.is_consented(&meta.id));
+
+        // Already unknown to the server, or a key it no longer knows:
+        // as unwatched as told.
+        manager
+            .premium_unwatch_wallet(&base_url, "w2")
+            .await
+            .unwrap();
+        assert!(!manager.premium_state().await.is_consented("w2"));
+        manager
+            .premium_unwatch_wallet(&base_url, "w3")
+            .await
+            .unwrap();
+        assert!(!manager.premium_state().await.is_consented("w3"));
+
+        // Refused for lack of paid time: still watched, the yes stands.
+        let refused = manager
+            .premium_unwatch_wallet(&base_url, "w4")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, CoreError::Premium(PremiumError::NoPaidTime)),
+            "{refused}"
+        );
+        assert!(manager.premium_state().await.is_consented("w4"));
+
+        // The server is gone: nothing changes here either.
+        let unreached = manager
+            .premium_unwatch_wallet(&base_url, "w5")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(unreached, CoreError::Premium(PremiumError::Unreachable(_))),
+            "{unreached}"
+        );
+        let premium = manager.premium_state().await;
+        assert!(premium.is_consented("w4") && premium.is_consented("w5"));
+        assert_eq!(premium.watched.len(), 2);
+
+        // The yes withdrawn, the question is asked again: a new yes
+        // starts a fresh date.
+        let mut premium = manager.premium_state().await;
+        premium.consent("w2", 200);
+        assert_eq!(premium.consented_at("w2"), Some(200));
     }
 
     #[tokio::test]
