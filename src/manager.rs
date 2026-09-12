@@ -29,6 +29,7 @@ use crate::chain::{
     self, BackendConfig, CertificateReport, CertificateStatus, Endpoint, EngineRequest,
     EngineResponse,
 };
+use crate::error::PremiumError;
 use crate::error::{CoreError, CoreResult};
 use crate::export::{ExportOptions, ExportResult};
 use crate::input::{ParsedInput, ParsedPayload, RecognizedKind};
@@ -415,6 +416,11 @@ impl WalletManager {
         })
     }
 
+    /// Removes a wallet from this device. One the user agreed to have
+    /// watched by the premium server is queued to be unwatched there
+    /// too, in the same write: the promise is that removing a wallet
+    /// here removes it there, and the removal cannot wait for the
+    /// network. [`Self::premium_flush_unwatch`] carries the message.
     pub async fn remove_wallet(&self, id: &str) -> CoreResult<()> {
         let mut state = self.state.lock().await;
         state.commit(|payload| {
@@ -422,6 +428,10 @@ impl WalletManager {
             payload.wallets.retain(|record| record.meta.id != id);
             if payload.wallets.len() == before {
                 return Err(CoreError::WalletNotFound(id.to_owned()));
+            }
+            let premium = &mut payload.settings.premium;
+            if premium.has_key() && premium.is_consented(id) {
+                premium.queue_unwatch(id);
             }
             Ok(())
         })?;
@@ -1670,6 +1680,56 @@ impl WalletManager {
         })
     }
 
+    /// Tells the server about the wallets removed from this device
+    /// since it last heard, one `DELETE` each in the order they went,
+    /// through the client [`Self::premium_client`] builds. A wallet the
+    /// server no longer knows counts as told. The first failure to reach
+    /// the server ends the round: what was told is forgotten, the rest
+    /// waits for the next call, and the error is returned. Nothing to
+    /// tell costs no connection. Returns how many removals still wait.
+    pub async fn premium_flush_unwatch(&self, base_url: &str) -> CoreResult<usize> {
+        let pending = {
+            let state = self.state.lock().await;
+            let premium = &state.payload.settings.premium;
+            if !premium.has_key() {
+                return Ok(premium.pending_unwatch.len());
+            }
+            premium.pending_unwatch.clone()
+        };
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let client = self.premium_client(base_url).await?;
+        let mut told = Vec::new();
+        let mut failure = None;
+        for id in &pending {
+            match client.delete_wallet(id).await {
+                Ok(()) => told.push(id.clone()),
+                // Refused (404 and the like): the server has nothing
+                // under that id, which is the state we wanted. A key the
+                // server does not know has no wallets either.
+                Err(CoreError::Premium(PremiumError::Rejected(_) | PremiumError::UnknownKey)) => {
+                    told.push(id.clone());
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        let left = self.state.lock().await.commit(|payload| {
+            let premium = &mut payload.settings.premium;
+            for id in &told {
+                premium.unwatched(id);
+            }
+            Ok(premium.pending_unwatch.len())
+        })?;
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(left),
+        }
+    }
+
     /// Whether the backend of the active network is reached through
     /// Tor: the same question a sync asks, over the same endpoints.
     async fn backend_needs_tor(&self) -> bool {
@@ -2504,6 +2564,116 @@ mod tests {
             }
         );
         assert_eq!(settings.app_prefs.get("theme").unwrap(), "dark");
+    }
+
+    #[tokio::test]
+    async fn removing_a_watched_wallet_queues_its_unwatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input(MULTIPATH).unwrap();
+
+        // No key: there is no server to tell.
+        let meta = manager
+            .add_wallet("Signet cold", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        manager.remove_wallet(&meta.id).await.unwrap();
+        assert!(manager.premium_state().await.pending_unwatch.is_empty());
+
+        // A key and a yes: the removal waits for the server, and the yes
+        // goes with the wallet.
+        let meta = manager
+            .add_wallet("Signet cold", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        let mut premium = PremiumState {
+            key: Some("abcdefghijkmnpqr".to_owned()),
+            ..PremiumState::default()
+        };
+        premium.consent(&meta.id, 100);
+        manager.set_premium_state(premium).await.unwrap();
+        manager.remove_wallet(&meta.id).await.unwrap();
+        let premium = manager.premium_state().await;
+        assert_eq!(premium.pending_unwatch, vec![meta.id.clone()]);
+        assert!(!premium.is_consented(&meta.id));
+
+        // It survives a reopen: the message waits in the vault.
+        let manager = WalletManager::open(dir.path(), key()).unwrap();
+        assert_eq!(manager.premium_state().await.pending_unwatch, vec![meta.id]);
+    }
+
+    #[tokio::test]
+    async fn the_flush_tells_the_server_and_keeps_what_it_could_not() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Two answers, then the server is gone: 200 for the first
+        // wallet, 404 for the second (already unknown, which is what we
+        // wanted), and a refused connection for the third.
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut seen) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let refusal = r#"{"error":"no such wallet"}"#;
+            let answers = [
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_owned(),
+                format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{refusal}",
+                    refusal.len()
+                ),
+            ];
+            for answer in answers {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = vec![0u8; 4096];
+                let n = stream.read(&mut bytes).await.unwrap();
+                let first_line = String::from_utf8_lossy(&bytes[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                sender.send(first_line).unwrap();
+                stream.write_all(answer.as_bytes()).await.unwrap();
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let mut premium = PremiumState {
+            key: Some("abcdefghijkmnpqr".to_owned()),
+            ..PremiumState::default()
+        };
+        for id in ["w1", "w2", "w3"] {
+            premium.queue_unwatch(id);
+        }
+        manager.set_premium_state(premium).await.unwrap();
+
+        let base_url = format!("http://{address}");
+        let outcome = manager.premium_flush_unwatch(&base_url).await;
+        assert!(
+            matches!(
+                outcome,
+                Err(CoreError::Premium(PremiumError::Unreachable(_)))
+            ),
+            "the third wallet met no server: {outcome:?}"
+        );
+        assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w1 HTTP/1.1");
+        assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w2 HTTP/1.1");
+        assert_eq!(
+            manager.premium_state().await.pending_unwatch,
+            vec!["w3".to_owned()],
+            "told and already-gone leave the queue, the unreached one stays"
+        );
+
+        // Nothing waiting: no connection is even attempted.
+        manager
+            .set_premium_state(PremiumState {
+                key: Some("abcdefghijkmnpqr".to_owned()),
+                ..PremiumState::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(manager.premium_flush_unwatch(&base_url).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -3395,6 +3565,7 @@ mod tests {
             key: Some("abcdefghijkmnpqr".to_owned()),
             certificate: Some("not.checked.here".to_owned()),
             acknowledged_offline_until: Some(1_800_000_000),
+            pending_unwatch: Vec::new(),
             ..PremiumState::default()
         };
         premium.consent("w1", 1_790_000_000);

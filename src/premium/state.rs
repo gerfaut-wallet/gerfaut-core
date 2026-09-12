@@ -5,8 +5,11 @@
 //! store. Beside it, the last certificate the server issued, so the
 //! screen says "premium until" without a network; which wallets the
 //! user agreed to send to the server, and when, because a descriptor
-//! leaves the device only on an explicit yes; and how long the "watch
-//! is offline" banner was told to keep quiet.
+//! leaves the device only on an explicit yes; which watched wallets
+//! were removed from the device before the server could be told,
+//! because removing a wallet here must remove it there and cannot wait
+//! for the network; and how long the "watch is offline" banner was told
+//! to keep quiet.
 
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +40,10 @@ pub struct PremiumState {
     /// hidden, because the user dismissed it.
     #[serde(default)]
     pub acknowledged_offline_until: Option<i64>,
+    /// Wallets removed from this device while the server still watched
+    /// them, in the order they went, until the server has been told.
+    #[serde(default)]
+    pub pending_unwatch: Vec<String>,
 }
 
 impl PremiumState {
@@ -56,6 +63,8 @@ impl PremiumState {
     /// Records the user's yes for a wallet. Asking twice keeps the first
     /// answer's date.
     pub fn consent(&mut self, wallet_id: &str, now_unix: i64) {
+        // A yes said now outranks a removal the server never heard of.
+        self.unwatched(wallet_id);
         if self.consented_at(wallet_id).is_none() {
             self.watched.push(WatchedWallet {
                 wallet_id: wallet_id.to_owned(),
@@ -69,11 +78,59 @@ impl PremiumState {
     pub fn withdraw(&mut self, wallet_id: &str) {
         self.watched.retain(|w| w.wallet_id != wallet_id);
     }
+
+    /// Whether the user agreed to have this wallet watched.
+    pub fn is_consented(&self, wallet_id: &str) -> bool {
+        self.consented_at(wallet_id).is_some()
+    }
+
+    /// Records that the server must stop watching a wallet that is gone
+    /// from this device, and forgets the yes with it. Queued once,
+    /// however many times it is asked.
+    pub fn queue_unwatch(&mut self, wallet_id: &str) {
+        self.withdraw(wallet_id);
+        if !self.pending_unwatch.iter().any(|w| w == wallet_id) {
+            self.pending_unwatch.push(wallet_id.to_owned());
+        }
+    }
+
+    /// The server no longer watches this wallet: nothing left to tell it.
+    pub fn unwatched(&mut self, wallet_id: &str) {
+        self.pending_unwatch.retain(|w| w != wallet_id);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_removal_waits_once_and_leaves_when_told() {
+        let mut state = PremiumState::default();
+        state.consent("w1", 100);
+        state.queue_unwatch("w1");
+        state.queue_unwatch("w1");
+        assert_eq!(state.pending_unwatch, vec!["w1".to_owned()]);
+        assert!(!state.is_consented("w1"), "the yes went with the wallet");
+        state.unwatched("w1");
+        assert!(state.pending_unwatch.is_empty());
+    }
+
+    #[test]
+    fn a_new_yes_cancels_a_pending_removal() {
+        let mut state = PremiumState::default();
+        state.queue_unwatch("w1");
+        state.consent("w1", 200);
+        assert!(state.pending_unwatch.is_empty());
+        assert_eq!(state.consented_at("w1"), Some(200));
+    }
+
+    #[test]
+    fn a_vault_from_before_reads_with_nothing_pending() {
+        let state: PremiumState =
+            serde_json::from_str(r#"{"key":"abcdefghijkmnpqr","watched":[]}"#).unwrap();
+        assert!(state.pending_unwatch.is_empty());
+    }
 
     #[test]
     fn an_empty_state_reads_from_nothing() {
@@ -106,11 +163,12 @@ mod tests {
                 consented_at: 100,
             }],
             acknowledged_offline_until: Some(500),
+            pending_unwatch: Vec::new(),
         };
         let json = serde_json::to_string(&state).unwrap();
         assert_eq!(
             json,
-            r#"{"key":"abcdefghijkmnpqr","certificate":"eyJ2IjoxfQ.c2ln","watched":[{"wallet_id":"w1","consented_at":100}],"acknowledged_offline_until":500}"#
+            r#"{"key":"abcdefghijkmnpqr","certificate":"eyJ2IjoxfQ.c2ln","watched":[{"wallet_id":"w1","consented_at":100}],"acknowledged_offline_until":500,"pending_unwatch":[]}"#
         );
         assert_eq!(serde_json::from_str::<PremiumState>(&json).unwrap(), state);
     }
