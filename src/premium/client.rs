@@ -20,6 +20,7 @@ use std::fmt;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use url::Url;
 
 use super::licence::{self, Claims, Heartbeat, KEY_ALPHABET, LICENCE_PUBLIC_KEY_HEX};
 use crate::chain;
@@ -180,10 +181,11 @@ pub struct Channel {
     /// the other kinds, and from a server that predates it.
     #[serde(default)]
     pub linked_name: Option<String>,
-    /// Unix seconds when the channel was confirmed: the code typed back
-    /// for an address, the chat that answered the bot. `None` while one
-    /// waits, and for the kinds that need no confirmation — an ntfy
-    /// topic and a webhook are live from `created_at`.
+    /// Unix seconds since the channel has been live: `created_at` for
+    /// the kinds that need no confirmation, an ntfy topic and a
+    /// webhook, and the confirmation for the others, the code typed
+    /// back for an address, the chat that answered the bot. `None`
+    /// while one waits, and from a server that sends no date.
     #[serde(default)]
     pub linked_at: Option<i64>,
     /// False for a channel the server stopped delivering to. Only a
@@ -460,13 +462,13 @@ impl PremiumClient {
     pub async fn put_wallet(&self, id: &str, name: &str, input: &str) -> CoreResult<()> {
         let request = self
             .http
-            .put(self.url(&format!("/v1/wallets/{id}")))
+            .put(self.resource(&["v1", "wallets", id])?)
             .json(&WalletBody { name, input });
         self.raw(self.authorized(request)?).await.map(drop)
     }
 
     pub async fn delete_wallet(&self, id: &str) -> CoreResult<()> {
-        let request = self.http.delete(self.url(&format!("/v1/wallets/{id}")));
+        let request = self.http.delete(self.resource(&["v1", "wallets", id])?);
         self.raw(self.authorized(request)?).await.map(drop)
     }
 
@@ -505,21 +507,23 @@ impl PremiumClient {
     pub async fn confirm_channel(&self, id: &str, code: &str) -> CoreResult<Channel> {
         let request = self
             .http
-            .post(self.url(&format!("/v1/channels/{id}/confirm")))
+            .post(self.resource(&["v1", "channels", id, "confirm"])?)
             .json(&ConfirmBody { code });
         let body = self.raw(self.authorized(request)?).await?;
         decode(&body)
     }
 
     pub async fn delete_channel(&self, id: &str) -> CoreResult<()> {
-        let request = self.http.delete(self.url(&format!("/v1/channels/{id}")));
+        let request = self.http.delete(self.resource(&["v1", "channels", id])?);
         self.raw(self.authorized(request)?).await.map(drop)
     }
 
     /// Sends a test message right away. The provider's refusal, if any,
     /// comes back as [`PremiumError::Rejected`] in the server's words.
     pub async fn test_channel(&self, id: &str) -> CoreResult<()> {
-        let request = self.http.post(self.url(&format!("/v1/channels/{id}/test")));
+        let request = self
+            .http
+            .post(self.resource(&["v1", "channels", id, "test"])?);
         self.raw(self.authorized(request)?).await.map(drop)
     }
 
@@ -537,6 +541,26 @@ impl PremiumClient {
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
+    }
+
+    /// The URL of a resource under the base, each segment encoded on
+    /// its way into the path. An id the server handed out is one
+    /// segment whatever it holds: a slash, a question mark, a hash or
+    /// a space in it names a stranger resource, and encoded it names
+    /// none. The ids the apps draw pass through untouched.
+    fn resource(&self, segments: &[&str]) -> CoreResult<String> {
+        let unusable = |detail: String| {
+            PremiumError::Unreachable(format!(
+                "{} is not a server address: {detail}",
+                self.base_url
+            ))
+        };
+        let mut url = Url::parse(&self.base_url).map_err(|e| unusable(e.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|()| unusable("it cannot carry a path".to_owned()))?
+            .pop_if_empty()
+            .extend(segments);
+        Ok(url.into())
     }
 
     /// The request with the account key, or [`PremiumError::NoKey`].
@@ -731,6 +755,74 @@ mod tests {
         request.split_once("\r\n\r\n").map_or("", |(_, body)| body)
     }
 
+    /// An id the server handed out goes into the path as one segment,
+    /// whatever it holds: the request names the resource it was meant
+    /// for and nothing beside it.
+    #[tokio::test]
+    async fn a_server_supplied_id_is_one_path_segment_whatever_it_holds() {
+        let mut stub = stub(200, "{}").await;
+        let client = client(&stub, Some("abcdefghijkmnpqr"));
+
+        client.delete_wallet("a/b?c#d e").await.unwrap();
+        let request = stub.request().await;
+        assert!(
+            request.starts_with("DELETE /v1/wallets/a%2Fb%3Fc%23d%20e HTTP/1.1"),
+            "{request}"
+        );
+
+        client
+            .put_wallet("../account", "name", "wpkh(x)")
+            .await
+            .unwrap();
+        let request = stub.request().await;
+        assert!(
+            request.starts_with("PUT /v1/wallets/..%2Faccount HTTP/1.1"),
+            "{request}"
+        );
+
+        // Already encoded is not a way out: the id is the text as given.
+        let _ = client.confirm_channel("x%2Fy", "123456").await;
+        let request = stub.request().await;
+        assert!(
+            request.starts_with("POST /v1/channels/x%252Fy/confirm HTTP/1.1"),
+            "{request}"
+        );
+
+        // The ids the apps draw pass through untouched.
+        client
+            .delete_wallet("0f3b7c2e-1a2b-4c3d-8e9f-a0b1c2d3e4f5")
+            .await
+            .unwrap();
+        let request = stub.request().await;
+        assert!(
+            request.starts_with("DELETE /v1/wallets/0f3b7c2e-1a2b-4c3d-8e9f-a0b1c2d3e4f5 HTTP/1.1"),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn resources_sit_under_the_base_path() {
+        let http = reqwest::Client::new();
+        let plain = PremiumClient::with_http("https://api.example.org", None, http.clone());
+        assert_eq!(
+            plain.resource(&["v1", "wallets", "w1"]).unwrap(),
+            "https://api.example.org/v1/wallets/w1"
+        );
+        let prefixed =
+            PremiumClient::with_http("https://api.example.org/premium/", None, http.clone());
+        assert_eq!(
+            prefixed
+                .resource(&["v1", "channels", "c1", "test"])
+                .unwrap(),
+            "https://api.example.org/premium/v1/channels/c1/test"
+        );
+        let unusable = PremiumClient::with_http("not a server", None, http);
+        assert!(matches!(
+            premium_error(unusable.resource(&["v1"]).unwrap_err()),
+            PremiumError::Unreachable(_)
+        ));
+    }
+
     #[test]
     fn urls_are_built_from_the_base_however_it_ends() {
         let http = reqwest::Client::new();
@@ -903,7 +995,7 @@ mod tests {
 
         let stub_channels = stub(
             200,
-            r#"{"channels":[{"id":"0b4b1e1c-7d1e-4b6a-9d0e-1a2b3c4d5e6f","kind":"ntfy","target":"abc…xyz","linked":true,"link_code":null,"link_url":null,"linked_name":null,"linked_at":null,"enabled":true,"created_at":1789000000},{"id":"1c5c2f2d-8e2f-4c7b-8e1f-2b3c4d5e6f70","kind":"telegram","target":"","linked":false,"link_code":"0123456789ab","link_url":"https://t.me/GerfautAlertsBot","enabled":true,"created_at":1789000001},{"id":"2d6d3030-9f30-4d8c-9f20-3c4d5e6f7081","kind":"webhook","target":"https://hooks.example.org/gerfaut","linked":true,"link_code":null,"link_url":null,"enabled":false,"created_at":1789000002},{"id":"3e7e4141-a041-4e9d-a031-4d5e6f708192","kind":"telegram","target":"…4242","linked":true,"link_code":null,"link_url":null,"linked_name":"Alice","linked_at":1789000500,"enabled":true,"created_at":1789000003}]}"#,
+            r#"{"channels":[{"id":"0b4b1e1c-7d1e-4b6a-9d0e-1a2b3c4d5e6f","kind":"ntfy","target":"abc…xyz","linked":true,"link_code":null,"link_url":null,"linked_name":null,"linked_at":1789000000,"enabled":true,"created_at":1789000000},{"id":"1c5c2f2d-8e2f-4c7b-8e1f-2b3c4d5e6f70","kind":"telegram","target":"","linked":false,"link_code":"0123456789ab","link_url":"https://t.me/GerfautAlertsBot","enabled":true,"created_at":1789000001},{"id":"2d6d3030-9f30-4d8c-9f20-3c4d5e6f7081","kind":"webhook","target":"https://hooks.example.org/gerfaut","linked":true,"link_code":null,"link_url":null,"enabled":false,"created_at":1789000002},{"id":"3e7e4141-a041-4e9d-a031-4d5e6f708192","kind":"telegram","target":"…4242","linked":true,"link_code":null,"link_url":null,"linked_name":"Alice","linked_at":1789000500,"enabled":true,"created_at":1789000003}]}"#,
         )
         .await;
         let channels = client(&stub_channels, Some("abcdefghijkmnpqr"))
@@ -928,9 +1020,15 @@ mod tests {
             Some(1_789_000_500),
             "the date the chat answered the bot"
         );
-        assert_eq!(channels[0].linked_at, None, "a topic needs no confirming");
-        // A server that sends no date at all reads as no date.
+        assert_eq!(
+            channels[0].linked_at,
+            Some(1_789_000_000),
+            "a topic needs no confirming: live since it was created"
+        );
+        // Waiting for the bot, and a server that sends no date at all,
+        // both read as no date.
         assert_eq!(channels[1].linked_at, None);
+        assert_eq!(channels[2].linked_at, None);
     }
 
     /// A server from before the flag says nothing about the scan. The
