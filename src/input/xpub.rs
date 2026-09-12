@@ -11,6 +11,7 @@
 use bdk_wallet::bitcoin::NetworkKind;
 use bdk_wallet::bitcoin::base58;
 use bdk_wallet::bitcoin::bip32::Xpub;
+use bdk_wallet::miniscript::descriptor::checksum::desc_checksum;
 
 use crate::error::{CoreError, CoreResult};
 use crate::input::ScriptKind;
@@ -108,14 +109,105 @@ const PRIVATE_VERSIONS: &[[u8; 4]] = &[
 const STANDARD_PUBLIC_MAINNET: [u8; 4] = [0x04, 0x88, 0xB2, 0x1E];
 const STANDARD_PUBLIC_TESTNET: [u8; 4] = [0x04, 0x35, 0x87, 0xCF];
 
+/// Textual prefixes of the SLIP-132 public keys: the spellings a
+/// descriptor parser does not read.
+const SLIP132_PUBLIC_PREFIXES: &[&str] = &[
+    "ypub", "zpub", "Ypub", "Zpub", "upub", "vpub", "Upub", "Vpub",
+];
+
+/// Textual prefixes of every extended private key, standard and
+/// SLIP-132. Any token starting with one is refused unread.
+pub(crate) const PRIVATE_PREFIXES: &[&str] = &[
+    "xprv", "yprv", "zprv", "Yprv", "Zprv", "tprv", "uprv", "vprv", "Uprv", "Vprv",
+];
+
 /// Textual prefixes that make a token look like an extended key at all.
 /// Used by the classifier to decide whether to attempt a decode.
 pub(crate) fn looks_like_extended_key(token: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "xpub", "ypub", "zpub", "Ypub", "Zpub", "tpub", "upub", "vpub", "Upub", "Vpub", "xprv",
-        "yprv", "zprv", "Yprv", "Zprv", "tprv", "uprv", "vprv", "Uprv", "Vprv",
-    ];
-    PREFIXES.iter().any(|p| token.starts_with(p))
+    ["xpub", "tpub"]
+        .iter()
+        .chain(SLIP132_PUBLIC_PREFIXES)
+        .chain(PRIVATE_PREFIXES)
+        .any(|p| token.starts_with(p))
+}
+
+/// Base58 alphabet, which delimits a key inside a descriptor: nothing
+/// else in one is spelled from these characters alone.
+pub(crate) fn is_base58_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l')
+}
+
+/// Rewrites every SLIP-132 public key in a descriptor to the standard
+/// prefix of its network, `xpub` or `tpub`. The descriptor parser reads
+/// only those, and the script type a SLIP-132 prefix hints at is what
+/// the descriptor already spells out. Returns the descriptor and
+/// whether any key was rewritten; one with no such key comes back as
+/// it was.
+///
+/// A checksum covers the text as written, so a rewrite makes it stale:
+/// it is recomputed when the original matched, and left alone when it
+/// did not, for the parser to refuse as it always has. A private key
+/// is refused before anything is rewritten.
+pub(crate) fn normalize_descriptor_keys(descriptor: &str) -> CoreResult<(String, bool)> {
+    let (body, checksum) = match descriptor.split_once('#') {
+        Some((body, checksum)) => (body, Some(checksum)),
+        None => (descriptor, None),
+    };
+    let mut rewritten = String::with_capacity(body.len());
+    let mut converted = false;
+    let mut rest = body;
+    while !rest.is_empty() {
+        let run = rest
+            .find(|c: char| !is_base58_char(c))
+            .unwrap_or(rest.len());
+        if run == 0 {
+            let delimiter = rest.chars().next().expect("rest is not empty");
+            rewritten.push(delimiter);
+            rest = &rest[delimiter.len_utf8()..];
+            continue;
+        }
+        let (token, tail) = rest.split_at(run);
+        match standard_form(token)? {
+            Some(standard) => {
+                rewritten.push_str(&standard);
+                converted = true;
+            }
+            None => rewritten.push_str(token),
+        }
+        rest = tail;
+    }
+    if !converted {
+        return Ok((descriptor.to_owned(), false));
+    }
+    let Some(given) = checksum else {
+        return Ok((rewritten, true));
+    };
+    if desc_checksum(body).ok().as_deref() != Some(given) {
+        return Ok((descriptor.to_owned(), false));
+    }
+    let fresh = desc_checksum(&rewritten).map_err(|e| CoreError::InvalidInput {
+        kind: "descriptor",
+        detail: e.to_string(),
+    })?;
+    Ok((format!("{rewritten}#{fresh}"), true))
+}
+
+/// The standard spelling of a SLIP-132 public key, `None` for any
+/// other token. A token that starts like one but does not decode is
+/// left as it is: the descriptor parser names what is wrong with it.
+fn standard_form(token: &str) -> CoreResult<Option<String>> {
+    if PRIVATE_PREFIXES.iter().any(|p| token.starts_with(p)) {
+        return Err(CoreError::PrivateMaterialRejected);
+    }
+    if !SLIP132_PUBLIC_PREFIXES.iter().any(|p| token.starts_with(p)) {
+        return Ok(None);
+    }
+    match decode_extended_key(token) {
+        Ok(decoded) if decoded.converted => Ok(Some(decoded.normalized)),
+        Ok(_) => Ok(None),
+        Err(CoreError::PrivateMaterialRejected) => Err(CoreError::PrivateMaterialRejected),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Decodes an extended public key in any known encoding, normalizing it
@@ -260,5 +352,73 @@ mod tests {
             decode_extended_key("xpubnotakey"),
             Err(CoreError::InvalidInput { .. })
         ));
+    }
+
+    #[test]
+    fn a_descriptor_of_standard_keys_is_left_as_it_is() {
+        let descriptor = format!("wpkh([deadbeef/84'/0'/0']{XPUB}/<0;1>/*)");
+        assert_eq!(
+            normalize_descriptor_keys(&descriptor).unwrap(),
+            (descriptor.clone(), false)
+        );
+        // A token that starts like a SLIP-132 key but is not one is
+        // the parser's to refuse, not something to rewrite.
+        let odd = "wpkh(zpubnotakey/0/*)";
+        assert_eq!(
+            normalize_descriptor_keys(odd).unwrap(),
+            (odd.to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn slip132_keys_are_rewritten_wherever_they_stand() {
+        let zpub = with_version([0x04, 0xB2, 0x47, 0x46]);
+        let zpub_multi = with_version([0x02, 0xAA, 0x7E, 0xD3]);
+        let descriptor = format!(
+            "wsh(sortedmulti(1,[deadbeef/48'/0'/0'/2']{zpub}/<0;1>/*,{zpub_multi}/<2;3>/*))"
+        );
+        let (rewritten, converted) = normalize_descriptor_keys(&descriptor).unwrap();
+        assert!(converted);
+        assert_eq!(
+            rewritten,
+            format!("wsh(sortedmulti(1,[deadbeef/48'/0'/0'/2']{XPUB}/<0;1>/*,{XPUB}/<2;3>/*))")
+        );
+    }
+
+    #[test]
+    fn a_matching_checksum_is_recomputed_and_a_wrong_one_is_kept() {
+        let zpub = with_version([0x04, 0xB2, 0x47, 0x46]);
+        let body = format!("wpkh({zpub}/0/*)");
+        let standard = format!("wpkh({XPUB}/0/*)");
+        let with_checksum = format!("{body}#{}", desc_checksum(&body).unwrap());
+        assert_eq!(
+            normalize_descriptor_keys(&with_checksum).unwrap(),
+            (
+                format!("{standard}#{}", desc_checksum(&standard).unwrap()),
+                true
+            )
+        );
+        // The checksum was wrong before the rewrite: the text goes to
+        // the parser as it was, and the parser says so.
+        let wrong = format!("{body}#00000000");
+        assert_eq!(
+            normalize_descriptor_keys(&wrong).unwrap(),
+            (wrong.clone(), false)
+        );
+    }
+
+    #[test]
+    fn a_private_key_inside_a_descriptor_is_refused_unread() {
+        for version in PRIVATE_VERSIONS {
+            let key = with_version(*version);
+            let descriptor = format!("wpkh({key}/0/*)");
+            assert!(
+                matches!(
+                    normalize_descriptor_keys(&descriptor),
+                    Err(CoreError::PrivateMaterialRejected)
+                ),
+                "version {version:02x?} must be rejected as private"
+            );
+        }
     }
 }

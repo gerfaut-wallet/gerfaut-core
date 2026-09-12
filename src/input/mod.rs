@@ -339,11 +339,6 @@ fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
 
 // --- private material rejection ---------------------------------------
 
-/// Base58 alphabet, used to delimit key-like tokens.
-fn is_base58_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l')
-}
-
 /// Rejects any input carrying private key material: extended private
 /// keys (all SLIP-132 prefixes), WIF keys, and likely seed phrases.
 ///
@@ -351,15 +346,11 @@ fn is_base58_char(c: char) -> bool {
 /// clear, dedicated error instead of a confusing format error — and so
 /// that no other code path ever sees the material.
 fn reject_private_material(input: &str) -> CoreResult<()> {
-    const PRIVATE_PREFIXES: &[&str] = &[
-        "xprv", "yprv", "zprv", "Yprv", "Zprv", "tprv", "uprv", "vprv", "Uprv", "Vprv",
-    ];
-
-    for token in input.split(|c: char| !is_base58_char(c)) {
+    for token in input.split(|c: char| !xpub::is_base58_char(c)) {
         if token.len() < 20 {
             continue;
         }
-        if PRIVATE_PREFIXES.iter().any(|p| token.starts_with(p)) {
+        if xpub::PRIVATE_PREFIXES.iter().any(|p| token.starts_with(p)) {
             return Err(CoreError::PrivateMaterialRejected);
         }
         // WIF: 51-52 base58check chars, version byte 0x80 (mainnet) or
@@ -446,8 +437,21 @@ fn networks_for_kind(kind: Option<NetworkKind>) -> Vec<Network> {
     }
 }
 
+/// A SLIP-132 key is read the same inside a descriptor as on its own:
+/// rewritten to the standard prefix, and said so once. The script type
+/// its prefix hints at is not consulted: the descriptor decides.
+fn slip132_warning(converted: bool) -> Vec<InputWarning> {
+    if converted {
+        vec![InputWarning::Slip132Converted]
+    } else {
+        vec![]
+    }
+}
+
 fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
-    let descriptor = parse_descriptor_str(s)?;
+    let (s, converted) = xpub::normalize_descriptor_keys(s)?;
+    let descriptor = parse_descriptor_str(&s)?;
+    let mut warnings = slip132_warning(converted);
 
     if descriptor.is_multipath() {
         let parts =
@@ -475,7 +479,7 @@ fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
                 internal: Some(parts[1].to_string()),
                 script: script_kind_of(&parts[0]),
             },
-            warnings: vec![],
+            warnings,
             script_options: vec![],
             derivation: None,
             derivation_editable: false,
@@ -483,7 +487,6 @@ fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
         });
     }
 
-    let mut warnings = vec![];
     if descriptor.has_wildcard() {
         warnings.push(InputWarning::ChangeNotTracked);
     }
@@ -504,8 +507,10 @@ fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
 }
 
 fn parse_descriptor_pair(first: &str, second: &str) -> CoreResult<ParsedInput> {
-    let external = parse_descriptor_str(first)?;
-    let internal = parse_descriptor_str(second)?;
+    let (first, first_converted) = xpub::normalize_descriptor_keys(first)?;
+    let (second, second_converted) = xpub::normalize_descriptor_keys(second)?;
+    let external = parse_descriptor_str(&first)?;
+    let internal = parse_descriptor_str(&second)?;
     if external.is_multipath() || internal.is_multipath() {
         return Err(CoreError::InvalidInput {
             kind: "descriptor",
@@ -527,7 +532,7 @@ fn parse_descriptor_pair(first: &str, second: &str) -> CoreResult<ParsedInput> {
             internal: Some(internal.to_string()),
             script: script_kind_of(&external),
         },
-        warnings: vec![],
+        warnings: slip132_warning(first_converted || second_converted),
         script_options: vec![],
         derivation: None,
         derivation_editable: false,
@@ -957,6 +962,8 @@ fn parse_json_export(input: &str) -> CoreResult<ParsedInput> {
 
 #[cfg(test)]
 mod tests {
+    use bdk_wallet::miniscript::descriptor::checksum::desc_checksum;
+
     use super::*;
 
     /// Public two-path descriptor from the BDK documentation.
@@ -966,6 +973,25 @@ mod tests {
     const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
     /// First receive address of `TPUB` on the default derivation.
     const DEFAULT_PREVIEW: &str = "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx";
+    /// BIP32 test vector 1, master private key: the one private key
+    /// these tests may spell, because everybody already knows it.
+    const TPRV: &str = "tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L";
+
+    /// SLIP-132 version bytes, public single-sig test (`vpub`), public
+    /// multisig test (`Vpub`), public single-sig main (`zpub`) and
+    /// private single-sig test (`vprv`).
+    const VPUB: [u8; 4] = [0x04, 0x5F, 0x1C, 0xF6];
+    const VPUB_MULTI: [u8; 4] = [0x02, 0x57, 0x54, 0x83];
+    const ZPUB: [u8; 4] = [0x04, 0xB2, 0x47, 0x46];
+    const VPRV: [u8; 4] = [0x04, 0x5F, 0x18, 0xBC];
+
+    /// `key` re-encoded under other version bytes, the way a wallet
+    /// exporting SLIP-132 spells the very same key.
+    fn slip132(key: &str, version: [u8; 4]) -> String {
+        let mut data = base58::decode_check(key).unwrap();
+        data[..4].copy_from_slice(&version);
+        base58::encode_check(&data)
+    }
 
     fn with_derivation(receive: &str, change: Option<&str>, origin: Option<&str>) -> ImportOptions {
         ImportOptions {
@@ -1002,6 +1028,162 @@ mod tests {
             parsed.networks,
             vec![Network::Signet, Network::Testnet4, Network::Regtest]
         );
+    }
+
+    /// A descriptor written with a SLIP-132 key reads exactly as the
+    /// same descriptor written with the standard key, plus the notice
+    /// that the key was rewritten. The prefix's script hint is not
+    /// consulted: the descriptor function already says.
+    #[test]
+    fn a_slip132_key_inside_a_descriptor_is_read_as_the_standard_one() {
+        let vpub = slip132(TPUB, VPUB);
+        assert!(vpub.starts_with("vpub"));
+        let parsed = parse_input(&MULTIPATH.replace(TPUB, &vpub)).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+        assert_eq!(
+            parsed.networks,
+            vec![Network::Signet, Network::Testnet4, Network::Regtest]
+        );
+        let (external, internal, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.starts_with("wpkh([9a6a2580/84'/1'/0']tpub"));
+        assert!(!external.contains(&vpub));
+        assert!(internal.unwrap().contains("/1/*"));
+
+        let standard = parse_input(MULTIPATH).unwrap();
+        assert_eq!(descriptors(&parsed), descriptors(&standard));
+        assert_eq!(parsed.preview_address, standard.preview_address);
+        assert!(parsed.script_options.is_empty());
+        assert!(!parsed.derivation_editable);
+    }
+
+    /// The checksum covers the text as written: rewriting a key inside
+    /// it makes it stale, so it is recomputed. One that was wrong to
+    /// begin with is still refused, before any key is looked at.
+    #[test]
+    fn a_checksummed_slip132_descriptor_is_accepted() {
+        let vpub = slip132(TPUB, VPUB);
+        let body = format!("wpkh({vpub}/0/*)");
+        let input = format!("{body}#{}", desc_checksum(&body).unwrap());
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::Descriptor);
+        assert!(parsed.warnings.contains(&InputWarning::Slip132Converted));
+        let (external, _, _) = descriptors(&parsed);
+        assert_eq!(external, format!("wpkh({TPUB}/0/*)#dmh8w44d"));
+
+        let error = parse_input(&format!("{body}#00000000"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.to_lowercase().contains("checksum"), "{error}");
+    }
+
+    #[test]
+    fn a_pair_of_slip132_descriptors_is_said_to_be_converted_once() {
+        let vpub = slip132(TPUB, VPUB);
+        let input = format!("wpkh({vpub}/0/*)\nwpkh({vpub}/1/*)");
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::DescriptorPair);
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+        let (external, internal, _) = descriptors(&parsed);
+        assert_eq!(external, format!("wpkh({TPUB}/0/*)#dmh8w44d"));
+        assert_eq!(internal.unwrap(), format!("wpkh({TPUB}/1/*)#u0jxnq94"));
+
+        // One converted line is enough to say so.
+        let input = format!("wpkh({TPUB}/0/*)\nwpkh({vpub}/1/*)");
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+    }
+
+    #[test]
+    fn a_descriptor_may_spell_its_keys_both_ways() {
+        let zpub = slip132(XPUB, ZPUB);
+        let input = format!("wsh(multi(1,{XPUB}/<0;1>/*,{zpub}/<2;3>/*))");
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
+        assert_eq!(parsed.networks, vec![Network::Mainnet]);
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::WitnessScript);
+        assert_eq!(external.matches(XPUB).count(), 2, "{external}");
+    }
+
+    /// The multisig prefixes are refused on their own, since a lone
+    /// cosigner key makes no wallet; inside the multisig descriptor
+    /// they were exported for, they read as the keys they are.
+    #[test]
+    fn multisig_prefixes_are_read_inside_a_multisig_descriptor() {
+        let cosigner = slip132(TPUB, VPUB_MULTI);
+        assert!(cosigner.starts_with("Vpub"));
+        let input = format!(
+            "wsh(sortedmulti(1,[9a6a2580/48'/1'/0'/2']{cosigner}/<0;1>/*,[00000000/48'/1'/0'/2']{cosigner}/<2;3>/*))"
+        );
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::WitnessScript);
+        assert!(external.starts_with("wsh(sortedmulti(1,[9a6a2580/48'/1'/0'/2']tpub"));
+        assert!(parsed.preview_address.unwrap().starts_with("tb1q"));
+
+        let error = parse_input(&cosigner).unwrap_err().to_string();
+        assert!(error.contains("multisig"), "{error}");
+    }
+
+    /// A rewritten key keeps its network: a mainnet `zpub` next to a
+    /// test `tpub` is the same mix it was, and refused the same way.
+    #[test]
+    fn a_slip132_key_keeps_its_network_inside_a_descriptor() {
+        let zpub = slip132(XPUB, ZPUB);
+        let error = parse_input(&format!("wsh(multi(1,{zpub}/0/*,{TPUB}/0/*))"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mixes mainnet and test"), "{error}");
+    }
+
+    /// The rewrite only touches descriptors: an address is not scanned
+    /// for keys, a JSON export is read field by field, and a field that
+    /// holds a descriptor is read like a pasted one.
+    #[test]
+    fn the_rewrite_reaches_descriptors_and_nothing_else() {
+        let address = parse_input("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+        assert!(address.warnings.is_empty());
+
+        let standard = parse_input(&format!("{{\"descriptor\": \"wpkh({TPUB}/0/*)\"}}")).unwrap();
+        assert!(!standard.warnings.contains(&InputWarning::Slip132Converted));
+
+        let vpub = slip132(TPUB, VPUB);
+        let export = parse_input(&format!("{{\"descriptor\": \"wpkh({vpub}/0/*)\"}}")).unwrap();
+        assert_eq!(export.kind, RecognizedKind::WalletExport);
+        assert!(export.warnings.contains(&InputWarning::Slip132Converted));
+        let (external, _, _) = descriptors(&export);
+        assert_eq!(external, format!("wpkh({TPUB}/0/*)#dmh8w44d"));
+
+        // A Coldcard-style export names its script by account, and its
+        // key is decoded as a key, not rewritten as text.
+        let zpub = slip132(XPUB, ZPUB);
+        let coldcard = parse_input(&format!(
+            "{{\"xfp\": \"0F056943\", \"bip84\": {{\"xpub\": \"{zpub}\", \"deriv\": \"m/84'/0'/0'\"}}}}"
+        ))
+        .unwrap();
+        assert_eq!(coldcard.kind, RecognizedKind::WalletExport);
+        let (external, _, script) = descriptors(&coldcard);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.contains(XPUB));
+    }
+
+    #[test]
+    fn a_slip132_private_key_inside_a_descriptor_is_rejected() {
+        let vprv = slip132(TPRV, VPRV);
+        assert!(vprv.starts_with("vprv"));
+        assert!(matches!(
+            parse_input(&format!("wpkh({vprv}/0/*)")),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
+        assert!(matches!(
+            parse_input(&format!("wpkh({vprv}/0/*)\nwpkh({vprv}/1/*)")),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
     }
 
     #[test]
@@ -1142,9 +1324,7 @@ mod tests {
         let error = parse_input(&tampered).unwrap_err().to_string();
         assert!(error.contains("first address"), "{error}");
 
-        let private = format!(
-            "BSMS 1.0\nwsh(pk(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/**))\n/0/*,/1/*\n{first}\n"
-        );
+        let private = format!("BSMS 1.0\nwsh(pk({TPRV}/**))\n/0/*,/1/*\n{first}\n");
         assert!(matches!(
             parse_input(&private),
             Err(CoreError::PrivateMaterialRejected)
@@ -1203,9 +1383,9 @@ mod tests {
 
     #[test]
     fn descriptor_with_tprv_is_rejected_as_private() {
-        let input = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
+        let input = format!("wpkh({TPRV}/84'/1'/0'/0/*)");
         assert!(matches!(
-            parse_input(input),
+            parse_input(&input),
             Err(CoreError::PrivateMaterialRejected)
         ));
     }
