@@ -51,13 +51,30 @@ pub struct Health {
     pub now: i64,
 }
 
-/// The server's node, as `getblockchaininfo` describes it.
+/// The server's node, as `getblockchaininfo` describes it. A node that
+/// missed the server's deadline while still feeding the engine is a slow
+/// node, not an outage: it comes back as `answering: false` and nothing
+/// else, since the numbers would be older than the answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeHealth {
-    pub headers: i64,
-    pub blocks: i64,
-    pub initial_block_download: bool,
-    pub verification_progress: f64,
+    /// Whether the node answered the server in time. A server that
+    /// predates the flag only ever published the numbers, so its silence
+    /// here means it did.
+    #[serde(default = "answered")]
+    pub answering: bool,
+    #[serde(default)]
+    pub headers: Option<i64>,
+    #[serde(default)]
+    pub blocks: Option<i64>,
+    #[serde(default)]
+    pub initial_block_download: Option<bool>,
+    #[serde(default)]
+    pub verification_progress: Option<f64>,
+}
+
+/// What a body without the flag means; see [`NodeHealth::answering`].
+fn answered() -> bool {
+    true
 }
 
 /// The watching engine: where it stands, and nothing about what it
@@ -797,14 +814,15 @@ mod tests {
         // tuple of components; it must not break the decode.
         let mut public = stub(
             200,
-            r#"{"ok":true,"network":"bitcoin","node":{"headers":910000,"blocks":910000,"initial_block_download":false,"verification_progress":0.9999},"engine":{"tip_height":910000,"tip_seen_at":[2026,248,12,0,0,0,0,0,0]},"now":1790000000}"#,
+            r#"{"ok":true,"network":"bitcoin","node":{"answering":true,"headers":910000,"blocks":910000,"initial_block_download":false,"verification_progress":0.9999},"engine":{"tip_height":910000,"tip_seen_at":[2026,248,12,0,0,0,0,0,0]},"now":1790000000}"#,
         )
         .await;
         let health = client(&public, None).health().await.unwrap();
         assert!(health.ok);
         assert_eq!(health.network, "bitcoin");
-        assert_eq!(health.node.blocks, 910_000);
-        assert!(!health.node.initial_block_download);
+        assert!(health.node.answering);
+        assert_eq!(health.node.blocks, Some(910_000));
+        assert_eq!(health.node.initial_block_download, Some(false));
         assert_eq!(health.engine.tip_height, Some(910_000));
         assert!(health.engine.tip_seen_at.is_some());
         assert_eq!(health.now, NOW);
@@ -825,6 +843,30 @@ mod tests {
         let health = client(&older, None).health().await.unwrap();
         assert_eq!(health.engine.tip_height, None);
         assert_eq!(health.engine.tip_seen_at, None);
+        assert!(
+            health.node.answering,
+            "a server that only ever sent the numbers was answering"
+        );
+    }
+
+    /// A node too slow to answer, still feeding the engine: the server
+    /// says so and drops its numbers. That is a health body like any
+    /// other, not a shape the app has to call unexpected.
+    #[tokio::test]
+    async fn a_health_body_from_a_node_that_is_not_answering_decodes() {
+        let slow = stub(
+            200,
+            r#"{"ok":true,"network":"bitcoin","node":{"answering":false},"engine":{"tip_height":910000,"tip_seen_at":[2026,248,12,0,0,0,0,0,0],"heard_at":1789999900},"now":1790000000}"#,
+        )
+        .await;
+        let health = client(&slow, None).health().await.unwrap();
+        assert!(health.ok);
+        assert!(!health.node.answering);
+        assert_eq!(health.node.headers, None);
+        assert_eq!(health.node.blocks, None);
+        assert_eq!(health.node.initial_block_download, None);
+        assert_eq!(health.node.verification_progress, None);
+        assert_eq!(health.engine.tip_height, Some(910_000));
     }
 
     #[tokio::test]
