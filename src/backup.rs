@@ -211,13 +211,32 @@ pub fn seal(payload: &BackupPayload, password: &str) -> CoreResult<Vec<u8>> {
     Ok(cipher::seal_with(BACKUP_MAGIC, &compressed, &key)?)
 }
 
+/// The refusal a backup from a newer Gerfaut gets, whichever part of
+/// it this build does not know: the envelope version, the key profile
+/// the password is derived under, or the payload schema. Its own
+/// sentence, and never the one a wrong password or a damaged file
+/// gets: the restore screens show that one as "wrong password", and a
+/// person holding the right password would only type it again.
+fn newer_gerfaut(unknown: &str) -> CoreError {
+    backup_error(format!(
+        "this backup was written by a newer Gerfaut ({unknown}); update Gerfaut to open it"
+    ))
+}
+
 /// Opens a sealed backup. A wrong password and a tampered file are one
 /// and the same failure; a file that is not a backup is said to be so;
-/// a payload written by a newer schema is refused by name rather than
-/// half-read.
+/// a file written by a newer Gerfaut, at any layer of its format, is
+/// refused by name rather than half-read or blamed on the password.
 pub fn open(bytes: &[u8], password: &str) -> CoreResult<BackupPayload> {
     let key = password_key(password)?;
-    let compressed = cipher::unseal_with(BACKUP_MAGIC, bytes, &key)?;
+    let compressed =
+        cipher::unseal_with(BACKUP_MAGIC, bytes, &key).map_err(|error| match error {
+            VaultError::UnsupportedVersion(version) => {
+                newer_gerfaut(&format!("file version {version}"))
+            }
+            VaultError::UnsupportedKdf(kdf) => newer_gerfaut(&format!("key profile {kdf}")),
+            other => other.into(),
+        })?;
     let mut json = Vec::new();
     // Bounded: zlib reaches a thousand to one, and a crafted file must
     // not be able to inflate until the device gives up.
@@ -238,9 +257,7 @@ pub fn open(bytes: &[u8], password: &str) -> CoreResult<BackupPayload> {
     let Versioned { version } =
         serde_json::from_slice(&json).map_err(|e| VaultError::CorruptedPayload(e.to_string()))?;
     if version > BACKUP_VERSION {
-        return Err(backup_error(format!(
-            "backup version {version} needs a newer Gerfaut"
-        )));
+        return Err(newer_gerfaut(&format!("backup version {version}")));
     }
     serde_json::from_slice(&json).map_err(|e| VaultError::CorruptedPayload(e.to_string()).into())
 }
@@ -446,6 +463,52 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("version 2"), "{error}");
+        assert!(error.to_string().contains("newer Gerfaut"), "{error}");
+    }
+
+    /// A backup whose header names a key profile or an envelope version
+    /// this build does not know was written by a newer Gerfaut. It is
+    /// refused under that name, in the sentence the restore screens
+    /// print as it is, and never as the wrong-password failure they
+    /// rewrite into "wrong password, or the file is damaged".
+    #[test]
+    fn a_file_from_a_newer_gerfaut_is_not_blamed_on_the_password() {
+        let sealed = seal(&payload(), PASSWORD).unwrap();
+        let wrong_password = open(&sealed, "correct horse battery stapler").unwrap_err();
+        assert!(matches!(
+            wrong_password,
+            CoreError::Vault(VaultError::WrongKeyOrCorrupted)
+        ));
+
+        // The key profile byte, then the envelope version byte, forged
+        // to values no build has assigned yet.
+        for (offset, forged, named) in [(9, 3u8, "key profile 3"), (8, 3u8, "file version 3")] {
+            let mut newer = sealed.clone();
+            newer[offset] = forged;
+            let error = open(&newer, PASSWORD).unwrap_err();
+            assert!(
+                matches!(error, CoreError::InvalidInput { kind: "backup", .. }),
+                "{error}"
+            );
+            let message = error.to_string();
+            assert_eq!(
+                message,
+                format!(
+                    "invalid backup: this backup was written by a newer Gerfaut ({named}); update Gerfaut to open it"
+                )
+            );
+            assert_ne!(message, wrong_password.to_string());
+            assert!(!message.contains("password"), "{message}");
+            assert!(!message.contains("corrupt"), "{message}");
+            // The right password is not what is missing: the same file
+            // with the wrong one gets the same answer.
+            assert_eq!(
+                open(&newer, "correct horse battery stapler")
+                    .unwrap_err()
+                    .to_string(),
+                message
+            );
+        }
     }
 
     #[test]

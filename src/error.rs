@@ -88,6 +88,11 @@ pub enum VaultError {
     #[error("vault version {0} is not supported by this build")]
     UnsupportedVersion(u8),
 
+    /// The file names a key derivation profile this build does not
+    /// know: it was written by a newer build, not damaged.
+    #[error("vault key profile {0} is not supported by this build")]
+    UnsupportedKdf(u8),
+
     /// Decryption failed: wrong key/password, or the file was tampered with.
     #[error("vault decryption failed: wrong key or corrupted file")]
     WrongKeyOrCorrupted,

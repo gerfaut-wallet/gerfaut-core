@@ -158,12 +158,12 @@ pub fn unseal_with(magic: &[u8; 8], file: &[u8], key: &VaultKey) -> Result<Vec<u
     // lets an app prompt for the right credential kind. Decryption still
     // trusts the provided key: the byte is bound as associated data, so
     // rewriting it to a lighter profile fails authentication rather than
-    // yielding a key to guess at.
+    // yielding a key to guess at. A profile this build does not know is
+    // one a newer build added: the file is refused as such, before any
+    // key is derived, never reported as a wrong key.
     let kdf = file[9];
     if !matches!(kdf, KDF_RAW | KDF_ARGON2ID | KDF_ARGON2ID_64M) {
-        return Err(VaultError::CorruptedPayload(format!(
-            "unknown kdf id {kdf}"
-        )));
+        return Err(VaultError::UnsupportedKdf(kdf));
     }
     let salt = &file[10..10 + SALT_LEN];
     let nonce = &file[10 + SALT_LEN..HEADER_LEN];
@@ -196,9 +196,7 @@ pub fn kdf_kind(file: &[u8]) -> Result<VaultKdf, VaultError> {
     match file[9] {
         KDF_RAW => Ok(VaultKdf::PlatformKey),
         KDF_ARGON2ID | KDF_ARGON2ID_64M => Ok(VaultKdf::Password),
-        other => Err(VaultError::CorruptedPayload(format!(
-            "unknown kdf id {other}"
-        ))),
+        other => Err(VaultError::UnsupportedKdf(other)),
     }
 }
 
@@ -363,7 +361,8 @@ mod tests {
 
     /// The byte is bound as associated data: rewriting a backup to the
     /// lighter profile does not hand out a lighter key to guess at, and
-    /// a profile this build does not know is named rather than tried.
+    /// a profile this build does not know is named as a newer one
+    /// rather than tried, or blamed on the key.
     #[test]
     fn the_kdf_byte_cannot_be_downgraded_and_an_unknown_one_is_named() {
         let key = VaultKey::Password("correct horse".to_owned());
@@ -376,7 +375,13 @@ mod tests {
         backup[9] = 9;
         assert!(matches!(
             unseal_with(BACKUP_MAGIC, &backup, &key),
-            Err(VaultError::CorruptedPayload(detail)) if detail.contains("unknown kdf id 9")
+            Err(VaultError::UnsupportedKdf(9))
+        ));
+        let mut vault = seal(b"payload", &key).unwrap();
+        vault[9] = 9;
+        assert!(matches!(
+            kdf_kind(&vault),
+            Err(VaultError::UnsupportedKdf(9))
         ));
     }
 
