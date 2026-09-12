@@ -434,6 +434,11 @@ pub struct InputFacts {
     pub spent: Option<bool>,
     /// Whether the backend was asked and did not know the outpoint.
     pub unknown: bool,
+    /// Whether nothing could be asked at all: every endpoint tried
+    /// stopped answering before this coin. Different from `unknown`,
+    /// which is a backend's answer; this is the absence of one, and it
+    /// leaves the PSBT's own declaration unconfronted.
+    pub unchecked: bool,
 }
 
 /// What the manager learned about an output beyond the script.
@@ -556,6 +561,18 @@ pub fn build_preview(
                 format!(
                     "Input {i} was not found on {network}: the transaction may belong to \
                      another network, or spend a coin this backend does not know."
+                ),
+            ));
+        } else if facts.unchecked {
+            // Saying it "was not found" would be a claim nobody made.
+            // Nothing answered, so the value shown for this coin is the
+            // transaction's own word, and the fee rests on it.
+            warnings.push(TxWarning::new(
+                TxWarningKind::InputUnknown,
+                format!(
+                    "Input {i} could not be checked: no backend answered about this coin. \
+                     Its value here, and the fee, are what this transaction claims, not \
+                     something confirmed."
                 ),
             ));
         } else if facts.spent == Some(true) {
@@ -839,6 +856,7 @@ mod tests {
             }),
             spent: Some(false),
             unknown: false,
+            unchecked: false,
         }];
         let preview = build_preview(
             &decoded,
@@ -876,6 +894,7 @@ mod tests {
             wallet: None,
             spent: Some(true),
             unknown: false,
+            unchecked: false,
         }];
         let preview = build_preview(&decoded, Network::Mainnet, &facts, &[], Some(100), 0);
         assert!(!preview.ready);
@@ -892,6 +911,7 @@ mod tests {
             Network::Mainnet,
             &[InputFacts {
                 unknown: true,
+                unchecked: false,
                 ..Default::default()
             }],
             &[],
@@ -953,6 +973,13 @@ mod tests {
     /// claimed one of 200.
     const PAID: u64 = 10_000;
 
+    /// The one key in this repository, and it never leaves a test
+    /// binary: the whole module is `#[cfg(test)]`, so no release
+    /// build contains it. A *finalized* PSBT is what the tests below
+    /// have to forge, and a finalized input carries a real signature
+    /// — there is no way to build one without signing something. The
+    /// key is a fixed constant, belongs to nobody, and holds nothing.
+    /// Gerfaut itself never generates, stores or signs with a key.
     fn throwaway_key() -> (SecretKey, CompressedPublicKey) {
         let secp = Secp256k1::new();
         let sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
@@ -1010,6 +1037,7 @@ mod tests {
             }),
             spent: Some(false),
             unknown: false,
+            unchecked: false,
         }]
     }
 
@@ -1160,6 +1188,7 @@ mod tests {
             wallet: None,
             spent: Some(false),
             unknown: false,
+            unchecked: false,
         }];
         let preview = build_preview(&decoded, Network::Regtest, &from_chain, &[], Some(100), 0);
         let mismatch = preview
