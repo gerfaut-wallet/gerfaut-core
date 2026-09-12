@@ -69,7 +69,9 @@ pub struct TxInputPreview {
     pub vout: u32,
     /// Value of the output being spent, when known: from a watched
     /// wallet or from the backend first, from the PSBT only when neither
-    /// knows the coin. What the PSBT declares is its author's word.
+    /// knows the coin. Within the PSBT, the previous transaction it
+    /// carries counts before its bare witness entry: the outpoint pins
+    /// the transaction's txid, and nothing pins the entry.
     pub value_sats: Option<u64>,
     /// Address of the output being spent, when known.
     pub address: Option<String>,
@@ -114,7 +116,8 @@ pub enum TxWarningKind {
     /// An input was already spent, by this transaction or another.
     InputSpent,
     /// The PSBT declares a coin other than the one the wallet or the
-    /// backend holds at that outpoint: another value, another script.
+    /// backend holds at that outpoint, or other than the one its own
+    /// previous transaction pays: another value, another script.
     InputMismatch,
     /// The fee could not be computed: an input's value is unknown.
     FeeUnknown,
@@ -264,7 +267,17 @@ pub struct DecodedTx {
 #[derive(Debug, Clone)]
 pub struct DecodedInput {
     pub signed: bool,
+    /// Value and script of the coin spent, when the container carried
+    /// them. A PSBT input may describe the coin twice: by the previous
+    /// transaction, whose txid the outpoint pins, and by a bare witness
+    /// entry nothing pins. The transaction is the one read; the entry
+    /// stands in only when the transaction is absent.
     pub prevout: Option<TxOut>,
+    /// The witness entry, kept only when the same input also carries
+    /// the previous transaction and the two disagree. Never the amount
+    /// shown: what the PSBT's author declared, for the caution that
+    /// names it.
+    pub disputed_witness_utxo: Option<TxOut>,
 }
 
 /// Decodes a transaction from text: base64 PSBT, hex PSBT, hex raw
@@ -313,6 +326,7 @@ pub fn decode_bytes_as_transaction(bytes: &[u8]) -> CoreResult<DecodedTx> {
         .map(|input| DecodedInput {
             signed: !input.script_sig.is_empty() || !input.witness.is_empty(),
             prevout: None,
+            disputed_witness_utxo: None,
         })
         .collect::<Vec<_>>();
     let ready = inputs.iter().all(|input| input.signed);
@@ -391,15 +405,26 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
         let outpoint = psbt.unsigned_tx.input[index].previous_output;
         let final_present =
             input.final_script_sig.is_some() || input.final_script_witness.is_some();
-        let prevout = input.witness_utxo.clone().or_else(|| {
-            input
-                .non_witness_utxo
-                .as_ref()
-                .and_then(|prev| prev.output.get(outpoint.vout as usize).cloned())
-        });
+        // The previous transaction, checked above to be the one this
+        // input spends, is the truth about the coin: its txid commits
+        // to every output in it. The witness entry commits to nothing
+        // and only stands in when there is no transaction to read;
+        // when both are there and disagree, the entry is what the
+        // PSBT's author chose to declare, and it is kept for the
+        // caution that says so.
+        let from_previous = input
+            .non_witness_utxo
+            .as_ref()
+            .and_then(|prev| prev.output.get(outpoint.vout as usize).cloned());
+        let disputed_witness_utxo = match (&from_previous, &input.witness_utxo) {
+            (Some(known), Some(declared)) if known != declared => Some(declared.clone()),
+            _ => None,
+        };
+        let prevout = from_previous.or_else(|| input.witness_utxo.clone());
         inputs.push(DecodedInput {
             signed: final_present && !unfinished.contains(&index),
             prevout,
+            disputed_witness_utxo,
         });
     }
     let ready = inputs.iter().all(|input| input.signed);
@@ -526,6 +551,31 @@ pub fn build_preview(
             ),
         ));
     }
+    let place = |prevout: &TxOut| {
+        address_of(&prevout.script_pubkey)
+            .unwrap_or_else(|| format!("script {:x}", prevout.script_pubkey))
+    };
+    for (i, input) in decoded.inputs.iter().enumerate() {
+        // The PSBT disagrees with itself on the coin: the previous
+        // transaction it carries, which the outpoint pins, pays one
+        // thing, and its witness entry declares another. The amount
+        // and the fee already go by the transaction; this says why.
+        if let (Some(known), Some(declared)) = (&input.prevout, &input.disputed_witness_utxo) {
+            warnings.push(TxWarning::new(
+                TxWarningKind::InputMismatch,
+                format!(
+                    "Input {i} is not what the PSBT says: its witness entry declares {} sats \
+                     on {}, but the previous transaction it carries, the one this input \
+                     spends, pays {} sats to {}. The value shown and the fee go by that \
+                     transaction; whoever built this PSBT declared a different coin.",
+                    declared.value.to_sat(),
+                    place(declared),
+                    known.value.to_sat(),
+                    place(known)
+                ),
+            ));
+        }
+    }
     for (i, facts) in input_facts.iter().enumerate() {
         // The PSBT and the chain disagree on the coin: a value or a
         // script the signer was shown that is not the one being spent.
@@ -538,10 +588,6 @@ pub fn build_preview(
                 .wallet
                 .as_ref()
                 .map_or("the backend", |wallet| wallet.name.as_str());
-            let place = |prevout: &TxOut| {
-                address_of(&prevout.script_pubkey)
-                    .unwrap_or_else(|| format!("script {:x}", prevout.script_pubkey))
-            };
             warnings.push(TxWarning::new(
                 TxWarningKind::InputMismatch,
                 format!(
@@ -1349,6 +1395,231 @@ mod tests {
         );
         assert_eq!(preview.fee_sats, Some(REAL - PAID));
         assert!(!kinds(&preview).contains(&TxWarningKind::InputMismatch));
+    }
+
+    /// The script the coin pays to: what `finalized_p2wpkh` spends.
+    fn coin_script() -> ScriptBuf {
+        ScriptBuf::new_p2wpkh(&fixed_pubkey().wpubkey_hash())
+    }
+
+    /// A P2WPKH spend whose PSBT describes the coin twice: by the
+    /// previous transaction, the genuine one, and by a witness entry
+    /// of the caller's choosing. Final, so nothing reads the witness.
+    fn psbt_with_both_descriptions(witness_utxo: TxOut) -> (Psbt, ScriptBuf) {
+        let (tx, spk) = finalized_p2wpkh();
+        let mut psbt = Psbt::from_unsigned_tx(spend(tx.input[0].previous_output)).unwrap();
+        psbt.inputs[0].non_witness_utxo = Some(funding(&spk));
+        psbt.inputs[0].witness_utxo = Some(witness_utxo);
+        psbt.inputs[0].final_script_witness = Some(tx.input[0].witness.clone());
+        (psbt, spk)
+    }
+
+    fn mismatches(preview: &TxPreview) -> Vec<&TxWarning> {
+        preview
+            .warnings
+            .iter()
+            .filter(|w| w.kind == TxWarningKind::InputMismatch)
+            .collect()
+    }
+
+    /// Two descriptions that agree are one description: the coin reads
+    /// from the transaction, and nothing is disputed.
+    #[test]
+    fn a_witness_entry_that_agrees_with_the_previous_transaction_is_silent() {
+        let (psbt, spk) = psbt_with_both_descriptions(TxOut {
+            value: Amount::from_sat(REAL),
+            script_pubkey: coin_script(),
+        });
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        assert!(decoded.ready);
+        let prevout = decoded.inputs[0].prevout.as_ref().unwrap();
+        assert_eq!(prevout.value.to_sat(), REAL);
+        assert_eq!(prevout.script_pubkey, spk);
+        assert!(decoded.inputs[0].disputed_witness_utxo.is_none());
+
+        let preview = build_preview(
+            &decoded,
+            Network::Regtest,
+            &[InputFacts::default()],
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(preview.inputs[0].value_sats, Some(REAL));
+        assert_eq!(preview.fee_sats, Some(REAL - PAID));
+        assert!(mismatches(&preview).is_empty());
+    }
+
+    /// The witness entry says the coin is worth less than the previous
+    /// transaction pays: the transaction sets the value and the fee,
+    /// the entry never does, and the disagreement is named on the input
+    /// with both figures. A wallet that agrees with the transaction adds
+    /// nothing to it.
+    #[test]
+    fn a_witness_entry_that_disagrees_on_the_value_never_sets_the_amount() {
+        let (psbt, spk) = psbt_with_both_descriptions(TxOut {
+            value: Amount::from_sat(CLAIMED),
+            script_pubkey: coin_script(),
+        });
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        assert!(decoded.ready);
+        assert_eq!(
+            decoded.inputs[0].prevout.as_ref().unwrap().value.to_sat(),
+            REAL
+        );
+        assert_eq!(
+            decoded.inputs[0]
+                .disputed_witness_utxo
+                .as_ref()
+                .unwrap()
+                .value
+                .to_sat(),
+            CLAIMED
+        );
+
+        let alone = build_preview(
+            &decoded,
+            Network::Regtest,
+            &[InputFacts::default()],
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(alone.inputs[0].value_sats, Some(REAL));
+        assert_eq!(alone.fee_sats, Some(REAL - PAID));
+        let found = mismatches(&alone);
+        let [caution] = found.as_slice() else {
+            panic!("one mismatch expected, got {:?}", alone.warnings);
+        };
+        assert_eq!(caution.severity, TxSeverity::Alert);
+        assert!(
+            caution.message.starts_with("Input 0 "),
+            "{}",
+            caution.message
+        );
+        assert!(
+            caution.message.contains("10200 sats"),
+            "{}",
+            caution.message
+        );
+        assert!(
+            caution.message.contains("100000 sats"),
+            "{}",
+            caution.message
+        );
+        assert!(
+            caution.message.contains("previous transaction"),
+            "{}",
+            caution.message
+        );
+        assert!(kinds(&alone).contains(&TxWarningKind::HighFeeRate));
+
+        let with_wallet = build_preview(
+            &decoded,
+            Network::Regtest,
+            &wallet_facts(&spk),
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(with_wallet.inputs[0].value_sats, Some(REAL));
+        assert_eq!(mismatches(&with_wallet).len(), 1);
+    }
+
+    /// A different script is as much of a disagreement as a different
+    /// value: the address shown is the transaction's, and the caution
+    /// names the one the entry declared.
+    #[test]
+    fn a_witness_entry_that_disagrees_on_the_script_is_reported() {
+        let elsewhere = p2wpkh(0x44);
+        let (psbt, spk) = psbt_with_both_descriptions(TxOut {
+            value: Amount::from_sat(REAL),
+            script_pubkey: elsewhere.clone(),
+        });
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        assert_eq!(
+            decoded.inputs[0].prevout.as_ref().unwrap().script_pubkey,
+            spk
+        );
+        let preview = build_preview(
+            &decoded,
+            Network::Regtest,
+            &[InputFacts::default()],
+            &[],
+            Some(100),
+            0,
+        );
+        let regtest = |script: &ScriptBuf| {
+            Address::from_script(script, Network::Regtest.to_bitcoin())
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(preview.inputs[0].address, Some(regtest(&spk)));
+        assert_eq!(preview.fee_sats, Some(REAL - PAID));
+        let found = mismatches(&preview);
+        let [caution] = found.as_slice() else {
+            panic!("one mismatch expected, got {:?}", preview.warnings);
+        };
+        assert!(
+            caution.message.contains(&regtest(&elsewhere)),
+            "{}",
+            caution.message
+        );
+        assert!(
+            caution.message.contains(&regtest(&spk)),
+            "{}",
+            caution.message
+        );
+    }
+
+    /// One description alone is read as it is, whichever it is: the
+    /// entry when there is no transaction, the transaction when there
+    /// is no entry. Neither leaves anything disputed.
+    #[test]
+    fn one_description_of_the_coin_is_taken_as_it_is() {
+        let (tx, spk) = finalized_p2wpkh();
+        let mut psbt = Psbt::from_unsigned_tx(spend(tx.input[0].previous_output)).unwrap();
+        psbt.inputs[0].final_script_witness = Some(tx.input[0].witness.clone());
+
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(CLAIMED),
+            script_pubkey: spk.clone(),
+        });
+        let entry_only = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        assert_eq!(
+            entry_only.inputs[0]
+                .prevout
+                .as_ref()
+                .unwrap()
+                .value
+                .to_sat(),
+            CLAIMED,
+            "nothing better to read: the entry is the PSBT's word"
+        );
+        assert!(entry_only.inputs[0].disputed_witness_utxo.is_none());
+
+        psbt.inputs[0].witness_utxo = None;
+        psbt.inputs[0].non_witness_utxo = Some(funding(&spk));
+        let transaction_only = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        assert_eq!(
+            transaction_only.inputs[0]
+                .prevout
+                .as_ref()
+                .unwrap()
+                .value
+                .to_sat(),
+            REAL
+        );
+        assert!(transaction_only.inputs[0].disputed_witness_utxo.is_none());
+        let preview = build_preview(
+            &transaction_only,
+            Network::Regtest,
+            &[InputFacts::default()],
+            &[],
+            Some(100),
+            0,
+        );
+        assert!(mismatches(&preview).is_empty());
     }
 
     /// The finalizer reads the spent output of a previous transaction
