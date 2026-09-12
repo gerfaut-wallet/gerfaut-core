@@ -1004,10 +1004,22 @@ impl WalletManager {
         let needs_chain = input_facts
             .iter()
             .any(|f| f.prevout.is_none() || f.spent.is_none());
-        if needs_chain
-            && let Ok(endpoints) = chain::endpoints(&config, network, &certs)
-            && let Ok(proxy) = self.tor_proxy_for(&endpoints).await
-        {
+        // No backend for this network, or a Tor route that cannot be
+        // opened, is no answer at all: the coins stay unchecked below,
+        // the same as when every endpoint stopped answering. Without
+        // this the PSBT's word went through unconfronted and unmarked.
+        let route = if needs_chain {
+            match chain::endpoints(&config, network, &certs) {
+                Ok(endpoints) => match self.tor_proxy_for(&endpoints).await {
+                    Ok(proxy) => Some((endpoints, proxy)),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if let Some((endpoints, proxy)) = route {
             // A coin is settled once an endpoint has spoken for it:
             // either it handed the output over, or it said it has no
             // such outpoint. Anything else is still an open question,
@@ -1043,11 +1055,13 @@ impl WalletManager {
                     break;
                 }
             }
-            // A coin no endpoint spoke for is not a confirmed coin. The
-            // preview still has the PSBT's word for it and still shows a
-            // fee, but it says which coin nobody stood behind: without
-            // this, a backend that stopped answering was indistinguishable
-            // from one that agreed.
+        }
+        // A coin no endpoint spoke for is not a confirmed coin. The
+        // preview still has the PSBT's word for it and still shows a
+        // fee, but it says which coin nobody stood behind: without
+        // this, a backend that stopped answering, or no backend at all,
+        // was indistinguishable from one that agreed.
+        if needs_chain {
             for facts in input_facts.iter_mut() {
                 if facts.prevout.is_none() && !facts.unknown {
                     facts.unchecked = true;
@@ -3635,6 +3649,69 @@ mod tests {
         );
         assert!(request.contains("Bearer abcdefghijkmnpqr"), "{request}");
         assert!(request.ends_with(r#"{"code":"482913"}"#), "{request}");
+    }
+
+    /// The same lie with no backend to ask: regtest has no public
+    /// server and none was configured. The preview cannot catch the
+    /// lie, so it must say so: the coin is marked unchecked, with the
+    /// warning a backend that stopped answering would earn.
+    #[tokio::test]
+    async fn a_psbt_lie_with_no_backend_at_all_is_marked_unchecked() {
+        use crate::broadcast::TxWarningKind;
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::{
+            OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, Txid, WPubkeyHash, Witness,
+            absolute, transaction,
+        };
+
+        const CLAIMED: u64 = 10_200;
+        const PAID: u64 = 10_000;
+        let spk = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x33; 20]));
+        let spend = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([0x44; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(PAID),
+                script_pubkey: ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x11; 20])),
+            }],
+        };
+        let mut witness = Witness::new();
+        witness.push([0x30; 71]);
+        witness.push([0x02; 33]);
+        let mut psbt = Psbt::from_unsigned_tx(spend).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(CLAIMED),
+            script_pubkey: spk,
+        });
+        psbt.inputs[0].final_script_witness = Some(witness);
+        let text = data_encoding::BASE64.encode(&psbt.serialize());
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let preview = manager
+            .preview_transaction(&text, Network::Regtest)
+            .await
+            .unwrap();
+        let kinds: Vec<_> = preview.warnings.iter().map(|w| w.kind).collect();
+        assert!(
+            kinds.contains(&TxWarningKind::InputUnknown),
+            "nobody checked this coin and the preview must say so: {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&TxWarningKind::InputMismatch),
+            "no one contradicted the PSBT either: {kinds:?}"
+        );
+        assert_eq!(
+            preview.inputs[0].value_sats,
+            Some(CLAIMED),
+            "the value shown is the transaction's own word"
+        );
     }
 
     /// A finalized PSBT spends a coin no watched wallet holds and
