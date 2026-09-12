@@ -958,11 +958,11 @@ mod tests {
     //
     // A finalized PSBT is what every signer hands a broadcaster, and a
     // finalized input never meets the interpreter: whatever it declares
-    // about the coin is taken on its word. Regtest, a throwaway key, no
-    // network; the coin is worth REAL, the PSBT says CLAIMED.
+    // about the coin is taken on its word. Regtest, no network, and no
+    // key: the witnesses below are fixed bytes, which is enough because
+    // nothing on the finalized path reads them. The coin is worth REAL,
+    // the PSBT says CLAIMED.
 
-    use bdk_wallet::bitcoin::secp256k1::{Message, SecretKey};
-    use bdk_wallet::bitcoin::sighash::{EcdsaSighashType, SighashCache};
     use bdk_wallet::bitcoin::{CompressedPublicKey, PublicKey, ecdsa};
 
     /// What the coin is really worth, on chain and in the watched wallet.
@@ -973,20 +973,28 @@ mod tests {
     /// claimed one of 200.
     const PAID: u64 = 10_000;
 
-    /// The one key in this repository, and it never leaves a test
-    /// binary: the whole module is `#[cfg(test)]`, so no release
-    /// build contains it. A *finalized* PSBT is what the tests below
-    /// have to forge, and a finalized input carries a real signature
-    /// — there is no way to build one without signing something. The
-    /// key is a fixed constant, belongs to nobody, and holds nothing.
-    /// Gerfaut itself never generates, stores or signs with a key.
-    fn throwaway_key() -> (SecretKey, CompressedPublicKey) {
-        let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[7u8; 32]).unwrap();
-        let pk = CompressedPublicKey(bdk_wallet::bitcoin::secp256k1::PublicKey::from_secret_key(
-            &secp, &sk,
-        ));
-        (sk, pk)
+    /// The secp256k1 generator point: the public key of the number one,
+    /// which everybody knows and which holds nothing. It only has to
+    /// parse as a key and hash into a script; nothing here signs.
+    fn fixed_pubkey() -> CompressedPublicKey {
+        const G: [u8; 33] = [
+            0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
+            0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
+            0x5b, 0x16, 0xf8, 0x17, 0x98,
+        ];
+        CompressedPublicKey::from_slice(&G).unwrap()
+    }
+
+    /// Bytes shaped like a signature and nothing more: strict DER, r
+    /// and s in range, SIGHASH_ALL. Computed over nothing, it verifies
+    /// over nothing, and no test below needs it to.
+    fn fixed_signature() -> ecdsa::Signature {
+        let mut bytes = vec![0x30, 0x44, 0x02, 0x20];
+        bytes.extend_from_slice(&[0x11; 32]);
+        bytes.extend_from_slice(&[0x02, 0x20]);
+        bytes.extend_from_slice(&[0x22; 32]);
+        bytes.push(0x01);
+        ecdsa::Signature::from_slice(&bytes).unwrap()
     }
 
     /// The transaction that created the coin, with its true value.
@@ -1045,32 +1053,21 @@ mod tests {
         preview.warnings.iter().map(|w| w.kind).collect()
     }
 
-    /// A P2WPKH spend signed over the REAL amount: the network accepts
-    /// it, with a 90 000 sat fee.
-    fn signed_p2wpkh() -> (
-        Transaction,
-        ScriptBuf,
-        ecdsa::Signature,
-        CompressedPublicKey,
-    ) {
-        let secp = Secp256k1::new();
-        let (sk, pk) = throwaway_key();
+    /// A P2WPKH spend of the coin with its witness in place: the fixed
+    /// signature and key, laid out as a signer would. A finalized input
+    /// is taken as signed on presence alone, so these bytes are read
+    /// exactly as a genuine witness would be.
+    fn finalized_p2wpkh() -> (Transaction, ScriptBuf) {
+        let pk = fixed_pubkey();
         let spk = ScriptBuf::new_p2wpkh(&pk.wpubkey_hash());
         let fund = funding(&spk);
         let mut tx = spend(OutPoint::new(fund.compute_txid(), 0));
-        let sighash = SighashCache::new(&tx)
-            .p2wpkh_signature_hash(0, &spk, Amount::from_sat(REAL), EcdsaSighashType::All)
-            .unwrap();
-        let sig = ecdsa::Signature {
-            signature: secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &sk),
-            sighash_type: EcdsaSighashType::All,
-        };
-        tx.input[0].witness = Witness::p2wpkh(&sig, &pk.0);
-        (tx, spk, sig, pk)
+        tx.input[0].witness = Witness::p2wpkh(&fixed_signature(), &pk.0);
+        (tx, spk)
     }
 
     fn lying_finalized_psbt() -> (Psbt, Transaction, ScriptBuf) {
-        let (tx, spk, _, _) = signed_p2wpkh();
+        let (tx, spk) = finalized_p2wpkh();
         let mut psbt = Psbt::from_unsigned_tx(spend(tx.input[0].previous_output)).unwrap();
         psbt.inputs[0].witness_utxo = Some(TxOut {
             value: Amount::from_sat(CLAIMED),
@@ -1082,13 +1079,18 @@ mod tests {
 
     /// The wallet's knowledge wins over the PSBT's word: the real value
     /// is shown, the real fee computed, both fee alerts fire, and the
-    /// disagreement itself is the loudest caution of all.
+    /// disagreement itself is the loudest caution of all. Nothing here
+    /// looks at the witness, so fixed bytes prove the same thing a
+    /// signature would.
     #[test]
     fn a_finalized_psbt_cannot_talk_the_preview_out_of_what_the_wallet_knows() {
         let (psbt, tx, spk) = lying_finalized_psbt();
         let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
         assert!(decoded.ready, "a finalized input is accepted as signed");
-        assert_eq!(decoded.tx, tx, "the extracted tx is the network-valid one");
+        assert_eq!(
+            decoded.tx, tx,
+            "the extracted tx carries the witness as given"
+        );
 
         let preview = build_preview(
             &decoded,
@@ -1150,26 +1152,53 @@ mod tests {
         assert!(!kinds(&from_raw).contains(&TxWarningKind::InputMismatch));
     }
 
-    /// The signature really commits to the REAL amount: what the PSBT
-    /// carries is not garbage a node would refuse, it is a transaction
-    /// the network accepts with a 90 000 sat fee.
+    /// Only an unfinalized input meets the interpreter, and there a
+    /// signature has to verify: the fixed one verifies over nothing, so
+    /// the input stays unsigned even when the PSBT tells the truth
+    /// about the coin. The very same bytes as a final witness are never
+    /// looked at, and the input counts as signed. That asymmetry is why
+    /// the preview cannot lean on the interpreter: no signer hands a
+    /// broadcaster an unfinalized PSBT, and a finalized one is not
+    /// checked. Whether a genuine signature breaks when the amount is
+    /// lied about is the network's business, not proved here.
     #[test]
-    fn the_lying_psbt_carries_a_signature_valid_over_the_real_amount() {
-        let secp = Secp256k1::verification_only();
-        let (tx, spk, sig, pk) = signed_p2wpkh();
-        let over = |amount: u64| {
-            let h = SighashCache::new(&tx)
-                .p2wpkh_signature_hash(0, &spk, Amount::from_sat(amount), EcdsaSighashType::All)
-                .unwrap();
-            secp.verify_ecdsa(
-                &Message::from_digest(h.to_byte_array()),
-                &sig.signature,
-                &pk.0,
-            )
-            .is_ok()
-        };
-        assert!(over(REAL));
-        assert!(!over(CLAIMED));
+    fn only_an_unfinalized_input_meets_the_interpreter() {
+        use bdk_wallet::miniscript::psbt::{Error, InputError};
+
+        let (tx, spk) = finalized_p2wpkh();
+        let mut psbt = Psbt::from_unsigned_tx(spend(tx.input[0].previous_output)).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(REAL),
+            script_pubkey: spk.clone(),
+        });
+        psbt.inputs[0]
+            .partial_sigs
+            .insert(PublicKey::from(fixed_pubkey()), fixed_signature());
+
+        // The interpreter is what refuses it, not a missing key: the
+        // partial signature is filed under the key the script pays.
+        let errors = psbt
+            .clone()
+            .finalize_mut(&Secp256k1::verification_only())
+            .unwrap_err();
+        assert!(
+            matches!(
+                errors[..],
+                [Error::InputError(InputError::Interpreter(_), 0)]
+            ),
+            "{errors:?}"
+        );
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        assert!(!decoded.ready, "the interpreter ran and refused it");
+        assert!(!decoded.inputs[0].signed);
+
+        // The same bytes, final: nobody looks.
+        psbt.inputs[0].partial_sigs.clear();
+        psbt.inputs[0].final_script_witness = Some(tx.input[0].witness.clone());
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        assert!(decoded.ready);
+        assert!(decoded.inputs[0].signed);
+        assert_eq!(decoded.tx, tx);
     }
 
     /// The word of a backend counts the same as a wallet's: a coin the
@@ -1211,10 +1240,11 @@ mod tests {
 
     /// The honest path did not move: a PSBT whose word matches what
     /// the wallet knows previews exactly as it always did, and a coin
-    /// nobody but the PSBT knows still reads its value from it.
+    /// nobody but the PSBT knows still reads its value from it. The
+    /// witness is final and so never read; fixed bytes are enough.
     #[test]
     fn an_honest_psbt_previews_as_before() {
-        let (tx, spk, _, _) = signed_p2wpkh();
+        let (tx, spk) = finalized_p2wpkh();
         let mut psbt = Psbt::from_unsigned_tx(spend(tx.input[0].previous_output)).unwrap();
         psbt.inputs[0].witness_utxo = Some(TxOut {
             value: Amount::from_sat(REAL),
@@ -1258,28 +1288,26 @@ mod tests {
     /// and a legacy signature never covers the amount: a forged one, a
     /// copy with the value changed, is a different transaction with a
     /// different txid, and nothing on this path used to compare it with
-    /// the outpoint. The genuine one still reads as before.
+    /// the outpoint. The comparison runs before the finalizer, so the
+    /// signature never comes into it: the fixed one shows the forged
+    /// copy refused for the mismatch alone, whether the input still
+    /// waits to be finalized or already is. The genuine one, once
+    /// final, still reads as before.
     #[test]
     fn a_previous_transaction_that_is_not_the_one_spent_is_refused() {
-        let secp = Secp256k1::new();
-        let (sk, pk) = throwaway_key();
+        let pk = fixed_pubkey();
         let spk = ScriptBuf::new_p2pkh(&pk.pubkey_hash());
         let fund = funding(&spk);
         let tx = spend(OutPoint::new(fund.compute_txid(), 0));
-        let sighash = SighashCache::new(&tx)
-            .legacy_signature_hash(0, &spk, EcdsaSighashType::All.to_u32())
-            .unwrap();
-        let sig = ecdsa::Signature {
-            signature: secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &sk),
-            sighash_type: EcdsaSighashType::All,
-        };
         let mut forged = fund.clone();
         forged.output[0].value = Amount::from_sat(CLAIMED);
         assert_ne!(forged.compute_txid(), fund.compute_txid());
 
         let mut psbt = Psbt::from_unsigned_tx(tx.clone()).unwrap();
         psbt.inputs[0].non_witness_utxo = Some(forged);
-        psbt.inputs[0].partial_sigs.insert(PublicKey::from(pk), sig);
+        psbt.inputs[0]
+            .partial_sigs
+            .insert(PublicKey::from(pk), fixed_signature());
         let error = decode_bytes_as_transaction(&psbt.serialize())
             .unwrap_err()
             .to_string();
@@ -1288,9 +1316,22 @@ mod tests {
             &data_encoding::BASE64.encode(&psbt.serialize())
         ));
 
-        // The genuine previous transaction: the input finalizes, and
-        // the preview reads the real value, in agreement with the
-        // wallet.
+        // Already final: refused all the same, before anyone could
+        // take the input on its word.
+        let script_sig = ScriptBuf::builder()
+            .push_slice(fixed_signature().serialize())
+            .push_key(&PublicKey::from(pk))
+            .into_script();
+        psbt.inputs[0].partial_sigs.clear();
+        psbt.inputs[0].final_script_sig = Some(script_sig);
+        let again = decode_bytes_as_transaction(&psbt.serialize())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(again, error);
+
+        // The genuine previous transaction: the input is accepted, the
+        // real value read from the transaction it carries, and the
+        // preview agrees with the wallet.
         psbt.inputs[0].non_witness_utxo = Some(fund);
         let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
         assert!(decoded.ready);
@@ -1317,8 +1358,7 @@ mod tests {
     /// malformed PSBT.
     #[test]
     fn a_previous_transaction_without_the_spent_output_is_refused() {
-        let (_, pk) = throwaway_key();
-        let spk = ScriptBuf::new_p2pkh(&pk.pubkey_hash());
+        let spk = ScriptBuf::new_p2pkh(&fixed_pubkey().pubkey_hash());
         let fund = funding(&spk);
         assert_eq!(fund.output.len(), 1);
         let tx = spend(OutPoint::new(fund.compute_txid(), 1));
@@ -1331,29 +1371,5 @@ mod tests {
         assert!(!looks_like_transaction(
             &data_encoding::BASE64.encode(&psbt.serialize())
         ));
-    }
-
-    /// Only a PSBT still carrying partial signatures meets the
-    /// interpreter, where a lie about the amount breaks the signature.
-    /// No signer hands a broadcaster a PSBT in that state, which is why
-    /// the preview cannot rely on it.
-    #[test]
-    fn an_unfinalized_segwit_psbt_that_lies_does_not_finalize() {
-        let (tx, spk, sig, pk) = signed_p2wpkh();
-        let mut psbt = Psbt::from_unsigned_tx(spend(tx.input[0].previous_output)).unwrap();
-        psbt.inputs[0].witness_utxo = Some(TxOut {
-            value: Amount::from_sat(CLAIMED),
-            script_pubkey: spk.clone(),
-        });
-        psbt.inputs[0].partial_sigs.insert(PublicKey::from(pk), sig);
-        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
-        assert!(!decoded.ready, "the sighash covers the amount");
-        assert!(!decoded.inputs[0].signed);
-        psbt.inputs[0].witness_utxo.as_mut().unwrap().value = Amount::from_sat(REAL);
-        assert!(
-            decode_bytes_as_transaction(&psbt.serialize())
-                .unwrap()
-                .ready
-        );
     }
 }
