@@ -7,12 +7,14 @@ pub mod public;
 pub(crate) mod tls;
 pub mod tor;
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
 use serde::{Deserialize, Serialize};
+use url::{Host, ParseError, Url};
 
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
@@ -85,11 +87,15 @@ pub(crate) fn is_onion(url: &str) -> bool {
 }
 
 /// Whether a bare host name is a hidden service, in whatever case it
-/// was spelled. Compared on bytes: the name may be anything a camera
-/// decoded, and a byte index into the middle of a character would panic.
+/// was spelled, and with or without the trailing dot a fully qualified
+/// name may carry: `x.onion.` names the same service as `x.onion`, and
+/// a resolver handed either would tell the world about it. Compared on
+/// bytes: the name may be anything a camera decoded, and a byte index
+/// into the middle of a character would panic.
 pub(crate) fn is_onion_host(host: &str) -> bool {
     const SUFFIX: &[u8] = b".onion";
     let bytes = host.as_bytes();
+    let bytes = bytes.strip_suffix(b".").unwrap_or(bytes);
     bytes.len() >= SUFFIX.len() && bytes[bytes.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
 }
 
@@ -99,15 +105,64 @@ pub(crate) fn needs_tor(endpoints: &[Endpoint]) -> bool {
     endpoints.iter().any(Endpoint::is_onion)
 }
 
-/// Extracts the host part of a URL-ish string, without any userinfo.
-/// The host ends where the backend parser says it does: at the path,
-/// the query or the fragment, whichever comes first.
+/// The host of a server address, without any userinfo.
 pub(crate) fn host_of(url: &str) -> Option<String> {
-    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
-    let host_port = rest.split(['/', '?', '#']).next()?;
-    let host = host_port.rsplit_once('@').map_or(host_port, |(_, h)| h);
-    let host = host.split(':').next()?;
-    (!host.is_empty()).then(|| host.to_owned())
+    host_and_port(url).map(|(host, _)| host)
+}
+
+/// The host of a server address and the port it names, read by the
+/// URL parser the HTTP client reads with, so that whatever the two
+/// could disagree on is settled the client's way: under `http` and
+/// `https` a `\` ends the host, `%2E` is a dot, capitals are not, and
+/// the userinfo before an `@` is not the host. `ssl://` and `tcp://`
+/// are not schemes the standard knows; a host under them is read as
+/// written, then given the same reading, and a bare `host:port` is
+/// read as `ssl://`, the way the Electrum client reads it. An IPv6
+/// literal comes back without its brackets. `None` for anything that
+/// names no host a client could connect to.
+pub(crate) fn host_and_port(url: &str) -> Option<(String, Option<u16>)> {
+    let text = if url.contains("://") {
+        Cow::Borrowed(url)
+    } else {
+        Cow::Owned(format!("ssl://{url}"))
+    };
+    let parsed = Url::parse(&text).ok()?;
+    let host = host_of_parsed(&parsed)?;
+    Some((host, parsed.port()))
+}
+
+/// The host of a parsed URL in canonical form. Under a standard
+/// scheme the parser already read it; under any other it is the text
+/// as written, and this is where it gets the same reading.
+pub(crate) fn host_of_parsed(parsed: &Url) -> Option<String> {
+    let host = match parsed.host()? {
+        Host::Domain(domain) => canonical_host(domain).ok()?,
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// A host as the URL standard reads it: percent-decoded, in lower
+/// case, an IP address in its canonical spelling, an IPv6 literal with
+/// or without brackets given back without them, and the trailing dot
+/// of a fully qualified name dropped. Refuses whatever a host cannot
+/// contain, a `\` or a space among them.
+pub(crate) fn canonical_host(host: &str) -> Result<String, ParseError> {
+    let literal = if host.contains(':') && !host.starts_with('[') {
+        Cow::Owned(format!("[{host}]"))
+    } else {
+        Cow::Borrowed(host)
+    };
+    let host = match Host::parse(&literal)? {
+        Host::Domain(domain) => domain.strip_suffix('.').unwrap_or(&domain).to_owned(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    };
+    if host.is_empty() {
+        return Err(ParseError::EmptyHost);
+    }
+    Ok(host)
 }
 
 /// One concrete server to talk to.
@@ -486,6 +541,84 @@ mod tests {
         assert!(needs_tor(&[Endpoint::Esplora(
             "http://abc.onion#frag".to_owned()
         )]));
+    }
+
+    /// The host is read with the parser the HTTP client reads with, so
+    /// a disguised onion goes through Tor and a disguised clearnet host
+    /// does not: the two never mean different machines.
+    #[test]
+    fn a_host_is_read_the_way_the_client_connects_to_it() {
+        // Under a standard scheme a backslash ends the host: the client
+        // would reach evil.com, in the clear, with `/.onion` as a path.
+        assert_eq!(
+            host_of("https://evil.com\\.onion").as_deref(),
+            Some("evil.com")
+        );
+        assert!(!is_onion("https://evil.com\\.onion"));
+        // A percent-encoded dot is a dot to the client: an onion, and
+        // one that must never reach a resolver.
+        assert_eq!(
+            host_of("https://evil%2Eonion").as_deref(),
+            Some("evil.onion")
+        );
+        assert!(is_onion("https://evil%2Eonion"));
+        assert!(is_onion("https://EVIL%2eONION/api"));
+        // A fully qualified name is the same name.
+        assert_eq!(host_of("https://x.onion.").as_deref(), Some("x.onion"));
+        assert!(is_onion("https://x.onion."));
+        assert!(is_onion_host("X.ONION."));
+        // The userinfo is not the host, whatever it holds.
+        assert_eq!(
+            host_and_port("https://user:Pass@Host.Example:3002/api"),
+            Some(("host.example".to_owned(), Some(3002)))
+        );
+        assert_eq!(
+            host_of("https://x.onion@evil.com/").as_deref(),
+            Some("evil.com")
+        );
+        assert!(!is_onion("https://x.onion@evil.com/"));
+
+        // The Electrum schemes, and a bare address, read the same way.
+        assert_eq!(
+            host_and_port("ssl://xxx.onion:50002"),
+            Some(("xxx.onion".to_owned(), Some(50002)))
+        );
+        assert!(is_onion("ssl://xxx.onion:50002"));
+        assert_eq!(
+            host_and_port("tcp://XXX%2Eonion:50001"),
+            Some(("xxx.onion".to_owned(), Some(50001)))
+        );
+        assert!(is_onion("tcp://XXX%2Eonion:50001"));
+        assert!(is_onion("tcp://xxx.onion.:50001"));
+        assert_eq!(
+            host_and_port("node.example:50001"),
+            Some(("node.example".to_owned(), Some(50001)))
+        );
+        assert_eq!(
+            host_and_port("ssl://user:pass@node.example"),
+            Some(("node.example".to_owned(), None))
+        );
+        // Under a scheme the standard does not know a backslash is not
+        // a character a host may hold: there is no host to name, and
+        // nothing to route through Tor.
+        assert_eq!(host_of("ssl://evil.com\\.onion:50002"), None);
+        assert!(!is_onion("ssl://evil.com\\.onion:50002"));
+
+        // An IPv6 literal, bracketed on the way in, bare on the way out.
+        assert_eq!(
+            host_and_port("ssl://[2001:DB8::1]:50002"),
+            Some(("2001:db8::1".to_owned(), Some(50002)))
+        );
+        assert_eq!(
+            host_and_port("https://[::1]:3002/api"),
+            Some(("::1".to_owned(), Some(3002)))
+        );
+
+        // Nothing to connect to.
+        assert_eq!(host_of("https://"), None);
+        assert_eq!(host_of("ssl://:50002"), None);
+        assert_eq!(host_of("https://host name/"), None);
+        assert_eq!(host_of(""), None);
     }
 
     #[test]

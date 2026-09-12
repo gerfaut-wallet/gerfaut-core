@@ -12,7 +12,10 @@
 //! nothing on its own: what it returns fills the form, and the person
 //! still presses Save.
 
+use std::fmt::Write as _;
+
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::error::{CoreError, CoreResult};
 
@@ -109,14 +112,17 @@ fn split_host_port(rest: &str) -> Result<(String, Option<u16>), CoreError> {
         return Err(reject("the address has a space in it"));
     }
     // Host names have no case, and a QR code prints them in capitals.
-    // The lower-case form is the one stored, so a `.ONION` read off a
-    // screen is the same hidden service to every later check, and an
-    // accepted certificate is keyed the same whatever the spelling.
-    Ok((host.to_ascii_lowercase(), port))
+    // The host is stored as the URL standard reads it, lower case and
+    // decoded, so a `.ONION` read off a screen is the same hidden
+    // service to every later check, and an accepted certificate is
+    // keyed the same whatever the spelling.
+    let host = super::canonical_host(&host)
+        .map_err(|e| reject(format!("{host} is not a host name: {e}")))?;
+    Ok((host, port))
 }
 
 fn electrum(host: String, port: Option<u16>, tls: bool) -> ScannedBackend {
-    let onion = host.to_ascii_lowercase().ends_with(".onion");
+    let onion = super::is_onion_host(&host);
     let port = port.unwrap_or(if tls {
         ELECTRUM_TLS_PORT
     } else {
@@ -181,29 +187,7 @@ pub fn parse_backend(text: &str) -> CoreResult<ScannedBackend> {
     if let Some((scheme, rest)) = text.split_once("://") {
         let rest = rest.trim_end_matches('/');
         return match scheme.to_ascii_lowercase().as_str() {
-            "http" | "https" => {
-                let (authority, tail) = match rest.find(['/', '?', '#']) {
-                    Some(at) => rest.split_at(at),
-                    None => (rest, ""),
-                };
-                let (host, port) = split_host_port(authority)?;
-                let onion = host.ends_with(".onion");
-                let tls = scheme.eq_ignore_ascii_case("https");
-                // The host goes into the URL in the case it is stored
-                // in; the path keeps its own, a server may care.
-                Ok(ScannedBackend {
-                    kind: ScannedBackendKind::Esplora,
-                    url: format!(
-                        "{}://{}{tail}",
-                        scheme.to_ascii_lowercase(),
-                        authority.to_ascii_lowercase()
-                    ),
-                    host,
-                    port,
-                    tls,
-                    onion,
-                })
-            }
+            "http" | "https" => esplora(text),
             // `electrum://` is what a few node dashboards print; it says
             // the protocol, never whether the socket is encrypted.
             "ssl" | "tls" | "electrums" => {
@@ -261,13 +245,60 @@ pub fn parse_backend(text: &str) -> CoreResult<ScannedBackend> {
     let tls = match port {
         Some(p) if PLAIN_PORTS.contains(&p) => false,
         Some(p) if TLS_PORTS.contains(&p) => true,
-        _ => !host.to_ascii_lowercase().ends_with(".onion"),
+        _ => !super::is_onion_host(&host),
     };
     Ok(electrum(host, port, tls))
 }
 
 fn strip_path(rest: &str) -> &str {
     rest.split(['/', '?', '#']).next().unwrap_or_default()
+}
+
+/// An HTTP endpoint, read by the parser the HTTP client reads with:
+/// what it takes for the host is what the client will connect to, and
+/// what it refuses could never be connected to. The address is stored
+/// back from its parts, the host in the case the parser gives it, the
+/// userinfo and the path in their own, since a server may care about
+/// those.
+fn esplora(text: &str) -> CoreResult<ScannedBackend> {
+    let parsed =
+        Url::parse(text).map_err(|e| reject(format!("{text} is not a server address: {e}")))?;
+    let host = super::host_of_parsed(&parsed).ok_or_else(|| reject("the address has no host"))?;
+    let port = parsed.port();
+    let onion = super::is_onion_host(&host);
+    let tls = parsed.scheme() == "https";
+    let mut url = format!("{}://", parsed.scheme());
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        url.push_str(parsed.username());
+        if let Some(password) = parsed.password() {
+            url.push(':');
+            url.push_str(password);
+        }
+        url.push('@');
+    }
+    if host.contains(':') {
+        let _ = write!(url, "[{host}]");
+    } else {
+        url.push_str(&host);
+    }
+    if let Some(port) = port {
+        let _ = write!(url, ":{port}");
+    }
+    url.push_str(parsed.path().trim_end_matches('/'));
+    if let Some(query) = parsed.query() {
+        let _ = write!(url, "?{query}");
+    }
+    if let Some(fragment) = parsed.fragment() {
+        let _ = write!(url, "#{fragment}");
+    }
+    Ok(ScannedBackend {
+        kind: ScannedBackendKind::Esplora,
+        url,
+        host,
+        port,
+        tls,
+        onion,
+    })
 }
 
 #[cfg(test)]
@@ -407,6 +438,60 @@ mod tests {
         );
     }
 
+    /// The host is read by the parser the HTTP client reads with, so
+    /// the scanner, the Tor check and the connection all mean the same
+    /// machine: a `\` ends the host, `%2E` is a dot, a trailing dot is
+    /// the same fully qualified name, and the userinfo before an `@`
+    /// keeps its case while the host loses its own.
+    #[test]
+    fn the_host_is_read_the_way_the_client_reads_it() {
+        let disguised = ok("https://evil.com\\.onion");
+        assert_eq!(disguised.host, "evil.com");
+        assert!(!disguised.onion);
+        assert_eq!(disguised.url, "https://evil.com/.onion");
+
+        let encoded = ok("https://evil%2Eonion");
+        assert_eq!(encoded.host, "evil.onion");
+        assert!(encoded.onion);
+        assert_eq!(encoded.url, "https://evil.onion");
+
+        let qualified = ok("https://x.onion.");
+        assert_eq!(qualified.host, "x.onion");
+        assert!(qualified.onion);
+        assert_eq!(qualified.url, "https://x.onion");
+
+        let with_userinfo = ok("https://user:Pass@Host.Example:3002/Api/?q=1");
+        assert_eq!(with_userinfo.host, "host.example");
+        assert_eq!(with_userinfo.port, Some(3002));
+        assert_eq!(
+            with_userinfo.url,
+            "https://user:Pass@host.example:3002/Api?q=1"
+        );
+        // An onion in the userinfo is not an onion.
+        let decoy = ok("https://x.onion@evil.com/api");
+        assert_eq!(decoy.host, "evil.com");
+        assert!(!decoy.onion);
+
+        let electrum = ok("ssl://xxx.onion:50002");
+        assert_eq!(electrum.host, "xxx.onion");
+        assert_eq!(electrum.port, Some(50002));
+        assert!(electrum.onion && electrum.tls);
+        let encoded = ok("tcp://XXX%2Eonion:50001");
+        assert_eq!(encoded.host, "xxx.onion");
+        assert!(encoded.onion);
+        assert_eq!(encoded.url, "tcp://xxx.onion:50001");
+        let qualified = ok("xxx.onion.:50001:t");
+        assert_eq!(qualified.host, "xxx.onion");
+        assert!(qualified.onion);
+
+        // What the standard refuses as a host is refused here, with
+        // the reason.
+        let error = parse_backend("ssl://evil.com\\.onion:50002").expect_err("refused");
+        assert!(error.to_string().contains("not a host name"), "{error}");
+        assert!(parse_backend("https://").is_err());
+        assert!(parse_backend("https://host name/").is_err());
+    }
+
     #[test]
     fn ipv6_keeps_its_brackets() {
         let one = ok("ssl://[2001:db8::1]:50002");
@@ -414,6 +499,11 @@ mod tests {
         assert_eq!(one.url, "ssl://[2001:db8::1]:50002");
         // Unbracketed, there is no room for a port to hide in.
         assert_eq!(ok("[2001:db8::1]").url, "ssl://[2001:db8::1]:50002");
+
+        let web = ok("https://[2001:DB8::1]:3002/api");
+        assert_eq!(web.host, "2001:db8::1");
+        assert_eq!(web.port, Some(3002));
+        assert_eq!(web.url, "https://[2001:db8::1]:3002/api");
     }
 
     #[test]
