@@ -200,66 +200,87 @@ fn verify_signature(public_key_hex: &str, message: &[u8], signature: &[u8]) -> R
 }
 
 #[cfg(test)]
-pub(crate) mod testing {
-    //! A signer for the tests only: the server's side of the protocol,
-    //! so what is verified here was produced the way the server does it.
+pub(crate) mod fixtures {
+    //! The server's side of the protocol, done once and offline: two
+    //! throwaway Ed25519 keys, drawn at random and discarded the moment
+    //! the constants below were printed, signed the certificates and
+    //! heartbeats the tests verify. Nothing in this crate signs, not
+    //! even a test; whoever audits that promise with a grep should
+    //! find no signer here to explain away.
+    //!
+    //! To produce a new set, in a scratch project outside the
+    //! repository with `ed25519-dalek`, `data-encoding` and `rand`:
+    //! draw two 32-byte seeds, make a signing key of each, and with
+    //! the server's key sign the exact text named above each constant.
+    //! A certificate is `base64url(text).base64url(signature)`, both
+    //! without padding; a heartbeat signature is the lower-case hex of
+    //! the signature over the exact text. The other key signs the valid
+    //! claims and the `tip_height` 1 heartbeat once each, so a test can
+    //! hand the verifier the right text under the wrong key. Replace
+    //! the whole set at once: the keys that made this one are gone.
 
-    use data_encoding::{BASE64URL_NOPAD, HEXLOWER};
-    use ed25519_dalek::{Signer, SigningKey};
+    /// The unix second every fixture is dated against.
+    pub const NOW: i64 = 1_790_000_000;
 
-    use super::Claims;
+    /// The server's verifying key, hex.
+    pub const SERVER_PUBLIC_KEY_HEX: &str =
+        "4c506fd45f58d9ba24b9526fba8dac4021648531d3dd08a131aa1acca9d3cacd";
+    /// A second verifying key, hex: another server, or whoever
+    /// pretends to be one.
+    pub const OTHER_PUBLIC_KEY_HEX: &str =
+        "f40d3c96a47ccc48c29dd01102f3e3858c56c1a02974ff8c099a554d74381a6f";
 
-    pub struct Issuer {
-        signing: SigningKey,
-    }
+    /// Over `{"v":1,"sub":"<ab × 32>","exp":1790086400,"iat":1789999940}`:
+    /// a day of paid time left at [`NOW`].
+    pub const VALID_CERTIFICATE: &str = "eyJ2IjoxLCJzdWIiOiJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIiwiZXhwIjoxNzkwMDg2NDAwLCJpYXQiOjE3ODk5OTk5NDB9.agV86zDZGD4sf_rRL2bF1J19z_9somd00AiFZ-OKrd5rlmBjc5el5obcZbH06P5xXisCmGJR50VK1YONErH_Aw";
+    /// The same claims as [`VALID_CERTIFICATE`], under the other key.
+    pub const OTHER_KEY_CERTIFICATE: &str = "eyJ2IjoxLCJzdWIiOiJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIiwiZXhwIjoxNzkwMDg2NDAwLCJpYXQiOjE3ODk5OTk5NDB9.rK_XjHUg2YYWikvyfpPQiA_mHUtzPBAf6RyJBen-3UuFUporQRD1T7ERJfmYyW6ZrfIpqw8RsXEHYMPFjlSvCA";
+    /// Over `{"v":1,"sub":"<ab × 32>","exp":1789996400,"iat":1789999940}`:
+    /// paid time that ended an hour before [`NOW`].
+    pub const EXPIRED_CERTIFICATE: &str = "eyJ2IjoxLCJzdWIiOiJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIiwiZXhwIjoxNzg5OTk2NDAwLCJpYXQiOjE3ODk5OTk5NDB9.wHO7bYAQ4KzyCqi5UmnpUhrus-Jhhe6rdE9-xMWnJegedn7XZ7mcOypRtxnmBVCB9LXB0BNJbpw6KCvrPso4Bg";
+    /// Over `{"v":2,"sub":"<ab × 32>","exp":1790086400,"iat":1789999940}`:
+    /// a format this build does not read.
+    pub const VERSION_2_CERTIFICATE: &str = "eyJ2IjoyLCJzdWIiOiJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIiwiZXhwIjoxNzkwMDg2NDAwLCJpYXQiOjE3ODk5OTk5NDB9.nvXqaGMGcMhjvrEvYOj2cuew1rGZSdGrHRMt3D5uWAJTDEEST1odtVY1X4ue6lfka7sk96YGSYVphl7EXug5CA";
+    /// Over the five bytes `hello`: genuine, and not claims.
+    pub const NOT_JSON_CERTIFICATE: &str = "aGVsbG8.bITsEGQQAfyTRSxxBq5ZMCGoQ_t3MV254F0jsQvLmx6QOxcgBnTQZHdawxRIGHohshE1xGVgY0q4JI0UdTrNBg";
+    /// Over `{"v":1,"sub":"<cd × 32>","exp":1792592000,"iat":1790000000}`:
+    /// thirty days of paid time on another account, issued at [`NOW`].
+    pub const ACCOUNT_CERTIFICATE: &str = "eyJ2IjoxLCJzdWIiOiJjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkIiwiZXhwIjoxNzkyNTkyMDAwLCJpYXQiOjE3OTAwMDAwMDB9.40dcvoUVC3xvZQPjOeoxeI2-IEhn2CsCKY7DnS11zqsrH3u-blK4F7UHQcUUb9LRS1r-KCOlYbaf46RbkeYhAQ";
 
-    impl Issuer {
-        pub fn from_seed(seed: u8) -> Self {
-            Issuer {
-                signing: SigningKey::from_bytes(&[seed; 32]),
-            }
-        }
+    /// A heartbeat: the exact text the server signed, and its
+    /// signature in hex.
+    pub type SignedText = (&'static str, &'static str);
 
-        pub fn public_key_hex(&self) -> String {
-            HEXLOWER.encode(&self.signing.verifying_key().to_bytes())
-        }
-
-        pub fn sign_hex(&self, message: &[u8]) -> String {
-            HEXLOWER.encode(&self.signing.sign(message).to_bytes())
-        }
-
-        /// `base64url(claims).base64url(signature)`, as the server
-        /// issues it.
-        pub fn issue(&self, claims: &Claims) -> String {
-            let payload = serde_json::to_vec(claims).expect("claims serialize");
-            self.issue_bytes(&payload)
-        }
-
-        pub fn issue_bytes(&self, payload: &[u8]) -> String {
-            let signature = self.signing.sign(payload);
-            format!(
-                "{}.{}",
-                BASE64URL_NOPAD.encode(payload),
-                BASE64URL_NOPAD.encode(&signature.to_bytes())
-            )
-        }
-
-        /// The `{"now":..,"tip_height":..}` text and its hex signature.
-        pub fn heartbeat(&self, now: i64, tip_height: Option<u32>) -> (String, String) {
-            let payload = serde_json::json!({ "now": now, "tip_height": tip_height }).to_string();
-            let signature = self.sign_hex(payload.as_bytes());
-            (payload, signature)
-        }
-    }
+    pub const HEARTBEAT_AT_900000: SignedText = (
+        r#"{"now":1790000000,"tip_height":900000}"#,
+        "f739acee9837abaab25189ad65f1ecf0e29b1f69ea8fb8bce15d8d71779d6727be2a29342dcfee6dffd4d5935ce3ce2c2a4edccc995653a3b0603b534d4e420f",
+    );
+    pub const HEARTBEAT_BEFORE_FIRST_BLOCK: SignedText = (
+        r#"{"now":1790000000,"tip_height":null}"#,
+        "b3993262d46fcaf25571dcfc1e9a9fe1c404b23e361c89d784c18daaaff0cb8d4abd443ec57acfb71ad88f14fea1058e2f6eeae0ffff3d6acf2fc0038d3fce01",
+    );
+    pub const HEARTBEAT_AT_1: SignedText = (
+        r#"{"now":1790000000,"tip_height":1}"#,
+        "39b0c66f457f6aff8aee9a84da4494ef7a0a05add364f7459a797d787fb7ea0a3afe41ad1444a32a44dd76e5bfa6e7b695ff83c1aaff3b93fc1b15690f012f0f",
+    );
+    pub const HEARTBEAT_AT_910000: SignedText = (
+        r#"{"now":1790000000,"tip_height":910000}"#,
+        "6e0a468ac8d73796563eee08fe93a70e2f55c166d17e09ff39709598da423ca1e074ff9ace97e6533f01feecfe69a68ff3b3c107171623836bbb9c9351949d0a",
+    );
+    /// Genuine, and not a heartbeat.
+    pub const NOT_A_HEARTBEAT: SignedText = (
+        r#"{"hello":"world"}"#,
+        "777711416a55dd1cfb000ce0d015a558145558dc44c43e95b3ec2cbca2e9434ee5c0f860bc0d56cabd8db523110e6c85ec37b6a068de3c9388a7cc506f849708",
+    );
+    /// The other key's signature over the text of [`HEARTBEAT_AT_1`].
+    pub const OTHER_KEY_HEARTBEAT_AT_1_SIGNATURE_HEX: &str = "4bff0264c6d3e1c7b31a6fe0a849e08dd92500a20c98ec2c0bfbf8cce4efa7b574c52c52d2ae7cc192ed7a128492edcf4ab8498ce0a7b514a5303d7d2a7fd40c";
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::Issuer;
+    use super::fixtures::*;
     use super::*;
     use crate::error::CoreError;
-
-    const NOW: i64 = 1_790_000_000;
 
     fn claims(exp: i64) -> Claims {
         Claims {
@@ -315,11 +336,8 @@ mod tests {
 
     #[test]
     fn a_certificate_verifies_and_reads_its_claims() {
-        let issuer = Issuer::from_seed(7);
-        let issued = claims(NOW + 86_400);
-        let certificate = issuer.issue(&issued);
-        let read = verify_certificate(&certificate, &issuer.public_key_hex()).unwrap();
-        assert_eq!(read, issued);
+        let read = verify_certificate(VALID_CERTIFICATE, SERVER_PUBLIC_KEY_HEX).unwrap();
+        assert_eq!(read, claims(NOW + 86_400));
         assert!(read.is_active(NOW));
         assert_eq!(
             read.state(NOW),
@@ -328,16 +346,17 @@ mod tests {
             }
         );
         // Whitespace around a pasted certificate is nobody's fault.
-        assert!(verify_certificate(&format!(" {certificate}\n"), &issuer.public_key_hex()).is_ok());
+        assert!(
+            verify_certificate(&format!(" {VALID_CERTIFICATE}\n"), SERVER_PUBLIC_KEY_HEX).is_ok()
+        );
     }
 
     /// Verification is about who wrote the certificate, not whether it
     /// still holds: the screen decides what an ended paid time means.
     #[test]
     fn an_expired_certificate_verifies_and_says_so() {
-        let issuer = Issuer::from_seed(7);
-        let certificate = issuer.issue(&claims(NOW - 3_600));
-        let read = verify_certificate(&certificate, &issuer.public_key_hex()).unwrap();
+        let read = verify_certificate(EXPIRED_CERTIFICATE, SERVER_PUBLIC_KEY_HEX).unwrap();
+        assert_eq!(read, claims(NOW - 3_600));
         assert!(!read.is_active(NOW));
         assert_eq!(
             read.state(NOW),
@@ -351,42 +370,35 @@ mod tests {
 
     #[test]
     fn another_key_or_a_changed_claim_is_refused() {
-        let issuer = Issuer::from_seed(7);
-        let certificate = issuer.issue(&claims(NOW + 86_400));
-        let other = Issuer::from_seed(8);
         let refused =
-            premium_error(verify_certificate(&certificate, &other.public_key_hex()).unwrap_err());
+            premium_error(verify_certificate(VALID_CERTIFICATE, OTHER_PUBLIC_KEY_HEX).unwrap_err());
         assert_eq!(
             refused,
             PremiumError::InvalidCertificate("the signature does not match".to_owned())
         );
         // A later expiry pasted over the signed one.
-        let (payload, signature) = certificate.split_once('.').unwrap();
+        let (payload, signature) = VALID_CERTIFICATE.split_once('.').unwrap();
         let mut forged = claims(NOW + 86_400);
         forged.exp = NOW + 10 * 365 * 86_400;
         let forged = format!(
             "{}.{signature}",
             BASE64URL_NOPAD.encode(&serde_json::to_vec(&forged).unwrap())
         );
-        assert!(verify_certificate(&forged, &issuer.public_key_hex()).is_err());
-        // The right claims under another certificate's signature.
-        let swapped = format!(
-            "{payload}.{}",
-            other
-                .issue(&claims(NOW + 86_400))
-                .split_once('.')
-                .unwrap()
-                .1
-        );
-        assert!(verify_certificate(&swapped, &issuer.public_key_hex()).is_err());
+        assert!(verify_certificate(&forged, SERVER_PUBLIC_KEY_HEX).is_err());
+        // The right claims under another key's signature: the other
+        // key's certificate holds the very same claims, and is good
+        // under its own key alone.
+        let (other_payload, other_signature) = OTHER_KEY_CERTIFICATE.split_once('.').unwrap();
+        assert_eq!(other_payload, payload);
+        assert!(verify_certificate(OTHER_KEY_CERTIFICATE, OTHER_PUBLIC_KEY_HEX).is_ok());
+        let swapped = format!("{payload}.{other_signature}");
+        assert!(verify_certificate(&swapped, SERVER_PUBLIC_KEY_HEX).is_err());
     }
 
     #[test]
     fn a_malformed_certificate_is_named_not_guessed_at() {
-        let issuer = Issuer::from_seed(7);
-        let key = issuer.public_key_hex();
         let detail = |certificate: &str| match premium_error(
-            verify_certificate(certificate, &key).unwrap_err(),
+            verify_certificate(certificate, SERVER_PUBLIC_KEY_HEX).unwrap_err(),
         ) {
             PremiumError::InvalidCertificate(detail) => detail,
             other => panic!("{other}"),
@@ -400,29 +412,24 @@ mod tests {
         assert!(detail("AAA=.AAAA").contains("not base64url"));
         assert!(detail("AAAA.AAAA").contains("bytes, not 64"));
         // Signed by the right key, but not JSON claims.
-        assert!(detail(&issuer.issue_bytes(b"hello")).contains("do not parse"));
+        assert!(detail(NOT_JSON_CERTIFICATE).contains("do not parse"));
         // Signed by the right key, in a format this build does not read.
-        let mut future = claims(NOW + 86_400);
-        future.v = 2;
-        assert!(detail(&issuer.issue(&future)).contains("version 2"));
+        assert!(detail(VERSION_2_CERTIFICATE).contains("version 2"));
     }
 
     #[test]
     fn a_bad_public_key_is_refused_before_anything_else() {
-        let issuer = Issuer::from_seed(7);
-        let certificate = issuer.issue(&claims(NOW + 86_400));
-        assert!(verify_certificate(&certificate, "zz").is_err());
-        assert!(verify_certificate(&certificate, "abcd").is_err());
-        assert!(verify_certificate(&certificate, "").is_err());
+        assert!(verify_certificate(VALID_CERTIFICATE, "zz").is_err());
+        assert!(verify_certificate(VALID_CERTIFICATE, "abcd").is_err());
+        assert!(verify_certificate(VALID_CERTIFICATE, "").is_err());
     }
 
     #[test]
     fn a_fresh_heartbeat_verifies() {
-        let issuer = Issuer::from_seed(7);
-        let (payload, signature) = issuer.heartbeat(NOW, Some(900_000));
+        let (payload, signature) = HEARTBEAT_AT_900000;
         assert_eq!(payload, format!(r#"{{"now":{NOW},"tip_height":900000}}"#));
         let heartbeat =
-            verify_heartbeat(&payload, &signature, &issuer.public_key_hex(), NOW + 30).unwrap();
+            verify_heartbeat(payload, signature, SERVER_PUBLIC_KEY_HEX, NOW + 30).unwrap();
         assert_eq!(
             heartbeat,
             Heartbeat {
@@ -432,11 +439,11 @@ mod tests {
         );
         // Before the first block the tip is null; the hex may be upper
         // case.
-        let (payload, signature) = issuer.heartbeat(NOW, None);
+        let (payload, signature) = HEARTBEAT_BEFORE_FIRST_BLOCK;
         let heartbeat = verify_heartbeat(
-            &payload,
+            payload,
             &signature.to_uppercase(),
-            &issuer.public_key_hex(),
+            SERVER_PUBLIC_KEY_HEX,
             NOW - 299,
         )
         .unwrap();
@@ -445,48 +452,44 @@ mod tests {
 
     #[test]
     fn a_heartbeat_off_by_more_than_five_minutes_is_stale() {
-        let issuer = Issuer::from_seed(7);
-        let (payload, signature) = issuer.heartbeat(NOW, Some(1));
-        let key = issuer.public_key_hex();
-        assert!(verify_heartbeat(&payload, &signature, &key, NOW + 300).is_ok());
-        assert!(verify_heartbeat(&payload, &signature, &key, NOW - 300).is_ok());
+        let (payload, signature) = HEARTBEAT_AT_1;
+        let key = SERVER_PUBLIC_KEY_HEX;
+        assert!(verify_heartbeat(payload, signature, key, NOW + 300).is_ok());
+        assert!(verify_heartbeat(payload, signature, key, NOW - 300).is_ok());
         assert_eq!(
-            premium_error(verify_heartbeat(&payload, &signature, &key, NOW + 301).unwrap_err()),
+            premium_error(verify_heartbeat(payload, signature, key, NOW + 301).unwrap_err()),
             PremiumError::StaleHeartbeat { skew: 301 }
         );
         assert_eq!(
-            premium_error(verify_heartbeat(&payload, &signature, &key, NOW - 301).unwrap_err()),
+            premium_error(verify_heartbeat(payload, signature, key, NOW - 301).unwrap_err()),
             PremiumError::StaleHeartbeat { skew: -301 }
         );
     }
 
     #[test]
     fn a_heartbeat_is_the_exact_text_that_was_signed() {
-        let issuer = Issuer::from_seed(7);
-        let (payload, signature) = issuer.heartbeat(NOW, Some(1));
-        let key = issuer.public_key_hex();
+        let (payload, signature) = HEARTBEAT_AT_1;
+        let key = SERVER_PUBLIC_KEY_HEX;
         // The same value, spelled with a space: not what was signed.
         let respaced = payload.replace(',', ", ");
-        assert!(verify_heartbeat(&respaced, &signature, &key, NOW).is_err());
+        assert!(verify_heartbeat(&respaced, signature, key, NOW).is_err());
         // A later clock pasted in, to look fresh.
         let advanced = payload.replace(&NOW.to_string(), &(NOW + 1000).to_string());
-        assert!(verify_heartbeat(&advanced, &signature, &key, NOW + 1000).is_err());
-        // Another server's signature, and no signature at all.
-        let other = Issuer::from_seed(8);
-        assert!(
-            verify_heartbeat(&payload, &other.sign_hex(payload.as_bytes()), &key, NOW).is_err()
-        );
+        assert!(verify_heartbeat(&advanced, signature, key, NOW + 1000).is_err());
+        // Another server's signature, good under its own key and no
+        // other, and no signature at all.
+        let elsewhere = OTHER_KEY_HEARTBEAT_AT_1_SIGNATURE_HEX;
+        assert!(verify_heartbeat(payload, elsewhere, key, NOW).is_err());
+        assert!(verify_heartbeat(payload, elsewhere, OTHER_PUBLIC_KEY_HEX, NOW).is_ok());
         assert_eq!(
-            premium_error(verify_heartbeat(&payload, "not hex", &key, NOW).unwrap_err()),
+            premium_error(verify_heartbeat(payload, "not hex", key, NOW).unwrap_err()),
             PremiumError::InvalidHeartbeat("the signature is not hex".to_owned())
         );
-        assert!(verify_heartbeat(&payload, "abcd", &key, NOW).is_err());
+        assert!(verify_heartbeat(payload, "abcd", key, NOW).is_err());
         // Signed, but not a heartbeat.
-        let text = r#"{"hello":"world"}"#;
+        let (text, signature) = NOT_A_HEARTBEAT;
         assert!(matches!(
-            premium_error(
-                verify_heartbeat(text, &issuer.sign_hex(text.as_bytes()), &key, NOW).unwrap_err()
-            ),
+            premium_error(verify_heartbeat(text, signature, key, NOW).unwrap_err()),
             PremiumError::InvalidHeartbeat(detail) if detail.contains("does not parse")
         ));
     }

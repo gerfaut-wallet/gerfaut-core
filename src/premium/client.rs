@@ -633,7 +633,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::premium::licence::testing::Issuer;
+    use crate::premium::licence::fixtures;
 
     const NOW: i64 = 1_790_000_000;
 
@@ -1254,15 +1254,14 @@ mod tests {
     /// only reported.
     #[tokio::test]
     async fn a_heartbeat_is_verified_against_the_embedded_key() {
-        let issuer = Issuer::from_seed(7);
-        let (payload, signature) = issuer.heartbeat(NOW, Some(910_000));
+        let (payload, signature) = fixtures::HEARTBEAT_AT_910000;
         let body = format!(
             r#"{{"heartbeat": {payload}, "public_key": "{}", "signature": "{signature}"}}"#,
-            Issuer::from_seed(9).public_key_hex()
+            fixtures::OTHER_PUBLIC_KEY_HEX
         );
         let stub = stub(200, &body).await;
         let report = client(&stub, None)
-            .with_public_key(&issuer.public_key_hex())
+            .with_public_key(fixtures::SERVER_PUBLIC_KEY_HEX)
             .heartbeat(NOW + 10)
             .await
             .unwrap();
@@ -1270,7 +1269,7 @@ mod tests {
         assert_eq!(report.heartbeat.tip_height, Some(910_000));
         assert_eq!(report.payload, payload);
         assert_eq!(report.signature, signature);
-        assert_eq!(report.public_key, Issuer::from_seed(9).public_key_hex());
+        assert_eq!(report.public_key, fixtures::OTHER_PUBLIC_KEY_HEX);
 
         // The production key is the default, and this is not its server.
         assert!(matches!(
@@ -1281,7 +1280,7 @@ mod tests {
         assert_eq!(
             premium_error(
                 client(&stub, None)
-                    .with_public_key(&issuer.public_key_hex())
+                    .with_public_key(fixtures::SERVER_PUBLIC_KEY_HEX)
                     .heartbeat(NOW + 3_600)
                     .await
                     .unwrap_err()
@@ -1292,22 +1291,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_licence_comes_back_with_verified_claims() {
-        let issuer = Issuer::from_seed(7);
         let claims = Claims {
             v: 1,
             sub: "cd".repeat(32),
             exp: NOW + 30 * 86_400,
             iat: NOW,
         };
-        let certificate = issuer.issue(&claims);
+        let certificate = fixtures::ACCOUNT_CERTIFICATE;
         let body = format!(
             r#"{{"certificate":"{certificate}","public_key":"{}","paid_until":{}}}"#,
-            issuer.public_key_hex(),
+            fixtures::SERVER_PUBLIC_KEY_HEX,
             claims.exp
         );
         let stub = stub(200, &body).await;
         let licence = client(&stub, Some("abcdefghijkmnpqr"))
-            .with_public_key(&issuer.public_key_hex())
+            .with_public_key(fixtures::SERVER_PUBLIC_KEY_HEX)
             .licence()
             .await
             .unwrap();

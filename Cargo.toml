@@ -69,9 +69,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # So `tests/tls_provider.rs` can name the backend it expects. Already a
 # dependency above; this only makes it visible to the test crates.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-# Tests sign the licences they then verify. The library itself never
-# signs anything and does not depend on this.
-ed25519-dalek = "2"
 
 # arti pulls in `saturating-time`, whose limit search never terminates
 # on a clock coarser than a nanosecond: Windows counts 100 ns intervals,
