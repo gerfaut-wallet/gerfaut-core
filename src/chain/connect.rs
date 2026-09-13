@@ -90,10 +90,7 @@ fn split_host_port(rest: &str) -> Result<(String, Option<u16>), CoreError> {
             // and swallowing it whole would save an address that can
             // never connect and say nothing about why.
             Some((head, _)) if head.contains(':') => {
-                if !rest
-                    .chars()
-                    .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
-                {
+                if !is_bare_ipv6(rest) {
                     return Err(reject(format!(
                         "{rest} has more than one colon and is not an IPv6 address; \
                          bracket it as [address]:port if it is"
@@ -208,14 +205,12 @@ pub fn parse_backend(text: &str) -> CoreResult<ScannedBackend> {
     // (plain TCP), the form every Electrum client has read since the
     // start and the one node dashboards print in their QR codes.
     //
-    // Only a letter is a flag. A one-character *digit* is a port, or the
-    // last group of a bare IPv6 literal — `2001:db8::1` and
-    // `host.example:5` both end in one character and neither is a
-    // connection type.
-    if let Some((head, flag)) = text.rsplit_once(':')
-        && flag.len() == 1
-        && flag.chars().all(|c| c.is_ascii_alphabetic())
-    {
+    // Only a letter is a flag, and only outside a bare IPv6 literal. A
+    // one-character *digit* is a port, or the last group of such a
+    // literal — `2001:db8::1` and `host.example:5` both end in one
+    // character and neither is a connection type — and the last group
+    // of `2001:db8::a` is a letter that is no connection type either.
+    if let Some((head, flag)) = split_flag(text) {
         let tls = match flag.to_ascii_lowercase().as_str() {
             "s" => true,
             "t" => false,
@@ -271,11 +266,12 @@ pub(crate) fn stored_form(kind: ScannedBackendKind, url: &str) -> CoreResult<Str
             parse_backend(text)?
         }
         ScannedBackendKind::Electrum => {
-            let flagged = text.rsplit_once(':').is_some_and(|(_, flag)| {
-                flag.len() == 1 && flag.chars().all(|c| c.is_ascii_alphabetic())
-            });
-            if text.contains("://") || flagged {
+            if text.contains("://") || split_flag(text).is_some() {
                 parse_backend(text)?
+            } else if is_bare_ipv6(text) {
+                // In brackets, so the parser tells the address from a
+                // port.
+                parse_backend(&format!("ssl://[{text}]"))?
             } else {
                 parse_backend(&format!("ssl://{text}"))?
             }
@@ -292,6 +288,30 @@ pub(crate) fn stored_form(kind: ScannedBackendKind, url: &str) -> CoreResult<Str
 
 fn strip_path(rest: &str) -> &str {
     rest.split(['/', '?', '#']).next().unwrap_or_default()
+}
+
+/// Whether the text can only be a bare IPv6 literal: hex digits,
+/// colons and dots and nothing else, with more than one colon. Its
+/// last group is often one character long, and in `2001:db8::a` that
+/// character is a letter, without being a connection flag.
+fn is_bare_ipv6(text: &str) -> bool {
+    text.matches(':').count() > 1
+        && text
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
+}
+
+/// The connection flag of an Electrum one-liner split off the rest,
+/// `host:port` and `s` for `host:port:s`. Any single letter is taken
+/// for a flag, so that one which is not `s` or `t` is refused by name
+/// rather than read as a port. `None` when the text has no such tail,
+/// or is a bare IPv6 literal, whose last group may be one hex letter.
+fn split_flag(text: &str) -> Option<(&str, &str)> {
+    if is_bare_ipv6(text) {
+        return None;
+    }
+    let (head, flag) = text.rsplit_once(':')?;
+    (flag.len() == 1 && flag.chars().all(|c| c.is_ascii_alphabetic())).then_some((head, flag))
 }
 
 /// An HTTP endpoint, read by the parser the HTTP client reads with:
@@ -378,6 +398,16 @@ mod tests {
             "tcp://node.example.org:50001"
         );
         assert_eq!(stored(Electrum, "2001:DB8::1"), "ssl://[2001:db8::1]:50002");
+        // A last group of one hex letter is no connection flag.
+        assert_eq!(stored(Electrum, "2001:db8::a"), "ssl://[2001:db8::a]:50002");
+        assert_eq!(
+            stored(Electrum, "[2001:db8::a]:50002"),
+            "ssl://[2001:db8::a]:50002"
+        );
+        assert_eq!(
+            stored(Electrum, "node.example.org:50002:t"),
+            "tcp://node.example.org:50002"
+        );
         assert_eq!(
             stored(Electrum, " ssl://node.example.org:50002 "),
             "ssl://node.example.org:50002"
@@ -462,17 +492,27 @@ mod tests {
     }
 
     /// A one-character tail is only a connection flag when it is a
-    /// letter. A digit there is a port, or the last group of a bare
-    /// IPv6 literal — reading either as `s`/`t` refused an address that
-    /// was perfectly good, with a message about Electrum transports.
+    /// letter outside a bare IPv6 literal. A digit there is a port, or
+    /// the last group of such a literal, and a hex letter is its last
+    /// group as well — reading any of them as `s`/`t` refused an
+    /// address that was perfectly good, with a message about Electrum
+    /// transports.
     #[test]
-    fn a_single_digit_tail_is_not_a_connection_flag() {
+    fn a_one_character_tail_is_a_flag_only_outside_an_ipv6_literal() {
         let bare = ok("2001:db8::1");
         assert_eq!(bare.host, "2001:db8::1");
         assert_eq!(bare.url, "ssl://[2001:db8::1]:50002");
 
+        let lettered = ok("2001:db8::a");
+        assert_eq!(lettered.host, "2001:db8::a");
+        assert_eq!(lettered.url, "ssl://[2001:db8::a]:50002");
+        assert_eq!(ok("[2001:db8::a]:50002").url, "ssl://[2001:db8::a]:50002");
+
         let short_port = ok("node.example.org:5");
         assert_eq!(short_port.port, Some(5));
+
+        // The one-liner reads its flag as before.
+        assert_eq!(ok("host.example:50002:t").url, "tcp://host.example:50002");
     }
 
     /// Two colons and no brackets is an IPv6 literal or it is nothing.
