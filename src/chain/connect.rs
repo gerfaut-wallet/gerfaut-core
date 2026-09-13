@@ -250,6 +250,46 @@ pub fn parse_backend(text: &str) -> CoreResult<ScannedBackend> {
     Ok(electrum(host, port, tls))
 }
 
+/// The form a custom backend address is stored in, read the way a
+/// scan is: the host in lower case, its trailing dot dropped, an IPv6
+/// literal in brackets, an Electrum address with its port, and a bare
+/// `host:port` as TLS, the way the Electrum client reads it, unless
+/// the one-line form says otherwise. An address the parser cannot
+/// read is refused with the reason: stored as typed,
+/// `tcp://x.onion:50001:extra` would reach the sync as an address the
+/// URL parser gives up on, no onion to its eyes, and go to the
+/// resolver in the clear. An address already in this form comes back
+/// byte for byte, so the certificate accepted for it stays keyed to
+/// it.
+pub(crate) fn stored_form(kind: ScannedBackendKind, url: &str) -> CoreResult<String> {
+    let text = url.trim();
+    let scanned = match kind {
+        ScannedBackendKind::Esplora => {
+            if !text.contains("://") {
+                return Err(reject("an Esplora address starts with http:// or https://"));
+            }
+            parse_backend(text)?
+        }
+        ScannedBackendKind::Electrum => {
+            let flagged = text.rsplit_once(':').is_some_and(|(_, flag)| {
+                flag.len() == 1 && flag.chars().all(|c| c.is_ascii_alphabetic())
+            });
+            if text.contains("://") || flagged {
+                parse_backend(text)?
+            } else {
+                parse_backend(&format!("ssl://{text}"))?
+            }
+        }
+    };
+    if scanned.kind != kind {
+        return Err(reject(match kind {
+            ScannedBackendKind::Esplora => "an Esplora address starts with http:// or https://",
+            ScannedBackendKind::Electrum => "an Electrum address starts with ssl:// or tcp://",
+        }));
+    }
+    Ok(scanned.url)
+}
+
 fn strip_path(rest: &str) -> &str {
     rest.split(['/', '?', '#']).next().unwrap_or_default()
 }
@@ -307,6 +347,63 @@ mod tests {
 
     fn ok(text: &str) -> ScannedBackend {
         parse_backend(text).expect("parsed")
+    }
+
+    /// What the settings store is what a scan would have read, and an
+    /// address in that form already is stored as it is.
+    #[test]
+    fn a_stored_address_is_read_the_way_a_scan_is() {
+        use ScannedBackendKind::{Electrum, Esplora};
+        let stored = |kind, url| stored_form(kind, url).unwrap();
+        assert_eq!(
+            stored(Electrum, "SSL://Node.Example.ORG.:50002"),
+            "ssl://node.example.org:50002"
+        );
+        assert_eq!(
+            stored(Electrum, "ssl://node.example.org:50002"),
+            "ssl://node.example.org:50002"
+        );
+        assert_eq!(
+            stored(Electrum, "tcp://x.onion:50001"),
+            "tcp://x.onion:50001"
+        );
+        // A bare address is TLS, the way the connection reads it,
+        // whatever its port; the one-line form says its transport.
+        assert_eq!(
+            stored(Electrum, "node.example.org:50001"),
+            "ssl://node.example.org:50001"
+        );
+        assert_eq!(
+            stored(Electrum, "node.example.org:50001:t"),
+            "tcp://node.example.org:50001"
+        );
+        assert_eq!(stored(Electrum, "2001:DB8::1"), "ssl://[2001:db8::1]:50002");
+        assert_eq!(
+            stored(Electrum, " ssl://node.example.org:50002 "),
+            "ssl://node.example.org:50002"
+        );
+        assert_eq!(
+            stored(Esplora, "HTTPS://Esplora.Example.ORG./api/"),
+            "https://esplora.example.org/api"
+        );
+        assert_eq!(
+            stored(Esplora, "https://esplora.example.org/api"),
+            "https://esplora.example.org/api"
+        );
+        assert_eq!(stored(Esplora, "http://x.onion"), "http://x.onion");
+
+        let refused = |kind, url: &str| stored_form(kind, url).unwrap_err().to_string();
+        assert!(
+            refused(Electrum, "tcp://x.onion:50001:extra").contains("more than one colon"),
+            "{}",
+            refused(Electrum, "tcp://x.onion:50001:extra")
+        );
+        assert!(refused(Electrum, "ssl://x.onion:99999").contains("99999 is not a port number"));
+        assert!(refused(Electrum, "https://node.example.org").contains("ssl:// or tcp://"));
+        assert!(
+            refused(Esplora, "ssl://esplora.example.org:50002").contains("http:// or https://")
+        );
+        assert!(refused(Esplora, "esplora.example.org/api").contains("http:// or https://"));
     }
 
     #[test]

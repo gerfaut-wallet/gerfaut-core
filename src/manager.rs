@@ -24,6 +24,7 @@ use crate::backup::{
 use crate::broadcast::{
     self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, TxPreview, WalletRef,
 };
+use crate::chain::connect::ScannedBackendKind;
 use crate::chain::tor::{self, TorRoute, TorSettings, TorStatus};
 use crate::chain::{
     self, BackendConfig, CertificateReport, CertificateStatus, Endpoint, EngineRequest,
@@ -160,7 +161,24 @@ impl WalletManager {
         })
     }
 
+    /// Remembers the backend of a network. A custom address is stored
+    /// in the form a scan reads it into, the host in lower case and an
+    /// IPv6 literal in brackets, and refused with the reason when the
+    /// parser the sync reads with cannot read it: stored as typed, an
+    /// address that parser gives up on has no host to be an onion, and
+    /// the sync would hand it to the resolver in the clear. One already
+    /// in that form is stored byte for byte, and the certificate
+    /// accepted for it stays keyed to it.
     pub async fn set_backend(&self, network: Network, config: BackendConfig) -> CoreResult<()> {
+        let config = match config {
+            BackendConfig::CustomEsplora { url } => BackendConfig::CustomEsplora {
+                url: chain::connect::stored_form(ScannedBackendKind::Esplora, &url)?,
+            },
+            BackendConfig::CustomElectrum { url } => BackendConfig::CustomElectrum {
+                url: chain::connect::stored_form(ScannedBackendKind::Electrum, &url)?,
+            },
+            public @ BackendConfig::Public { .. } => public,
+        };
         self.state.lock().await.commit(|payload| {
             payload.settings.backends.insert(network, config);
             Ok(())
@@ -2613,6 +2631,85 @@ mod tests {
             }
         );
         assert_eq!(settings.app_prefs.get("theme").unwrap(), "dark");
+    }
+
+    /// A custom address is stored the way a scan reads it, and refused
+    /// when the parser cannot read it: stored as typed, the sync would
+    /// see no onion in `tcp://x.onion:50001:extra` and hand it to the
+    /// resolver in the clear. A refusal leaves the setting as it was.
+    #[tokio::test]
+    async fn a_custom_backend_is_stored_canonical_or_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let electrum = |url: &str| BackendConfig::CustomElectrum {
+            url: url.to_owned(),
+        };
+        let esplora = |url: &str| BackendConfig::CustomEsplora {
+            url: url.to_owned(),
+        };
+
+        manager
+            .set_backend(Network::Signet, electrum("ssl://node.example.org:50002"))
+            .await
+            .unwrap();
+        for (config, problem) in [
+            (electrum("tcp://x.onion:50001:extra"), "more than one colon"),
+            (
+                electrum("ssl://x.onion:99999"),
+                "99999 is not a port number",
+            ),
+            (esplora("ssl://x.onion:50002"), "http:// or https://"),
+        ] {
+            let refused = manager
+                .set_backend(Network::Signet, config.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&refused, CoreError::InvalidInput { kind: "server", detail } if detail.contains(problem)),
+                "{config:?}: {refused}"
+            );
+        }
+        assert_eq!(
+            manager.settings().await.backend_for(Network::Signet),
+            electrum("ssl://node.example.org:50002"),
+            "a refused address leaves the setting as it was"
+        );
+
+        manager
+            .set_backend(Network::Signet, electrum("SSL://Node.Example.ORG.:50002"))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.settings().await.backend_for(Network::Signet),
+            electrum("ssl://node.example.org:50002")
+        );
+        manager
+            .set_backend(
+                Network::Signet,
+                esplora("HTTPS://Esplora.Example.ORG./api/"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.settings().await.backend_for(Network::Signet),
+            esplora("https://esplora.example.org/api")
+        );
+        // Already in that form: byte for byte, the key of an accepted
+        // certificate among what stays the same.
+        for config in [
+            electrum("tcp://x.onion:50001"),
+            electrum("ssl://[2001:db8::1]:50002"),
+            esplora("https://esplora.example.org/api"),
+        ] {
+            manager
+                .set_backend(Network::Signet, config.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                manager.settings().await.backend_for(Network::Signet),
+                config
+            );
+        }
     }
 
     #[tokio::test]
