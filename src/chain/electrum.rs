@@ -109,10 +109,17 @@ fn parse(url: &str) -> Result<(bool, String, u16), String> {
 }
 
 /// The key a trusted fingerprint is stored under: the host and port
-/// that identify the socket, scheme and path stripped.
+/// that identify the socket, scheme and path stripped. The host is
+/// read the way the settings store it, in lower case and without the
+/// trailing dot of a fully qualified name, so a certificate accepted
+/// under one spelling of the address is found under every other. A
+/// host the URL standard cannot read keys as written.
 pub fn certificate_key(url: &str) -> String {
     match parse(url) {
-        Ok((_, host, port)) => format!("{host}:{port}"),
+        Ok((_, host, port)) => {
+            let host = crate::chain::canonical_host(&host).unwrap_or(host);
+            format!("{host}:{port}")
+        }
         Err(_) => url.to_owned(),
     }
 }
@@ -576,5 +583,24 @@ mod tests {
         // A default port is spelled out, so the key never depends on how
         // the user typed the address.
         assert_eq!(certificate_key("ssl://host"), "host:50002");
+    }
+
+    /// The settings store the address in canonical form. The key has
+    /// to read the host the same way, or a certificate accepted from
+    /// the address as typed is looked up under another key and asked
+    /// for a second time.
+    #[test]
+    fn the_trust_key_reads_the_host_the_way_the_store_does() {
+        let canonical = certificate_key("ssl://node.example.org:50002");
+        assert_eq!(canonical, "node.example.org:50002");
+        assert_eq!(certificate_key("SSL://Node.Example.ORG.:50002"), canonical);
+        assert_eq!(certificate_key("node.example.org.:50002"), canonical);
+        assert_eq!(certificate_key("ssl://NODE.EXAMPLE.ORG:50002"), canonical);
+        // An IPv6 literal in its canonical spelling, keyed as before.
+        assert_eq!(
+            certificate_key("ssl://[2001:DB8:0:0::1]:50002"),
+            "2001:db8::1:50002"
+        );
+        assert_eq!(certificate_key("[2001:db8::1]:50002"), "2001:db8::1:50002");
     }
 }
