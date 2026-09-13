@@ -123,8 +123,11 @@ pub enum PremiumError {
     NoPaidTime,
 
     /// The server has no resource under the id the route named (HTTP
-    /// 404 and 410): a wallet or a channel already gone from it. For
-    /// a route that removes something, the state that was wanted.
+    /// 404 and 410, said in the server's own error body): a wallet or
+    /// a channel already gone from it. For a route that removes
+    /// something, the state that was wanted. A bare 404, the answer of
+    /// a captive portal or a proxy without a route, is a refusal
+    /// instead.
     #[error("the server has nothing under that id")]
     NotFound,
 

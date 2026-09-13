@@ -610,7 +610,10 @@ fn decode<'a, T: Deserialize<'a>>(body: &'a [u8]) -> CoreResult<T> {
 }
 
 /// What a failing status means, with the server's own sentence when the
-/// body carries one.
+/// body carries one. Nothing under that id is an answer only in the
+/// server's own words: a bare 404 is what a captive portal or a proxy
+/// without a route answers, and says nothing about what the server
+/// holds.
 fn refusal(status: u16, body: &[u8]) -> PremiumError {
     let words = serde_json::from_slice::<ErrorBody>(body)
         .ok()
@@ -618,7 +621,7 @@ fn refusal(status: u16, body: &[u8]) -> PremiumError {
     match status {
         401 => PremiumError::UnknownKey,
         403 => PremiumError::NoPaidTime,
-        404 | 410 => PremiumError::NotFound,
+        404 | 410 if words.is_some() => PremiumError::NotFound,
         400..=499 => PremiumError::Rejected(words.unwrap_or_else(|| format!("HTTP {status}"))),
         _ => PremiumError::Unreachable(match words {
             Some(words) => format!("HTTP {status}: {words}"),
@@ -1179,9 +1182,8 @@ mod tests {
             PremiumError::Rejected("HTTP 405".to_owned())
         );
         // Nothing under that id, whether the server says so or says it
-        // is gone: one answer, not a refusal to read the words of. A
-        // rate limit is a refusal like any other, and says nothing
-        // about what the server holds.
+        // is gone, in its own words: one answer, not a refusal to read
+        // the words of.
         for status in [404, 410] {
             let missing = stub(status, r#"{"error":"no such channel"}"#).await;
             assert_eq!(
@@ -1192,6 +1194,24 @@ mod tests {
                         .unwrap_err()
                 ),
                 PremiumError::NotFound,
+                "HTTP {status}"
+            );
+        }
+        // The same status without the server's envelope is the page of
+        // a captive portal or a proxy without a route, not the server
+        // saying there is nothing there: a refusal, which settles
+        // nothing. A rate limit is a refusal like any other, and says
+        // nothing about what the server holds.
+        for status in [404, 410] {
+            let portal = stub(status, "<html><body>Not Found</body></html>").await;
+            assert_eq!(
+                premium_error(
+                    client(&portal, Some("abcdefghijkmnpqr"))
+                        .delete_channel("nope")
+                        .await
+                        .unwrap_err()
+                ),
+                PremiumError::Rejected(format!("HTTP {status}")),
                 "HTTP {status}"
             );
         }
