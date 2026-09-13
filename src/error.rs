@@ -122,6 +122,12 @@ pub enum PremiumError {
     #[error("this key has no paid time left")]
     NoPaidTime,
 
+    /// The server has no resource under the id the route named (HTTP
+    /// 404 and 410): a wallet or a channel already gone from it. For
+    /// a route that removes something, the state that was wanted.
+    #[error("the server has nothing under that id")]
+    NotFound,
+
     /// The server refused the request; the sentence is its own.
     #[error("the premium server refused: {0}")]
     Rejected(String),

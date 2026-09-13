@@ -608,6 +608,7 @@ fn refusal(status: u16, body: &[u8]) -> PremiumError {
     match status {
         401 => PremiumError::UnknownKey,
         403 => PremiumError::NoPaidTime,
+        404 | 410 => PremiumError::NotFound,
         400..=499 => PremiumError::Rejected(words.unwrap_or_else(|| format!("HTTP {status}"))),
         _ => PremiumError::Unreachable(match words {
             Some(words) => format!("HTTP {status}: {words}"),
@@ -1112,7 +1113,7 @@ mod tests {
             )
         );
         // A refusal without the promised body still names its status.
-        let bare = stub(404, "not found").await;
+        let bare = stub(405, "method not allowed").await;
         assert_eq!(
             premium_error(
                 client(&bare, Some("abcdefghijkmnpqr"))
@@ -1120,7 +1121,34 @@ mod tests {
                     .await
                     .unwrap_err()
             ),
-            PremiumError::Rejected("HTTP 404".to_owned())
+            PremiumError::Rejected("HTTP 405".to_owned())
+        );
+        // Nothing under that id, whether the server says so or says it
+        // is gone: one answer, not a refusal to read the words of. A
+        // rate limit is a refusal like any other, and says nothing
+        // about what the server holds.
+        for status in [404, 410] {
+            let missing = stub(status, r#"{"error":"no such channel"}"#).await;
+            assert_eq!(
+                premium_error(
+                    client(&missing, Some("abcdefghijkmnpqr"))
+                        .delete_channel("nope")
+                        .await
+                        .unwrap_err()
+                ),
+                PremiumError::NotFound,
+                "HTTP {status}"
+            );
+        }
+        let limited = stub(429, r#"{"error":"too many requests"}"#).await;
+        assert_eq!(
+            premium_error(
+                client(&limited, Some("abcdefghijkmnpqr"))
+                    .delete_channel("nope")
+                    .await
+                    .unwrap_err()
+            ),
+            PremiumError::Rejected("too many requests".to_owned())
         );
         // The server is there and not well: for the banner, offline.
         let down = stub(503, r#"{"error":"node unreachable"}"#).await;

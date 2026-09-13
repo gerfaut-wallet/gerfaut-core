@@ -1699,21 +1699,23 @@ impl WalletManager {
 
     /// Tells the server to stop watching a wallet that stays on this
     /// device: the switch in the settings turned off. The yes goes with
-    /// it once the server has nothing under that id: told, refused as
-    /// unknown (404 and the like), or a key it no longer knows. A wallet
-    /// the server does not watch needs no consent on file; one left
-    /// behind would have a later removal queue a message the server has
-    /// already heard, and the screens say the server is told when it
-    /// has nothing to hear. Switching the wallet back on asks the
-    /// question again, as it should: the descriptor leaves the device
-    /// only on a yes said for that sending. A server that cannot be
-    /// reached, or that refuses for lack of paid time, leaves
-    /// everything as it was: the wallet is still watched there, and
-    /// the yes still stands here.
+    /// it once the server has nothing under that id: told, answered
+    /// that there is nothing there ([`PremiumError::NotFound`]), or a
+    /// key it no longer knows. A wallet the server does not watch
+    /// needs no consent on file; one left behind would have a later
+    /// removal queue a message the server has already heard, and the
+    /// screens say the server is told when it has nothing to hear.
+    /// Switching the wallet back on asks the question again, as it
+    /// should: the descriptor leaves the device only on a yes said for
+    /// that sending. Any other answer leaves everything as it was: a
+    /// server that cannot be reached, one that refuses for lack of
+    /// paid time, a rate limit or any refusal of its own says nothing
+    /// about what it still holds, and the wallet is still watched
+    /// there, the yes still standing here, until it is told again.
     pub async fn premium_unwatch_wallet(&self, base_url: &str, id: &str) -> CoreResult<()> {
         match self.premium_client(base_url).await?.delete_wallet(id).await {
-            Ok(())
-            | Err(CoreError::Premium(PremiumError::Rejected(_) | PremiumError::UnknownKey)) => {}
+            Ok(()) | Err(CoreError::Premium(PremiumError::NotFound | PremiumError::UnknownKey)) => {
+            }
             Err(e) => return Err(e),
         }
         self.state.lock().await.commit(|payload| {
@@ -1727,10 +1729,12 @@ impl WalletManager {
     /// Tells the server about the wallets removed from this device
     /// since it last heard, one `DELETE` each in the order they went,
     /// through the client [`Self::premium_client`] builds. A wallet the
-    /// server no longer knows counts as told. The first failure to reach
-    /// the server ends the round: what was told is forgotten, the rest
-    /// waits for the next call, and the error is returned. Nothing to
-    /// tell costs no connection. Returns how many removals still wait.
+    /// server has nothing under, or a key it no longer knows, counts as
+    /// told. The first other answer ends the round, a server that
+    /// cannot be reached and a refusal alike: what was told is
+    /// forgotten, the rest waits for the next call, and the error is
+    /// returned. Nothing to tell costs no connection. Returns how many
+    /// removals still wait.
     pub async fn premium_flush_unwatch(&self, base_url: &str) -> CoreResult<usize> {
         let pending = {
             let state = self.state.lock().await;
@@ -1749,10 +1753,11 @@ impl WalletManager {
         for id in &pending {
             match client.delete_wallet(id).await {
                 Ok(()) => told.push(id.clone()),
-                // Refused (404 and the like): the server has nothing
-                // under that id, which is the state we wanted. A key the
-                // server does not know has no wallets either.
-                Err(CoreError::Premium(PremiumError::Rejected(_) | PremiumError::UnknownKey)) => {
+                // Nothing under that id: the state we wanted. A key the
+                // server does not know has no wallets either. Any other
+                // refusal, a rate limit among them, says nothing about
+                // what the server holds, and the message waits.
+                Err(CoreError::Premium(PremiumError::NotFound | PremiumError::UnknownKey)) => {
                     told.push(id.clone());
                 }
                 Err(e) => {
@@ -2734,12 +2739,66 @@ mod tests {
         assert_eq!(manager.premium_flush_unwatch(&base_url).await.unwrap(), 0);
     }
 
+    /// A refusal that is not "nothing under that id" says nothing
+    /// about what the server holds: a rate limit ends the round the way
+    /// a server that cannot be reached does, and the wallet it refused
+    /// stays queued with the ones behind it.
+    #[tokio::test]
+    async fn the_flush_stops_at_a_refusal_and_keeps_the_wallet() {
+        let (base_url, mut seen) = answering(vec![
+            answer("200 OK", "{}"),
+            answer("429 Too Many Requests", r#"{"error":"too many requests"}"#),
+            answer("200 OK", "{}"),
+        ])
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let mut premium = PremiumState {
+            key: Some("abcdefghijkmnpqr".to_owned()),
+            ..PremiumState::default()
+        };
+        for id in ["w1", "w2", "w3"] {
+            premium.queue_unwatch(id);
+        }
+        manager.set_premium_state(premium).await.unwrap();
+
+        let outcome = manager.premium_flush_unwatch(&base_url).await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(CoreError::Premium(PremiumError::Rejected(words))) if words == "too many requests"
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w1 HTTP/1.1");
+        assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w2 HTTP/1.1");
+        assert_eq!(
+            manager.premium_state().await.pending_unwatch,
+            vec!["w2".to_owned(), "w3".to_owned()],
+            "the refused wallet and the one behind it wait for the next round"
+        );
+
+        // The next round picks up where it stopped: the third answer
+        // is still there for w2, and w3 meets no server.
+        let left = manager.premium_flush_unwatch(&base_url).await;
+        assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w2 HTTP/1.1");
+        assert!(
+            matches!(left, Err(CoreError::Premium(PremiumError::Unreachable(_)))),
+            "{left:?}"
+        );
+        assert_eq!(
+            manager.premium_state().await.pending_unwatch,
+            vec!["w3".to_owned()]
+        );
+    }
+
     /// Switching a wallet off withdraws the yes once the server has
     /// nothing under its id: told, already unknown, or a key it no
     /// longer knows. Removing the wallet after that queues nothing,
     /// since the server has nothing to hear. A refusal for lack of
-    /// paid time, or a server that cannot be reached, leaves the yes
-    /// in place, and a removal still queues its message.
+    /// paid time, a rate limit, or a server that cannot be reached,
+    /// leaves the yes in place, and a removal still queues its message.
     #[tokio::test]
     async fn switching_a_wallet_off_withdraws_the_yes_once_the_server_has_heard() {
         let (base_url, mut seen) = answering(vec![
@@ -2747,6 +2806,7 @@ mod tests {
             answer("404 Not Found", r#"{"error":"no such wallet"}"#),
             answer("401 Unauthorized", r#"{"error":"unknown key"}"#),
             answer("403 Forbidden", r#"{"error":"no paid time"}"#),
+            answer("429 Too Many Requests", r#"{"error":"too many requests"}"#),
         ])
         .await;
 
@@ -2761,7 +2821,7 @@ mod tests {
             key: Some("abcdefghijkmnpqr".to_owned()),
             ..PremiumState::default()
         };
-        for id in [meta.id.as_str(), "w2", "w3", "w4", "w5"] {
+        for id in [meta.id.as_str(), "w2", "w3", "w4", "w5", "w6"] {
             premium.consent(id, 100);
         }
         manager.set_premium_state(premium).await.unwrap();
@@ -2806,6 +2866,18 @@ mod tests {
         );
         assert!(manager.premium_state().await.is_consented("w4"));
 
+        // Rate limited: the server still watches the wallet, and the
+        // yes stands until it is told and heard.
+        let limited = manager
+            .premium_unwatch_wallet(&base_url, "w6")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&limited, CoreError::Premium(PremiumError::Rejected(words)) if words == "too many requests"),
+            "{limited}"
+        );
+        assert!(manager.premium_state().await.is_consented("w6"));
+
         // The server is gone: nothing changes here either.
         let unreached = manager
             .premium_unwatch_wallet(&base_url, "w5")
@@ -2817,7 +2889,8 @@ mod tests {
         );
         let premium = manager.premium_state().await;
         assert!(premium.is_consented("w4") && premium.is_consented("w5"));
-        assert_eq!(premium.watched.len(), 2);
+        assert!(premium.is_consented("w6"));
+        assert_eq!(premium.watched.len(), 3);
 
         // The yes withdrawn, the question is asked again: a new yes
         // starts a fresh date.
@@ -3783,14 +3856,15 @@ mod tests {
         let reopened = WalletManager::open(dir.path(), key()).unwrap();
         assert_eq!(reopened.premium_state().await, PremiumState::default());
 
-        // Refused for another reason: not gone, and kept.
+        // Any other answer, a server without the route among them:
+        // not gone, and kept.
         let refusing = tempfile::tempdir().unwrap();
         let kept = WalletManager::open(refusing.path(), key()).unwrap();
         kept.set_premium_state(premium_account()).await.unwrap();
         let (base_url, _) = premium_answering(404, r#"{"error":"no such route"}"#).await;
         let error = kept.premium_delete_account(&base_url).await.unwrap_err();
         assert!(
-            matches!(error, CoreError::Premium(PremiumError::Rejected(_))),
+            matches!(error, CoreError::Premium(PremiumError::NotFound)),
             "{error}"
         );
         assert_eq!(kept.premium_state().await, premium_account());
