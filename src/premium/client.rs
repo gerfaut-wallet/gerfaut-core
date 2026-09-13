@@ -547,8 +547,18 @@ impl PremiumClient {
     /// its way into the path. An id the server handed out is one
     /// segment whatever it holds: a slash, a question mark, a hash or
     /// a space in it names a stranger resource, and encoded it names
-    /// none. The ids the apps draw pass through untouched.
+    /// none. Three spellings the path syntax swallows instead of
+    /// encoding, `.`, `..` and nothing at all, would name the
+    /// collection itself, the removal of one channel sent as a request
+    /// on all of them: refused before a URL is built. The ids the apps
+    /// draw pass through untouched.
     fn resource(&self, segments: &[&str]) -> CoreResult<String> {
+        if segments.iter().any(|s| matches!(*s, "" | "." | "..")) {
+            return Err(PremiumError::Rejected(
+                "the server named an id this app cannot use".to_owned(),
+            )
+            .into());
+        }
         let unusable = |detail: String| {
             PremiumError::Unreachable(format!(
                 "{} is not a server address: {detail}",
@@ -798,6 +808,51 @@ mod tests {
         assert!(
             request.starts_with("DELETE /v1/wallets/0f3b7c2e-1a2b-4c3d-8e9f-a0b1c2d3e4f5 HTTP/1.1"),
             "{request}"
+        );
+    }
+
+    /// An id the path syntax would swallow names the collection, not a
+    /// resource in it: `..` would turn the removal of one channel into
+    /// a request on all of them. Refused before any URL is built, so
+    /// nothing is sent.
+    #[tokio::test]
+    async fn an_id_the_path_would_swallow_is_refused_unsent() {
+        // A port nothing listens on: reaching it would be an error of
+        // another kind.
+        let client = PremiumClient::new(
+            "http://127.0.0.1:9",
+            Some("abcdefghijkmnpqr".to_owned()),
+            None,
+        )
+        .unwrap();
+        let refusal =
+            PremiumError::Rejected("the server named an id this app cannot use".to_owned());
+        for id in ["..", ".", ""] {
+            assert_eq!(
+                premium_error(client.delete_channel(id).await.unwrap_err()),
+                refusal,
+                "{id:?}"
+            );
+            assert_eq!(
+                premium_error(client.delete_wallet(id).await.unwrap_err()),
+                refusal,
+                "{id:?}"
+            );
+            assert_eq!(
+                premium_error(client.test_channel(id).await.unwrap_err()),
+                refusal,
+                "{id:?}"
+            );
+            assert_eq!(
+                premium_error(client.resource(&["v1", "channels", id]).unwrap_err()),
+                refusal,
+                "{id:?}"
+            );
+        }
+        // One that merely contains the spelling is an id like any other.
+        assert_eq!(
+            client.resource(&["v1", "channels", "..x", "test"]).unwrap(),
+            "http://127.0.0.1:9/v1/channels/..x/test"
         );
     }
 
