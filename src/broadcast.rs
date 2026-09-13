@@ -14,9 +14,11 @@
 //! (`.txn`, `.tx`); either of those inside a `ur:crypto-psbt`, a
 //! `ur:bytes` or a BBQr envelope pasted or scanned.
 
+use std::collections::HashMap;
+
 use bdk_wallet::bitcoin::consensus::encode;
 use bdk_wallet::bitcoin::secp256k1::Secp256k1;
-use bdk_wallet::bitcoin::{Address, Amount, OutPoint, Psbt, ScriptBuf, Transaction, TxOut};
+use bdk_wallet::bitcoin::{Address, Amount, OutPoint, Psbt, ScriptBuf, Transaction, TxIn, TxOut};
 use bdk_wallet::miniscript::psbt::PsbtExt;
 use serde::{Deserialize, Serialize};
 
@@ -320,6 +322,11 @@ pub fn decode_bytes_as_transaction(bytes: &[u8]) -> CoreResult<DecodedTx> {
     if tx.input.is_empty() {
         return Err(tx_error("the transaction spends nothing"));
     }
+    if let Some((later, earlier)) = repeated_outpoint(&tx.input) {
+        return Err(tx_error(format!(
+            "input {later} spends the same coin as input {earlier}"
+        )));
+    }
     let inputs = tx
         .input
         .iter()
@@ -361,6 +368,11 @@ fn decode_bytes(text: &str) -> CoreResult<Vec<u8>> {
 fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
     if psbt.unsigned_tx.input.is_empty() {
         return Err(tx_error("the PSBT spends nothing"));
+    }
+    if let Some((later, earlier)) = repeated_outpoint(&psbt.unsigned_tx.input) {
+        return Err(tx_error(format!(
+            "invalid PSBT: input {later} spends the same coin as input {earlier}"
+        )));
     }
     // Checked before the finalizer runs, which reads the spent output
     // of a previous transaction by index without looking whether it
@@ -438,6 +450,18 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
         tx,
         inputs,
         ready,
+    })
+}
+
+/// The first input that spends a coin an earlier one already spends,
+/// as `(later, earlier)`. No block takes such a transaction, and a
+/// preview that summed its inputs as they come would count the coin
+/// twice and show a fee nothing pays.
+fn repeated_outpoint(inputs: &[TxIn]) -> Option<(usize, usize)> {
+    let mut seen = HashMap::with_capacity(inputs.len());
+    inputs.iter().enumerate().find_map(|(index, input)| {
+        seen.insert(input.previous_output, index)
+            .map(|earlier| (index, earlier))
     })
 }
 
@@ -818,6 +842,42 @@ mod tests {
         let mut tx = signed_tx();
         tx.input[0].witness = Witness::new();
         tx
+    }
+
+    /// A transaction that spends one coin twice is not one the network
+    /// takes, and read as it comes its input total counts the coin
+    /// twice: a fee shown that nothing pays. Refused in both containers,
+    /// naming the two inputs.
+    #[test]
+    fn a_coin_spent_twice_is_refused_in_both_containers() {
+        let mut tx = unsigned_tx();
+        tx.input.push(tx.input[0].clone());
+        let psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        let error = decode_bytes_as_transaction(&psbt.serialize())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid transaction: invalid PSBT: input 1 spends the same coin as input 0"
+        );
+
+        let mut signed = signed_tx();
+        signed.input.push(signed.input[0].clone());
+        let error = decode_transaction(&encode::serialize_hex(&signed))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid transaction: input 1 spends the same coin as input 0"
+        );
+
+        // Two outputs of the same transaction are two coins.
+        let mut tx = unsigned_tx();
+        let mut other = tx.input[0].clone();
+        other.previous_output.vout = 2;
+        tx.input.push(other);
+        let psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        assert!(decode_bytes_as_transaction(&psbt.serialize()).is_ok());
     }
 
     #[test]
