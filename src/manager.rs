@@ -1748,11 +1748,14 @@ impl WalletManager {
     /// since it last heard, one `DELETE` each in the order they went,
     /// through the client [`Self::premium_client`] builds. A wallet the
     /// server has nothing under, or a key it no longer knows, counts as
-    /// told. The first other answer ends the round, a server that
-    /// cannot be reached and a refusal alike: what was told is
-    /// forgotten, the rest waits for the next call, and the error is
-    /// returned. Nothing to tell costs no connection. Returns how many
-    /// removals still wait.
+    /// told. A wallet the server refuses stays queued and the round
+    /// goes on to the next: a refusal is about that one id, and one
+    /// the server never accepts must not hold every wallet behind it.
+    /// Any other answer ends the round where it stands, a server that
+    /// cannot be reached first of all. Either way what was told is
+    /// forgotten, the rest waits for the next call, and the first
+    /// error is returned. Nothing to tell costs no connection. Returns
+    /// how many removals still wait.
     pub async fn premium_flush_unwatch(&self, base_url: &str) -> CoreResult<usize> {
         let pending = {
             let state = self.state.lock().await;
@@ -1772,14 +1775,24 @@ impl WalletManager {
             match client.delete_wallet(id).await {
                 Ok(()) => told.push(id.clone()),
                 // Nothing under that id: the state we wanted. A key the
-                // server does not know has no wallets either. Any other
-                // refusal, a rate limit among them, says nothing about
-                // what the server holds, and the message waits.
+                // server does not know has no wallets either.
                 Err(CoreError::Premium(PremiumError::NotFound | PremiumError::UnknownKey)) => {
                     told.push(id.clone());
                 }
+                // A refusal, a rate limit among them, says nothing about
+                // what the server holds, and the message waits. It is
+                // about this id, though, and the next may fare better:
+                // one the server refuses for good would otherwise hold
+                // the rest for good too.
+                Err(e @ CoreError::Premium(PremiumError::Rejected(_))) => {
+                    if failure.is_none() {
+                        failure = Some(e);
+                    }
+                }
                 Err(e) => {
-                    failure = Some(e);
+                    if failure.is_none() {
+                        failure = Some(e);
+                    }
                     break;
                 }
             }
@@ -2837,11 +2850,65 @@ mod tests {
     }
 
     /// A refusal that is not "nothing under that id" says nothing
-    /// about what the server holds: a rate limit ends the round the way
-    /// a server that cannot be reached does, and the wallet it refused
-    /// stays queued with the ones behind it.
+    /// about what the server holds, and is about that one id: the
+    /// wallet it refused stays queued, the ones behind it are still
+    /// told, and the refusal comes back once the round is over. One id
+    /// the server never accepts used to hold every wallet behind it
+    /// for good.
     #[tokio::test]
-    async fn the_flush_stops_at_a_refusal_and_keeps_the_wallet() {
+    async fn the_flush_goes_on_past_a_refused_wallet_and_keeps_it() {
+        let (base_url, mut seen) = answering(vec![
+            answer("422 Unprocessable Entity", r#"{"error":"not a wallet id"}"#),
+            answer("200 OK", "{}"),
+        ])
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let mut premium = PremiumState {
+            key: Some("abcdefghijkmnpqr".to_owned()),
+            ..PremiumState::default()
+        };
+        for id in ["w1", "w2"] {
+            premium.queue_unwatch(id);
+        }
+        manager.set_premium_state(premium).await.unwrap();
+
+        let outcome = manager.premium_flush_unwatch(&base_url).await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(CoreError::Premium(PremiumError::Rejected(words))) if words == "not a wallet id"
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w1 HTTP/1.1");
+        assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w2 HTTP/1.1");
+        assert_eq!(
+            manager.premium_state().await.pending_unwatch,
+            vec!["w1".to_owned()],
+            "the refused wallet waits for the next round, the one behind it was told"
+        );
+
+        // The next round starts again from the refused one, and meets
+        // no server.
+        let left = manager.premium_flush_unwatch(&base_url).await;
+        assert!(
+            matches!(left, Err(CoreError::Premium(PremiumError::Unreachable(_)))),
+            "{left:?}"
+        );
+        assert_eq!(
+            manager.premium_state().await.pending_unwatch,
+            vec!["w1".to_owned()]
+        );
+    }
+
+    /// The first error of the round is the one returned, and a server
+    /// that cannot be reached still ends the round where it stands:
+    /// the wallets after it are not tried, and wait with the refused
+    /// one.
+    #[tokio::test]
+    async fn the_flush_returns_its_first_error_and_stops_at_a_lost_server() {
         let (base_url, mut seen) = answering(vec![
             answer("200 OK", "{}"),
             answer("429 Too Many Requests", r#"{"error":"too many requests"}"#),
@@ -2855,7 +2922,7 @@ mod tests {
             key: Some("abcdefghijkmnpqr".to_owned()),
             ..PremiumState::default()
         };
-        for id in ["w1", "w2", "w3"] {
+        for id in ["w1", "w2", "w3", "w4"] {
             premium.queue_unwatch(id);
         }
         manager.set_premium_state(premium).await.unwrap();
@@ -2870,23 +2937,11 @@ mod tests {
         );
         assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w1 HTTP/1.1");
         assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w2 HTTP/1.1");
+        assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w3 HTTP/1.1");
         assert_eq!(
             manager.premium_state().await.pending_unwatch,
-            vec!["w2".to_owned(), "w3".to_owned()],
-            "the refused wallet and the one behind it wait for the next round"
-        );
-
-        // The next round picks up where it stopped: the third answer
-        // is still there for w2, and w3 meets no server.
-        let left = manager.premium_flush_unwatch(&base_url).await;
-        assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w2 HTTP/1.1");
-        assert!(
-            matches!(left, Err(CoreError::Premium(PremiumError::Unreachable(_)))),
-            "{left:?}"
-        );
-        assert_eq!(
-            manager.premium_state().await.pending_unwatch,
-            vec!["w3".to_owned()]
+            vec!["w2".to_owned(), "w4".to_owned()],
+            "the refused wallet and the one the lost server never heard of wait"
         );
     }
 
