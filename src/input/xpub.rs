@@ -34,6 +34,18 @@ pub struct DecodedXpub {
     pub multisig_only: bool,
 }
 
+/// What the prefix of a SLIP-132 key rewritten inside a descriptor
+/// said about the key, for the descriptor to be held against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Slip132Hint {
+    /// The prefix as written: `zpub`, `Ypub` and the rest.
+    pub prefix: &'static str,
+    /// The script the prefix says the key was exported for.
+    pub script: Option<ScriptKind>,
+    /// A multisig prefix: that script holds several keys.
+    pub multisig_only: bool,
+}
+
 /// Version bytes: (prefix bytes, mainnet?, script hint, multisig-only).
 const PUBLIC_VERSIONS: &[([u8; 4], bool, Option<ScriptKind>, bool)] = &[
     // Standard BIP32. No script hint: a bare xpub does not say how it is used.
@@ -138,23 +150,25 @@ pub(crate) fn is_base58_char(c: char) -> bool {
 }
 
 /// Rewrites every SLIP-132 public key in a descriptor to the standard
-/// prefix of its network, `xpub` or `tpub`. The descriptor parser reads
-/// only those, and the script type a SLIP-132 prefix hints at is what
-/// the descriptor already spells out. Returns the descriptor and
-/// whether any key was rewritten; one with no such key comes back as
-/// it was.
+/// prefix of its network, `xpub` or `tpub`, which are all the
+/// descriptor parser reads. Returns the descriptor and what the prefix
+/// of each rewritten key said, in the order the keys stand, for the
+/// descriptor to be held against; one with no such key comes back as
+/// it was, with nothing to hold it against.
 ///
 /// A checksum covers the text as written, so a rewrite makes it stale:
 /// it is recomputed when the original matched, and left alone when it
 /// did not, for the parser to refuse as it always has. A private key
 /// is refused before anything is rewritten.
-pub(crate) fn normalize_descriptor_keys(descriptor: &str) -> CoreResult<(String, bool)> {
+pub(crate) fn normalize_descriptor_keys(
+    descriptor: &str,
+) -> CoreResult<(String, Vec<Slip132Hint>)> {
     let (body, checksum) = match descriptor.split_once('#') {
         Some((body, checksum)) => (body, Some(checksum)),
         None => (descriptor, None),
     };
     let mut rewritten = String::with_capacity(body.len());
-    let mut converted = false;
+    let mut hints = Vec::new();
     let mut rest = body;
     while !rest.is_empty() {
         let run = rest
@@ -168,42 +182,53 @@ pub(crate) fn normalize_descriptor_keys(descriptor: &str) -> CoreResult<(String,
         }
         let (token, tail) = rest.split_at(run);
         match standard_form(token)? {
-            Some(standard) => {
+            Some((standard, hint)) => {
                 rewritten.push_str(&standard);
-                converted = true;
+                hints.push(hint);
             }
             None => rewritten.push_str(token),
         }
         rest = tail;
     }
-    if !converted {
-        return Ok((descriptor.to_owned(), false));
+    if hints.is_empty() {
+        return Ok((descriptor.to_owned(), hints));
     }
     let Some(given) = checksum else {
-        return Ok((rewritten, true));
+        return Ok((rewritten, hints));
     };
     if desc_checksum(body).ok().as_deref() != Some(given) {
-        return Ok((descriptor.to_owned(), false));
+        return Ok((descriptor.to_owned(), Vec::new()));
     }
     let fresh = desc_checksum(&rewritten).map_err(|e| CoreError::InvalidInput {
         kind: "descriptor",
         detail: e.to_string(),
     })?;
-    Ok((format!("{rewritten}#{fresh}"), true))
+    Ok((format!("{rewritten}#{fresh}"), hints))
 }
 
-/// The standard spelling of a SLIP-132 public key, `None` for any
-/// other token. A token that starts like one but does not decode is
-/// left as it is: the descriptor parser names what is wrong with it.
-fn standard_form(token: &str) -> CoreResult<Option<String>> {
+/// The standard spelling of a SLIP-132 public key and what its prefix
+/// said, `None` for any other token. A token that starts like one but
+/// does not decode is left as it is: the descriptor parser names what
+/// is wrong with it.
+fn standard_form(token: &str) -> CoreResult<Option<(String, Slip132Hint)>> {
     if PRIVATE_PREFIXES.iter().any(|p| token.starts_with(p)) {
         return Err(CoreError::PrivateMaterialRejected);
     }
-    if !SLIP132_PUBLIC_PREFIXES.iter().any(|p| token.starts_with(p)) {
+    let Some(&prefix) = SLIP132_PUBLIC_PREFIXES
+        .iter()
+        .find(|p| token.starts_with(**p))
+    else {
         return Ok(None);
-    }
+    };
     match decode_extended_key(token) {
-        Ok(decoded) if decoded.converted => Ok(Some(decoded.normalized)),
+        Ok(decoded) if decoded.converted => Ok(Some((
+            decoded.normalized,
+            Slip132Hint {
+                prefix,
+                script: decoded.script_hint,
+                multisig_only: decoded.multisig_only,
+            },
+        ))),
         Ok(_) => Ok(None),
         Err(CoreError::PrivateMaterialRejected) => Err(CoreError::PrivateMaterialRejected),
         Err(_) => Ok(None),
@@ -359,14 +384,14 @@ mod tests {
         let descriptor = format!("wpkh([deadbeef/84'/0'/0']{XPUB}/<0;1>/*)");
         assert_eq!(
             normalize_descriptor_keys(&descriptor).unwrap(),
-            (descriptor.clone(), false)
+            (descriptor.clone(), vec![])
         );
         // A token that starts like a SLIP-132 key but is not one is
         // the parser's to refuse, not something to rewrite.
         let odd = "wpkh(zpubnotakey/0/*)";
         assert_eq!(
             normalize_descriptor_keys(odd).unwrap(),
-            (odd.to_owned(), false)
+            (odd.to_owned(), vec![])
         );
     }
 
@@ -377,11 +402,27 @@ mod tests {
         let descriptor = format!(
             "wsh(sortedmulti(1,[deadbeef/48'/0'/0'/2']{zpub}/<0;1>/*,{zpub_multi}/<2;3>/*))"
         );
-        let (rewritten, converted) = normalize_descriptor_keys(&descriptor).unwrap();
-        assert!(converted);
+        let (rewritten, hints) = normalize_descriptor_keys(&descriptor).unwrap();
         assert_eq!(
             rewritten,
             format!("wsh(sortedmulti(1,[deadbeef/48'/0'/0'/2']{XPUB}/<0;1>/*,{XPUB}/<2;3>/*))")
+        );
+        // Each prefix is reported as written, in the order the keys
+        // stand, with what it says of the key.
+        assert_eq!(
+            hints,
+            vec![
+                Slip132Hint {
+                    prefix: "zpub",
+                    script: Some(ScriptKind::Segwit),
+                    multisig_only: false,
+                },
+                Slip132Hint {
+                    prefix: "Zpub",
+                    script: Some(ScriptKind::Segwit),
+                    multisig_only: true,
+                },
+            ]
         );
     }
 
@@ -391,19 +432,18 @@ mod tests {
         let body = format!("wpkh({zpub}/0/*)");
         let standard = format!("wpkh({XPUB}/0/*)");
         let with_checksum = format!("{body}#{}", desc_checksum(&body).unwrap());
+        let (rewritten, hints) = normalize_descriptor_keys(&with_checksum).unwrap();
         assert_eq!(
-            normalize_descriptor_keys(&with_checksum).unwrap(),
-            (
-                format!("{standard}#{}", desc_checksum(&standard).unwrap()),
-                true
-            )
+            rewritten,
+            format!("{standard}#{}", desc_checksum(&standard).unwrap())
         );
+        assert_eq!(hints.len(), 1);
         // The checksum was wrong before the rewrite: the text goes to
         // the parser as it was, and the parser says so.
         let wrong = format!("{body}#00000000");
         assert_eq!(
             normalize_descriptor_keys(&wrong).unwrap(),
-            (wrong.clone(), false)
+            (wrong.clone(), vec![])
         );
     }
 

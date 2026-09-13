@@ -438,8 +438,7 @@ fn networks_for_kind(kind: Option<NetworkKind>) -> Vec<Network> {
 }
 
 /// A SLIP-132 key is read the same inside a descriptor as on its own:
-/// rewritten to the standard prefix, and said so once. The script type
-/// its prefix hints at is not consulted: the descriptor decides.
+/// rewritten to the standard prefix, and said so once.
 fn slip132_warning(converted: bool) -> Vec<InputWarning> {
     if converted {
         vec![InputWarning::Slip132Converted]
@@ -448,10 +447,68 @@ fn slip132_warning(converted: bool) -> Vec<InputWarning> {
     }
 }
 
+/// The prefix of a SLIP-132 key names the script the wallet exported
+/// it for: `zpub` a P2WPKH key, `ypub` one under P2SH, `Zpub` a P2WSH
+/// cosigner and `Ypub` one under P2SH, `vpub` and the rest the same on
+/// a test network. A descriptor that wraps the key in anything else
+/// was not written by the wallet that exported the key, or not for
+/// it, and the addresses it derives are not the ones that wallet
+/// shows. Refused naming both, the prefix and the function, rather
+/// than imported as the descriptor says with a notice beside it.
+fn check_slip132_hints(
+    hints: &[xpub::Slip132Hint],
+    descriptor: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<()> {
+    use DescriptorType::{ShWpkh, ShWsh, ShWshSortedMulti, Wpkh, Wsh, WshSortedMulti};
+    let kind = descriptor.desc_type();
+    for hint in hints {
+        let (says, agrees) = match (hint.multisig_only, hint.script) {
+            (false, Some(ScriptKind::Segwit)) => ("Native SegWit", kind == Wpkh),
+            (false, Some(ScriptKind::NestedSegwit)) => ("Nested SegWit", kind == ShWpkh),
+            (true, Some(ScriptKind::Segwit)) => (
+                "Native SegWit multisig",
+                matches!(kind, Wsh | WshSortedMulti),
+            ),
+            (true, Some(ScriptKind::NestedSegwit)) => (
+                "Nested SegWit multisig",
+                matches!(kind, ShWsh | ShWshSortedMulti),
+            ),
+            _ => continue,
+        };
+        if !agrees {
+            return Err(CoreError::InvalidInput {
+                kind: "descriptor",
+                detail: format!(
+                    "the key's {} prefix says {says}, but the descriptor wraps it in {}: \
+                     check the export",
+                    hint.prefix,
+                    descriptor_function(kind)
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The outer function of a descriptor, the way it is written.
+fn descriptor_function(kind: DescriptorType) -> &'static str {
+    match kind {
+        DescriptorType::Pkh => "pkh()",
+        DescriptorType::Wpkh => "wpkh()",
+        DescriptorType::ShWpkh => "sh(wpkh())",
+        DescriptorType::Tr => "tr()",
+        DescriptorType::Wsh | DescriptorType::WshSortedMulti => "wsh()",
+        DescriptorType::ShWsh | DescriptorType::ShWshSortedMulti => "sh(wsh())",
+        DescriptorType::Sh | DescriptorType::ShSortedMulti => "sh()",
+        _ => "a bare script",
+    }
+}
+
 fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
-    let (s, converted) = xpub::normalize_descriptor_keys(s)?;
+    let (s, hints) = xpub::normalize_descriptor_keys(s)?;
     let descriptor = parse_descriptor_str(&s)?;
-    let mut warnings = slip132_warning(converted);
+    check_slip132_hints(&hints, &descriptor)?;
+    let mut warnings = slip132_warning(!hints.is_empty());
 
     if descriptor.is_multipath() {
         let parts =
@@ -507,10 +564,12 @@ fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
 }
 
 fn parse_descriptor_pair(first: &str, second: &str) -> CoreResult<ParsedInput> {
-    let (first, first_converted) = xpub::normalize_descriptor_keys(first)?;
-    let (second, second_converted) = xpub::normalize_descriptor_keys(second)?;
+    let (first, first_hints) = xpub::normalize_descriptor_keys(first)?;
+    let (second, second_hints) = xpub::normalize_descriptor_keys(second)?;
     let external = parse_descriptor_str(&first)?;
     let internal = parse_descriptor_str(&second)?;
+    check_slip132_hints(&first_hints, &external)?;
+    check_slip132_hints(&second_hints, &internal)?;
     if external.is_multipath() || internal.is_multipath() {
         return Err(CoreError::InvalidInput {
             kind: "descriptor",
@@ -532,7 +591,7 @@ fn parse_descriptor_pair(first: &str, second: &str) -> CoreResult<ParsedInput> {
             internal: Some(internal.to_string()),
             script: script_kind_of(&external),
         },
-        warnings: slip132_warning(first_converted || second_converted),
+        warnings: slip132_warning(!first_hints.is_empty() || !second_hints.is_empty()),
         script_options: vec![],
         derivation: None,
         derivation_editable: false,
@@ -977,12 +1036,16 @@ mod tests {
     /// these tests may spell, because everybody already knows it.
     const TPRV: &str = "tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L";
 
-    /// SLIP-132 version bytes, public single-sig test (`vpub`), public
-    /// multisig test (`Vpub`), public single-sig main (`zpub`) and
-    /// private single-sig test (`vprv`).
+    /// SLIP-132 version bytes: public single-sig test, native (`vpub`)
+    /// and nested (`upub`); public multisig test, native (`Vpub`) and
+    /// nested (`Upub`); public main, single-sig (`zpub`) and multisig
+    /// (`Zpub`); and private single-sig test (`vprv`).
     const VPUB: [u8; 4] = [0x04, 0x5F, 0x1C, 0xF6];
+    const UPUB: [u8; 4] = [0x04, 0x4A, 0x52, 0x62];
     const VPUB_MULTI: [u8; 4] = [0x02, 0x57, 0x54, 0x83];
+    const UPUB_MULTI: [u8; 4] = [0x02, 0x42, 0x89, 0xEF];
     const ZPUB: [u8; 4] = [0x04, 0xB2, 0x47, 0x46];
+    const ZPUB_MULTI: [u8; 4] = [0x02, 0xAA, 0x7E, 0xD3];
     const VPRV: [u8; 4] = [0x04, 0x5F, 0x18, 0xBC];
 
     /// `key` re-encoded under other version bytes, the way a wallet
@@ -1032,8 +1095,8 @@ mod tests {
 
     /// A descriptor written with a SLIP-132 key reads exactly as the
     /// same descriptor written with the standard key, plus the notice
-    /// that the key was rewritten. The prefix's script hint is not
-    /// consulted: the descriptor function already says.
+    /// that the key was rewritten, when the prefix and the function
+    /// agree, as an export's do.
     #[test]
     fn a_slip132_key_inside_a_descriptor_is_read_as_the_standard_one() {
         let vpub = slip132(TPUB, VPUB);
@@ -1097,8 +1160,8 @@ mod tests {
 
     #[test]
     fn a_descriptor_may_spell_its_keys_both_ways() {
-        let zpub = slip132(XPUB, ZPUB);
-        let input = format!("wsh(multi(1,{XPUB}/<0;1>/*,{zpub}/<2;3>/*))");
+        let cosigner = slip132(XPUB, ZPUB_MULTI);
+        let input = format!("wsh(multi(1,{XPUB}/<0;1>/*,{cosigner}/<2;3>/*))");
         let parsed = parse_input(&input).unwrap();
         assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
         assert_eq!(parsed.networks, vec![Network::Mainnet]);
@@ -1134,11 +1197,100 @@ mod tests {
     /// test `tpub` is the same mix it was, and refused the same way.
     #[test]
     fn a_slip132_key_keeps_its_network_inside_a_descriptor() {
-        let zpub = slip132(XPUB, ZPUB);
-        let error = parse_input(&format!("wsh(multi(1,{zpub}/0/*,{TPUB}/0/*))"))
+        let cosigner = slip132(XPUB, ZPUB_MULTI);
+        let error = parse_input(&format!("wsh(multi(1,{cosigner}/0/*,{TPUB}/0/*))"))
             .unwrap_err()
             .to_string();
         assert!(error.contains("mixes mainnet and test"), "{error}");
+    }
+
+    /// The prefix names the script the key was exported for, and the
+    /// descriptor has to agree: a `zpub` under `pkh()`, `tr()` or a
+    /// multisig, a `upub` under `wpkh()`, is a descriptor written for
+    /// another key, and the addresses it derives are not the exporting
+    /// wallet's. Refused naming both, on either line of a pair.
+    #[test]
+    fn a_slip132_prefix_the_descriptor_contradicts_is_refused() {
+        let zpub = slip132(XPUB, ZPUB);
+        let error = parse_input(&format!("pkh({zpub}/0/*)"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid descriptor: the key's zpub prefix says Native SegWit, but the descriptor \
+             wraps it in pkh(): check the export"
+        );
+        let error = parse_input(&format!("tr({zpub}/0/*)"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("wraps it in tr()"), "{error}");
+        let error = parse_input(&format!("wsh(multi(1,{zpub}/0/*,{XPUB}/0/*))"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("says Native SegWit, but the descriptor wraps it in wsh()"),
+            "{error}"
+        );
+
+        let upub = slip132(TPUB, UPUB);
+        let error = parse_input(&format!("wpkh({upub}/0/*)"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid descriptor: the key's upub prefix says Nested SegWit, but the descriptor \
+             wraps it in wpkh(): check the export"
+        );
+
+        let vpub = slip132(TPUB, VPUB);
+        let error = parse_input(&format!("wpkh({vpub}/0/*)\nsh(wpkh({vpub}/1/*))"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("wraps it in sh(wpkh())"), "{error}");
+    }
+
+    /// A prefix that agrees with the function passes with the notice
+    /// that the key was rewritten, and nothing else: `upub` under
+    /// `sh(wpkh())`, `Upub` under `sh(wsh())`.
+    #[test]
+    fn a_slip132_prefix_the_descriptor_agrees_with_is_read() {
+        let upub = slip132(TPUB, UPUB);
+        let parsed = parse_input(&format!("sh(wpkh({upub}/<0;1>/*))")).unwrap();
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::NestedSegwit);
+        assert!(external.starts_with("sh(wpkh(tpub"), "{external}");
+
+        let cosigner = slip132(TPUB, UPUB_MULTI);
+        let parsed = parse_input(&format!(
+            "sh(wsh(sortedmulti(1,{cosigner}/<0;1>/*,{TPUB}/<0;1>/*)))"
+        ))
+        .unwrap();
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+        assert_eq!(descriptors(&parsed).2, ScriptKind::WitnessScript);
+    }
+
+    /// A multisig prefix marks a cosigner key: under a single-key
+    /// function it was pasted where it does not belong, and under the
+    /// other multisig wrapper it was exported for another setup.
+    #[test]
+    fn a_multisig_prefix_in_a_single_key_descriptor_is_refused() {
+        let cosigner = slip132(TPUB, VPUB_MULTI);
+        let error = parse_input(&format!("wpkh({cosigner}/0/*)"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid descriptor: the key's Vpub prefix says Native SegWit multisig, but the \
+             descriptor wraps it in wpkh(): check the export"
+        );
+        let error = parse_input(&format!("sh(wsh(multi(1,{cosigner}/0/*,{TPUB}/0/*)))"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("says Native SegWit multisig, but the descriptor wraps it in sh(wsh())"),
+            "{error}"
+        );
     }
 
     /// The rewrite only touches descriptors: an address is not scanned
