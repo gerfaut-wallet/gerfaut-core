@@ -64,3 +64,14 @@ The first release: the library both Gerfaut apps are built on.
 - Switching a wallet off on the premium server withdraws the consent kept
   for it once the server has nothing left under its id, so removing the
   wallet later has nothing to tell the server.
+- A custom server address is stored the way a scan reads it, the host in
+  lower case and an IPv6 literal in brackets, and one the URL parser cannot
+  read is refused when saved, with the reason. Stored as typed, an address
+  such as `tcp://x.onion:50001:extra` showed the sync no onion, and its name
+  went to the resolver in the clear.
+- A SLIP-132 key inside a descriptor is held to what its prefix says: a
+  `zpub` under `pkh()`, a `ypub` under `wpkh()` or a `Zpub` in a single-key
+  descriptor is refused, naming both the prefix and the function, since a
+  descriptor written for another key derives addresses the exporting wallet
+  never shows. A prefix that agrees with the function is read as before,
+  with the notice that the key was rewritten.
