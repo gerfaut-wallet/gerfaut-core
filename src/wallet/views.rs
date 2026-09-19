@@ -100,24 +100,89 @@ pub(crate) fn tx_summaries(wallet: &bdk_wallet::Wallet) -> Vec<TxSummary> {
 }
 
 /// Pending first, then by descending height, txid as a stable tiebreak.
+/// What the engine held before a sync, to tell afterwards what the
+/// sync changed.
+pub(crate) struct Known {
+    /// Every transaction.
+    pub all: std::collections::HashSet<Txid>,
+    /// Those still waiting for a block.
+    pub pending: std::collections::HashSet<Txid>,
+}
+
+pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
+    let mut known = Known {
+        all: Default::default(),
+        pending: Default::default(),
+    };
+    for wtx in wallet.transactions() {
+        known.all.insert(wtx.tx_node.txid);
+        if !wtx.chain_position.is_confirmed() {
+            known.pending.insert(wtx.tx_node.txid);
+        }
+    }
+    known
+}
+
 /// The transactions the engine holds that `known` does not: what a
 /// sync just brought in.
-pub(crate) fn new_txs(
-    wallet: &bdk_wallet::Wallet,
-    known: &std::collections::HashSet<bdk_wallet::bitcoin::Txid>,
-) -> Vec<NewTx> {
+pub(crate) fn new_txs(wallet: &bdk_wallet::Wallet, known: &Known) -> Vec<NewTx> {
     wallet
         .transactions()
-        .filter(|wtx| !known.contains(&wtx.tx_node.txid))
-        .map(|wtx| {
-            let (sent, received) = wallet.sent_and_received(&wtx.tx_node.tx);
-            NewTx {
-                txid: wtx.tx_node.txid.to_string(),
-                net_sats: received.to_sat() as i64 - sent.to_sat() as i64,
-                confirmed: wtx.chain_position.is_confirmed(),
-            }
+        .filter(|wtx| !known.all.contains(&wtx.tx_node.txid))
+        .map(|wtx| NewTx {
+            txid: wtx.tx_node.txid.to_string(),
+            net_sats: net_of(wallet, &wtx.tx_node.tx),
+            confirmed: wtx.chain_position.is_confirmed(),
         })
         .collect()
+}
+
+/// The transactions that were waiting for a block before the sync and
+/// are in one now.
+pub(crate) fn confirmed_txs(wallet: &bdk_wallet::Wallet, known: &Known) -> Vec<NewTx> {
+    wallet
+        .transactions()
+        .filter(|wtx| {
+            wtx.chain_position.is_confirmed() && known.pending.contains(&wtx.tx_node.txid)
+        })
+        .map(|wtx| NewTx {
+            txid: wtx.tx_node.txid.to_string(),
+            net_sats: net_of(wallet, &wtx.tx_node.tx),
+            confirmed: true,
+        })
+        .collect()
+}
+
+/// The same two lists for a watched address, whose state is replaced
+/// whole by each sync: what `watch` holds that `previous` did not, and
+/// what `previous` held unconfirmed that `watch` has in a block.
+pub(crate) fn address_changes(
+    previous: Option<&AddressWatchState>,
+    watch: &AddressWatchState,
+) -> (Vec<NewTx>, Vec<NewTx>) {
+    let before: std::collections::HashMap<&str, bool> = previous
+        .iter()
+        .flat_map(|state| &state.txs)
+        .map(|tx| (tx.txid.as_str(), tx.height.is_some()))
+        .collect();
+    let line = |tx: &AddressTx| NewTx {
+        txid: tx.txid.clone(),
+        net_sats: tx.net_sats,
+        confirmed: tx.height.is_some(),
+    };
+    let new = watch
+        .txs
+        .iter()
+        .filter(|tx| !before.contains_key(tx.txid.as_str()))
+        .map(line)
+        .collect();
+    let confirmed = watch
+        .txs
+        .iter()
+        .filter(|tx| tx.height.is_some() && before.get(tx.txid.as_str()) == Some(&false))
+        .map(line)
+        .collect();
+    (new, confirmed)
 }
 
 pub(crate) fn sort_summaries(txs: &mut [TxSummary]) {
@@ -491,6 +556,138 @@ mod tests {
         );
         let kept = (!spent.is_null()).then_some(spent);
         assert_eq!(kept.map(|o| o.vout), Some(2));
+    }
+
+    /// BIP-84 test vector account, on testnet paths: public, and used
+    /// across the tests of this crate.
+    const EXTERNAL: &str = "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)";
+    const INTERNAL: &str = "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)";
+
+    /// A payment is worth two words: when it shows up, and when a block
+    /// takes it. The first sync lists it as new and pending, the one
+    /// that finds it in a block lists it as confirmed, and neither
+    /// says it twice.
+    #[test]
+    fn a_sync_tells_an_arrival_from_a_confirmation() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::{
+            Amount, BlockHash, OutPoint, Transaction, TxIn, TxOut, absolute, transaction,
+        };
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+
+        let mut wallet = bdk_wallet::Wallet::create(EXTERNAL, INTERNAL)
+            .network(bdk_wallet::bitcoin::Network::Signet)
+            .create_wallet_no_persist()
+            .unwrap();
+        let address = wallet.reveal_next_address(KeychainKind::External).address;
+        let payment = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+                ..TxIn::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: address.script_pubkey(),
+            }],
+        };
+        let txid = payment.compute_txid();
+
+        // It enters the mempool.
+        let before = known(&wallet);
+        wallet.apply_unconfirmed_txs([(payment.clone(), 1_700_000_000)]);
+        assert_eq!(
+            new_txs(&wallet, &before),
+            vec![NewTx {
+                txid: txid.to_string(),
+                net_sats: 50_000,
+                confirmed: false,
+            }]
+        );
+        assert!(confirmed_txs(&wallet, &before).is_empty());
+
+        // A sync that finds nothing changed says nothing.
+        let before = known(&wallet);
+        assert!(before.pending.contains(&txid));
+        assert!(new_txs(&wallet, &before).is_empty());
+        assert!(confirmed_txs(&wallet, &before).is_empty());
+
+        // A block takes it.
+        let block = BlockId {
+            height: 10,
+            hash: BlockHash::from_byte_array([1; 32]),
+        };
+        let mut update = bdk_wallet::Update {
+            chain: Some(wallet.latest_checkpoint().push(block).unwrap()),
+            ..Default::default()
+        };
+        update.tx_update.anchors.insert((
+            ConfirmationBlockTime {
+                block_id: block,
+                confirmation_time: 1_700_000_600,
+            },
+            txid,
+        ));
+        wallet.apply_update(update).unwrap();
+        assert!(new_txs(&wallet, &before).is_empty());
+        assert_eq!(
+            confirmed_txs(&wallet, &before),
+            vec![NewTx {
+                txid: txid.to_string(),
+                net_sats: 50_000,
+                confirmed: true,
+            }]
+        );
+
+        // And the sync after that has nothing left to say about it.
+        let before = known(&wallet);
+        assert!(before.pending.is_empty());
+        assert!(confirmed_txs(&wallet, &before).is_empty());
+    }
+
+    /// The same for a watched address, whose state each sync replaces
+    /// whole: one seen for the first time already in a block is new,
+    /// not "confirmed" as well.
+    #[test]
+    fn a_watched_address_tells_an_arrival_from_a_confirmation() {
+        let tx = |txid: &str, height: Option<u32>| AddressTx {
+            txid: txid.to_owned(),
+            net_sats: 1_000,
+            fee_sats: None,
+            height,
+            timestamp: None,
+            vsize: 100,
+            inputs: vec![],
+            outputs: vec![],
+            extras: None,
+        };
+        let line = |txid: &str, confirmed: bool| NewTx {
+            txid: txid.to_owned(),
+            net_sats: 1_000,
+            confirmed,
+        };
+        let first = AddressWatchState {
+            txs: vec![tx("pending", None), tx("old", Some(100))],
+            ..Default::default()
+        };
+        assert_eq!(
+            address_changes(None, &first),
+            (vec![line("pending", false), line("old", true)], vec![])
+        );
+        let second = AddressWatchState {
+            txs: vec![
+                tx("fresh", Some(201)),
+                tx("pending", Some(200)),
+                tx("old", Some(100)),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            address_changes(Some(&first), &second),
+            (vec![line("fresh", true)], vec![line("pending", true)])
+        );
+        assert_eq!(address_changes(Some(&second), &second), (vec![], vec![]));
     }
 
     fn summary(txid: &str, status: TxStatus) -> TxSummary {

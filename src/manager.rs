@@ -40,7 +40,7 @@ use crate::store::{Settings, Vault, VaultKey, VaultPayload, WalletRecord};
 use crate::wallet::meta::{CachedTotals, SyncStamp, WalletIcon, WalletKind, WalletMeta};
 use crate::wallet::policy::{self, PolicySnapshot};
 use crate::wallet::snapshot::{
-    AddressEntry, AddressList, NewTx, SyncReport, TxDetail, UtxoInfo, WalletSnapshot,
+    AddressEntry, AddressList, SyncReport, TxDetail, UtxoInfo, WalletSnapshot,
 };
 use crate::wallet::views;
 use crate::wallet::{AddressTx, AddressWatchState};
@@ -723,8 +723,7 @@ impl WalletManager {
                 } else {
                     EngineRequest::Incremental(engine.start_sync_with_revealed_spks().build())
                 };
-                let known: HashSet<_> = engine.transactions().map(|tx| tx.tx_node.txid).collect();
-                (request, known)
+                (request, views::known(engine))
             };
 
             match chain::sync_engine(endpoint, request, meta.gap_limit, proxy).await {
@@ -745,6 +744,7 @@ impl WalletManager {
                     let tip_height = views::tip_height(engine);
                     let tx_count_after = engine.transactions().count() as u32;
                     let new_txs = views::new_txs(engine, &known);
+                    let confirmed_txs = views::confirmed_txs(engine, &known);
                     let staged = engine.take_staged();
 
                     if let Some(staged) = staged {
@@ -754,6 +754,7 @@ impl WalletManager {
                         wallet_id: meta.id.clone(),
                         new_tx_count: new_txs.len() as u32,
                         new_txs,
+                        confirmed_txs,
                         balance,
                         tip_height,
                         took_ms: started.elapsed().as_millis() as u64,
@@ -783,11 +784,14 @@ impl WalletManager {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(mut watch) => {
                     let mut state = self.state.lock().await;
-                    let known: HashSet<String> = find_record(&state.payload, &meta.id)?
-                        .address_state
-                        .as_ref()
-                        .map(|s| s.txs.iter().map(|tx| tx.txid.clone()).collect())
-                        .unwrap_or_default();
+                    // Against the state as stored, before the older
+                    // rounds are carried over into the fresh one.
+                    let (new_txs, confirmed_txs) = views::address_changes(
+                        find_record(&state.payload, &meta.id)?
+                            .address_state
+                            .as_ref(),
+                        &watch,
+                    );
                     // A sync fetches the newest round only. Keep the older
                     // rounds the user already loaded, otherwise every sync
                     // would silently undo "load older transactions".
@@ -798,20 +802,11 @@ impl WalletManager {
                         keep_older_history(&mut watch, previous);
                     }
                     let tx_count_after = watch.txs.len() as u32;
-                    let new_txs: Vec<NewTx> = watch
-                        .txs
-                        .iter()
-                        .filter(|tx| !known.contains(&tx.txid))
-                        .map(|tx| NewTx {
-                            txid: tx.txid.clone(),
-                            net_sats: tx.net_sats,
-                            confirmed: tx.height.is_some(),
-                        })
-                        .collect();
                     let report = SyncReport {
                         wallet_id: meta.id.clone(),
                         new_tx_count: new_txs.len() as u32,
                         new_txs,
+                        confirmed_txs,
                         balance: views::address_balance(&watch),
                         tip_height: watch.tip_height,
                         took_ms: started.elapsed().as_millis() as u64,

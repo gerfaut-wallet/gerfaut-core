@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::wallet::meta::WalletMeta;
 use crate::wallet::tx_extras::{OpReturnData, TxExtras};
 
-/// A transaction a sync brought in for the first time.
+/// A transaction a sync has something to say about: one it brought in
+/// for the first time, or one it saw get its first confirmation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewTx {
     pub txid: String,
@@ -196,6 +197,12 @@ pub struct SyncReport {
     /// happened (a notification, a banner) without reloading the wallet.
     #[serde(default)]
     pub new_txs: Vec<NewTx>,
+    /// Transactions the wallet already held unconfirmed and that this
+    /// sync found in a block: the second thing worth announcing about a
+    /// payment, after its arrival. One first seen already confirmed is
+    /// in `new_txs` only, never in both.
+    #[serde(default)]
+    pub confirmed_txs: Vec<NewTx>,
     pub balance: BalanceSnapshot,
     pub tip_height: u32,
     pub took_ms: u64,
