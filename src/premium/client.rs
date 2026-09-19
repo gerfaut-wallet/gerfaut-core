@@ -147,6 +147,38 @@ pub struct WalletWatch {
     pub baseline_height: Option<i64>,
     pub coins: u64,
     pub value_sats: u64,
+    /// False once the server has refused the wallet: it keeps the row,
+    /// to say why in `refusal`, and watches nothing under it. A server
+    /// that predates the flag refuses no wallet and does not send it.
+    #[serde(default = "watching_by_default")]
+    pub watching: bool,
+    /// Why the server does not watch this wallet, when it does not.
+    #[serde(default)]
+    pub refusal: Option<WalletRefusal>,
+}
+
+fn watching_by_default() -> bool {
+    true
+}
+
+/// Why the server stopped watching a wallet, or never started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletRefusal {
+    /// For the app. `too_many_coins` is the only one today; an app that
+    /// meets another shows the message all the same.
+    pub code: String,
+    /// For the person who owns the wallet, in English, to show as it is.
+    pub message: String,
+}
+
+/// What a [`EventKind::WalletRefused`] event carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletRefused {
+    pub code: String,
+    /// The ceiling the wallet went past, when the code is about one.
+    #[serde(default)]
+    pub limit: Option<u64>,
+    pub message: String,
 }
 
 /// Where an account wants to be told.
@@ -215,6 +247,9 @@ pub enum EventKind {
     TimelockDue,
     /// The first scan is done.
     WalletRegistered,
+    /// The server no longer watches the wallet, and says why: read it
+    /// with [`Event::wallet_refused`].
+    WalletRefused,
     #[serde(other)]
     Other,
 }
@@ -232,6 +267,16 @@ pub struct Event {
     pub at: i64,
     /// The kind's own fields, as the API documents them.
     pub data: serde_json::Value,
+}
+
+impl Event {
+    /// The refusal a [`EventKind::WalletRefused`] event carries; `None`
+    /// for any other kind, or for data this build cannot read.
+    pub fn wallet_refused(&self) -> Option<WalletRefused> {
+        (self.kind == EventKind::WalletRefused)
+            .then(|| serde_json::from_value(self.data.clone()).ok())
+            .flatten()
+    }
 }
 
 // --- request and response bodies -----------------------------------------
@@ -445,15 +490,22 @@ impl PremiumClient {
         // A server that predates the flag leaves it false, which would
         // read as a scan already done. The date it does send answers the
         // same question, so it settles the ones that say nothing.
+        // A refused wallet has no date either, and no scan to come.
         for wallet in &mut wallets {
-            wallet.baseline_pending = wallet.baseline_pending || wallet.baseline_at.is_none();
+            wallet.baseline_pending =
+                wallet.baseline_pending || (wallet.watching && wallet.baseline_at.is_none());
         }
         Ok(wallets)
     }
 
     /// Registers, or replaces, a wallet under the app's own `id`.
-    /// `input` is the descriptor text as the app imported it; a single
-    /// address is refused by the server for now.
+    /// `input` is what the app imported: the descriptor text, or for a
+    /// wallet that is a single address, that address, bare or as
+    /// `addr(<address>)`. The server answers `200` before it has counted
+    /// the wallet's coins; one past its ceiling is refused by the scan,
+    /// which [`PremiumClient::wallets`] then reports as `watching: false`
+    /// with the reason, and sending it again as it was is
+    /// [`PremiumError::Rejected`] in the same words.
     ///
     /// The answer is dropped: it repeats the request, plus the
     /// `baseline_pending` flag that [`PremiumClient::wallets`] reports
@@ -1126,11 +1178,61 @@ mod tests {
         assert_eq!(events[1].kind, EventKind::TimelockDue);
         assert_eq!(events[1].data["milestone"], "7d");
         assert_eq!(events[2].kind, EventKind::Other);
+        assert_eq!(events[0].wallet_refused(), None);
         let request = stub.request().await;
         assert!(
             request.starts_with("GET /v1/events?after=40&limit=50 HTTP/1.1"),
             "{request}"
         );
+    }
+
+    /// A wallet the server refused stays in the list to say why, with
+    /// no scan to wait for, and the event that announced it carries the
+    /// same words. A server from before all that sends neither field,
+    /// and every wallet of its list is watched.
+    #[tokio::test]
+    async fn a_refused_wallet_says_why_in_the_list_and_in_its_event() {
+        let listed = stub(
+            200,
+            r#"{"wallets":[{"id":"w1","name":"Busy","script_kind":"p2wpkh","watched_since":1789000000,"baseline_at":null,"baseline_pending":false,"watching":false,"refusal":{"code":"too_many_coins","message":"This wallet holds more than 5,000 coins."},"baseline_height":null,"coins":0,"value_sats":0},{"id":"w2","name":"Address","script_kind":"p2tr","watched_since":1789000000,"baseline_at":1789000100,"baseline_pending":false,"watching":true,"refusal":null,"baseline_height":909000,"coins":1,"value_sats":5000},{"id":"w3","name":"Old server","script_kind":"p2wsh","watched_since":1789000000,"baseline_at":1789000100,"baseline_height":909000,"coins":1,"value_sats":5000}]}"#,
+        )
+        .await;
+        let wallets = client(&listed, Some("abcdefghijkmnpqr"))
+            .wallets()
+            .await
+            .unwrap();
+        assert!(!wallets[0].watching);
+        assert!(!wallets[0].baseline_pending, "no scan is coming");
+        assert_eq!(
+            wallets[0].refusal,
+            Some(WalletRefusal {
+                code: "too_many_coins".to_owned(),
+                message: "This wallet holds more than 5,000 coins.".to_owned(),
+            })
+        );
+        assert!(wallets[1].watching && wallets[1].refusal.is_none());
+        assert!(wallets[2].watching && wallets[2].refusal.is_none());
+
+        let logged = stub(
+            200,
+            r#"{"events":[{"id":7,"kind":"wallet_refused","wallet":"w1","wallet_name":"Busy","at":1790000000,"data":{"code":"too_many_coins","limit":5000,"message":"This wallet holds more than 5,000 coins."}},{"id":8,"kind":"wallet_refused","wallet":"w1","wallet_name":"Busy","at":1790000001,"data":{"code":"something_new","message":"No longer watched."}}]}"#,
+        )
+        .await;
+        let events = client(&logged, Some("abcdefghijkmnpqr"))
+            .events(0, 50)
+            .await
+            .unwrap();
+        assert_eq!(events[0].kind, EventKind::WalletRefused);
+        assert_eq!(
+            events[0].wallet_refused(),
+            Some(WalletRefused {
+                code: "too_many_coins".to_owned(),
+                limit: Some(5000),
+                message: "This wallet holds more than 5,000 coins.".to_owned(),
+            })
+        );
+        // A code this build does not know still has its sentence.
+        assert_eq!(events[1].wallet_refused().unwrap().limit, None);
     }
 
     #[tokio::test]
@@ -1155,21 +1257,18 @@ mod tests {
             ),
             PremiumError::NoPaidTime
         );
-        let refused = stub(
-            400,
-            r#"{"error":"a single address cannot be watched yet; send a descriptor"}"#,
-        )
-        .await;
+        // A wallet the scan refused, sent again as it was (HTTP 409).
+        let sentence = "This wallet holds more than 5,000 coins, which is more than Gerfaut \
+                        Premium watches.";
+        let refused = stub(409, &format!(r#"{{"error":"{sentence}"}}"#)).await;
         assert_eq!(
             premium_error(
                 client(&refused, Some("abcdefghijkmnpqr"))
-                    .put_wallet("w1", "Cold", "bc1q...")
+                    .put_wallet("w1", "Cold", "addr(bc1q...)")
                     .await
                     .unwrap_err()
             ),
-            PremiumError::Rejected(
-                "a single address cannot be watched yet; send a descriptor".to_owned()
-            )
+            PremiumError::Rejected(sentence.to_owned())
         );
         // A refusal without the promised body still names its status.
         let bare = stub(405, "method not allowed").await;

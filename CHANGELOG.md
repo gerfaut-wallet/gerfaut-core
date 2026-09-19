@@ -49,6 +49,9 @@ The first release: the library both Gerfaut apps are built on.
   repeats one. Settings and wallets change under a running watch without a
   call from the app, and a host whose timers sleep can ask for a check of
   the connection from an alarm.
+- The premium client reads a wallet the server refused: `watching` is false
+  and `refusal` says why, in the list and in a `wallet_refused` event. A
+  single address can be registered like a descriptor.
 - One sync of a wallet runs at a time. A caller that arrives while one runs
   waits for it and takes its result instead of asking the backend again.
 - On a phone, the built-in Tor client uses reduced channel padding, so a
