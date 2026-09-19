@@ -639,6 +639,7 @@ impl PremiumClient {
             .await
             .map_err(|e| PremiumError::Unreachable(describe(&e)))?;
         let status = response.status().as_u16();
+        let retry_after = retry_after(response.headers());
         let body = response
             .bytes()
             .await
@@ -646,8 +647,27 @@ impl PremiumClient {
         if (200..300).contains(&status) {
             return Ok(body.to_vec());
         }
-        Err(refusal(status, &body).into())
+        Err(refusal(status, retry_after, &body).into())
     }
+}
+
+/// The longest wait a `Retry-After` is believed for, in seconds. The
+/// server's windows are a minute or an hour; a header asking for more
+/// comes from something else on the path.
+const RETRY_AFTER_MAX: u64 = 3_600;
+
+/// The whole seconds a `Retry-After` header asks for, one at least and
+/// [`RETRY_AFTER_MAX`] at most. The date form, which the server never
+/// sends, reads as no header.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let seconds: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(seconds.clamp(1, RETRY_AFTER_MAX))
 }
 
 fn events_path(after: i64, limit: u32) -> String {
@@ -667,11 +687,20 @@ fn decode<'a, T: Deserialize<'a>>(body: &'a [u8]) -> CoreResult<T> {
 /// proxy without a route answers, a bare 401 or 403 what one that wants
 /// a login first answers, and neither says anything about what the
 /// server holds, a key it would no longer know least of all.
-fn refusal(status: u16, body: &[u8]) -> PremiumError {
+///
+/// The server sends `Retry-After` with every 429 that a wait resolves,
+/// and only with those: that is a rate limit. Its one other 429, five
+/// wrong codes on a channel, comes without the header and is a refusal
+/// in its own words, since waiting changes nothing there. A bare 429
+/// is somebody on the path asking for the same patience.
+fn refusal(status: u16, retry_after: Option<u64>, body: &[u8]) -> PremiumError {
     let words = serde_json::from_slice::<ErrorBody>(body)
         .ok()
         .map(|b| b.error);
     match status {
+        429 if retry_after.is_some() || words.is_none() => {
+            PremiumError::RateLimited { retry_after }
+        }
         401 if words.is_some() => PremiumError::UnknownKey,
         403 if words.is_some() => PremiumError::NoPaidTime,
         404 | 410 if words.is_some() => PremiumError::NotFound,
@@ -742,6 +771,11 @@ mod tests {
     }
 
     async fn stub(status: u16, body: &str) -> Stub {
+        stub_with(status, "", body).await
+    }
+
+    /// The same, with header lines of its own, each ended by `\r\n`.
+    async fn stub_with(status: u16, headers: &'static str, body: &str) -> Stub {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let (sender, seen) = mpsc::unbounded_channel();
@@ -786,7 +820,7 @@ mod tests {
                 }
                 let _ = sender.send(String::from_utf8_lossy(&bytes).into_owned());
                 let response = format!(
-                    "HTTP/1.1 {status} Stub\r\nContent-Type: application/json\r\n\
+                    "HTTP/1.1 {status} Stub\r\nContent-Type: application/json\r\n{headers}\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
@@ -1331,16 +1365,46 @@ mod tests {
                 "HTTP {status}"
             );
         }
-        let limited = stub(429, r#"{"error":"too many requests"}"#).await;
-        assert_eq!(
-            premium_error(
-                client(&limited, Some("abcdefghijkmnpqr"))
-                    .delete_channel("nope")
-                    .await
-                    .unwrap_err()
-            ),
-            PremiumError::Rejected("too many requests".to_owned())
-        );
+        // A rate limit is its own answer: it is about the client, not
+        // about the request, and says how long to wait. The wait is held
+        // to a sane range, and a header that is not a number of seconds
+        // reads as none.
+        for (header, retry_after) in [
+            ("Retry-After: 42\r\n", 42),
+            ("Retry-After: 0\r\n", 1),
+            ("Retry-After: 999999999\r\n", 3_600),
+        ] {
+            let limited = stub_with(429, header, r#"{"error":"too many requests"}"#).await;
+            assert_eq!(
+                premium_error(
+                    client(&limited, Some("abcdefghijkmnpqr"))
+                        .delete_channel("nope")
+                        .await
+                        .unwrap_err()
+                ),
+                PremiumError::RateLimited {
+                    retry_after: Some(retry_after)
+                },
+                "{header:?}"
+            );
+        }
+        // Without the header and without the server's words, it is
+        // somebody on the path: patience all the same, for a time nobody
+        // named. The date form of the header is one the server never
+        // sends, and reads as none.
+        for header in ["", "Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n"] {
+            let portal = stub_with(429, header, "<html>Too Many Requests</html>").await;
+            assert_eq!(
+                premium_error(
+                    client(&portal, Some("abcdefghijkmnpqr"))
+                        .delete_channel("nope")
+                        .await
+                        .unwrap_err()
+                ),
+                PremiumError::RateLimited { retry_after: None },
+                "{header:?}"
+            );
+        }
         // The server is there and not well: for the banner, offline.
         let down = stub(503, r#"{"error":"node unreachable"}"#).await;
         assert_eq!(

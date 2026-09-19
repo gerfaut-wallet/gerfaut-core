@@ -1854,8 +1854,9 @@ impl WalletManager {
     /// told. A wallet the server refuses stays queued and the round
     /// goes on to the next: a refusal is about that one id, and one
     /// the server never accepts must not hold every wallet behind it.
-    /// Any other answer ends the round where it stands, a server that
-    /// cannot be reached first of all. Either way what was told is
+    /// Any other answer ends the round where it stands: a server that
+    /// cannot be reached, and a rate limit, which is about this client
+    /// and would turn away every request behind it as well. Either way what was told is
     /// forgotten, the rest waits for the next call, and the first
     /// error is returned. Nothing to tell costs no connection. Returns
     /// how many removals still wait.
@@ -1882,9 +1883,9 @@ impl WalletManager {
                 Err(CoreError::Premium(PremiumError::NotFound | PremiumError::UnknownKey)) => {
                     told.push(id.clone());
                 }
-                // A refusal, a rate limit among them, says nothing about
-                // what the server holds, and the message waits. It is
-                // about this id, though, and the next may fare better:
+                // A refusal says nothing about what the server holds,
+                // and the message waits. It is about this id, though,
+                // and the next may fare better:
                 // one the server refuses for good would otherwise hold
                 // the rest for good too.
                 Err(e @ CoreError::Premium(PremiumError::Rejected(_))) => {
@@ -3055,7 +3056,7 @@ mod tests {
     async fn the_flush_returns_its_first_error_and_stops_at_a_lost_server() {
         let (base_url, mut seen) = answering(vec![
             answer("200 OK", "{}"),
-            answer("429 Too Many Requests", r#"{"error":"too many requests"}"#),
+            answer("400 Bad Request", r#"{"error":"not a wallet id"}"#),
             answer("200 OK", "{}"),
         ])
         .await;
@@ -3075,7 +3076,7 @@ mod tests {
         assert!(
             matches!(
                 &outcome,
-                Err(CoreError::Premium(PremiumError::Rejected(words))) if words == "too many requests"
+                Err(CoreError::Premium(PremiumError::Rejected(words))) if words == "not a wallet id"
             ),
             "{outcome:?}"
         );
@@ -3086,6 +3087,60 @@ mod tests {
             manager.premium_state().await.pending_unwatch,
             vec!["w2".to_owned(), "w4".to_owned()],
             "the refused wallet and the one the lost server never heard of wait"
+        );
+    }
+
+    /// A rate limit is about this client, not about the wallet it was
+    /// answered for: the round stops there, the requests behind it are
+    /// not sent to be turned away in their turn, and the queue waits
+    /// with the time the server asked for.
+    #[tokio::test]
+    async fn the_flush_stops_at_a_rate_limit_and_keeps_the_queue() {
+        let body = r#"{"error":"too many requests"}"#;
+        let (base_url, mut seen) = answering(vec![
+            answer("200 OK", "{}"),
+            format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 17\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            answer("200 OK", "{}"),
+        ])
+        .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let mut premium = PremiumState {
+            key: Some("abcdefghijkmnpqr".to_owned()),
+            ..PremiumState::default()
+        };
+        for id in ["w1", "w2", "w3"] {
+            premium.queue_unwatch(id);
+        }
+        manager.set_premium_state(premium).await.unwrap();
+
+        let outcome = manager.premium_flush_unwatch(&base_url).await;
+        assert!(
+            matches!(
+                &outcome,
+                Err(CoreError::Premium(PremiumError::RateLimited {
+                    retry_after: Some(17)
+                }))
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w1 HTTP/1.1");
+        assert_eq!(seen.recv().await.unwrap(), "DELETE /v1/wallets/w2 HTTP/1.1");
+        assert_eq!(
+            manager.premium_state().await.pending_unwatch,
+            vec!["w2".to_owned(), "w3".to_owned()],
+            "the limited wallet and the one never sent wait"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), seen.recv())
+                .await
+                .is_err(),
+            "nothing is sent behind a rate limit"
         );
     }
 

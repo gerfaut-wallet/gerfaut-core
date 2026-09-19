@@ -91,6 +91,10 @@ The first release: the library both Gerfaut apps are built on.
   when it comes in the server's own error body. The bare status is what a
   captive portal or a proxy answers, and it no longer makes the app forget
   a key or a wallet the server still holds.
+- A 429 from the premium server that names a wait is a rate limit of its
+  own, with the wait it named, an hour at most. Telling the server about
+  removed wallets stops at one and keeps the rest for later, instead of
+  sending every request behind it to be turned away too.
 - Switching a wallet off on the premium server withdraws the consent kept
   for it once the server has nothing left under its id, so removing the
   wallet later has nothing to tell the server.

@@ -137,6 +137,16 @@ pub enum PremiumError {
     #[error("the premium server refused: {0}")]
     Rejected(String),
 
+    /// The server asks this client to slow down (HTTP 429 with
+    /// `Retry-After`, or a bare 429 from something on the path). Not a
+    /// word about the request itself: the same one may pass later, and
+    /// whatever follows it now would be turned away too. `retry_after`
+    /// is the wait that was named, in seconds, 3,600 at most. A 429 the
+    /// server words itself and gives no wait for, five wrong codes on a
+    /// channel, is [`PremiumError::Rejected`]: waiting settles nothing.
+    #[error("the premium server asks to wait before trying again")]
+    RateLimited { retry_after: Option<u64> },
+
     /// The server could not be reached, or answered with a failure of
     /// its own (HTTP 5xx).
     #[error("the premium server is unreachable: {0}")]
