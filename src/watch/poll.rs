@@ -97,7 +97,7 @@ impl Plan {
                     .client
                     .get_scripthash_stats(script)
                     .await
-                    .map_err(|_| "request failed".to_owned())?;
+                    .map_err(|e| self.client.describe(&e))?;
                 found.push((
                     hex.clone(),
                     Fingerprint {
@@ -158,17 +158,12 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
             let hash = client
                 .get_tip_hash()
                 .await
-                .map_err(|_| "request failed".to_owned())?
+                .map_err(|e| client.describe(&e))?
                 .to_string();
             let height = if known_tip.as_deref() == Some(hash.as_str()) {
                 None
             } else {
-                Some(
-                    client
-                        .get_height()
-                        .await
-                        .map_err(|_| "request failed".to_owned())?,
-                )
+                Some(client.get_height().await.map_err(|e| client.describe(&e))?)
             };
             Ok::<_, String>((hash, height, plan.check().await?))
         };

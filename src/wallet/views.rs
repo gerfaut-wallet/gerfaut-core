@@ -123,6 +123,71 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
     known
 }
 
+/// The scripts worth watching live for a descriptor wallet, the ones
+/// most likely to move first, since a transport may only cover the
+/// head of the list: the unused receive addresses, the scripts holding
+/// coins (a spend shows there first), the receive addresses within the
+/// gap limit past the last revealed one, the change addresses the same
+/// way, and then the used, empty ones, newest first. A script past the
+/// revealed range is marked: only a full scan looks that far, so a
+/// change seen there asks for one.
+pub(crate) fn watch_scripts(
+    wallet: &bdk_wallet::Wallet,
+    gap_limit: u32,
+) -> Vec<crate::watch::WatchedScript> {
+    let mut seen = std::collections::HashSet::new();
+    let mut scripts = Vec::new();
+    let mut push = |script: bdk_wallet::bitcoin::ScriptBuf, lookahead: bool| {
+        if seen.insert(script.clone()) {
+            scripts.push(crate::watch::WatchedScript {
+                script: script.to_hex_string(),
+                lookahead,
+            });
+        }
+    };
+    let keychains: Vec<KeychainKind> = wallet.keychains().map(|(keychain, _)| keychain).collect();
+    let ahead = |keychain: KeychainKind| {
+        let next = wallet
+            .derivation_index(keychain)
+            .map_or(0, |last| last.saturating_add(1));
+        (next..next.saturating_add(gap_limit))
+            .map(move |index| wallet.peek_address(keychain, index).script_pubkey())
+    };
+    for info in wallet.list_unused_addresses(KeychainKind::External) {
+        push(info.script_pubkey(), false);
+    }
+    for coin in wallet.list_unspent() {
+        push(coin.txout.script_pubkey, false);
+    }
+    for script in ahead(KeychainKind::External) {
+        push(script, true);
+    }
+    if keychains.contains(&KeychainKind::Internal) {
+        for info in wallet.list_unused_addresses(KeychainKind::Internal) {
+            push(info.script_pubkey(), false);
+        }
+        for script in ahead(KeychainKind::Internal) {
+            push(script, true);
+        }
+    }
+    for keychain in keychains {
+        let Some(last) = wallet.derivation_index(keychain) else {
+            continue;
+        };
+        for index in (0..=last).rev() {
+            push(wallet.peek_address(keychain, index).script_pubkey(), false);
+        }
+    }
+    scripts
+}
+
+/// Whether the wallet holds a transaction still waiting for a block.
+pub(crate) fn has_pending(wallet: &bdk_wallet::Wallet) -> bool {
+    wallet
+        .transactions()
+        .any(|wtx| !wtx.chain_position.is_confirmed())
+}
+
 /// The transactions the engine holds that `known` does not: what a
 /// sync just brought in.
 pub(crate) fn new_txs(wallet: &bdk_wallet::Wallet, known: &Known) -> Vec<NewTx> {

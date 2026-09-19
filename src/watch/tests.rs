@@ -503,6 +503,9 @@ struct MempoolState {
     counts: HashMap<String, u64>,
     looked_up: Vec<String>,
     tip: u32,
+    /// The transactions of the one address the REST side knows, as
+    /// Esplora spells them, for a sync to read.
+    address_txs: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -603,6 +606,30 @@ impl FakeMempool {
                 ("200 OK", format!("{:064x}", state.tip))
             } else if path.ends_with("/blocks/tip/height") {
                 ("200 OK", state.tip.to_string())
+            } else if path.ends_with("/utxo") || path.contains("/txs/chain/") {
+                ("200 OK", "[]".to_owned())
+            } else if path.ends_with("/txs") {
+                (
+                    "200 OK",
+                    Value::Array(state.address_txs.clone()).to_string(),
+                )
+            } else if let Some(address) = path.rsplit_once("/address/").map(|(_, a)| a) {
+                let count = |confirmed: bool| {
+                    let txs = state
+                        .address_txs
+                        .iter()
+                        .filter(|tx| tx["status"]["confirmed"] == confirmed)
+                        .count();
+                    json!({
+                        "funded_txo_count": txs, "funded_txo_sum": txs * 50_000,
+                        "spent_txo_count": 0, "spent_txo_sum": 0, "tx_count": txs,
+                    })
+                };
+                (
+                    "200 OK",
+                    json!({ "address": address, "chain_stats": count(true), "mempool_stats": count(false) })
+                        .to_string(),
+                )
             } else if let Some(hash) = path.rsplit_once("/scripthash/").map(|(_, hash)| hash) {
                 state.looked_up.push(hash.to_owned());
                 let count = state.counts.get(hash).copied().unwrap_or(0);
@@ -951,6 +978,217 @@ fn a_backoff_doubles_up_to_its_cap() {
     assert_eq!(ceiling, timings.backoff_cap);
     backoff.reset();
     assert!(backoff.delay(&timings) <= timings.backoff_first);
+}
+
+// --- the manager ---------------------------------------------------------------
+
+/// The BIP-173 test vector address, and its script.
+const ADDRESS: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+const ADDRESS_SCRIPT: &str = "0014751e76e8199196d454941c45d1b3a323f1433bd6";
+
+fn payment(confirmed: bool) -> Value {
+    json!({
+        "txid": "11".repeat(32), "version": 2, "locktime": 0, "size": 110, "weight": 440, "fee": 200,
+        "vin": [{
+            "txid": "22".repeat(32), "vout": 0, "scriptsig": "", "sequence": 4294967293u32,
+            "is_coinbase": false,
+            "prevout": { "scriptpubkey": script(9), "value": 60_000 },
+        }],
+        "vout": [{ "scriptpubkey": ADDRESS_SCRIPT, "value": 50_000 }],
+        "status": if confirmed {
+            json!({ "confirmed": true, "block_height": 501, "block_hash": "33".repeat(32), "block_time": 1_700_000_000 })
+        } else {
+            json!({ "confirmed": false })
+        },
+    })
+}
+
+async fn next_live(events: &mut crate::live::LiveEvents) -> crate::live::LiveEvent {
+    loop {
+        match tokio::time::timeout(WAIT, events.next()).await {
+            Ok(Some(crate::live::LiveEvent::Status(_))) => {}
+            Ok(Some(event)) => return event,
+            Ok(None) => panic!("the live watch stopped"),
+            Err(_) => panic!("no live event within {WAIT:?}"),
+        }
+    }
+}
+
+/// The whole path, against a fake Esplora: the watch sees the script
+/// move, the manager syncs the wallet, and the payment is announced
+/// when it enters the mempool and again when it confirms, once each,
+/// whoever else syncs or asks, and across a restart.
+#[tokio::test]
+async fn the_manager_announces_a_payment_twice_and_no_more() {
+    use crate::live::{LiveEvent, LiveTx};
+    use crate::store::TxStage;
+
+    let server = FakeMempool::start(false, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let key = crate::store::VaultKey::Raw([7; 32]);
+    let manager = crate::WalletManager::open(dir.path(), key).unwrap();
+    manager.set_active_network(Network::Signet).await.unwrap();
+    manager
+        .set_backend(Network::Signet, server.backend())
+        .await
+        .unwrap();
+    let parsed = crate::input::parse_input(ADDRESS).unwrap();
+    let wallet = manager
+        .add_wallet("Watched", &parsed, Network::Signet)
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.watch_list(Network::Signet).await,
+        vec![WatchedWallet {
+            wallet_id: wallet.id.clone(),
+            scripts: vec![WatchedScript {
+                script: ADDRESS_SCRIPT.to_owned(),
+                lookahead: false,
+            }],
+            has_pending: false,
+        }]
+    );
+    manager.sync_wallet(&wallet.id).await.unwrap();
+
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    let rest_key = FakeMempool::rest_key(ADDRESS_SCRIPT);
+    let started = std::time::Instant::now();
+    while !server.state.lock().unwrap().looked_up.contains(&rest_key) {
+        assert!(started.elapsed() < WAIT, "never polled");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(manager.live_status().await.state, WatchState::Polling);
+
+    // The payment enters the mempool.
+    {
+        let mut state = server.state.lock().unwrap();
+        state.address_txs = vec![payment(false)];
+        state.counts.insert(rest_key.clone(), 1);
+    }
+    let announced = |stage| {
+        LiveEvent::Transaction(LiveTx {
+            wallet_id: wallet.id.clone(),
+            txid: "11".repeat(32),
+            net_sats: 50_000,
+            stage,
+        })
+    };
+    assert_eq!(next_live(&mut events).await, announced(TxStage::Mempool));
+    match next_live(&mut events).await {
+        LiveEvent::WalletSynced { report } => assert_eq!(report.new_txs.len(), 1),
+        other => panic!("expected the sync, got {other:?}"),
+    }
+
+    // A block takes it: the wallet waits for one, so the new tip is
+    // worth a sync, and that sync finds the confirmation.
+    {
+        let mut state = server.state.lock().unwrap();
+        state.address_txs = vec![payment(true)];
+        state.tip = 501;
+    }
+    loop {
+        match next_live(&mut events).await {
+            LiveEvent::NewBlock { height } => assert_eq!(height, 501),
+            LiveEvent::WalletSynced { .. } => {}
+            event => {
+                assert_eq!(event, announced(TxStage::Confirmed));
+                break;
+            }
+        }
+    }
+
+    // Anyone else reading the same news is told it was said already,
+    // in this process and after a restart.
+    let said = crate::wallet::snapshot::SyncReport {
+        wallet_id: wallet.id.clone(),
+        new_tx_count: 1,
+        new_txs: vec![crate::wallet::snapshot::NewTx {
+            txid: "11".repeat(32),
+            net_sats: 50_000,
+            confirmed: false,
+        }],
+        confirmed_txs: vec![crate::wallet::snapshot::NewTx {
+            txid: "11".repeat(32),
+            net_sats: 50_000,
+            confirmed: true,
+        }],
+        ..manager.sync_wallet(&wallet.id).await.unwrap()
+    };
+    assert!(manager.claim_announcements(&said).await.unwrap().is_empty());
+    manager.live_stop().await;
+    assert!(
+        tokio::time::timeout(WAIT, async { while events.next().await.is_some() {} })
+            .await
+            .is_ok(),
+        "a stopped watch closes its events"
+    );
+    assert_eq!(manager.live_status().await, WatchStatus::default());
+    drop(manager);
+    let reopened =
+        crate::WalletManager::open(dir.path(), crate::store::VaultKey::Raw([7; 32])).unwrap();
+    assert!(
+        reopened
+            .claim_announcements(&said)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Something never said is handed out, once.
+    let mut other = said.clone();
+    other.new_txs[0].txid = "44".repeat(32);
+    other.confirmed_txs.clear();
+    assert_eq!(reopened.claim_announcements(&other).await.unwrap().len(), 1);
+    assert!(
+        reopened
+            .claim_announcements(&other)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A descriptor wallet is watched from the address it shows next, past
+/// the ones it has revealed, on both keychains.
+#[tokio::test]
+async fn a_descriptor_wallet_is_watched_past_what_it_revealed() {
+    const EXTERNAL: &str = "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)";
+    let dir = tempfile::tempdir().unwrap();
+    let key = crate::store::VaultKey::Raw([7; 32]);
+    let manager = crate::WalletManager::open(dir.path(), key).unwrap();
+    let parsed = crate::input::parse_input(EXTERNAL).unwrap();
+    let wallet = manager
+        .add_wallet("Cold", &parsed, Network::Signet)
+        .await
+        .unwrap();
+    let next = manager.receive_addresses(&wallet.id, 0).await.unwrap()[0]
+        .address
+        .clone();
+    let next_script = next
+        .parse::<bdk_wallet::bitcoin::Address<_>>()
+        .unwrap()
+        .assume_checked()
+        .script_pubkey()
+        .to_hex_string();
+    let list = manager.watch_list(Network::Signet).await;
+    assert_eq!(list.len(), 1);
+    assert!(!list[0].has_pending);
+    let scripts = &list[0].scripts;
+    assert_eq!(
+        scripts[0].script, next_script,
+        "the address shown comes first"
+    );
+    assert!(!scripts[0].lookahead);
+    let gap = manager.settings().await.gap_limit as usize;
+    let ahead = scripts.iter().filter(|script| script.lookahead).count();
+    assert!(
+        ahead >= gap,
+        "{ahead} scripts past the revealed ones, gap {gap}"
+    );
+    let unique: std::collections::HashSet<&String> =
+        scripts.iter().map(|script| &script.script).collect();
+    assert_eq!(unique.len(), scripts.len());
+    // Another network has nothing to watch.
+    assert!(manager.watch_list(Network::Mainnet).await.is_empty());
 }
 
 // --- live -----------------------------------------------------------------------

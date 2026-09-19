@@ -66,7 +66,7 @@ impl Deref for Client {
 
 impl Client {
     /// The error as a sentence the sync report can show.
-    fn describe(&self, error: &esplora_client::Error) -> String {
+    pub(crate) fn describe(&self, error: &esplora_client::Error) -> String {
         describe(error, self.budget)
     }
 }

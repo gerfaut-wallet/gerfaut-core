@@ -884,12 +884,22 @@ async fn supervise(mut hub: Hub) {
                 no_push = None;
             }
             Exit::Reprobe => no_push = None,
-            Exit::Lost(detail) | Exit::Unreachable(detail) | Exit::NoPush(detail) => {
+            exit @ (Exit::Lost(_) | Exit::Unreachable(_) | Exit::NoPush(_)) => {
                 if started.elapsed() >= hub.timings.stable {
                     backoff.reset();
                 }
                 let delay = backoff.delay(&hub.timings);
+                // Without a session, the transport last tried is not one
+                // in use.
+                let established = matches!(exit, Exit::Lost(_));
+                let (Exit::Lost(detail) | Exit::Unreachable(detail) | Exit::NoPush(detail)) = exit
+                else {
+                    continue;
+                };
                 hub.set_status(|status| {
+                    if !established {
+                        status.transport = None;
+                    }
                     status.state = WatchState::Reconnecting;
                     status.detail = Some(detail);
                     status.pushed_scripts = 0;

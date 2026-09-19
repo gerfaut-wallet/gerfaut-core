@@ -42,6 +42,15 @@ The first release: the library both Gerfaut apps are built on.
   already tells it, plus how long the app stays connected.
 - A sync report lists the transactions it saw confirm, next to the ones it
   saw for the first time, so an app can announce both.
+- Live alerts on the wallet manager. It starts the watch, syncs the wallet
+  that moved, and hands out each transaction to announce once when it
+  enters the mempool and once when it confirms. The record of what was
+  announced is kept in the vault, so a restart or a second caller never
+  repeats one. Settings and wallets change under a running watch without a
+  call from the app, and a host whose timers sleep can ask for a check of
+  the connection from an alarm.
+- One sync of a wallet runs at a time. A caller that arrives while one runs
+  waits for it and takes its result instead of asking the backend again.
 - Encrypted local storage: XChaCha20-Poly1305 under an Argon2id key, an app
   lock that slows repeated attempts and survives a restart, and an encrypted
   backup file that doubles as the sync format between two devices.

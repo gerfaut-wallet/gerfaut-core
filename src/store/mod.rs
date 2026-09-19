@@ -108,12 +108,35 @@ impl Settings {
     }
 }
 
+/// How far a transaction had come when it was announced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxStage {
+    /// Seen, not yet in a block.
+    Mempool,
+    /// In a block.
+    Confirmed,
+}
+
+/// One announcement already made: see
+/// [`crate::WalletManager::claim_announcements`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Announced {
+    pub txid: String,
+    pub stage: TxStage,
+}
+
 /// Everything the vault persists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultPayload {
     pub version: u32,
     pub settings: Settings,
     pub wallets: Vec<WalletRecord>,
+    /// What was announced, oldest first, so that no transaction is
+    /// announced twice at the same stage by two callers or after a
+    /// restart. Absent from vaults written before live alerts.
+    #[serde(default)]
+    pub announced: Vec<Announced>,
 }
 
 impl Default for VaultPayload {
@@ -122,6 +145,7 @@ impl Default for VaultPayload {
             version: PAYLOAD_VERSION,
             settings: Settings::default(),
             wallets: Vec::new(),
+            announced: Vec::new(),
         }
     }
 }

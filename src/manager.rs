@@ -65,14 +65,14 @@ pub struct SyncFailure {
     pub message: String,
 }
 
-struct ManagerState {
+pub(crate) struct ManagerState {
     vault: Vault,
-    payload: VaultPayload,
+    pub(crate) payload: VaultPayload,
     /// Loaded BDK engines, keyed by wallet id. Lazily populated.
     engines: HashMap<String, bdk_wallet::Wallet>,
     /// Where the vault lives, and where the embedded Tor client keeps
     /// its state.
-    data_dir: PathBuf,
+    pub(crate) data_dir: PathBuf,
 }
 
 impl ManagerState {
@@ -90,7 +90,7 @@ impl ManagerState {
     /// it was: the error the caller reports is then the whole truth, and
     /// no later save, made for something else, quietly commits a change
     /// nobody was told about.
-    fn commit<T>(
+    pub(crate) fn commit<T>(
         &mut self,
         change: impl FnOnce(&mut VaultPayload) -> CoreResult<T>,
     ) -> CoreResult<T> {
@@ -102,12 +102,37 @@ impl ManagerState {
     }
 }
 
-/// The facade. Cheap to share behind an `Arc`.
+/// The facade. A handle: cloning it is cheap and every clone is the
+/// same manager, which is how a task that outlives a call, the live
+/// watch for one, keeps it.
+#[derive(Clone)]
 pub struct WalletManager {
-    state: Mutex<ManagerState>,
+    shared: std::sync::Arc<Shared>,
+}
+
+/// What every clone of the manager shares.
+pub struct Shared {
+    pub(crate) state: Mutex<ManagerState>,
     /// Recent failed unlock attempts, kept apart from the vault lock so
     /// an unlock never waits on a sync.
     attempts: Mutex<LockAttempts>,
+    /// The live watch, while one runs. Taken before the state lock,
+    /// never after it.
+    pub(crate) live: Mutex<Option<crate::live::Running>>,
+    /// One sync at a time per wallet, and when the last one ended.
+    syncing: std::sync::Mutex<HashMap<String, SyncSlot>>,
+}
+
+/// The last sync of a wallet to finish, behind the lock a sync of that
+/// wallet holds while it runs.
+type SyncSlot = std::sync::Arc<Mutex<Option<(Instant, SyncReport)>>>;
+
+impl std::ops::Deref for WalletManager {
+    type Target = Shared;
+
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
 }
 
 fn now_secs() -> u64 {
@@ -131,13 +156,17 @@ impl WalletManager {
         let (vault, payload) = Vault::open_or_create(data_dir.join(VAULT_FILE), key)?;
         let attempts = LockAttempts::load(data_dir.join(ATTEMPTS_FILE));
         Ok(WalletManager {
-            state: Mutex::new(ManagerState {
-                vault,
-                payload,
-                engines: HashMap::new(),
-                data_dir,
+            shared: std::sync::Arc::new(Shared {
+                state: Mutex::new(ManagerState {
+                    vault,
+                    payload,
+                    engines: HashMap::new(),
+                    data_dir,
+                }),
+                attempts: Mutex::new(attempts),
+                live: Mutex::new(None),
+                syncing: std::sync::Mutex::new(HashMap::new()),
             }),
-            attempts: Mutex::new(attempts),
         })
     }
 
@@ -154,10 +183,15 @@ impl WalletManager {
     }
 
     pub async fn set_active_network(&self, network: Network) -> CoreResult<()> {
-        self.state.lock().await.commit(|payload| {
-            payload.settings.active_network = network;
-            Ok(())
-        })
+        let result: CoreResult<()> = async {
+            self.state.lock().await.commit(|payload| {
+                payload.settings.active_network = network;
+                Ok(())
+            })
+        }
+        .await;
+        self.live_refresh().await;
+        result
     }
 
     /// Remembers the backend of a network. A custom address is stored
@@ -169,11 +203,16 @@ impl WalletManager {
     /// in that form is stored byte for byte, and the certificate
     /// accepted for it stays keyed to it.
     pub async fn set_backend(&self, network: Network, config: BackendConfig) -> CoreResult<()> {
-        let config = config.canonical()?;
-        self.state.lock().await.commit(|payload| {
-            payload.settings.backends.insert(network, config);
-            Ok(())
-        })
+        let result: CoreResult<()> = async {
+            let config = config.canonical()?;
+            self.state.lock().await.commit(|payload| {
+                payload.settings.backends.insert(network, config);
+                Ok(())
+            })
+        }
+        .await;
+        self.live_refresh().await;
+        result
     }
 
     // --- Electrum certificates ------------------------------------------
@@ -224,45 +263,60 @@ impl WalletManager {
     /// From then on that host must present exactly this certificate:
     /// anything else is refused, never accepted again in silence.
     pub async fn trust_certificate(&self, url: &str, fingerprint: &str) -> CoreResult<()> {
-        if !chain::tls::is_fingerprint(fingerprint) {
-            return Err(CoreError::InvalidInput {
-                kind: "certificate fingerprint",
-                detail: "expected 32 hexadecimal bytes separated by colons".to_owned(),
-            });
+        let result: CoreResult<()> = async {
+            if !chain::tls::is_fingerprint(fingerprint) {
+                return Err(CoreError::InvalidInput {
+                    kind: "certificate fingerprint",
+                    detail: "expected 32 hexadecimal bytes separated by colons".to_owned(),
+                });
+            }
+            let host = chain::electrum::certificate_key(url);
+            self.state.lock().await.commit(|payload| {
+                payload
+                    .settings
+                    .electrum_certs
+                    .insert(host, fingerprint.to_ascii_uppercase());
+                Ok(())
+            })
         }
-        let host = chain::electrum::certificate_key(url);
-        self.state.lock().await.commit(|payload| {
-            payload
-                .settings
-                .electrum_certs
-                .insert(host, fingerprint.to_ascii_uppercase());
-            Ok(())
-        })
+        .await;
+        self.live_refresh().await;
+        result
     }
 
     /// Drops an accepted certificate: the next connection to that host
     /// asks again.
     pub async fn forget_certificate(&self, host: &str) -> CoreResult<()> {
-        self.state.lock().await.commit(|payload| {
-            payload.settings.electrum_certs.remove(host);
-            Ok(())
-        })
+        let result: CoreResult<()> = async {
+            self.state.lock().await.commit(|payload| {
+                payload.settings.electrum_certs.remove(host);
+                Ok(())
+            })
+        }
+        .await;
+        self.live_refresh().await;
+        result
     }
 
     /// Sets the gap limit shared by every wallet. Takes effect on the
     /// next sync; a raised limit widens the scan, a lowered one only
     /// narrows future scans (revealed addresses stay watched).
     pub async fn set_gap_limit(&self, gap_limit: u32) -> CoreResult<()> {
-        if !(1..=500).contains(&gap_limit) {
-            return Err(CoreError::InvalidInput {
-                kind: "gap limit",
-                detail: "must be between 1 and 500".to_owned(),
-            });
+        let result: CoreResult<()> = async {
+            if !(1..=500).contains(&gap_limit) {
+                return Err(CoreError::InvalidInput {
+                    kind: "gap limit",
+                    detail: "must be between 1 and 500".to_owned(),
+                });
+            }
+            self.state.lock().await.commit(|payload| {
+                payload.settings.gap_limit = gap_limit;
+                Ok(())
+            })
         }
-        self.state.lock().await.commit(|payload| {
-            payload.settings.gap_limit = gap_limit;
-            Ok(())
-        })
+        .await;
+        self.live_refresh().await;
+        result
     }
 
     /// Stores one small app preference (theme, hidden balances, ...) in
@@ -302,61 +356,66 @@ impl WalletManager {
         parsed: &ParsedInput,
         network: Network,
     ) -> CoreResult<WalletMeta> {
-        if !parsed.networks.contains(&network) {
-            return Err(CoreError::NetworkMismatch {
-                expected: network.to_string(),
-                found: parsed
-                    .networks
-                    .iter()
-                    .map(|n| n.to_string())
-                    .collect::<Vec<_>>()
-                    .join("/"),
-            });
-        }
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(CoreError::InvalidInput {
-                kind: "wallet name",
-                detail: "a wallet needs a name".to_owned(),
-            });
-        }
+        let result: CoreResult<WalletMeta> = async {
+            if !parsed.networks.contains(&network) {
+                return Err(CoreError::NetworkMismatch {
+                    expected: network.to_string(),
+                    found: parsed
+                        .networks
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                });
+            }
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(CoreError::InvalidInput {
+                    kind: "wallet name",
+                    detail: "a wallet needs a name".to_owned(),
+                });
+            }
 
-        let kind = match &parsed.payload {
-            ParsedPayload::Descriptors {
-                external,
-                internal,
-                script,
-            } => WalletKind::Descriptors {
-                external: external.clone(),
-                internal: internal.clone(),
-                script: *script,
-            },
-            ParsedPayload::Address { address } => WalletKind::SingleAddress {
-                address: address.clone(),
-            },
-        };
+            let kind = match &parsed.payload {
+                ParsedPayload::Descriptors {
+                    external,
+                    internal,
+                    script,
+                } => WalletKind::Descriptors {
+                    external: external.clone(),
+                    internal: internal.clone(),
+                    script: *script,
+                },
+                ParsedPayload::Address { address } => WalletKind::SingleAddress {
+                    address: address.clone(),
+                },
+            };
 
-        let mut state = self.state.lock().await;
-        if let Some(existing) = find_watched(&state.payload, network, &kind) {
-            return Err(CoreError::DuplicateWallet(existing.meta.name.clone()));
-        }
+            let mut state = self.state.lock().await;
+            if let Some(existing) = find_watched(&state.payload, network, &kind) {
+                return Err(CoreError::DuplicateWallet(existing.meta.name.clone()));
+            }
 
-        let meta = fresh_meta(
-            name,
-            network,
-            kind,
-            parsed.kind,
-            state.payload.settings.gap_limit,
-        );
-        let (record, engine) = build_record(meta.clone())?;
-        state.commit(|payload| {
-            payload.wallets.push(record);
-            Ok(())
-        })?;
-        if let Some(engine) = engine {
-            state.engines.insert(meta.id.clone(), engine);
+            let meta = fresh_meta(
+                name,
+                network,
+                kind,
+                parsed.kind,
+                state.payload.settings.gap_limit,
+            );
+            let (record, engine) = build_record(meta.clone())?;
+            state.commit(|payload| {
+                payload.wallets.push(record);
+                Ok(())
+            })?;
+            if let Some(engine) = engine {
+                state.engines.insert(meta.id.clone(), engine);
+            }
+            Ok(meta)
         }
-        Ok(meta)
+        .await;
+        self.live_refresh().await;
+        result
     }
 
     pub async fn rename_wallet(&self, id: &str, name: &str) -> CoreResult<()> {
@@ -431,21 +490,26 @@ impl WalletManager {
     /// here removes it there, and the removal cannot wait for the
     /// network. [`Self::premium_flush_unwatch`] carries the message.
     pub async fn remove_wallet(&self, id: &str) -> CoreResult<()> {
-        let mut state = self.state.lock().await;
-        state.commit(|payload| {
-            let before = payload.wallets.len();
-            payload.wallets.retain(|record| record.meta.id != id);
-            if payload.wallets.len() == before {
-                return Err(CoreError::WalletNotFound(id.to_owned()));
-            }
-            let premium = &mut payload.settings.premium;
-            if premium.has_key() && premium.is_consented(id) {
-                premium.queue_unwatch(id);
-            }
+        let result: CoreResult<()> = async {
+            let mut state = self.state.lock().await;
+            state.commit(|payload| {
+                let before = payload.wallets.len();
+                payload.wallets.retain(|record| record.meta.id != id);
+                if payload.wallets.len() == before {
+                    return Err(CoreError::WalletNotFound(id.to_owned()));
+                }
+                let premium = &mut payload.settings.premium;
+                if premium.has_key() && premium.is_consented(id) {
+                    premium.queue_unwatch(id);
+                }
+                Ok(())
+            })?;
+            state.engines.remove(id);
             Ok(())
-        })?;
-        state.engines.remove(id);
-        Ok(())
+        }
+        .await;
+        self.live_refresh().await;
+        result
     }
 
     // --- views ---------------------------------------------------------
@@ -652,7 +716,40 @@ impl WalletManager {
         self.sync_wallet_with(id, true).await
     }
 
+    /// One sync of a wallet at a time, whoever asks: the app, a
+    /// background job, the live watch. A caller that arrives while one
+    /// runs waits for it, and takes its result instead of asking the
+    /// backend the same question again. What that sync found was
+    /// reported to the caller that ran it, so the one that waited is
+    /// told of nothing new: every transaction is reported once.
     async fn sync_wallet_with(&self, id: &str, from_scratch: bool) -> CoreResult<SyncReport> {
+        let arrived = Instant::now();
+        let slot = match self.syncing.lock() {
+            Ok(mut slots) => slots.entry(id.to_owned()).or_default().clone(),
+            Err(_) => SyncSlot::default(),
+        };
+        let mut last = slot.lock().await;
+        if !from_scratch
+            && let Some((finished, report)) = last.as_ref()
+            && *finished > arrived
+        {
+            return Ok(SyncReport {
+                new_tx_count: 0,
+                new_txs: Vec::new(),
+                confirmed_txs: Vec::new(),
+                ..report.clone()
+            });
+        }
+        let report = self.sync_wallet_alone(id, from_scratch).await?;
+        *last = Some((Instant::now(), report.clone()));
+        drop(last);
+        // The scripts this sync revealed, and whether something is
+        // still waiting for a block.
+        self.live_refresh().await;
+        Ok(report)
+    }
+
+    async fn sync_wallet_alone(&self, id: &str, from_scratch: bool) -> CoreResult<SyncReport> {
         let started = Instant::now();
 
         // Snapshot what the sync needs; do not hold the lock during I/O.
@@ -1454,121 +1551,124 @@ impl WalletManager {
         password: &str,
         choices: &ImportChoices,
     ) -> CoreResult<ImportReport> {
-        let payload = backup::open(&backup::decode_source(source)?, password)?;
-        let chosen: BTreeSet<usize> = match &choices.indexes {
-            Some(indexes) => indexes
-                .iter()
-                .map(|&index| {
-                    let index = index as usize;
-                    if index < payload.wallets.len() {
-                        Ok(index)
-                    } else {
-                        Err(CoreError::InvalidInput {
-                            kind: "backup",
-                            detail: format!("this backup has no wallet at index {index}"),
-                        })
-                    }
-                })
-                .collect::<CoreResult<_>>()?,
-            None => (0..payload.wallets.len()).collect(),
-        };
-        let settings_applied = choices.apply_settings && payload.has_settings();
-
-        let mut state = self.state.lock().await;
-        // Restored wallets take the gap limit in force once the settings
-        // are applied.
-        let gap_limit = match payload.gap_limit.filter(|_| settings_applied) {
-            Some(gap_limit) => gap_limit.clamp(1, 500),
-            None => state.payload.settings.gap_limit,
-        };
-
-        // Everything that can fail happens before the vault changes: a
-        // descriptor the engine refuses leaves nothing half-restored.
-        let mut pending: Vec<(WalletRecord, Option<bdk_wallet::Wallet>)> = Vec::new();
-        let mut skipped = (payload.wallets.len() - chosen.len()) as u32;
-        for index in chosen {
-            let wallet = &payload.wallets[index];
-            let watched = find_watched(&state.payload, wallet.network, &wallet.kind).is_some()
-                || pending.iter().any(|(record, _)| {
-                    record.meta.network == wallet.network && record.meta.kind == wallet.kind
-                });
-            if watched {
-                skipped += 1;
-                continue;
-            }
-            let name = wallet.name.trim();
-            if name.is_empty() {
-                return Err(CoreError::InvalidInput {
-                    kind: "wallet name",
-                    detail: "a wallet needs a name".to_owned(),
-                });
-            }
-            let mut meta = fresh_meta(
-                name,
-                wallet.network,
-                wallet.kind.clone(),
-                recognized_kind(&wallet.kind),
-                gap_limit,
-            );
-            meta.labels = wallet.labels.clone();
-            pending.push(build_record(meta)?);
-        }
-
-        // The vault changes as a whole or not at all, and the engines
-        // are kept only once it has: a save that fails must not leave
-        // wallets on screen that the disk never received.
-        let mut added = Vec::with_capacity(pending.len());
-        let mut engines = Vec::new();
-        state.commit(|next| {
-            if settings_applied {
-                let settings = &mut next.settings;
-                if let Some(backends) = &payload.backends {
-                    // Stored the way the settings screen stores them: a
-                    // backup from a vault older than that form, or one
-                    // written by hand, must not put in place an address
-                    // the screen would have refused. One that cannot be
-                    // read is left out, and the backend of that network
-                    // stays as it was.
-                    settings
-                        .backends
-                        .extend(backends.iter().filter_map(|(network, config)| {
-                            Some((*network, config.clone().canonical().ok()?))
-                        }));
-                }
-                if let Some(certs) = &payload.electrum_certs {
-                    for (host, fingerprint) in certs {
-                        // The same check an acceptance made by hand goes
-                        // through: a backup must not be able to pin what
-                        // the dialog would have refused, nor a fingerprint
-                        // shaped so that no real certificate can ever
-                        // match it and the host becomes permanently
-                        // unreachable.
-                        if !chain::tls::is_fingerprint(fingerprint) {
-                            continue;
+        let result: CoreResult<ImportReport> = async {
+            let payload = backup::open(&backup::decode_source(source)?, password)?;
+            let chosen: BTreeSet<usize> = match &choices.indexes {
+                Some(indexes) => indexes
+                    .iter()
+                    .map(|&index| {
+                        let index = index as usize;
+                        if index < payload.wallets.len() {
+                            Ok(index)
+                        } else {
+                            Err(CoreError::InvalidInput {
+                                kind: "backup",
+                                detail: format!("this backup has no wallet at index {index}"),
+                            })
                         }
-                        settings
-                            .electrum_certs
-                            .entry(host.clone())
-                            .or_insert_with(|| fingerprint.to_ascii_uppercase());
+                    })
+                    .collect::<CoreResult<_>>()?,
+                None => (0..payload.wallets.len()).collect(),
+            };
+            let settings_applied = choices.apply_settings && payload.has_settings();
+
+            let mut state = self.state.lock().await;
+            // Restored wallets take the gap limit in force once the settings
+            // are applied.
+            let gap_limit = match payload.gap_limit.filter(|_| settings_applied) {
+                Some(gap_limit) => gap_limit.clamp(1, 500),
+                None => state.payload.settings.gap_limit,
+            };
+
+            // Everything that can fail happens before the vault changes: a
+            // descriptor the engine refuses leaves nothing half-restored.
+            let mut pending: Vec<(WalletRecord, Option<bdk_wallet::Wallet>)> = Vec::new();
+            let mut skipped = (payload.wallets.len() - chosen.len()) as u32;
+            for index in chosen {
+                let wallet = &payload.wallets[index];
+                let watched = find_watched(&state.payload, wallet.network, &wallet.kind).is_some()
+                    || pending.iter().any(|(record, _)| {
+                        record.meta.network == wallet.network && record.meta.kind == wallet.kind
+                    });
+                if watched {
+                    skipped += 1;
+                    continue;
+                }
+                let name = wallet.name.trim();
+                if name.is_empty() {
+                    return Err(CoreError::InvalidInput {
+                        kind: "wallet name",
+                        detail: "a wallet needs a name".to_owned(),
+                    });
+                }
+                let mut meta = fresh_meta(
+                    name,
+                    wallet.network,
+                    wallet.kind.clone(),
+                    recognized_kind(&wallet.kind),
+                    gap_limit,
+                );
+                meta.labels = wallet.labels.clone();
+                pending.push(build_record(meta)?);
+            }
+
+            // The vault changes as a whole or not at all, and the engines
+            // are kept only once it has: a save that fails must not leave
+            // wallets on screen that the disk never received.
+            let mut added = Vec::with_capacity(pending.len());
+            let mut engines = Vec::new();
+            state.commit(|next| {
+                if settings_applied {
+                    let settings = &mut next.settings;
+                    if let Some(backends) = &payload.backends {
+                        // Stored the way the settings screen stores them: a
+                        // backup from a vault older than that form, or one
+                        // written by hand, must not put in place an address
+                        // the screen would have refused. One that cannot be
+                        // read is left out, and the backend of that network
+                        // stays as it was.
+                        settings.backends.extend(backends.iter().filter_map(
+                            |(network, config)| Some((*network, config.clone().canonical().ok()?)),
+                        ));
                     }
+                    if let Some(certs) = &payload.electrum_certs {
+                        for (host, fingerprint) in certs {
+                            // The same check an acceptance made by hand goes
+                            // through: a backup must not be able to pin what
+                            // the dialog would have refused, nor a fingerprint
+                            // shaped so that no real certificate can ever
+                            // match it and the host becomes permanently
+                            // unreachable.
+                            if !chain::tls::is_fingerprint(fingerprint) {
+                                continue;
+                            }
+                            settings
+                                .electrum_certs
+                                .entry(host.clone())
+                                .or_insert_with(|| fingerprint.to_ascii_uppercase());
+                        }
+                    }
+                    settings.gap_limit = gap_limit;
                 }
-                settings.gap_limit = gap_limit;
-            }
-            for (record, engine) in pending {
-                if let Some(engine) = engine {
-                    engines.push((record.meta.id.clone(), engine));
+                for (record, engine) in pending {
+                    if let Some(engine) = engine {
+                        engines.push((record.meta.id.clone(), engine));
+                    }
+                    added.push(record.meta.clone());
+                    next.wallets.push(record);
                 }
-                added.push(record.meta.clone());
-                next.wallets.push(record);
-            }
-            Ok(())
-        })?;
-        state.engines.extend(engines);
-        Ok(ImportReport {
-            added,
-            skipped,
-            settings_applied,
-        })
+                Ok(())
+            })?;
+            state.engines.extend(engines);
+            Ok(ImportReport {
+                added,
+                skipped,
+                settings_applied,
+            })
+        }
+        .await;
+        self.live_refresh().await;
+        result
     }
 
     // --- tor -----------------------------------------------------------
@@ -1584,20 +1684,25 @@ impl WalletManager {
     /// `host:port`, checked here so a typo fails at the settings screen
     /// and not at the next sync; blank means the default.
     pub async fn set_tor_settings(&self, settings: TorSettings) -> CoreResult<()> {
-        let socks_proxy = settings
-            .socks_proxy
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(tor::parse_socks_address)
-            .transpose()?;
-        self.state.lock().await.commit(|payload| {
-            payload.settings.tor = TorSettings {
-                mode: settings.mode,
-                socks_proxy,
-            };
-            Ok(())
-        })
+        let result: CoreResult<()> = async {
+            let socks_proxy = settings
+                .socks_proxy
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(tor::parse_socks_address)
+                .transpose()?;
+            self.state.lock().await.commit(|payload| {
+                payload.settings.tor = TorSettings {
+                    mode: settings.mode,
+                    socks_proxy,
+                };
+                Ok(())
+            })
+        }
+        .await;
+        self.live_refresh().await;
+        result
     }
 
     /// Reaches Tor now, the way the settings say, so a settings screen
@@ -1900,6 +2005,47 @@ fn keep_older_history(watch: &mut AddressWatchState, previous: &AddressWatchStat
     // The deeper cursor wins: the list now reaches at least that far.
     watch.history_cursor = previous.history_cursor.clone();
     watch.truncated = watch.history_cursor.is_some();
+}
+
+/// One wallet as the live watch takes it: its scripts in the order a
+/// transport should cover them, and whether it waits for a block.
+/// `None` for a wallet that cannot be read, which is then not watched.
+pub(crate) fn watched_wallet(
+    state: &mut ManagerState,
+    id: &str,
+    gap_limit: u32,
+) -> Option<crate::watch::WatchedWallet> {
+    let record = find_record(&state.payload, id).ok()?;
+    let (scripts, has_pending) = match &record.meta.kind {
+        WalletKind::SingleAddress { address } => {
+            let script = Address::from_str(address)
+                .ok()?
+                .require_network(record.meta.network.to_bitcoin())
+                .ok()?
+                .script_pubkey();
+            let has_pending = record
+                .address_state
+                .as_ref()
+                .is_some_and(|watch| watch.txs.iter().any(|tx| tx.height.is_none()));
+            let scripts = vec![crate::watch::WatchedScript {
+                script: script.to_hex_string(),
+                lookahead: false,
+            }];
+            (scripts, has_pending)
+        }
+        WalletKind::Descriptors { .. } => {
+            let engine = ensure_engine(state, id).ok()?;
+            (
+                views::watch_scripts(engine, gap_limit),
+                views::has_pending(engine),
+            )
+        }
+    };
+    Some(crate::watch::WatchedWallet {
+        wallet_id: id.to_owned(),
+        scripts,
+        has_pending,
+    })
 }
 
 fn find_record<'a>(payload: &'a VaultPayload, id: &str) -> CoreResult<&'a WalletRecord> {
