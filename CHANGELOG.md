@@ -31,6 +31,17 @@ The first release: the library both Gerfaut apps are built on.
 - A Tor client of its own (arti) behind a feature flag, exposed as a local
   SOCKS5 proxy on an ephemeral port, so an .onion backend works on a machine
   with no Tor daemon installed.
+- A live watch. One connection to the configured backend stays open and
+  says when a watched wallet moved, so the app syncs that wallet at once
+  instead of at the next scheduled sync. An Electrum server pushes every
+  script. A mempool instance pushes blocks and as many scripts as it allows
+  per connection, ten on the public ones, and the rest are polled. Any other
+  Esplora is polled once a minute, 240 requests an hour at most. The
+  connection takes the route a sync takes: Tor for an onion host, and never
+  around it, with the same certificate checks. The server learns what a sync
+  already tells it, plus how long the app stays connected.
+- A sync report lists the transactions it saw confirm, next to the ones it
+  saw for the first time, so an app can announce both.
 - Encrypted local storage: XChaCha20-Poly1305 under an Argon2id key, an app
   lock that slows repeated attempts and survives a restart, and an encrypted
   backup file that doubles as the sync format between two devices.

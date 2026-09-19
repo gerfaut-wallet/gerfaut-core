@@ -23,6 +23,7 @@ pub mod price;
 pub mod store;
 pub mod updates;
 pub mod wallet;
+pub mod watch;
 
 pub use error::{CoreError, CoreResult};
 pub use manager::WalletManager;

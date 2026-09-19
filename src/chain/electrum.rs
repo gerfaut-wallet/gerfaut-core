@@ -27,7 +27,7 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// Onion endpoints get more room: Tor circuits are slow to build.
 const TOR_TIMEOUT: Duration = Duration::from_secs(60);
 /// Name Gerfaut announces in `server.version`.
-const CLIENT_NAME: &str = "gerfaut";
+pub(crate) const CLIENT_NAME: &str = "gerfaut";
 /// Protocol version asked for, as an exact range. `electrum-client`
 /// reads block headers in the 1.4 shape unless it negotiated the version
 /// itself, which it cannot do on a stream Gerfaut opened: pinning both
@@ -69,7 +69,7 @@ pub(crate) enum Inspection {
 
 /// Splits `ssl://host:port` into its parts. A bare `host:port` is TLS,
 /// the way every Electrum client has always read it.
-fn parse(url: &str) -> Result<(bool, String, u16), String> {
+pub(crate) fn parse(url: &str) -> Result<(bool, String, u16), String> {
     let (scheme, rest) = match url.split_once("://") {
         Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
         None => ("ssl".to_owned(), url),

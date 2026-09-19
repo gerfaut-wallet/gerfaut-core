@@ -350,48 +350,152 @@ pub(crate) fn connect(
     pin: Option<&str>,
     timeout: Duration,
 ) -> Result<rustls::StreamOwned<ClientConnection, TcpStream>, ConnectError> {
-    let provider = provider();
-    let roots: RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
-    let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-        .build()
-        .map_err(|e| ConnectError::Io(e.to_string()))?;
-    let verifier = Arc::new(Tofu {
-        webpki,
-        pin: pin.map(str::to_owned),
-        verdict: Mutex::new(None),
-        provider: provider.clone(),
-    });
-
-    // A configuration per connection, so its session cache dies with it:
-    // a resumed session skips the certificate entirely, and the pin with
-    // it. Every connection does the full handshake, and the full check.
-    let config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| ConnectError::Io(e.to_string()))?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier.clone())
-        .with_no_client_auth();
-
-    // An IP address is a legitimate way to reach one's own server; it
-    // becomes the SNI-less variant of the name, which rustls handles.
-    let name = ServerName::try_from(host.to_owned())
-        .map_err(|_| ConnectError::Io(format!("{host} is not a usable host name")))?;
-    let mut session = ClientConnection::new(Arc::new(config), name)
+    let handshake = Handshake::new(pin)?;
+    let mut session = ClientConnection::new(handshake.config.clone(), server_name(host)?)
         .map_err(|e| ConnectError::Io(e.to_string()))?;
 
     let mut socket = tcp_connect(host, port, timeout)?;
     // Finish the handshake now: a refused certificate is a connection
     // error, not a surprise on the first read.
     if let Err(error) = session.complete_io(&mut socket) {
-        return Err(match verifier.verdict.lock().ok().and_then(|v| v.clone()) {
+        return Err(handshake.refusal(&error));
+    }
+
+    Ok(rustls::StreamOwned::new(session, socket))
+}
+
+/// What one TLS connection to an Electrum server is opened with: the
+/// configuration carrying the trust-on-first-use verifier, and that
+/// verifier, to ask afterwards what it saw. The blocking client above
+/// and the asynchronous one of the live watcher both go through here,
+/// so a server is held to the same check whichever of the two connects.
+pub(crate) struct Handshake {
+    pub(crate) config: Arc<ClientConfig>,
+    verifier: Arc<Tofu>,
+}
+
+impl Handshake {
+    pub(crate) fn new(pin: Option<&str>) -> Result<Self, ConnectError> {
+        let provider = provider();
+        let roots: RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
+        let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+            .build()
+            .map_err(|e| ConnectError::Io(e.to_string()))?;
+        let verifier = Arc::new(Tofu {
+            webpki,
+            pin: pin.map(str::to_owned),
+            verdict: Mutex::new(None),
+            provider: provider.clone(),
+        });
+
+        // A configuration per connection, so its session cache dies with
+        // it: a resumed session skips the certificate entirely, and the
+        // pin with it. Every connection does the full handshake, and the
+        // full check.
+        let config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| ConnectError::Io(e.to_string()))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier.clone())
+            .with_no_client_auth();
+        Ok(Handshake {
+            config: Arc::new(config),
+            verifier,
+        })
+    }
+
+    /// Why the handshake failed: what the verifier concluded about the
+    /// certificate when that is the reason, the error as it reads
+    /// otherwise.
+    pub(crate) fn refusal(&self, error: &dyn std::fmt::Display) -> ConnectError {
+        match self.verifier.verdict.lock().ok().and_then(|v| v.clone()) {
             Some(verdict @ (Verdict::Unknown { .. } | Verdict::Changed { .. })) => {
                 ConnectError::Certificate(verdict)
             }
             _ => ConnectError::Io(error.to_string()),
-        });
+        }
+    }
+}
+
+/// The name a handshake is made under. An IP address is a legitimate
+/// way to reach a server of one's own; it becomes the SNI-less variant
+/// of the name, which rustls handles.
+pub(crate) fn server_name(host: &str) -> Result<ServerName<'static>, ConnectError> {
+    ServerName::try_from(host.to_owned())
+        .map_err(|_| ConnectError::Io(format!("{host} is not a usable host name")))
+}
+
+/// The configuration an HTTPS server is reached with: the public
+/// authorities and nothing else, what the HTTP client of a sync checks
+/// a certificate against.
+pub(crate) fn public_config() -> Result<Arc<ClientConfig>, ConnectError> {
+    let roots: RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
+    let config = ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| ConnectError::Io(e.to_string()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+/// The configuration an `ssl://` hidden service is reached with. The
+/// onion address is the key of the server and the circuit proves the
+/// endpoint holds it; a certificate on top authenticates nothing, and
+/// the blocking client does not check one there either. Never used for
+/// a host that is not an onion.
+pub(crate) fn onion_config() -> Result<Arc<ClientConfig>, ConnectError> {
+    let provider = provider();
+    let config = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| ConnectError::Io(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(OnionIdentity { provider }))
+        .with_no_client_auth();
+    Ok(Arc::new(config))
+}
+
+/// Accepts the certificate of a hidden service as it comes; see
+/// [`onion_config`].
+#[derive(Debug)]
+struct OnionIdentity {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for OnionIdentity {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
     }
 
-    Ok(rustls::StreamOwned::new(session, socket))
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 /// The verdict a completed or refused handshake produced, for the
