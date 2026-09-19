@@ -113,12 +113,14 @@ pub enum PremiumError {
     #[error("no premium key")]
     NoKey,
 
-    /// The server does not know this key (HTTP 401).
+    /// The server does not know this key (HTTP 401, said in the
+    /// server's own error body; a bare 401 is a refusal instead).
     #[error("the premium server does not know this key")]
     UnknownKey,
 
     /// The key exists but has no paid time left, and the route changes
-    /// what is watched (HTTP 403).
+    /// what is watched (HTTP 403, said in the server's own error body;
+    /// a bare 403 is a refusal instead).
     #[error("this key has no paid time left")]
     NoPaidTime,
 

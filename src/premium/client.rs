@@ -610,17 +610,18 @@ fn decode<'a, T: Deserialize<'a>>(body: &'a [u8]) -> CoreResult<T> {
 }
 
 /// What a failing status means, with the server's own sentence when the
-/// body carries one. Nothing under that id is an answer only in the
-/// server's own words: a bare 404 is what a captive portal or a proxy
-/// without a route answers, and says nothing about what the server
-/// holds.
+/// body carries one. A status that settles something is an answer only
+/// in the server's own words: a bare 404 is what a captive portal or a
+/// proxy without a route answers, a bare 401 or 403 what one that wants
+/// a login first answers, and neither says anything about what the
+/// server holds, a key it would no longer know least of all.
 fn refusal(status: u16, body: &[u8]) -> PremiumError {
     let words = serde_json::from_slice::<ErrorBody>(body)
         .ok()
         .map(|b| b.error);
     match status {
-        401 => PremiumError::UnknownKey,
-        403 => PremiumError::NoPaidTime,
+        401 if words.is_some() => PremiumError::UnknownKey,
+        403 if words.is_some() => PremiumError::NoPaidTime,
         404 | 410 if words.is_some() => PremiumError::NotFound,
         400..=499 => PremiumError::Rejected(words.unwrap_or_else(|| format!("HTTP {status}"))),
         _ => PremiumError::Unreachable(match words {
@@ -1208,6 +1209,22 @@ mod tests {
                 premium_error(
                     client(&portal, Some("abcdefghijkmnpqr"))
                         .delete_channel("nope")
+                        .await
+                        .unwrap_err()
+                ),
+                PremiumError::Rejected(format!("HTTP {status}")),
+                "HTTP {status}"
+            );
+        }
+        // So is a bare 401 or 403, the page of a portal that wants a
+        // login first: taken for the server's word, the first would
+        // make the app forget a key the server still knows.
+        for status in [401, 403] {
+            let portal = stub(status, "<html><body>Sign in to continue</body></html>").await;
+            assert_eq!(
+                premium_error(
+                    client(&portal, Some("abcdefghijkmnpqr"))
+                        .delete_account()
                         .await
                         .unwrap_err()
                 ),

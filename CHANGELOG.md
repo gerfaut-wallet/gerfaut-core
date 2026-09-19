@@ -61,6 +61,10 @@ The first release: the library both Gerfaut apps are built on.
   before an `@` keeps its own.
 - The ids the premium server hands out are percent-encoded before they go
   into a URL path.
+- A 401, 403, 404 or 410 from the premium server counts as its answer only
+  when it comes in the server's own error body. The bare status is what a
+  captive portal or a proxy answers, and it no longer makes the app forget
+  a key or a wallet the server still holds.
 - Switching a wallet off on the premium server withdraws the consent kept
   for it once the server has nothing left under its id, so removing the
   wallet later has nothing to tell the server.

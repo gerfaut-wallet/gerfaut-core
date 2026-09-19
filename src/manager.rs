@@ -4114,6 +4114,16 @@ mod tests {
             "{error}"
         );
         assert_eq!(kept.premium_state().await, premium_account());
+
+        // A 401 without the server's envelope is a portal asking for a
+        // login, not the server disowning the key: kept as well.
+        let (base_url, _) = premium_answering(401, "<html>Sign in to continue</html>").await;
+        let error = kept.premium_delete_account(&base_url).await.unwrap_err();
+        assert!(
+            matches!(&error, CoreError::Premium(PremiumError::Rejected(words)) if words == "HTTP 401"),
+            "{error}"
+        );
+        assert_eq!(kept.premium_state().await, premium_account());
     }
 
     #[tokio::test]
