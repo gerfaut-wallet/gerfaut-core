@@ -1914,6 +1914,67 @@ impl WalletManager {
         }
     }
 
+    /// Whether this user reaches a backend through Tor: the active
+    /// network's, or the one configured for any other network. It
+    /// decides the route of what is not a sync and must not give away
+    /// more than one, the update check first: someone who set an onion
+    /// backend anywhere is not someone whose address GitHub should see.
+    /// For the apps, the reason a check is paused while Tor is down.
+    pub async fn uses_tor(&self) -> bool {
+        if self.backend_needs_tor().await {
+            return true;
+        }
+        let state = self.state.lock().await;
+        let settings = &state.payload.settings;
+        settings.backends.iter().any(|(network, config)| {
+            match chain::endpoints(config, *network, &settings.electrum_certs) {
+                Ok(endpoints) => chain::needs_tor(&endpoints),
+                // An address kept from before addresses were checked,
+                // which no sync will connect to: if it so much as names
+                // an onion, its owner meant Tor.
+                Err(_) => match config {
+                    BackendConfig::CustomEsplora { url }
+                    | BackendConfig::CustomElectrum { url } => {
+                        url.to_ascii_lowercase().contains(".onion")
+                    }
+                    BackendConfig::Public { .. } => false,
+                },
+            }
+        })
+    }
+
+    /// Asks GitHub for the latest release of `owner/repo` and compares
+    /// it with the running version: for the button, and for the check
+    /// the apps run on their own once a day. It takes the route the
+    /// syncs take. When [`Self::uses_tor`] says so it goes through the
+    /// Tor proxy a sync would resolve, and when that proxy cannot be
+    /// had it fails with [`CoreError::Tor`] before any request exists:
+    /// never a request in the clear. Anything else that goes wrong is
+    /// "could not check".
+    pub async fn check_update(
+        &self,
+        repo: &str,
+        current_version: &str,
+    ) -> CoreResult<crate::updates::UpdateCheck> {
+        self.check_update_at(crate::updates::GITHUB_API, repo, current_version)
+            .await
+    }
+
+    pub(crate) async fn check_update_at(
+        &self,
+        api: &str,
+        repo: &str,
+        current_version: &str,
+    ) -> CoreResult<crate::updates::UpdateCheck> {
+        let proxy = if self.uses_tor().await {
+            let (settings, data_dir) = self.tor_setup().await;
+            Some(tor::resolve(&settings, &data_dir).await?.proxy())
+        } else {
+            None
+        };
+        crate::updates::check_update(api, repo, current_version, proxy.as_deref()).await
+    }
+
     /// Whether the backend of the active network is reached through
     /// Tor: the same question a sync asks, over the same endpoints.
     async fn backend_needs_tor(&self) -> bool {

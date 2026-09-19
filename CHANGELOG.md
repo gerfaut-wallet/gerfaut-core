@@ -95,6 +95,10 @@ The first release: the library both Gerfaut apps are built on.
   own, with the wait it named, an hour at most. Telling the server about
   removed wallets stops at one and keeps the rest for later, instead of
   sending every request behind it to be turned away too.
+- The update check takes the route the syncs take. With an onion backend
+  configured on any network it goes through the same Tor proxy, and when
+  Tor cannot be had it does not go at all, where it used to ask GitHub in
+  the clear. It now runs from the wallet manager only.
 - Switching a wallet off on the premium server withdraws the consent kept
   for it once the server has nothing left under its id, so removing the
   wallet later has nothing to tell the server.
