@@ -24,7 +24,6 @@ use crate::backup::{
 use crate::broadcast::{
     self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, TxPreview, WalletRef,
 };
-use crate::chain::connect::ScannedBackendKind;
 use crate::chain::tor::{self, TorRoute, TorSettings, TorStatus};
 use crate::chain::{
     self, BackendConfig, CertificateReport, CertificateStatus, Endpoint, EngineRequest,
@@ -170,15 +169,7 @@ impl WalletManager {
     /// in that form is stored byte for byte, and the certificate
     /// accepted for it stays keyed to it.
     pub async fn set_backend(&self, network: Network, config: BackendConfig) -> CoreResult<()> {
-        let config = match config {
-            BackendConfig::CustomEsplora { url } => BackendConfig::CustomEsplora {
-                url: chain::connect::stored_form(ScannedBackendKind::Esplora, &url)?,
-            },
-            BackendConfig::CustomElectrum { url } => BackendConfig::CustomElectrum {
-                url: chain::connect::stored_form(ScannedBackendKind::Electrum, &url)?,
-            },
-            public @ BackendConfig::Public { .. } => public,
-        };
+        let config = config.canonical()?;
         self.state.lock().await.commit(|payload| {
             payload.settings.backends.insert(network, config);
             Ok(())
@@ -1412,13 +1403,19 @@ impl WalletManager {
         Ok(BackupPreview {
             created_at: payload.created_at,
             has_settings: payload.has_settings(),
+            // The backends a restore would put in place: the same
+            // reading as the import, so an address it would drop is not
+            // promised here.
             backends: payload
                 .backends
                 .iter()
                 .flatten()
-                .map(|(network, config)| BackupBackendPreview {
-                    network: *network,
-                    backend: config.label(*network),
+                .filter_map(|(network, config)| {
+                    let config = config.clone().canonical().ok()?;
+                    Some(BackupBackendPreview {
+                        network: *network,
+                        backend: config.label(*network),
+                    })
                 })
                 .collect(),
             // The hosts a restore would pin: the same check as the
@@ -1531,11 +1528,17 @@ impl WalletManager {
             if settings_applied {
                 let settings = &mut next.settings;
                 if let Some(backends) = &payload.backends {
-                    settings.backends.extend(
-                        backends
-                            .iter()
-                            .map(|(network, config)| (*network, config.clone())),
-                    );
+                    // Stored the way the settings screen stores them: a
+                    // backup from a vault older than that form, or one
+                    // written by hand, must not put in place an address
+                    // the screen would have refused. One that cannot be
+                    // read is left out, and the backend of that network
+                    // stays as it was.
+                    settings
+                        .backends
+                        .extend(backends.iter().filter_map(|(network, config)| {
+                            Some((*network, config.clone().canonical().ok()?))
+                        }));
                 }
                 if let Some(certs) = &payload.electrum_certs {
                     for (host, fingerprint) in certs {
@@ -3312,6 +3315,97 @@ mod tests {
         assert!(!preview.has_settings);
         assert!(preview.backends.is_empty());
         assert!(preview.electrum_hosts.is_empty());
+    }
+
+    /// A backup carries addresses as the vault that wrote it held
+    /// them. One from before addresses were stored in canonical form
+    /// lands in that form, and one the settings screen would have
+    /// refused does not land at all: the preview does not promise it,
+    /// and the backend of that network stays as it was.
+    #[tokio::test]
+    async fn a_restored_backend_is_stored_canonical_or_left_out() {
+        let payload = BackupPayload {
+            version: BACKUP_VERSION,
+            created_at: 1_756_000_000,
+            wallets: Vec::new(),
+            backends: Some(
+                [
+                    (
+                        Network::Mainnet,
+                        BackendConfig::CustomEsplora {
+                            url: "HTTPS://Esplora.Example.ORG./api/".to_owned(),
+                        },
+                    ),
+                    (
+                        Network::Signet,
+                        BackendConfig::CustomElectrum {
+                            url: "tcp://x.onion:50001:extra".to_owned(),
+                        },
+                    ),
+                    (
+                        Network::Testnet4,
+                        BackendConfig::Public {
+                            server: Some("mempool.emzy.de".to_owned()),
+                        },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            electrum_certs: None,
+            gap_limit: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let kept = BackendConfig::CustomElectrum {
+            url: "ssl://node.example.org:50002".to_owned(),
+        };
+        manager
+            .set_backend(Network::Signet, kept.clone())
+            .await
+            .unwrap();
+        let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+
+        let preview = manager
+            .preview_backup(&text, BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        assert_eq!(
+            preview.backends,
+            vec![
+                BackupBackendPreview {
+                    network: Network::Mainnet,
+                    backend: "esplora.example.org".to_owned(),
+                },
+                BackupBackendPreview {
+                    network: Network::Testnet4,
+                    backend: "mempool.emzy.de".to_owned(),
+                },
+            ]
+        );
+
+        let choices = ImportChoices {
+            indexes: None,
+            apply_settings: true,
+        };
+        manager
+            .import_backup(&text, BACKUP_PASSWORD, &choices)
+            .await
+            .unwrap();
+        let settings = manager.settings().await;
+        assert_eq!(
+            settings.backend_for(Network::Mainnet),
+            BackendConfig::CustomEsplora {
+                url: "https://esplora.example.org/api".to_owned(),
+            }
+        );
+        assert_eq!(settings.backend_for(Network::Signet), kept);
+        assert_eq!(
+            settings.backend_for(Network::Testnet4),
+            BackendConfig::Public {
+                server: Some("mempool.emzy.de".to_owned()),
+            }
+        );
     }
 
     #[tokio::test]

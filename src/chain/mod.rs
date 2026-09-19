@@ -74,6 +74,28 @@ impl BackendConfig {
             }
         }
     }
+
+    /// The configuration with a custom address in the form the settings
+    /// store it in ([`connect::stored_form`]), or the reason the address
+    /// cannot be read. Everything that takes a configuration from
+    /// outside the settings screen goes through here too: a vault
+    /// written before addresses were stored that way, a backup made by
+    /// such a vault. Read as typed, `tcp://x.onion:50001:extra` names no
+    /// host to the URL parser, so no onion, and would reach the
+    /// resolver in the clear. An address already in that form comes
+    /// back byte for byte.
+    pub fn canonical(self) -> CoreResult<Self> {
+        use connect::ScannedBackendKind::{Electrum, Esplora};
+        Ok(match self {
+            BackendConfig::CustomEsplora { url } => BackendConfig::CustomEsplora {
+                url: connect::stored_form(Esplora, &url)?,
+            },
+            BackendConfig::CustomElectrum { url } => BackendConfig::CustomElectrum {
+                url: connect::stored_form(Electrum, &url)?,
+            },
+            public @ BackendConfig::Public { .. } => public,
+        })
+    }
 }
 
 /// Whether a backend URL points at a Tor hidden service. Onion hosts
@@ -199,12 +221,15 @@ fn pin_for(certs: &TrustedCerts, url: &str) -> Option<String> {
 }
 
 /// Resolves a backend configuration into concrete endpoints, in the
-/// order they should be tried.
+/// order they should be tried. A custom address is read in its stored
+/// form whatever form the vault holds it in, and one that has none is
+/// refused here, before anything could connect to it.
 pub(crate) fn endpoints(
     config: &BackendConfig,
     network: Network,
     certs: &TrustedCerts,
 ) -> CoreResult<Vec<Endpoint>> {
+    let config = &config.clone().canonical()?;
     match config {
         // A chosen operator is the only endpoint: the point of picking
         // one is that no other host sees these addresses.
@@ -725,10 +750,11 @@ mod tests {
         let own = BackendConfig::CustomElectrum {
             url: "blackie.c3-soft.com:57010".to_owned(),
         };
+        // Read in the form the settings store, the fingerprint with it.
         assert_eq!(
             endpoints(&own, Network::Testnet4, &certs).unwrap(),
             vec![Endpoint::Electrum(electrum::Target::new(
-                "blackie.c3-soft.com:57010",
+                "ssl://blackie.c3-soft.com:57010",
                 pinned
             ))]
         );
@@ -743,6 +769,51 @@ mod tests {
                 None
             ))]
         );
+    }
+
+    /// A vault written before custom addresses were stored in canonical
+    /// form still holds them as typed. They are read in that form on
+    /// the way to a connection, and one that has none is refused before
+    /// anything connects: to the URL parser `tcp://x.onion:50001:extra`
+    /// names no host, so no onion, and the resolver would see the name.
+    #[test]
+    fn a_stored_address_is_read_in_canonical_form() {
+        let none = TrustedCerts::new();
+        let electrum = BackendConfig::CustomElectrum {
+            url: "Node.Example.ORG.:50002".to_owned(),
+        };
+        assert_eq!(
+            endpoints(&electrum, Network::Signet, &none).unwrap(),
+            vec![Endpoint::Electrum(electrum::Target::new(
+                "ssl://node.example.org:50002",
+                None
+            ))]
+        );
+        let esplora = BackendConfig::CustomEsplora {
+            url: "HTTPS://Esplora.Example.ORG./api/".to_owned(),
+        };
+        assert_eq!(
+            endpoints(&esplora, Network::Signet, &none).unwrap(),
+            vec![Endpoint::Esplora(
+                "https://esplora.example.org/api".to_owned()
+            )]
+        );
+        for unreadable in [
+            BackendConfig::CustomElectrum {
+                url: "tcp://x.onion:50001:extra".to_owned(),
+            },
+            BackendConfig::CustomEsplora {
+                url: "x.onion/api".to_owned(),
+            },
+        ] {
+            assert!(
+                matches!(
+                    endpoints(&unreadable, Network::Signet, &none),
+                    Err(CoreError::InvalidInput { kind: "server", .. })
+                ),
+                "{unreadable:?}"
+            );
+        }
     }
 
     #[test]

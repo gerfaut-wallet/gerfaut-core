@@ -68,7 +68,11 @@ The first release: the library both Gerfaut apps are built on.
   lower case and an IPv6 literal in brackets, and one the URL parser cannot
   read is refused when saved, with the reason. Stored as typed, an address
   such as `tcp://x.onion:50001:extra` looked to the sync like one with no
-  onion in it, and its name went to the resolver in the clear.
+  onion in it, and its name went to the resolver in the clear. An address
+  a vault or a backup holds from before that is read the same way: a sync
+  puts it in stored form before it connects, a restore stores it in that
+  form, and one that cannot be read is refused by the sync and left out by
+  the restore.
 - A SLIP-132 key inside a descriptor is held to what its prefix says: a
   `zpub` under `pkh()`, a `ypub` under `wpkh()` or a `Zpub` in a single-key
   descriptor is refused, naming both the prefix and the function, since a
