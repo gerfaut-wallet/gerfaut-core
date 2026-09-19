@@ -135,6 +135,16 @@ fn config(data_dir: &Path) -> CoreResult<TorClientConfig> {
     let mut builder =
         TorClientConfigBuilder::from_directories(tor_dir.join("state"), tor_dir.join("cache"));
     builder.address_filter().allow_onion_addrs(true);
+    // On a phone, reduced channel padding, the level arti names "for
+    // mobile": a cell every 9 to 14 s, client to relay only, where the
+    // normal level sends one every 1.5 to 9.5 s both ways. A live watch
+    // holds a circuit open for hours, and at the normal level the radio
+    // never gets to sleep. The price is somewhat less cover against an
+    // observer of the link who counts cells. A desktop keeps the normal
+    // level.
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        builder.channel().padding(tor_config::PaddingLevel::Reduced);
+    }
     // The data directory already holds the encrypted vault, in the
     // storage the platform keeps private to the app. arti's own walk up
     // the Unix permissions of every ancestor would refuse Android's

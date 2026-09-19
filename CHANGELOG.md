@@ -51,6 +51,9 @@ The first release: the library both Gerfaut apps are built on.
   the connection from an alarm.
 - One sync of a wallet runs at a time. A caller that arrives while one runs
   waits for it and takes its result instead of asking the backend again.
+- On a phone, the built-in Tor client uses reduced channel padding, so a
+  connection held open for hours lets the radio sleep between cells. A
+  desktop keeps the normal level.
 - Encrypted local storage: XChaCha20-Poly1305 under an Argon2id key, an app
   lock that slows repeated attempts and survives a restart, and an encrypted
   backup file that doubles as the sync format between two devices.

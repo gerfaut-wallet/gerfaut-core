@@ -17,7 +17,7 @@ default = []
 # A Tor client built into the library, so .onion backends work on a
 # device with no Tor daemon. Off, .onion hosts still work through a
 # system Tor.
-embedded-tor = ["dep:arti-client", "dep:tor-rtcompat"]
+embedded-tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:tor-config"]
 
 [dependencies]
 bdk_wallet = "3.1"
@@ -74,6 +74,10 @@ data-encoding = "2"
 # service client is what a .onion backend needs.
 arti-client = { version = "0.45", default-features = false, features = ["tokio", "rustls", "compression", "flowctl-cc", "onion-service-client", "vanguards", "static-sqlite"], optional = true }
 tor-rtcompat = { version = "0.45", default-features = false, features = ["tokio", "rustls"], optional = true }
+# Names the channel padding level, which arti-client takes and does not
+# re-export. The version arti already pulls in, so nothing new is
+# compiled.
+tor-config = { version = "0.45", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
