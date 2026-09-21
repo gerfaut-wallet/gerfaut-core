@@ -106,6 +106,18 @@ fn changed(id: &str, reason: ChangeReason, rescan: bool) -> WatchEvent {
     }
 }
 
+/// The next reports, one per wallet named, in whatever order they come.
+async fn reported(events: &mut WatchEvents, ids: &[&str], reason: ChangeReason) {
+    let mut seen = Vec::new();
+    for _ in ids {
+        seen.push(next_event(events).await);
+    }
+    seen.sort_by_key(|event| format!("{event:?}"));
+    let mut expected: Vec<WatchEvent> = ids.iter().map(|id| changed(id, reason, false)).collect();
+    expected.sort_by_key(|event| format!("{event:?}"));
+    assert_eq!(seen, expected);
+}
+
 #[tokio::test]
 async fn electrum_pushes_a_change_once_per_burst() {
     let server = FakeElectrum::start().await;
@@ -132,7 +144,10 @@ async fn electrum_pushes_a_change_once_per_burst() {
             scripthash(&script(3)),
         ]]
     );
-    // The first statuses were a baseline: nothing to report.
+    // Once every script has its first status, every wallet is reported
+    // once: what happened before anything listened is for a sync to say.
+    reported(&mut events, &["a", "b"], ChangeReason::Started).await;
+    // From then on the statuses are a baseline: nothing to report.
     no_event(&mut events, Duration::from_millis(300)).await;
 
     // A transaction touching two scripts of one wallet: two notices,
@@ -200,6 +215,7 @@ async fn electrum_reconnects_and_reports_what_moved_meanwhile() {
         Some(timings()),
     );
     until(&watch, "subscribed", |s| s.pushed_scripts == 2).await;
+    reported(&mut events, &["a", "b"], ChangeReason::Started).await;
 
     // The connection drops, and a payment to "b" lands while it is down.
     server.hang_up();
@@ -247,6 +263,30 @@ async fn electrum_reconnects_and_reports_what_moved_meanwhile() {
     server.set_status(&script(2), "ff");
     no_event(&mut events, Duration::from_millis(300)).await;
     assert_eq!(server.subscriptions().len(), 2, "no reconnection for that");
+}
+
+/// A script the server refused on the first connection has no status
+/// to compare with: on the next one, its wallet is reported.
+#[tokio::test]
+async fn electrum_reports_what_it_never_read_after_a_reconnection() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().refuse.insert(
+        "blockchain.scripthash.subscribe",
+        "history too long".to_owned(),
+    );
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &[1], &[], false), wallet("b", &[2], &[], false)],
+        Some(timings()),
+    );
+    // Refused, and answered all the same: the watch is ready.
+    reported(&mut events, &["a", "b"], ChangeReason::Started).await;
+    assert_eq!(watch.status().pushed_scripts, 0);
+    server.state.lock().unwrap().refuse.clear();
+    server.hang_up();
+    reported(&mut events, &["a", "b"], ChangeReason::Reconnected).await;
+    until(&watch, "subscribed", |s| s.pushed_scripts == 2).await;
+    no_event(&mut events, Duration::from_millis(300)).await;
 }
 
 #[tokio::test]
@@ -361,6 +401,7 @@ async fn a_mempool_websocket_pushes_what_it_tracks_and_polls_the_rest() {
         server.state.lock().unwrap().tracked,
         vec![vec![script(1), script(4)]]
     );
+    reported(&mut events, &["a", "b"], ChangeReason::Started).await;
 
     // A pushed transaction.
     server.push(json!({ "multi-scriptpubkey-transactions": {
@@ -440,6 +481,7 @@ async fn an_esplora_without_a_websocket_is_polled() {
     let status = until(&watch, "polling", |s| s.state == WatchState::Polling).await;
     assert_eq!(status.transport, Some(WatchTransport::EsploraPolling));
     assert_eq!(status.pushed_scripts, 0);
+    reported(&mut events, &["a"], ChangeReason::Started).await;
     no_event(&mut events, Duration::from_millis(300)).await;
 
     server
@@ -482,6 +524,7 @@ async fn a_new_configuration_moves_the_watch() {
         Some(timings()),
     );
     until(&watch, "subscribed", |s| s.pushed_scripts == 1).await;
+    reported(&mut events, &["a"], ChangeReason::Started).await;
     watch.reconfigure(
         config(second.backend()),
         vec![wallet("a", &[1], &[], false)],
@@ -492,6 +535,9 @@ async fn a_new_configuration_moves_the_watch() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     until(&watch, "subscribed again", |s| s.pushed_scripts == 1).await;
+    // Another server: nothing of the first one's statuses is compared
+    // with it, and what happened before is for a sync to say again.
+    reported(&mut events, &["a"], ChangeReason::Started).await;
     no_event(&mut events, Duration::from_millis(300)).await;
 
     // Nothing left to watch: the connection is given up.
@@ -707,6 +753,11 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
     while manager.live_status().await.state != WatchState::Polling {
         assert!(started.elapsed() < WAIT, "never polling");
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The watch catches up once it polls: a sync that finds nothing.
+    match next_live(&mut events).await {
+        LiveEvent::WalletSynced { report } => assert!(report.new_txs.is_empty()),
+        other => panic!("expected the catch-up, got {other:?}"),
     }
 
     // The payment enters the mempool.
@@ -927,17 +978,9 @@ async fn live_stop_abandons_a_sync_the_server_stalls() {
         .add_wallet("Watched", &parsed, Network::Signet)
         .await
         .unwrap();
-    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
-    within("subscribed", WAIT, || {
-        server
-            .subscriptions()
-            .iter()
-            .flatten()
-            .any(|hash| *hash == scripthash(ADDRESS_SCRIPT))
-    })
-    .await;
+    // The sync the watch runs to catch up is the one that stalls.
     server.state.lock().unwrap().stall = Some("blockchain.scripthash.get_history");
-    server.set_status(ADDRESS_SCRIPT, "aa");
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
     within("asked for the history", WAIT, || {
         server.was_asked("blockchain.scripthash.get_history")
     })

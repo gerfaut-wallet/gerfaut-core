@@ -172,14 +172,18 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
             Ok(Ok((hash, height, found))) => {
                 failed = 0;
                 hub.alive();
-                if tip.is_none() {
-                    hub.had_session = true;
-                }
+                let first_round = tip.is_none();
                 tip = Some(hash);
                 if let Some(height) = height {
                     hub.new_tip(height, true);
                 }
                 apply(hub, found);
+                // Polling reads a few scripts a round and cannot say what
+                // the others did before: at the start, and after a loss,
+                // every wallet is worth one sync.
+                if first_round {
+                    hub.ready(false);
+                }
                 hub.set_status(|status| {
                     status.state = WatchState::Polling;
                     status.transport = Some(WatchTransport::EsploraPolling);

@@ -51,6 +51,13 @@ struct Session {
     can_unsubscribe: bool,
     /// When the ping in flight, if any, is given up on.
     pong_by: Option<Instant>,
+    /// Script hashes of the first pass still waiting for their answer:
+    /// the session is ready once none is left.
+    opening: HashSet<String>,
+    /// The session picks up after another one under the same
+    /// configuration: a script it had no status for is reported.
+    resumed: bool,
+    ready_told: bool,
 }
 
 pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> Exit {
@@ -130,6 +137,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         refused: 0,
         can_unsubscribe: at_least_1_4_2(&negotiated),
         pong_by: None,
+        opening: HashSet::new(),
+        resumed: hub.caught_up,
+        ready_told: false,
     };
     hub.alive();
     hub.set_status(|status| {
@@ -146,10 +156,10 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         return Exit::Lost(detail);
     }
     session.enqueue(hub);
+    session.opening = session.queue.iter().cloned().collect();
     if let Err(detail) = session.pump().await {
         return Exit::Lost(detail);
     }
-    hub.had_session = true;
 
     let mut keepalive = tokio::time::interval_at(
         Instant::now() + hub.timings.keepalive,
@@ -163,6 +173,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                     hub.alive();
                     session.pong_by = None;
                     session.handle(hub, &line);
+                    session.check_ready(hub);
                     session.pump().await
                 }
                 Ok(None) => Err("the connection was closed".to_owned()),
@@ -173,7 +184,11 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                 Wake::Reconfigured => return Exit::Reconfigured,
                 // Nothing left to watch: the supervisor waits for a list.
                 Wake::Wallets if hub.watched.entries.is_empty() => return Exit::Reprobe,
-                Wake::Wallets => session.relist(hub).await,
+                Wake::Wallets => {
+                    let relisted = session.relist(hub).await;
+                    session.check_ready(hub);
+                    relisted
+                }
                 Wake::Tick { idle } => {
                     // A deadline set before the device slept says
                     // nothing about the server.
@@ -202,6 +217,15 @@ impl Session {
         let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         self.in_flight.insert(id, kind);
         send(&mut self.writer, &message).await
+    }
+
+    /// Tells the hub once every script of the first pass has its answer.
+    fn check_ready(&mut self, hub: &mut Hub) {
+        if !self.opening.is_empty() || self.ready_told {
+            return;
+        }
+        self.ready_told = true;
+        hub.ready(true);
     }
 
     /// Queues every script of the list not yet asked for.
@@ -240,6 +264,7 @@ impl Session {
             .collect();
         for scripthash in gone {
             self.subscribed.remove(&scripthash);
+            self.opening.remove(&scripthash);
             self.queue.retain(|queued| *queued != scripthash);
             hub.statuses.remove(&scripthash);
             if self.can_unsubscribe {
@@ -283,17 +308,21 @@ impl Session {
                     let acknowledged = self.acknowledged;
                     hub.set_status(|status| status.pushed_scripts = acknowledged);
                     self.status(hub, &scripthash, &message["result"]);
+                    self.opening.remove(&scripthash);
                 }
                 // One script refused, a history too long for the server
                 // to hash in time for instance, is left to the regular
                 // syncs. Several in a row is a server at its limit: what
                 // it took is watched, and the rest is not asked for.
-                Request::Subscribe(_) => {
+                Request::Subscribe(scripthash) => {
+                    self.opening.remove(&scripthash);
                     self.refused += 1;
                     let refusal = words(&message["error"]);
                     hub.set_status(|status| status.detail = Some(refusal));
                     if self.refused >= REFUSALS {
-                        self.queue.clear();
+                        for given_up in self.queue.drain(..) {
+                            self.opening.remove(&given_up);
+                        }
                     }
                 }
                 _ => {}
@@ -331,6 +360,11 @@ impl Session {
             .map(|s| s.chars().take(64).collect::<String>());
         match hub.statuses.insert(scripthash.to_owned(), status.clone()) {
             Some(known) if known != status => hub.mark_entry(&hex, ChangeReason::Activity),
+            // Never read before, by a session that picks up after
+            // another: what the script did meanwhile is unknown.
+            None if self.resumed && self.opening.contains(scripthash) => {
+                hub.mark_entry(&hex, ChangeReason::Reconnected);
+            }
             _ => {}
         }
     }

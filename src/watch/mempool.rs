@@ -140,13 +140,6 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         status.detail = None;
         status.pushed_scripts = 0;
     });
-    // This transport keeps no record of what it missed: after a loss,
-    // every wallet is worth one sync.
-    if hub.had_session {
-        hub.mark_all(ChangeReason::Reconnected);
-    }
-    hub.had_session = true;
-
     let mut tracked: Vec<String> = Vec::new();
     let want = json!({ "action": "want", "data": ["blocks"] });
     if let Err(detail) = say(&mut socket, &want).await {
@@ -155,6 +148,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
     if let Err(detail) = track(hub, &mut socket, &mut tracked).await {
         return Exit::Lost(detail);
     }
+    // This transport keeps no record of what it missed: at the start,
+    // and after a loss, every wallet is worth one sync.
+    hub.ready(false);
     let mut poller = match Poller::new(base, proxy.as_deref()) {
         Ok(poller) => poller,
         Err(detail) => return Exit::Lost(detail),

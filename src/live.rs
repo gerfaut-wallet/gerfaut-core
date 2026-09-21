@@ -12,7 +12,9 @@
 //!
 //! - [`WalletManager::live_start`] returns the single receiver of the
 //!   events. Consume it from one task, in Rust: a desktop window that
-//!   is minimised throttles its timers, a Tauri task does not care.
+//!   is minimised throttles its timers, a Tauri task does not care. A
+//!   watch that starts catches up on what happened while nothing ran:
+//!   the contract is written there.
 //! - [`LiveEvent::Transaction`] is what to announce: a transaction
 //!   seen for the first time, in the mempool or already in a block,
 //!   and later its first confirmation. Each is handed out once, and
@@ -227,6 +229,27 @@ impl WalletManager {
     /// Starts the live watch of the active network, or starts it over:
     /// a watch already running is stopped and its receiver closes.
     /// Must be called inside a tokio runtime.
+    ///
+    /// # Contract for a host
+    ///
+    /// - Start it as soon as the vault is open, before or alongside the
+    ///   app's own opening sync; there is nothing to wait for.
+    /// - Once its connection is up and has read every script once, the
+    ///   watch syncs every wallet of the network, two at a time, and
+    ///   hands out through [`LiveEvent::Transaction`] whatever happened
+    ///   while nothing listened: a payment that arrived while the app
+    ///   was closed, the phone off, the service killed. It does the
+    ///   same after a new configuration, and after a lost connection
+    ///   whose server cannot say what it missed.
+    /// - The opening sync of the app may race that catch-up. Each
+    ///   transaction still comes out exactly once, through the watch or
+    ///   through the app, provided the app claims after its own syncs
+    ///   ([`Self::claim_announcements`]) and announces what it claims.
+    /// - The events of one wallet come as its transactions, then its
+    ///   [`LiveEvent::WalletSynced`]: a host may hold the first until
+    ///   the second, to say them together.
+    /// - At exit, see the module documentation: [`Self::live_stop`]
+    ///   returns at once, and nothing of the core holds the runtime.
     pub async fn live_start(&self) -> CoreResult<LiveEvents> {
         self.live_start_with(None).await
     }

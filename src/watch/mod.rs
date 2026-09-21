@@ -53,10 +53,16 @@
 //! - [`WatchEvent::WalletChanged`] means "sync this wallet now". With
 //!   `rescan` set, the change was seen past the addresses the wallet
 //!   has revealed, where only a full scan looks.
+//! - Once the first connection is up and every script it covers has
+//!   been read once, every wallet is reported
+//!   ([`ChangeReason::Started`]): the sync that follows catches up on
+//!   whatever happened while nothing listened. The same after a new
+//!   configuration.
 //! - A lost connection is reopened with a capped, jittered backoff. An
 //!   Electrum server is asked for every status again and only the
-//!   scripts whose status moved meanwhile are reported; the other
-//!   transports cannot tell, and report every wallet once.
+//!   scripts whose status moved meanwhile are reported, along with any
+//!   it had no status for before; the other transports cannot tell,
+//!   and report every wallet once.
 //! - Timers stop while a phone sleeps. [`LiveWatch::tick`] is the
 //!   entry point a host alarm calls: it measures the pause on the wall
 //!   clock, pings at once, and cuts a backoff short.
@@ -137,6 +143,9 @@ pub struct WatchedWallet {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeReason {
+    /// The watch started, or started over under a new configuration:
+    /// what happened before it listened is unknown.
+    Started,
     /// The connection was lost and reopened, and the transport cannot
     /// say what happened meanwhile.
     Reconnected,
@@ -316,7 +325,8 @@ impl LiveWatch {
             status: status_tx,
             debounce: Debouncer::default(),
             tip: None,
-            had_session: false,
+            caught_up: false,
+            interrupted: false,
             statuses: HashMap::new(),
             fingerprints: HashMap::new(),
             track_limit: None,
@@ -605,8 +615,11 @@ pub(crate) struct Hub {
     status: watch::Sender<WatchStatus>,
     debounce: Debouncer,
     tip: Option<u32>,
-    /// A session was established under this configuration before.
-    pub had_session: bool,
+    /// Every wallet was reported once under this configuration, when
+    /// its first session was ready.
+    pub caught_up: bool,
+    /// A session was lost since the last one was ready.
+    pub interrupted: bool,
     /// Electrum statuses by script hash: the baseline a reconnection is
     /// compared against.
     pub statuses: HashMap<String, Option<String>>,
@@ -681,6 +694,21 @@ impl Hub {
         }
     }
 
+    /// A session is up and has read every script it covers once. The
+    /// first one under a configuration reports every wallet, so the
+    /// syncs that follow catch up on what happened before anything
+    /// listened. One after a lost connection does the same when the
+    /// transport cannot say what it missed (`exact` false).
+    pub fn ready(&mut self, exact: bool) {
+        if !self.caught_up {
+            self.caught_up = true;
+            self.mark_all(ChangeReason::Started);
+        } else if self.interrupted && !exact {
+            self.mark_all(ChangeReason::Reconnected);
+        }
+        self.interrupted = false;
+    }
+
     /// Notes a sign of life from the server.
     pub fn alive(&mut self) {
         self.last_alive = SystemTime::now();
@@ -748,7 +776,8 @@ impl Hub {
 
     fn forget_baselines(&mut self) {
         self.tip = None;
-        self.had_session = false;
+        self.caught_up = false;
+        self.interrupted = false;
         self.statuses.clear();
         self.fingerprints.clear();
         self.track_limit = None;
@@ -922,6 +951,7 @@ async fn supervise(hub: &mut Hub) {
                 // Without a session, the transport last tried is not one
                 // in use.
                 let established = matches!(exit, Exit::Lost(_));
+                hub.interrupted |= established;
                 let (Exit::Lost(detail) | Exit::Unreachable(detail) | Exit::NoPush(detail)) = exit
                 else {
                     continue;
