@@ -664,21 +664,32 @@ mod tests {
     /// A server that answers `server.version`, then starts its answer
     /// to the next request and never finishes it. It says when that
     /// request arrived, and when the client closed the connection.
+    ///
+    /// Only a client that opens with the `server.version` of this crate
+    /// counts: the port may be one another test just closed, and a
+    /// client of that test, still trying it, is turned away.
     fn stalling_server() -> (String, mpsc::Receiver<&'static str>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let url = format!("tcp://{}", listener.local_addr().unwrap());
         let (seen, heard) = mpsc::channel();
         std::thread::spawn(move || {
-            let Ok((stream, _)) = listener.accept() else {
-                return;
+            let (mut writer, mut lines) = loop {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let writer = stream.try_clone().unwrap();
+                let mut lines = BufReader::new(stream);
+                let mut hello = String::new();
+                let _ = lines.read_line(&mut hello);
+                if hello.contains("server.version") && hello.contains(CLIENT_NAME) {
+                    let _ = lines.get_ref().set_read_timeout(None);
+                    break (writer, lines);
+                }
             };
-            let mut writer = stream.try_clone().unwrap();
-            let mut lines = BufReader::new(stream);
-            let mut line = String::new();
-            let _ = lines.read_line(&mut line);
             let _ =
                 writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":[\"fake\",\"1.4\"]}\n");
-            line.clear();
+            let mut line = String::new();
             let _ = lines.read_line(&mut line);
             let _ = seen.send("asked");
             let _ = writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"height\":");

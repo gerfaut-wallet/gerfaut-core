@@ -193,15 +193,26 @@ impl FakeElectrum {
             state.connections.len() - 1
         };
         let mut stalled = false;
+        // Whether the client spoke the protocol: the port may be one
+        // another test just closed, and a client of that test, still
+        // trying it, is neither answered nor counted.
+        let mut spoke = false;
         loop {
             tokio::select! {
                 line = lines.next_line() => {
                     let Ok(Some(line)) = line else {
-                        state.lock().unwrap().closed += 1;
+                        if spoke {
+                            state.lock().unwrap().closed += 1;
+                        }
                         return;
                     };
-                    let request: Value = serde_json::from_str(&line).unwrap();
-                    let method = request["method"].as_str().unwrap().to_owned();
+                    let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                        return;
+                    };
+                    let Some(method) = request["method"].as_str().map(str::to_owned) else {
+                        return;
+                    };
+                    spoke = true;
                     let answer = {
                         let mut state = state.lock().unwrap();
                         state.asked.push(method.clone());
