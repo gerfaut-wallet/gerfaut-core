@@ -156,12 +156,19 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
 /// way, and then the used, empty ones, newest first. A script past the
 /// revealed range is marked: only a full scan looks that far, so a
 /// change seen there asks for one.
+///
+/// The list stops at [`crate::watch::MAX_SCRIPTS_PER_WALLET`], all a
+/// watch takes of one wallet, and nothing past it is derived: this runs
+/// under the lock of the vault after every sync, and a wallet a server
+/// had reveal a hundred thousand addresses would otherwise hold it for
+/// as many derivations each time.
 pub(crate) fn watch_scripts(
     wallet: &bdk_wallet::Wallet,
     gap_limit: u32,
 ) -> Vec<crate::watch::WatchedScript> {
     let mut seen = std::collections::HashSet::new();
     let mut scripts = Vec::new();
+    // True once the list is full.
     let mut push = |script: bdk_wallet::bitcoin::ScriptBuf, lookahead: bool| {
         if seen.insert(script.clone()) {
             scripts.push(crate::watch::WatchedScript {
@@ -169,6 +176,7 @@ pub(crate) fn watch_scripts(
                 lookahead,
             });
         }
+        scripts.len() >= crate::watch::MAX_SCRIPTS_PER_WALLET
     };
     let keychains: Vec<KeychainKind> = wallet.keychains().map(|(keychain, _)| keychain).collect();
     let ahead = |keychain: KeychainKind| {
@@ -178,29 +186,43 @@ pub(crate) fn watch_scripts(
         (next..next.saturating_add(gap_limit))
             .map(move |index| wallet.peek_address(keychain, index).script_pubkey())
     };
-    for info in wallet.list_unused_addresses(KeychainKind::External) {
-        push(info.script_pubkey(), false);
-    }
-    for coin in wallet.list_unspent() {
-        push(coin.txout.script_pubkey, false);
-    }
-    for script in ahead(KeychainKind::External) {
-        push(script, true);
-    }
-    if keychains.contains(&KeychainKind::Internal) {
-        for info in wallet.list_unused_addresses(KeychainKind::Internal) {
-            push(info.script_pubkey(), false);
+    'full: {
+        for info in wallet.list_unused_addresses(KeychainKind::External) {
+            if push(info.script_pubkey(), false) {
+                break 'full;
+            }
         }
-        for script in ahead(KeychainKind::Internal) {
-            push(script, true);
+        for coin in wallet.list_unspent() {
+            if push(coin.txout.script_pubkey, false) {
+                break 'full;
+            }
         }
-    }
-    for keychain in keychains {
-        let Some(last) = wallet.derivation_index(keychain) else {
-            continue;
-        };
-        for index in (0..=last).rev() {
-            push(wallet.peek_address(keychain, index).script_pubkey(), false);
+        for script in ahead(KeychainKind::External) {
+            if push(script, true) {
+                break 'full;
+            }
+        }
+        if keychains.contains(&KeychainKind::Internal) {
+            for info in wallet.list_unused_addresses(KeychainKind::Internal) {
+                if push(info.script_pubkey(), false) {
+                    break 'full;
+                }
+            }
+            for script in ahead(KeychainKind::Internal) {
+                if push(script, true) {
+                    break 'full;
+                }
+            }
+        }
+        for keychain in keychains {
+            let Some(last) = wallet.derivation_index(keychain) else {
+                continue;
+            };
+            for index in (0..=last).rev() {
+                if push(wallet.peek_address(keychain, index).script_pubkey(), false) {
+                    break 'full;
+                }
+            }
         }
     }
     scripts
@@ -762,6 +784,30 @@ mod tests {
         let before = known(&wallet);
         assert!(before.pending.is_empty());
         assert_eq!(moves(&wallet, &before).lines(), (vec![], vec![]));
+    }
+
+    /// A wallet that revealed far more addresses than a watch takes of
+    /// one wallet lists what the watch takes, the head first, and stops
+    /// there.
+    #[test]
+    fn a_long_wallet_lists_what_a_watch_takes_and_no_more() {
+        let mut wallet = bdk_wallet::Wallet::create(EXTERNAL, INTERNAL)
+            .network(bdk_wallet::bitcoin::Network::Signet)
+            .create_wallet_no_persist()
+            .unwrap();
+        let _ = wallet
+            .reveal_addresses_to(KeychainKind::External, 1_000)
+            .count();
+        let scripts = watch_scripts(&wallet, 20);
+        assert_eq!(scripts.len(), crate::watch::MAX_SCRIPTS_PER_WALLET);
+        assert_eq!(
+            scripts[0].script,
+            wallet
+                .peek_address(KeychainKind::External, 0)
+                .script_pubkey()
+                .to_hex_string()
+        );
+        assert!(scripts.iter().all(|script| !script.lookahead));
     }
 
     /// The same for a watched address, whose state each sync replaces
