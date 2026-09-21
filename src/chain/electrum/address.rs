@@ -764,4 +764,120 @@ mod tests {
         assert_eq!(snapshot.txs[0].fee_sats, Some(1_000));
         assert_eq!(manager.load_more_history(&wallet.id).await.unwrap(), 0);
     }
+
+    const SIGNET_ELECTRUM: &str = "ssl://signet-electrumx.wakiyamap.dev:50002";
+    /// Where a recent block is read. It serves no address routes.
+    const SIGNET_ESPLORA: &str = "https://mempool.emzy.de/signet/api";
+    /// Where the address is read. It limits requests per address: this
+    /// test asks it for a handful.
+    const SIGNET_ADDRESSES: &str = "https://blockstream.info/signet/api";
+
+    /// Live. An address a recent signet transaction spent from, with a
+    /// short history, read over Electrum and over Esplora: the same
+    /// transactions, with the same amounts, fees, sizes, heights, times
+    /// and deep facts, and the same coins. A few requests to each
+    /// Esplora server, and the Electrum calls of one round.
+    #[tokio::test]
+    #[ignore = "talks to public signet servers"]
+    async fn live_an_address_reads_the_same_over_electrum_and_esplora() {
+        let esplora = crate::chain::esplora::client(SIGNET_ESPLORA, None).unwrap();
+        let addresses = crate::chain::esplora::client(SIGNET_ADDRESSES, None).unwrap();
+        let tip = esplora.get_height().await.unwrap();
+        let block = esplora.get_block_hash(tip - 3).await.unwrap();
+        let txids = esplora.get_block_txids(&block).await.unwrap();
+        let mut address = None;
+        // The address an input of a recent transaction spent from: one
+        // that was paid, then spent, so both sides are read.
+        for txid in txids.iter().skip(1).take(12) {
+            let Ok(Some(tx)) = esplora.get_tx(txid).await else {
+                continue;
+            };
+            let spent = tx.input[0].previous_output;
+            let Ok(Some(parent)) = esplora.get_tx(&spent.txid).await else {
+                continue;
+            };
+            let Some(candidate) = parent.output.get(spent.vout as usize).and_then(|output| {
+                bdk_wallet::bitcoin::Address::from_script(
+                    &output.script_pubkey,
+                    bdk_wallet::bitcoin::Network::Signet,
+                )
+                .ok()
+            }) else {
+                continue;
+            };
+            let Ok(stats) = addresses.get_address_stats(&candidate).await else {
+                continue;
+            };
+            if (1..=40).contains(&(stats.chain_stats.tx_count + stats.mempool_stats.tx_count)) {
+                address = Some(candidate.to_string());
+                break;
+            }
+        }
+        let address = address.expect("a recent signet address with a short history");
+        println!("reading {address}");
+        let by_esplora =
+            crate::chain::esplora::fetch_address_state(&addresses, &address, Network::Signet)
+                .await
+                .unwrap();
+
+        // The server signs its own certificate: accepted by its
+        // fingerprint, the way the settings screen does it.
+        let pin = match super::super::inspect(&Target::new(SIGNET_ELECTRUM, None))
+            .await
+            .expect("the signet Electrum server answers")
+        {
+            super::super::Inspection::Tls(crate::chain::tls::Verdict::Unknown {
+                fingerprint,
+                ..
+            }) => Some(fingerprint),
+            _ => None,
+        };
+        let by_electrum = fetch_state(
+            &Target::new(SIGNET_ELECTRUM, pin),
+            &address,
+            Network::Signet,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // One line per transaction and per coin, in a fixed order.
+        let key = |state: &AddressWatchState| {
+            let mut lines: Vec<String> = state
+                .txs
+                .iter()
+                .map(|tx| {
+                    format!(
+                        "tx {} net {} fee {:?} at {:?} time {:?} vsize {}",
+                        tx.txid, tx.net_sats, tx.fee_sats, tx.height, tx.timestamp, tx.vsize
+                    )
+                })
+                .chain(state.utxos.iter().map(|coin| {
+                    format!(
+                        "coin {}:{} {} at {:?} time {:?}",
+                        coin.txid, coin.vout, coin.value_sats, coin.height, coin.timestamp
+                    )
+                }))
+                .collect();
+            lines.sort();
+            lines
+        };
+        assert_eq!(key(&by_electrum), key(&by_esplora));
+        assert!(by_electrum.tip_height.abs_diff(by_esplora.tip_height) <= 1);
+        let extras = |state: &AddressWatchState| {
+            let mut all: Vec<(String, Option<crate::wallet::tx_extras::TxExtras>)> = state
+                .txs
+                .iter()
+                .map(|tx| (tx.txid.clone(), tx.extras.clone()))
+                .collect();
+            all.sort_by(|a, b| a.0.cmp(&b.0));
+            all
+        };
+        assert_eq!(extras(&by_electrum), extras(&by_esplora));
+        println!(
+            "{} transactions, {} coins, the same both ways",
+            by_electrum.txs.len(),
+            by_electrum.utxos.len()
+        );
+    }
 }
