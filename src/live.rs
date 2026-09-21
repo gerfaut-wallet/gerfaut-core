@@ -17,12 +17,13 @@
 //!   the contract is written there.
 //! - [`LiveEvent::Transaction`] is what to announce: a transaction
 //!   seen for the first time, in the mempool or already in a block,
-//!   and later its first confirmation. Each is handed out once, and
-//!   the record of that lives in the vault: a restart, a second
-//!   isolate or a background job syncing on its own never makes it
-//!   twice.
-//! - Every sync, whoever runs it, records what it found in the vault
-//!   ([`news`]), and nothing of it goes out until someone claims it.
+//!   and later its first confirmation; a fee bump is not a new
+//!   transaction, and a payment that vanished from the mempool is said
+//!   so ([`TxStage::Dropped`]). Each is handed out once, and the record
+//!   of that lives in the vault: a restart, a second isolate or a
+//!   background job syncing on its own never makes it twice.
+//! - Every sync, whoever runs it, records what it found in the vault,
+//!   and nothing of it goes out until someone claims it.
 //!   The watch claims after each sync it runs. A host that runs a sync
 //!   of its own claims after it with
 //!   [`WalletManager::claim_announcements`] and announces what it gets:
@@ -103,7 +104,10 @@ pub struct LiveTx {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LiveEvent {
-    /// Announce this. Handed out once per transaction and stage.
+    /// Announce this. Handed out once per transaction and stage: see
+    /// [`WalletManager::claim_announcements`] for what each stage means.
+    /// With [`TxStage::Dropped`], warn that a payment said to be coming
+    /// has vanished.
     Transaction(LiveTx),
     /// A wallet was synced because it moved: refresh what shows it.
     WalletSynced {
@@ -375,6 +379,16 @@ impl WalletManager {
     /// - [`TxStage::Confirmed`]: its first confirmation, or a
     ///   transaction first seen already in a block. One seen and
     ///   confirmed before anyone claimed it comes out once, confirmed.
+    /// - [`TxStage::Dropped`]: an incoming payment that came out at the
+    ///   mempool stage left the mempool, and nothing the wallet holds
+    ///   pays it instead. Warn that the money is not coming.
+    ///
+    /// A fee bump comes out as nothing. A new unconfirmed transaction
+    /// that spends an output a pending one of the wallet spent, one
+    /// that came out at the mempool stage, and that moves the wallet the
+    /// same way, in or out, is recorded as said. Whichever of them
+    /// confirms comes out once, confirmed; if the replacement stops
+    /// paying the wallet, the payment comes out as dropped.
     ///
     /// A wallet's first sync records nothing: its whole history is an
     /// import, not news. What was pending then is news when it

@@ -7,11 +7,12 @@ use bdk_wallet::bitcoin::{Script, Txid};
 use bdk_wallet::chain::ChainPosition;
 
 use crate::error::{CoreError, CoreResult};
+use crate::live::news::{Moves, Seen};
 use crate::network::Network;
 use crate::wallet::policy::Coin;
 use crate::wallet::snapshot::{
-    AddressEntry, AddressList, AddressRow, BalanceSnapshot, Keychain, NewTx, TxDetail, TxIo,
-    TxStatus, TxSummary, UtxoInfo,
+    AddressEntry, AddressList, AddressRow, BalanceSnapshot, Keychain, TxDetail, TxIo, TxStatus,
+    TxSummary, UtxoInfo,
 };
 use crate::wallet::{AddressTx, AddressWatchState, tx_extras};
 
@@ -99,14 +100,36 @@ pub(crate) fn tx_summaries(wallet: &bdk_wallet::Wallet) -> Vec<TxSummary> {
     txs
 }
 
-/// Pending first, then by descending height, txid as a stable tiebreak.
 /// What the engine held before a sync, to tell afterwards what the
 /// sync changed.
 pub(crate) struct Known {
     /// Every transaction.
     pub all: std::collections::HashSet<Txid>,
-    /// Those still waiting for a block.
-    pub pending: std::collections::HashSet<Txid>,
+    /// Those still waiting for a block, as they were then.
+    pub pending: std::collections::HashMap<Txid, Seen>,
+}
+
+/// A transaction of the engine as a sync sees it.
+fn seen_of(
+    wallet: &bdk_wallet::Wallet,
+    tx: &bdk_wallet::bitcoin::Transaction,
+    confirmed: bool,
+) -> Seen {
+    Seen {
+        txid: tx.compute_txid().to_string(),
+        net_sats: net_of(wallet, tx),
+        confirmed,
+        spends: tx
+            .input
+            .iter()
+            .map(|input| {
+                (
+                    input.previous_output.txid.to_string(),
+                    input.previous_output.vout,
+                )
+            })
+            .collect(),
+    }
 }
 
 pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
@@ -117,7 +140,9 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
     for wtx in wallet.transactions() {
         known.all.insert(wtx.tx_node.txid);
         if !wtx.chain_position.is_confirmed() {
-            known.pending.insert(wtx.tx_node.txid);
+            known
+                .pending
+                .insert(wtx.tx_node.txid, seen_of(wallet, &wtx.tx_node.tx, false));
         }
     }
     known
@@ -188,66 +213,89 @@ pub(crate) fn has_pending(wallet: &bdk_wallet::Wallet) -> bool {
         .any(|wtx| !wtx.chain_position.is_confirmed())
 }
 
-/// The transactions the engine holds that `known` does not: what a
-/// sync just brought in.
-pub(crate) fn new_txs(wallet: &bdk_wallet::Wallet, known: &Known) -> Vec<NewTx> {
-    wallet
-        .transactions()
-        .filter(|wtx| !known.all.contains(&wtx.tx_node.txid))
-        .map(|wtx| NewTx {
-            txid: wtx.tx_node.txid.to_string(),
-            net_sats: net_of(wallet, &wtx.tx_node.tx),
-            confirmed: wtx.chain_position.is_confirmed(),
-        })
-        .collect()
+/// What a sync of a descriptor wallet moved, against what the engine
+/// held before it: the transactions it brought in, the ones it saw
+/// confirm, and the pending ones the wallet no longer holds, replaced
+/// by a conflicting transaction or evicted from the mempool.
+pub(crate) fn moves(wallet: &bdk_wallet::Wallet, known: &Known) -> Moves {
+    let mut moves = Moves {
+        pending_before: known.pending.values().cloned().collect(),
+        ..Moves::default()
+    };
+    let mut held = std::collections::HashSet::new();
+    for wtx in wallet.transactions() {
+        let txid = wtx.tx_node.txid;
+        held.insert(txid);
+        let confirmed = wtx.chain_position.is_confirmed();
+        if !known.all.contains(&txid) {
+            moves.new.push(seen_of(wallet, &wtx.tx_node.tx, confirmed));
+        } else if confirmed && known.pending.contains_key(&txid) {
+            moves.confirmed.push(seen_of(wallet, &wtx.tx_node.tx, true));
+        }
+    }
+    moves.gone = known
+        .pending
+        .iter()
+        .filter(|(txid, _)| !held.contains(*txid))
+        .map(|(_, seen)| seen.clone())
+        .collect();
+    moves
 }
 
-/// The transactions that were waiting for a block before the sync and
-/// are in one now.
-pub(crate) fn confirmed_txs(wallet: &bdk_wallet::Wallet, known: &Known) -> Vec<NewTx> {
-    wallet
-        .transactions()
-        .filter(|wtx| {
-            wtx.chain_position.is_confirmed() && known.pending.contains(&wtx.tx_node.txid)
-        })
-        .map(|wtx| NewTx {
-            txid: wtx.tx_node.txid.to_string(),
-            net_sats: net_of(wallet, &wtx.tx_node.tx),
-            confirmed: true,
-        })
-        .collect()
+/// A transaction of a watched address as a sync sees it.
+fn address_seen(tx: &AddressTx) -> Seen {
+    Seen {
+        txid: tx.txid.clone(),
+        net_sats: tx.net_sats,
+        confirmed: tx.height.is_some(),
+        spends: tx
+            .inputs
+            .iter()
+            .filter_map(|input| Some((input.prev_txid.clone()?, input.prev_vout?)))
+            .collect(),
+    }
 }
 
-/// The same two lists for a watched address, whose state is replaced
-/// whole by each sync: what `watch` holds that `previous` did not, and
-/// what `previous` held unconfirmed that `watch` has in a block.
-pub(crate) fn address_changes(
+/// The same for a watched address, whose state is replaced whole by
+/// each sync: what `watch` holds that `previous` did not, what
+/// `previous` held unconfirmed that `watch` has in a block, and what
+/// `previous` held unconfirmed that `watch` does not hold at all.
+pub(crate) fn address_moves(
     previous: Option<&AddressWatchState>,
     watch: &AddressWatchState,
-) -> (Vec<NewTx>, Vec<NewTx>) {
+) -> Moves {
     let before: std::collections::HashMap<&str, bool> = previous
         .iter()
         .flat_map(|state| &state.txs)
         .map(|tx| (tx.txid.as_str(), tx.height.is_some()))
         .collect();
-    let line = |tx: &AddressTx| NewTx {
-        txid: tx.txid.clone(),
-        net_sats: tx.net_sats,
-        confirmed: tx.height.is_some(),
-    };
-    let new = watch
-        .txs
+    let now: std::collections::HashSet<&str> =
+        watch.txs.iter().map(|tx| tx.txid.as_str()).collect();
+    let pending_before: Vec<&AddressTx> = previous
         .iter()
-        .filter(|tx| !before.contains_key(tx.txid.as_str()))
-        .map(line)
+        .flat_map(|state| &state.txs)
+        .filter(|tx| tx.height.is_none())
         .collect();
-    let confirmed = watch
-        .txs
-        .iter()
-        .filter(|tx| tx.height.is_some() && before.get(tx.txid.as_str()) == Some(&false))
-        .map(line)
-        .collect();
-    (new, confirmed)
+    Moves {
+        new: watch
+            .txs
+            .iter()
+            .filter(|tx| !before.contains_key(tx.txid.as_str()))
+            .map(address_seen)
+            .collect(),
+        confirmed: watch
+            .txs
+            .iter()
+            .filter(|tx| tx.height.is_some() && before.get(tx.txid.as_str()) == Some(&false))
+            .map(address_seen)
+            .collect(),
+        gone: pending_before
+            .iter()
+            .filter(|tx| !now.contains(tx.txid.as_str()))
+            .map(|tx| address_seen(tx))
+            .collect(),
+        pending_before: pending_before.into_iter().map(address_seen).collect(),
+    }
 }
 
 pub(crate) fn sort_summaries(txs: &mut [TxSummary]) {
@@ -598,6 +646,7 @@ pub(crate) fn address_utxos(state: &AddressWatchState, address: &str) -> Vec<Utx
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallet::snapshot::NewTx;
 
     /// A coinbase input carries the null outpoint the consensus rules
     /// require. It must never reach a screen as an identifier: the
@@ -663,20 +712,21 @@ mod tests {
         let before = known(&wallet);
         wallet.apply_unconfirmed_txs([(payment.clone(), 1_700_000_000)]);
         assert_eq!(
-            new_txs(&wallet, &before),
-            vec![NewTx {
-                txid: txid.to_string(),
-                net_sats: 50_000,
-                confirmed: false,
-            }]
+            moves(&wallet, &before).lines(),
+            (
+                vec![NewTx {
+                    txid: txid.to_string(),
+                    net_sats: 50_000,
+                    confirmed: false,
+                }],
+                vec![]
+            )
         );
-        assert!(confirmed_txs(&wallet, &before).is_empty());
 
         // A sync that finds nothing changed says nothing.
         let before = known(&wallet);
-        assert!(before.pending.contains(&txid));
-        assert!(new_txs(&wallet, &before).is_empty());
-        assert!(confirmed_txs(&wallet, &before).is_empty());
+        assert!(before.pending.contains_key(&txid));
+        assert_eq!(moves(&wallet, &before).lines(), (vec![], vec![]));
 
         // A block takes it.
         let block = BlockId {
@@ -695,20 +745,23 @@ mod tests {
             txid,
         ));
         wallet.apply_update(update).unwrap();
-        assert!(new_txs(&wallet, &before).is_empty());
         assert_eq!(
-            confirmed_txs(&wallet, &before),
-            vec![NewTx {
-                txid: txid.to_string(),
-                net_sats: 50_000,
-                confirmed: true,
-            }]
+            moves(&wallet, &before).lines(),
+            (
+                vec![],
+                vec![NewTx {
+                    txid: txid.to_string(),
+                    net_sats: 50_000,
+                    confirmed: true,
+                }]
+            )
         );
+        assert!(moves(&wallet, &before).gone.is_empty());
 
         // And the sync after that has nothing left to say about it.
         let before = known(&wallet);
         assert!(before.pending.is_empty());
-        assert!(confirmed_txs(&wallet, &before).is_empty());
+        assert_eq!(moves(&wallet, &before).lines(), (vec![], vec![]));
     }
 
     /// The same for a watched address, whose state each sync replaces
@@ -737,7 +790,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            address_changes(None, &first),
+            address_moves(None, &first).lines(),
             (vec![line("pending", false), line("old", true)], vec![])
         );
         let second = AddressWatchState {
@@ -749,10 +802,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            address_changes(Some(&first), &second),
+            address_moves(Some(&first), &second).lines(),
             (vec![line("fresh", true)], vec![line("pending", true)])
         );
-        assert_eq!(address_changes(Some(&second), &second), (vec![], vec![]));
+        assert!(address_moves(Some(&first), &second).gone.is_empty());
+        assert_eq!(
+            address_moves(Some(&second), &second).lines(),
+            (vec![], vec![])
+        );
+        // A pending one the next state does not hold is gone.
+        let third = AddressWatchState {
+            txs: vec![tx("old", Some(100))],
+            ..Default::default()
+        };
+        let moves = address_moves(Some(&first), &third);
+        assert_eq!(moves.gone.len(), 1);
+        assert_eq!(moves.gone[0].txid, "pending");
     }
 
     fn summary(txid: &str, status: TxStatus) -> TxSummary {

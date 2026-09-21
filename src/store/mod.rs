@@ -116,6 +116,13 @@ pub enum TxStage {
     Mempool,
     /// In a block.
     Confirmed,
+    /// An incoming payment announced at the [`TxStage::Mempool`] stage
+    /// left the mempool, and nothing the wallet holds pays it instead:
+    /// the sender replaced it with a transaction that pays elsewhere,
+    /// or it was evicted. The money it announced is not coming, unless
+    /// it is broadcast again, in which case its confirmation is
+    /// announced as usual.
+    Dropped,
 }
 
 /// One announcement already made: see

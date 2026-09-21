@@ -11,12 +11,109 @@
 //! sync's result with nothing listed as new, never swallows a
 //! transaction. It waits in the vault for the next claim.
 //!
+//! # Replacements
+//!
+//! A sender who bumps the fee of a payment replaces it with another
+//! transaction spending the same coins. Announced as it arrives, each
+//! replacement would be one more identical notification. So a new
+//! unconfirmed transaction that spends an output a pending transaction
+//! of the wallet spent, one already announced at the mempool stage,
+//! and that moves the wallet the same way (in, or out), is recorded as
+//! announced and not said. Whichever of them confirms is said once, as
+//! confirmed.
+//!
+//! An incoming payment announced at the mempool stage that leaves the
+//! wallet with no transaction paying the wallet in its place, replaced
+//! by one that pays elsewhere or evicted, is news of its own:
+//! [`TxStage::Dropped`], said once.
+//!
 //! Every function here works on the payload, under the lock of the
 //! caller, and does no I/O.
+
+use std::collections::HashMap;
 
 use crate::live::{ANNOUNCED_MAX, LiveTx};
 use crate::store::{Announced, TxStage, Unclaimed, VaultPayload};
 use crate::wallet::snapshot::NewTx;
+
+/// A transaction as a sync saw it: enough to tell a replacement from a
+/// new payment, and a payment that vanished from one replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Seen {
+    pub txid: String,
+    /// Net effect on the wallet, in satoshis.
+    pub net_sats: i64,
+    pub confirmed: bool,
+    /// The outputs it spends, txid and index.
+    pub spends: Vec<(String, u32)>,
+}
+
+impl Seen {
+    fn line(&self) -> NewTx {
+        NewTx {
+            txid: self.txid.clone(),
+            net_sats: self.net_sats,
+            confirmed: self.confirmed,
+        }
+    }
+
+    /// Whether the two move the wallet the same way.
+    fn same_way_as(&self, other: &Seen) -> bool {
+        self.net_sats.signum() == other.net_sats.signum()
+    }
+}
+
+/// What one sync of a wallet moved.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Moves {
+    /// Transactions seen for the first time.
+    pub new: Vec<Seen>,
+    /// Transactions pending before the sync and in a block now.
+    pub confirmed: Vec<Seen>,
+    /// Transactions pending before the sync, as they were then.
+    pub pending_before: Vec<Seen>,
+    /// Of those, the ones the wallet no longer holds: replaced by a
+    /// conflicting transaction, or evicted from the mempool.
+    pub gone: Vec<Seen>,
+}
+
+impl Moves {
+    /// The two lists of a sync report: the transactions seen for the
+    /// first time, and those seen confirm.
+    pub(crate) fn lines(&self) -> (Vec<NewTx>, Vec<NewTx>) {
+        (
+            self.new.iter().map(Seen::line).collect(),
+            self.confirmed.iter().map(Seen::line).collect(),
+        )
+    }
+}
+
+/// The transactions of `txs` by each output they spend: who conflicts
+/// with whom, read in one pass however many inputs a server lists.
+fn by_spent(txs: &[Seen]) -> HashMap<(&str, u32), Vec<&Seen>> {
+    let mut spenders: HashMap<(&str, u32), Vec<&Seen>> = HashMap::new();
+    for tx in txs {
+        for (txid, vout) in &tx.spends {
+            spenders.entry((txid.as_str(), *vout)).or_default().push(tx);
+        }
+    }
+    spenders
+}
+
+/// The transactions of `spenders` that spend an output `tx` spends:
+/// the ones it replaces, or that replace it. No more than one of them
+/// can ever be in a block.
+fn conflicting<'a>(
+    spenders: &'a HashMap<(&str, u32), Vec<&'a Seen>>,
+    tx: &'a Seen,
+) -> impl Iterator<Item = &'a Seen> + 'a {
+    tx.spends
+        .iter()
+        .filter_map(|(txid, vout)| spenders.get(&(txid.as_str(), *vout)))
+        .flatten()
+        .copied()
+        .filter(move |other| other.txid != tx.txid)
+}
 
 /// Unclaimed news kept, at most. Past this the oldest goes: it is news
 /// no caller took for hundreds of transactions.
@@ -25,6 +122,58 @@ pub(crate) const UNCLAIMED_MAX: usize = 500;
 /// news any more: whoever syncs with alerts off and claims nothing
 /// would have it all said the day the alerts are turned on.
 pub(crate) const UNCLAIMED_FOR: u64 = 12 * 3600;
+
+/// Whether this transaction was announced at exactly this stage.
+fn announced_as(payload: &VaultPayload, txid: &str, stage: TxStage) -> bool {
+    payload
+        .announced
+        .iter()
+        .any(|entry| entry.txid == txid && entry.stage == stage)
+}
+
+/// Whether this transaction is announced at the mempool stage, or
+/// waiting to be, for this wallet.
+fn pending_said(payload: &VaultPayload, wallet_id: &str, txid: &str) -> bool {
+    announced_as(payload, txid, TxStage::Mempool)
+        || payload.unclaimed.iter().any(|entry| {
+            entry.wallet_id == wallet_id && entry.txid == txid && entry.stage == TxStage::Mempool
+        })
+}
+
+/// Takes the arrival of a transaction out of the news still waiting.
+/// True when there was one.
+fn unsay_arrival(payload: &mut VaultPayload, wallet_id: &str, txid: &str) -> bool {
+    let before = payload.unclaimed.len();
+    payload.unclaimed.retain(|entry| {
+        !(entry.wallet_id == wallet_id && entry.txid == txid && entry.stage == TxStage::Mempool)
+    });
+    payload.unclaimed.len() < before
+}
+
+/// A replacement takes the place of what it replaces: in the news still
+/// waiting, where the arrival of the one it replaces is, so the
+/// notification names the transaction that is there; in the record
+/// otherwise, so it is never said.
+fn replace(payload: &mut VaultPayload, wallet_id: &str, replaced: &Seen, by: &Seen) {
+    let waiting = payload.unclaimed.iter_mut().find(|entry| {
+        entry.wallet_id == wallet_id
+            && entry.txid == replaced.txid
+            && entry.stage == TxStage::Mempool
+    });
+    match waiting {
+        Some(entry) => {
+            entry.txid = by.txid.clone();
+            entry.net_sats = by.net_sats;
+        }
+        None => remember(
+            payload,
+            [Announced {
+                txid: by.txid.clone(),
+                stage: TxStage::Mempool,
+            }],
+        ),
+    }
+}
 
 /// Whether this transaction was announced at this stage already. A
 /// confirmation announced covers its arrival too: nobody is told a
@@ -85,22 +234,21 @@ pub(crate) fn push(
 }
 
 /// Records what one sync of a wallet found: what it saw for the first
-/// time, and what it saw confirm. A wallet's first sync records
-/// nothing: its whole history is "new", and that is an import, not
-/// news.
+/// time, what it saw confirm, and the payments it saw vanish. A
+/// wallet's first sync records nothing: its whole history is "new",
+/// and that is an import, not news.
 pub(crate) fn record(
     payload: &mut VaultPayload,
     wallet_id: &str,
     first_sync: bool,
-    new: &[NewTx],
-    confirmed: &[NewTx],
+    moves: &Moves,
     now: u64,
 ) {
     expire(payload, now);
     if first_sync {
         return;
     }
-    for tx in confirmed {
+    for tx in &moves.confirmed {
         push(
             payload,
             wallet_id,
@@ -110,13 +258,56 @@ pub(crate) fn record(
             now,
         );
     }
-    for tx in new {
-        let stage = if tx.confirmed {
-            TxStage::Confirmed
-        } else {
-            TxStage::Mempool
-        };
-        push(payload, wallet_id, &tx.txid, tx.net_sats, stage, now);
+    let before = by_spent(&moves.pending_before);
+    for tx in &moves.new {
+        if tx.confirmed {
+            push(
+                payload,
+                wallet_id,
+                &tx.txid,
+                tx.net_sats,
+                TxStage::Confirmed,
+                now,
+            );
+            continue;
+        }
+        // A replacement of what was announced, the same way: said.
+        let replaced = conflicting(&before, tx)
+            .find(|old| old.same_way_as(tx) && pending_said(payload, wallet_id, &old.txid));
+        match replaced {
+            Some(old) => replace(payload, wallet_id, old, tx),
+            None => push(
+                payload,
+                wallet_id,
+                &tx.txid,
+                tx.net_sats,
+                TxStage::Mempool,
+                now,
+            ),
+        }
+    }
+    let arrived = by_spent(&moves.new);
+    for old in &moves.gone {
+        // Never said: nothing to take back.
+        if unsay_arrival(payload, wallet_id, &old.txid) {
+            continue;
+        }
+        let said_pending = announced_as(payload, &old.txid, TxStage::Mempool)
+            && !announced_as(payload, &old.txid, TxStage::Confirmed);
+        if !said_pending || old.net_sats <= 0 {
+            continue;
+        }
+        let paid_instead = conflicting(&arrived, old).any(|tx| tx.net_sats > 0);
+        if !paid_instead {
+            push(
+                payload,
+                wallet_id,
+                &old.txid,
+                old.net_sats,
+                TxStage::Dropped,
+                now,
+            );
+        }
     }
 }
 
@@ -184,11 +375,36 @@ mod tests {
 
     const NOW: u64 = 1_800_000_000;
 
-    fn seen(txid: &str, net_sats: i64, confirmed: bool) -> NewTx {
-        NewTx {
+    fn seen(txid: &str, net_sats: i64, confirmed: bool) -> Seen {
+        Seen {
             txid: txid.to_owned(),
             net_sats,
             confirmed,
+            spends: vec![(format!("parent-of-{txid}"), 0)],
+        }
+    }
+
+    /// Spending the same output as `other`.
+    fn replacing(other: &Seen, txid: &str, net_sats: i64, confirmed: bool) -> Seen {
+        Seen {
+            txid: txid.to_owned(),
+            net_sats,
+            confirmed,
+            spends: other.spends.clone(),
+        }
+    }
+
+    fn arrived(new: &[Seen]) -> Moves {
+        Moves {
+            new: new.to_vec(),
+            ..Moves::default()
+        }
+    }
+
+    fn confirmed(txs: &[Seen]) -> Moves {
+        Moves {
+            confirmed: txs.to_vec(),
+            ..Moves::default()
         }
     }
 
@@ -202,7 +418,13 @@ mod tests {
     #[test]
     fn news_is_claimed_once_by_whoever_asks_first() {
         let mut payload = VaultPayload::default();
-        record(&mut payload, "w", false, &[seen("a", 5, false)], &[], NOW);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(&[seen("a", 5, false)]),
+            NOW,
+        );
         assert_eq!(waiting(&payload, "w", NOW), 1);
         assert!(claim(&mut payload, "other", 10, NOW).is_empty());
         let claimed = claim(&mut payload, "w", 10, NOW);
@@ -210,11 +432,29 @@ mod tests {
         assert_eq!(claimed[0].net_sats, 5);
         assert!(claim(&mut payload, "w", 10, NOW).is_empty());
         // Seen again, by another sync: said already.
-        record(&mut payload, "w", false, &[seen("a", 5, false)], &[], NOW);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(&[seen("a", 5, false)]),
+            NOW,
+        );
         assert_eq!(waiting(&payload, "w", NOW), 0);
         // Its confirmation is news of its own, once.
-        record(&mut payload, "w", false, &[], &[seen("a", 5, true)], NOW);
-        record(&mut payload, "w", false, &[], &[seen("a", 5, true)], NOW);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &confirmed(&[seen("a", 5, true)]),
+            NOW,
+        );
+        record(
+            &mut payload,
+            "w",
+            false,
+            &confirmed(&[seen("a", 5, true)]),
+            NOW,
+        );
         assert_eq!(
             stages(&claim(&mut payload, "w", 10, NOW)),
             [("a", TxStage::Confirmed)]
@@ -229,8 +469,7 @@ mod tests {
             &mut payload,
             "w",
             true,
-            &[seen("old", 1, true), seen("pending", 2, false)],
-            &[],
+            &arrived(&[seen("old", 1, true), seen("pending", 2, false)]),
             NOW,
         );
         assert_eq!(waiting(&payload, "w", NOW), 0);
@@ -239,8 +478,7 @@ mod tests {
             &mut payload,
             "w",
             false,
-            &[],
-            &[seen("pending", 2, true)],
+            &confirmed(&[seen("pending", 2, true)]),
             NOW,
         );
         assert_eq!(
@@ -258,29 +496,183 @@ mod tests {
             &mut payload,
             "w",
             false,
-            &[seen("a", 1, false), seen("b", 2, false)],
-            &[],
+            &arrived(&[seen("a", 1, false), seen("b", 2, false)]),
             NOW,
         );
-        record(&mut payload, "w", false, &[], &[seen("a", 1, true)], NOW);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &confirmed(&[seen("a", 1, true)]),
+            NOW,
+        );
         let first = claim(&mut payload, "w", 1, NOW);
         assert_eq!(stages(&first), [("b", TxStage::Mempool)]);
         let rest = claim(&mut payload, "w", 10, NOW);
         assert_eq!(stages(&rest), [("a", TxStage::Confirmed)]);
     }
 
+    /// A sender bumps the fee again and again: every replacement pays
+    /// the wallet as the first did, none is said again, and the one
+    /// that confirms is said once.
+    #[test]
+    fn a_fee_bump_is_not_said_again() {
+        let mut payload = VaultPayload::default();
+        let a = seen("a", 50_000, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(std::slice::from_ref(&a)),
+            NOW,
+        );
+        assert_eq!(
+            stages(&claim(&mut payload, "w", 10, NOW)),
+            [("a", TxStage::Mempool)]
+        );
+        let mut current = a;
+        for (txid, sats) in [("b", 49_800), ("c", 49_600), ("d", 49_400)] {
+            let bump = replacing(&current, txid, sats, false);
+            let moves = Moves {
+                new: vec![bump.clone()],
+                pending_before: vec![current.clone()],
+                gone: vec![current.clone()],
+                ..Moves::default()
+            };
+            record(&mut payload, "w", false, &moves, NOW);
+            assert!(claim(&mut payload, "w", 10, NOW).is_empty(), "{txid}");
+            current = bump;
+        }
+        let mined = Seen {
+            confirmed: true,
+            ..current.clone()
+        };
+        record(&mut payload, "w", false, &confirmed(&[mined]), NOW);
+        assert_eq!(
+            stages(&claim(&mut payload, "w", 10, NOW)),
+            [("d", TxStage::Confirmed)]
+        );
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+    }
+
+    /// Replaced before anyone claimed the first: one notice, naming the
+    /// transaction that is there.
+    #[test]
+    fn a_replacement_takes_the_place_of_an_arrival_nobody_claimed() {
+        let mut payload = VaultPayload::default();
+        let a = seen("a", 50_000, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(std::slice::from_ref(&a)),
+            NOW,
+        );
+        let b = replacing(&a, "b", 49_800, false);
+        let moves = Moves {
+            new: vec![b],
+            pending_before: vec![a.clone()],
+            gone: vec![a],
+            ..Moves::default()
+        };
+        record(&mut payload, "w", false, &moves, NOW);
+        let claimed = claim(&mut payload, "w", 10, NOW);
+        assert_eq!(stages(&claimed), [("b", TxStage::Mempool)]);
+        assert_eq!(claimed[0].net_sats, 49_800);
+    }
+
+    /// The sender replaces the payment with one that pays elsewhere, or
+    /// it is evicted: the wallet holds nothing that pays it instead.
+    /// Said once, as dropped. Nothing is taken back that was never said,
+    /// and a spend that vanishes is no loss to warn about.
+    #[test]
+    fn a_payment_that_vanishes_is_said_once() {
+        let mut payload = VaultPayload::default();
+        let a = seen("a", 50_000, false);
+        let out = seen("out", -10_000, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(&[a.clone(), out.clone()]),
+            NOW,
+        );
+        assert_eq!(claim(&mut payload, "w", 10, NOW).len(), 2);
+        let vanished = Moves {
+            pending_before: vec![a.clone(), out.clone()],
+            gone: vec![a.clone(), out],
+            ..Moves::default()
+        };
+        record(&mut payload, "w", false, &vanished, NOW);
+        let claimed = claim(&mut payload, "w", 10, NOW);
+        assert_eq!(stages(&claimed), [("a", TxStage::Dropped)]);
+        assert_eq!(claimed[0].net_sats, 50_000);
+        record(&mut payload, "w", false, &vanished, NOW);
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+
+        let x = seen("x", 1_000, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(std::slice::from_ref(&x)),
+            NOW,
+        );
+        let unsaid = Moves {
+            pending_before: vec![x.clone()],
+            gone: vec![x],
+            ..Moves::default()
+        };
+        record(&mut payload, "w", false, &unsaid, NOW);
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+    }
+
+    /// Replaced by a transaction that pays the wallet and is already in
+    /// a block: its confirmation is said, and nothing vanished.
+    #[test]
+    fn a_replacement_that_confirms_is_said_once() {
+        let mut payload = VaultPayload::default();
+        let a = seen("a", 50_000, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(std::slice::from_ref(&a)),
+            NOW,
+        );
+        claim(&mut payload, "w", 10, NOW);
+        let mined = replacing(&a, "b", 49_800, true);
+        let moves = Moves {
+            new: vec![mined],
+            pending_before: vec![a.clone()],
+            gone: vec![a],
+            ..Moves::default()
+        };
+        record(&mut payload, "w", false, &moves, NOW);
+        assert_eq!(
+            stages(&claim(&mut payload, "w", 10, NOW)),
+            [("b", TxStage::Confirmed)]
+        );
+    }
+
     #[test]
     fn news_nobody_claims_is_forgotten_in_time_and_in_number() {
         let mut payload = VaultPayload::default();
-        record(&mut payload, "w", false, &[seen("a", 1, false)], &[], NOW);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(&[seen("a", 1, false)]),
+            NOW,
+        );
         let later = NOW + UNCLAIMED_FOR + 1;
         assert_eq!(waiting(&payload, "w", later), 0);
         assert!(claim(&mut payload, "w", 10, later).is_empty());
 
-        let many: Vec<NewTx> = (0..UNCLAIMED_MAX + 20)
+        let many: Vec<Seen> = (0..UNCLAIMED_MAX + 20)
             .map(|n| seen(&format!("t{n}"), 1, false))
             .collect();
-        record(&mut payload, "w", false, &many, &[], NOW);
+        record(&mut payload, "w", false, &arrived(&many), NOW);
         assert_eq!(payload.unclaimed.len(), UNCLAIMED_MAX);
         assert_eq!(payload.unclaimed[0].txid, "t20", "the oldest went first");
     }

@@ -847,8 +847,8 @@ impl WalletManager {
                     let balance = views::balance(engine);
                     let tip_height = views::tip_height(engine);
                     let tx_count_after = engine.transactions().count() as u32;
-                    let new_txs = views::new_txs(engine, &known);
-                    let confirmed_txs = views::confirmed_txs(engine, &known);
+                    let moves = views::moves(engine, &known);
+                    let (new_txs, confirmed_txs) = moves.lines();
                     let staged = engine.take_staged();
 
                     if let Some(staged) = staged {
@@ -858,8 +858,7 @@ impl WalletManager {
                         &mut state.payload,
                         &meta.id,
                         meta.last_sync.is_none(),
-                        &new_txs,
-                        &confirmed_txs,
+                        &moves,
                         now_secs(),
                     );
                     let report = SyncReport {
@@ -898,12 +897,13 @@ impl WalletManager {
                     let mut state = self.state.lock().await;
                     // Against the state as stored, before the older
                     // rounds are carried over into the fresh one.
-                    let (new_txs, confirmed_txs) = views::address_changes(
+                    let moves = views::address_moves(
                         find_record(&state.payload, &meta.id)?
                             .address_state
                             .as_ref(),
                         &watch,
                     );
+                    let (new_txs, confirmed_txs) = moves.lines();
                     // A sync fetches the newest round only. Keep the older
                     // rounds the user already loaded, otherwise every sync
                     // would silently undo "load older transactions".
@@ -918,8 +918,7 @@ impl WalletManager {
                         &mut state.payload,
                         &meta.id,
                         meta.last_sync.is_none(),
-                        &new_txs,
-                        &confirmed_txs,
+                        &moves,
                         now_secs(),
                     );
                     let report = SyncReport {
