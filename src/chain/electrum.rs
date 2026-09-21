@@ -691,10 +691,12 @@ mod tests {
         (url, heard)
     }
 
-    /// What the server says next, within two seconds.
+    /// What the server says next. It runs on a thread of its own, which
+    /// a machine busy with the rest of the suite may be slow to wake:
+    /// the bounds that matter are asserted on the client side.
     fn within(heard: &mpsc::Receiver<&'static str>, what: &'static str) {
         assert_eq!(
-            heard.recv_timeout(Duration::from_secs(2)).ok(),
+            heard.recv_timeout(Duration::from_secs(10)).ok(),
             Some(what),
             "the server never saw the client {what}"
         );

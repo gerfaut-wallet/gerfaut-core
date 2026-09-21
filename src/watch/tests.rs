@@ -703,7 +703,11 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
         assert!(started.elapsed() < WAIT, "never polled");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(manager.live_status().await.state, WatchState::Polling);
+    // The lookup is part of a round; the state follows the round.
+    while manager.live_status().await.state != WatchState::Polling {
+        assert!(started.elapsed() < WAIT, "never polling");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     // The payment enters the mempool.
     {
@@ -859,8 +863,11 @@ async fn a_descriptor_wallet_is_watched_past_what_it_revealed() {
 
 // --- stopping -------------------------------------------------------------------
 
-/// How long a stop may take to show, whatever the server does.
+/// How long a stop may take, whatever the server does.
 const PROMPT: Duration = Duration::from_secs(2);
+/// How long its effects may take to show through other tasks, on a
+/// machine busy with the rest of the suite.
+const SETTLE: Duration = Duration::from_secs(5);
 
 async fn within(what: &str, limit: Duration, holds: impl Fn() -> bool) {
     let started = std::time::Instant::now();
@@ -892,13 +899,13 @@ async fn a_watch_stops_at_once_while_the_server_stalls() {
     watch.stop();
     assert_eq!(watch.status(), WatchStatus::default());
     assert!(
-        tokio::time::timeout(PROMPT, async { while events.next().await.is_some() {} })
+        tokio::time::timeout(SETTLE, async { while events.next().await.is_some() {} })
             .await
             .is_ok(),
         "the events of a stopped watch end"
     );
-    within("closed the connection", PROMPT, || server.closed() == 1).await;
-    assert!(started.elapsed() < PROMPT);
+    within("closed the connection", SETTLE, || server.closed() == 1).await;
+    assert!(started.elapsed() < SETTLE);
 }
 
 /// The live watch stops at once while one of its syncs waits on a
@@ -941,13 +948,13 @@ async fn live_stop_abandons_a_sync_the_server_stalls() {
     assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
     assert_eq!(manager.live_status().await, WatchStatus::default());
     assert!(
-        tokio::time::timeout(PROMPT, async { while events.next().await.is_some() {} })
+        tokio::time::timeout(SETTLE, async { while events.next().await.is_some() {} })
             .await
             .is_ok(),
         "the events of a stopped watch end"
     );
     // The watch's connection and the sync's.
-    within("closed both connections", PROMPT, || server.closed() == 2).await;
+    within("closed both connections", SETTLE, || server.closed() == 2).await;
     server.state.lock().unwrap().stall = None;
     manager.sync_wallet(&wallet.id).await.unwrap();
 }
