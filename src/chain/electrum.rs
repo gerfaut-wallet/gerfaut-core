@@ -5,8 +5,11 @@
 //! waiting on a server there would hold a runtime shutdown, and with it
 //! the exit of the app, for as long as the server takes. The caller
 //! awaits the thread under a deadline, and the moment it stops waiting,
-//! the deadline passed or its future dropped, the socket is shut down
-//! and the thread ends at its next read.
+//! the deadline passed or its future dropped, the socket is shut down:
+//! the server sees the connection end there and then, and the thread
+//! ends when its read returns, at once on Linux and at the latest at the
+//! socket timeout on Windows, where a shutdown does not wake a read
+//! already waiting.
 //!
 //! Every socket is opened here: TCP, the Tor proxy in front of it for a
 //! hidden service, and TLS by [`crate::chain::tls`], so the certificate
@@ -149,24 +152,53 @@ pub fn certificate_key(url: &str) -> String {
     }
 }
 
+/// The socket of a connection, shared by the thread that reads and
+/// writes it and by the [`Cancel`] that shuts it down: one handle, never
+/// a copy. On Windows, a copy made with `try_clone` right after a timed
+/// connect is at times refused every call, the shutdown among them
+/// (WSAENOTCONN), and the connection then outlived its abandonment until
+/// its next timeout.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedSocket(Arc<TcpStream>);
+
+impl SharedSocket {
+    fn new(socket: TcpStream) -> Self {
+        SharedSocket(Arc::new(socket))
+    }
+}
+
+impl Read for SharedSocket {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self.0).read(buf)
+    }
+}
+
+impl Write for SharedSocket {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self.0).flush()
+    }
+}
+
 /// What abandons a connection from outside the thread that uses it: a
-/// flag every read and write checks, and a handle on the socket, shut
-/// down so that a read waiting on the server returns at once.
+/// flag every read and write checks, and the socket itself, shut down so
+/// that the server sees the connection end at once, and a read waiting
+/// on it returns (at once, or at the socket timeout on Windows).
 #[derive(Debug, Default)]
 pub(crate) struct Cancel {
     cancelled: AtomicBool,
-    socket: Mutex<Option<TcpStream>>,
+    socket: Mutex<Option<SharedSocket>>,
 }
 
 impl Cancel {
-    /// Keeps a handle on the socket a connection was opened on. One
-    /// abandoned before this point is shut down here.
-    fn hold(&self, socket: &TcpStream) -> Result<(), ConnectError> {
-        let handle = socket
-            .try_clone()
-            .map_err(|e| ConnectError::Io(e.to_string()))?;
+    /// Keeps the socket a connection was opened on. One abandoned before
+    /// this point is shut down here.
+    fn hold(&self, socket: &SharedSocket) -> Result<(), ConnectError> {
         if let Ok(mut held) = self.socket.lock() {
-            *held = Some(handle);
+            *held = Some(socket.clone());
         }
         if self.is_cancelled() {
             self.abort();
@@ -180,7 +212,7 @@ impl Cancel {
         if let Ok(held) = self.socket.lock()
             && let Some(socket) = held.as_ref()
         {
-            let _ = socket.shutdown(Shutdown::Both);
+            let _ = socket.0.shutdown(Shutdown::Both);
         }
     }
 
@@ -346,6 +378,7 @@ fn connect(
                 ))
             })?
             .into_inner();
+        let socket = SharedSocket::new(socket);
         cancel.hold(&socket)?;
         if tls_wanted {
             Box::new(tls::onion_handshake(&host, socket)?)
@@ -353,7 +386,7 @@ fn connect(
             Box::new(socket)
         }
     } else {
-        let socket = tls::tcp_connect(&host, port, timeout)?;
+        let socket = SharedSocket::new(tls::tcp_connect(&host, port, timeout)?);
         cancel.hold(&socket)?;
         if tls_wanted {
             Box::new(tls::handshake(&host, target.pin.as_deref(), socket)?)
@@ -725,27 +758,74 @@ mod tests {
 
     /// A call is held to its deadline however the server stalls, and
     /// the connection is shut down when it runs out: the thread does
-    /// not go on reading.
+    /// not go on reading. The deadline leaves a busy machine the time to
+    /// connect and ask; what is asserted is that the call ends with it.
     #[tokio::test]
     async fn a_stalled_call_is_abandoned_at_its_deadline() {
         let (url, heard) = stalling_server();
+        let deadline = Duration::from_secs(2);
         let started = Instant::now();
-        let outcome = run(
-            &Target::new(url, None),
-            None,
-            Duration::from_millis(500),
-            |client| {
-                client
-                    .inner
-                    .block_headers_subscribe()
-                    .map_err(|e| e.to_string())
-            },
-        )
+        let outcome = run(&Target::new(url, None), None, deadline, |client| {
+            client
+                .inner
+                .block_headers_subscribe()
+                .map_err(|e| e.to_string())
+        })
         .await;
-        assert_eq!(outcome.err().as_deref(), Some("no answer within 0 s"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(outcome.err().as_deref(), Some("no answer within 2 s"));
+        assert!(started.elapsed() < deadline + Duration::from_secs(2));
         within(&heard, "asked");
         within(&heard, "closed");
+    }
+
+    /// Abandoned, a connection is shut down on the socket it reads from,
+    /// at once, every time: the server sees it go while the thread still
+    /// waits on its read. Each socket comes out of a timed connect and is
+    /// held at once, the way a call holds it; on Windows a copy of such a
+    /// socket, the handle this used to keep, at times refused the
+    /// shutdown, and the server then waited for the read timeout.
+    #[test]
+    fn an_abandoned_connection_is_shut_down_at_once() {
+        // A read the shutdown does not wake, on Windows, ends at this.
+        const READ_TIMEOUT: Duration = Duration::from_secs(2);
+        let mut readers = Vec::new();
+        for round in 0..100 {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let cancel = Arc::new(Cancel::default());
+            let socket = SharedSocket::new(
+                tls::tcp_connect("127.0.0.1", address.port(), READ_TIMEOUT).unwrap(),
+            );
+            cancel.hold(&socket).unwrap();
+            let (mut accepted, _) = listener.accept().unwrap();
+            let mut reader = Guarded::new(Box::new(socket), cancel.clone(), MAX_LINE);
+            readers.push(std::thread::spawn(move || {
+                reader.read(&mut [0u8; 8]).map(|_| ())
+            }));
+            // The read is under way, or about to be: either way it ends.
+            std::thread::sleep(Duration::from_millis(round % 3));
+            cancel.abort();
+            accepted
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let seen = accepted.read(&mut [0u8; 8]);
+            assert!(
+                matches!(seen, Ok(0) | Err(_)),
+                "round {round}: the server read {seen:?}"
+            );
+            if let Err(error) = &seen {
+                assert!(
+                    !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ),
+                    "round {round}: the server never saw the connection go"
+                );
+            }
+        }
+        for reader in readers {
+            let _ = reader.join().unwrap();
+        }
     }
 
     /// The call runs on a thread of its own, not on the blocking pool: a

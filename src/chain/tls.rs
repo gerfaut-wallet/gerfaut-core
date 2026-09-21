@@ -13,6 +13,7 @@
 //! verification off would leave a window for a man in the middle to let
 //! the probe through and answer the real connection itself.
 
+use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -356,11 +357,11 @@ pub(crate) fn connect(
 
 /// The same handshake over a socket the caller opened, so it can keep a
 /// handle on the socket and shut it down from another thread.
-pub(crate) fn handshake(
+pub(crate) fn handshake<S: Read + Write>(
     host: &str,
     pin: Option<&str>,
-    mut socket: TcpStream,
-) -> Result<rustls::StreamOwned<ClientConnection, TcpStream>, ConnectError> {
+    mut socket: S,
+) -> Result<rustls::StreamOwned<ClientConnection, S>, ConnectError> {
     let handshake = Handshake::new(pin)?;
     let mut session = ClientConnection::new(handshake.config.clone(), server_name(host)?)
         .map_err(|e| ConnectError::Io(e.to_string()))?;
@@ -374,10 +375,10 @@ pub(crate) fn handshake(
 
 /// The handshake of an `ssl://` hidden service, over the circuit the
 /// caller opened: see [`onion_config`].
-pub(crate) fn onion_handshake(
+pub(crate) fn onion_handshake<S: Read + Write>(
     host: &str,
-    mut socket: TcpStream,
-) -> Result<rustls::StreamOwned<ClientConnection, TcpStream>, ConnectError> {
+    mut socket: S,
+) -> Result<rustls::StreamOwned<ClientConnection, S>, ConnectError> {
     let mut session = ClientConnection::new(onion_config()?, server_name(host)?)
         .map_err(|e| ConnectError::Io(e.to_string()))?;
     session
