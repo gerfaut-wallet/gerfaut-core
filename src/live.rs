@@ -65,7 +65,8 @@ use crate::network::Network;
 use crate::store::TxStage;
 use crate::wallet::snapshot::SyncReport;
 use crate::watch::{
-    ChangeReason, LiveWatch, WatchConfig, WatchEvent, WatchEvents, WatchStatus, WatchedWallet,
+    ChangeReason, LiveWatch, Timings, WatchConfig, WatchEvent, WatchEvents, WatchStatus,
+    WatchedWallet,
 };
 
 pub(crate) mod news;
@@ -78,11 +79,9 @@ mod tests;
 pub(crate) const ANNOUNCED_MAX: usize = 2_000;
 /// Events held for a consumer that lags.
 const EVENT_QUEUE: usize = 256;
-/// When a change was pushed and the sync found nothing, the sync is
-/// run again after these delays: with the automatic backend the push
-/// comes from one server and the sync reads another, which may hear of
-/// the transaction a moment later.
-const RETRIES: [Duration; 2] = [Duration::from_secs(3), Duration::from_secs(10)];
+/// Pushed changes of a wallet the syncs may find nothing behind, in a
+/// row, before the next one is made to wait: see [`Futile`].
+const FREE_FUTILE: u32 = 2;
 /// Transactions claimed, and handed out, at a time.
 const CLAIM_BATCH: usize = 32;
 /// Syncs the watch runs at once. A wallet that takes long to sync holds
@@ -176,6 +175,48 @@ impl Asked {
 /// What a sync the watch ran came to: its report, or why it failed.
 type Synced = Result<SyncReport, String>;
 
+/// Pushed changes the syncs found nothing behind, in a row, by wallet.
+///
+/// A sync costs the backend's answers, a vault written to disk and a
+/// radio kept awake. A server that keeps saying a wallet moved when
+/// nothing did, a status forged anew every few seconds, would have the
+/// app pay that for as long as the watch runs. So past [`FREE_FUTILE`]
+/// such changes in a row, the sync the next one asks for waits, twice
+/// as long each time, up to a cap. A sync that finds something,
+/// whatever asked for it, ends the wait. A block, a reconnection and
+/// the catch-up of a start never wait: only what the server claims
+/// about a script does.
+#[derive(Debug, Default)]
+struct Futile(HashMap<String, u32>);
+
+impl Futile {
+    /// How long the sync `asked` for this wallet waits before it runs.
+    fn hold(&self, wallet_id: &str, asked: Asked, timings: &Timings) -> Duration {
+        if asked.reason != ChangeReason::Activity {
+            return Duration::ZERO;
+        }
+        let futile = self.0.get(wallet_id).copied().unwrap_or(0);
+        let Some(doublings) = futile.checked_sub(FREE_FUTILE) else {
+            return Duration::ZERO;
+        };
+        timings
+            .hold
+            .saturating_mul(2u32.saturating_pow(doublings))
+            .min(timings.hold_cap)
+    }
+
+    /// Takes what a sync `asked` for this wallet came to: whether it
+    /// found anything, a failure counting as nothing found.
+    fn settle(&mut self, wallet_id: &str, asked: Asked, found: bool) {
+        if found {
+            self.0.remove(wallet_id);
+        } else if asked.reason == ChangeReason::Activity {
+            let futile = self.0.entry(wallet_id.to_owned()).or_default();
+            *futile = futile.saturating_add(1);
+        }
+    }
+}
+
 /// Resolves once the watch is asked to stop, or its handle is gone.
 async fn stopped(halted: &mut watch::Receiver<bool>) {
     loop {
@@ -258,11 +299,9 @@ impl WalletManager {
         self.live_start_with(None).await
     }
 
-    pub(crate) async fn live_start_with(
-        &self,
-        timings: Option<crate::watch::Timings>,
-    ) -> CoreResult<LiveEvents> {
+    pub(crate) async fn live_start_with(&self, timings: Option<Timings>) -> CoreResult<LiveEvents> {
         let (config, wallets, applied) = self.watch_setup().await;
+        let pace = timings.unwrap_or_else(|| Timings::of(&config));
         let (watch, changes) = LiveWatch::start_with(config.clone(), wallets.clone(), timings);
         let (halt, halted) = watch::channel(false);
         let (events, receiver) = mpsc::channel(EVENT_QUEUE);
@@ -276,7 +315,7 @@ impl WalletManager {
         if let Some(previous) = previous {
             previous.stop();
         }
-        tokio::spawn(self.clone().relay(changes, events, halted));
+        tokio::spawn(self.clone().relay(changes, events, halted, pace));
         // Whatever changed between the reading above and now.
         self.live_refresh().await;
         Ok(LiveEvents { events: receiver })
@@ -445,12 +484,15 @@ impl WalletManager {
         mut changes: WatchEvents,
         events: mpsc::Sender<LiveEvent>,
         mut halted: watch::Receiver<bool>,
+        pace: Timings,
     ) {
         let permits = Arc::new(Semaphore::new(SYNCS_AT_ONCE));
         let mut syncs: JoinSet<Synced> = JoinSet::new();
-        let mut wallet_of: HashMap<tokio::task::Id, String> = HashMap::new();
+        // The wallet of each sync, and what that sync was asked for.
+        let mut wallet_of: HashMap<tokio::task::Id, (String, Asked)> = HashMap::new();
         // A wallet with a sync under way, and what was asked of it since.
         let mut again: HashMap<String, Option<Asked>> = HashMap::new();
+        let mut futile = Futile::default();
         // The loop waits on its own copy: the ones below hand theirs to
         // what they call.
         let mut stop = halted.clone();
@@ -472,12 +514,15 @@ impl WalletManager {
                                 Some(next) => *next = Some(next.map_or(asked, |n| n.and(asked))),
                                 None => {
                                     again.insert(wallet_id.clone(), None);
+                                    let hold = futile.hold(&wallet_id, asked, &pace);
                                     let task = syncs.spawn(self.clone().live_sync(
                                         wallet_id.clone(),
                                         asked,
                                         permits.clone(),
+                                        hold,
+                                        pace.retries,
                                     ));
-                                    wallet_of.insert(task.id(), wallet_id);
+                                    wallet_of.insert(task.id(), (wallet_id, asked));
                                 }
                             }
                             continue;
@@ -494,20 +539,33 @@ impl WalletManager {
                         Ok((task, outcome)) => (task, outcome),
                         Err(error) => (error.id(), Err("the sync stopped unexpectedly".to_owned())),
                     };
-                    let Some(wallet_id) = wallet_of.remove(&task) else {
+                    let Some((wallet_id, asked)) = wallet_of.remove(&task) else {
                         continue;
                     };
+                    // Before the news is claimed and handed out below.
+                    let found = match &outcome {
+                        Ok(report) => {
+                            !report.new_txs.is_empty()
+                                || !report.confirmed_txs.is_empty()
+                                || self.news_waiting(&wallet_id).await > 0
+                        }
+                        Err(_) => false,
+                    };
+                    futile.settle(&wallet_id, asked, found);
                     if !self.announce(&wallet_id, outcome, &events, &mut halted).await {
                         break;
                     }
                     if let Some(Some(next)) = again.remove(&wallet_id) {
                         again.insert(wallet_id.clone(), None);
+                        let hold = futile.hold(&wallet_id, next, &pace);
                         let task = syncs.spawn(self.clone().live_sync(
                             wallet_id.clone(),
                             next,
                             permits.clone(),
+                            hold,
+                            pace.retries,
                         ));
-                        wallet_of.insert(task.id(), wallet_id);
+                        wallet_of.insert(task.id(), (wallet_id, next));
                     }
                 }
             }
@@ -572,8 +630,22 @@ impl WalletManager {
         }
     }
 
-    /// The sync a change asked for, run under one of the permits.
-    async fn live_sync(self, wallet_id: String, asked: Asked, permits: Arc<Semaphore>) -> Synced {
+    /// The sync a change asked for, run under one of the permits once
+    /// `hold` has passed. When a pushed change found nothing, it is run
+    /// again after each of `retries`: with the automatic backend the
+    /// push comes from one server and the sync reads another, which may
+    /// hear of the transaction a moment later.
+    async fn live_sync(
+        self,
+        wallet_id: String,
+        asked: Asked,
+        permits: Arc<Semaphore>,
+        hold: Duration,
+        retries: [Duration; 2],
+    ) -> Synced {
+        if !hold.is_zero() {
+            tokio::time::sleep(hold).await;
+        }
         let sync = async || {
             let _permit = permits.acquire().await;
             if asked.rescan {
@@ -583,7 +655,7 @@ impl WalletManager {
             }
         };
         let mut outcome = sync().await;
-        for delay in RETRIES {
+        for delay in retries {
             let found_nothing = matches!(
                 &outcome,
                 Ok(report) if report.new_txs.is_empty() && report.confirmed_txs.is_empty()

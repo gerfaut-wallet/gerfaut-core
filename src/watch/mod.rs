@@ -237,10 +237,20 @@ pub(crate) struct Timings {
     pub poll: Duration,
     /// While polling, how often push is tried again.
     pub reprobe: Duration,
+    /// For the live alerts ([`crate::live`]): the delays after which a
+    /// sync that found nothing behind a pushed change is run again. The
+    /// push may come from one server and the sync read another, which
+    /// hears of the transaction a moment later.
+    pub retries: [Duration; 2],
+    /// For the live alerts too: the first wait put before the sync of a
+    /// wallet whose pushed changes the syncs keep finding nothing
+    /// behind, doubled each time after, up to `hold_cap`.
+    pub hold: Duration,
+    pub hold_cap: Duration,
 }
 
 impl Timings {
-    fn of(config: &WatchConfig) -> Self {
+    pub(crate) fn of(config: &WatchConfig) -> Self {
         let keepalive = config.keepalive_secs.unwrap_or(240).clamp(30, 540);
         Timings {
             quiet: Duration::from_millis(600),
@@ -255,6 +265,9 @@ impl Timings {
             tor_connect: Duration::from_secs(60),
             poll: Duration::from_secs(60),
             reprobe: Duration::from_secs(30 * 60),
+            retries: [Duration::from_secs(3), Duration::from_secs(10)],
+            hold: Duration::from_secs(30),
+            hold_cap: Duration::from_secs(10 * 60),
         }
     }
 }

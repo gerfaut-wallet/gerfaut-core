@@ -39,7 +39,9 @@ The first release: the library both Gerfaut apps are built on.
   Esplora is polled once a minute, 240 requests an hour at most. The
   connection takes the route a sync takes: Tor for an onion host, and never
   around it, with the same certificate checks. The server learns what a sync
-  already tells it, plus how long the app stays connected.
+  already tells it, plus how long the app stays connected. When a server
+  keeps reporting changes that no sync can find, each sync it asks for
+  waits longer than the last, up to ten minutes.
 - A sync report lists the transactions it saw confirm, next to the ones it
   saw for the first time, so an app can announce both.
 - Live alerts on the wallet manager. It starts the watch, syncs the wallet

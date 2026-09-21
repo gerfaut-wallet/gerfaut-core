@@ -167,6 +167,9 @@ fn timings() -> crate::watch::Timings {
         tor_connect: Duration::from_secs(5),
         poll: Duration::from_millis(100),
         reprobe: Duration::from_secs(3600),
+        retries: [Duration::from_millis(20), Duration::from_millis(50)],
+        hold: Duration::from_millis(100),
+        hold_cap: Duration::from_millis(400),
     }
 }
 
@@ -269,6 +272,114 @@ async fn an_opening_sync_racing_the_catch_up_announces_once() {
         );
         manager.live_stop().await;
     }
+}
+
+// --- a server that forges changes ---------------------------------------------
+
+/// The next sync of `wallet` the watch hands out, and how long it took
+/// to come.
+async fn next_sync(events: &mut LiveEvents, wallet: &str) -> (SyncReport, Duration) {
+    let started = std::time::Instant::now();
+    loop {
+        match tokio::time::timeout(WAIT, events.next()).await {
+            Ok(Some(LiveEvent::WalletSynced { report })) if report.wallet_id == wallet => {
+                return (report, started.elapsed());
+            }
+            Ok(Some(LiveEvent::SyncFailed { message, .. })) => panic!("the sync failed: {message}"),
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the watch stopped"),
+            Err(_) => panic!("no sync within {WAIT:?}"),
+        }
+    }
+}
+
+/// Past two pushed changes in a row that a sync found nothing behind,
+/// the next one waits, twice as long each time, up to the cap. Blocks,
+/// reconnections and starts never wait, nor does another wallet, and a
+/// sync that finds something ends the wait.
+#[test]
+fn a_change_no_sync_finds_is_heard_less_and_less_often() {
+    let second = Duration::from_secs(1);
+    let pace = crate::watch::Timings {
+        hold: second,
+        hold_cap: second * 5,
+        ..timings()
+    };
+    let pushed = Asked {
+        reason: ChangeReason::Activity,
+        rescan: false,
+    };
+    let block = Asked {
+        reason: ChangeReason::NewBlock,
+        rescan: false,
+    };
+    let mut futile = Futile::default();
+    for _ in 0..FREE_FUTILE {
+        assert_eq!(futile.hold("w", pushed, &pace), Duration::ZERO);
+        futile.settle("w", pushed, false);
+    }
+    let holds: Vec<Duration> = (0..5)
+        .map(|_| {
+            let hold = futile.hold("w", pushed, &pace);
+            futile.settle("w", pushed, false);
+            hold
+        })
+        .collect();
+    assert_eq!(holds, [1, 2, 4, 5, 5].map(|n| second * n));
+    assert_eq!(futile.hold("w", block, &pace), Duration::ZERO);
+    assert_eq!(futile.hold("other", pushed, &pace), Duration::ZERO);
+    // A block that finds nothing is no claim of the server's.
+    futile.settle("w", block, false);
+    assert_eq!(futile.hold("w", pushed, &pace), second * 5);
+    futile.settle("w", block, true);
+    assert_eq!(futile.hold("w", pushed, &pace), Duration::ZERO);
+}
+
+/// A server forges a new status for the watched address again and
+/// again, where nothing moved. The first two are synced at once, the
+/// next ones wait longer and longer, and a payment that does arrive is
+/// still announced.
+#[tokio::test]
+async fn a_server_that_forges_changes_is_heard_less_and_less() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), server.backend()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    let hold = Duration::from_secs(1);
+    let pace = crate::watch::Timings {
+        hold,
+        hold_cap: hold * 2,
+        ..timings()
+    };
+    let mut events = manager.live_start_with(Some(pace)).await.unwrap();
+    assert!(caught_up(&mut events, &wallet).await.is_empty());
+
+    let mut forged = 0u32;
+    let mut forge = || {
+        forged += 1;
+        server.set_status(ADDRESS_SCRIPT, &format!("forged {forged}"));
+    };
+    for _ in 0..FREE_FUTILE {
+        forge();
+        let (report, _) = next_sync(&mut events, &wallet).await;
+        assert!(report.new_txs.is_empty());
+    }
+    forge();
+    let (_, waited) = next_sync(&mut events, &wallet).await;
+    assert!(waited >= hold, "{waited:?}");
+    forge();
+    let (_, waited) = next_sync(&mut events, &wallet).await;
+    assert!(waited >= hold * 2, "{waited:?}");
+
+    let payment = transaction(&[nowhere(3, 0)], &[(ADDRESS_SCRIPT, 7_000)]);
+    server.add_tx(&payment);
+    server.set_history(ADDRESS_SCRIPT, &[(payment.compute_txid(), 0)]);
+    server.set_status(ADDRESS_SCRIPT, "paid");
+    assert_eq!(
+        staged(&caught_up(&mut events, &wallet).await),
+        [(payment.compute_txid().to_string(), TxStage::Mempool)]
+    );
+    manager.live_stop().await;
 }
 
 // --- replacements ---------------------------------------------------------------
