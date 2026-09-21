@@ -116,7 +116,9 @@ The first release: the library both Gerfaut apps are built on.
   a vault or a backup holds from before that is read the same way: a sync
   puts it in stored form before it connects, a restore stores it in that
   form, and one that cannot be read is refused by the sync and left out by
-  the restore.
+  the restore. The certificate check of an Electrum server, which can run
+  on an address before it is saved, also reads `ssl://[x.onion]:50002` as
+  the onion it names and never sends that name to the resolver.
 - A SLIP-132 key inside a descriptor is held to what its prefix says: a
   `zpub` under `pkh()`, a `ypub` under `wpkh()` or a `Zpub` in a single-key
   descriptor is refused, naming both the prefix and the function, since a

@@ -296,6 +296,16 @@ pub(crate) fn too_long(limit: usize) -> String {
 /// A connected client.
 pub(crate) type Connection = RawClient<Guarded>;
 
+/// Whether this server is a hidden service: by the URL parser, and by
+/// the host [`parse`] reads out of the address, which is the name a
+/// connection would hand the resolver. The two agree on every address
+/// stored the way the settings store it. One typed as
+/// `ssl://[x.onion]:50002`, which the URL parser gives up on and
+/// [`parse`] reads as `x.onion`, is still an onion.
+fn is_onion(target: &Target, host: &str) -> bool {
+    crate::chain::is_onion(&target.url) || crate::chain::is_onion_host(host)
+}
+
 /// Opens the connection. `proxy` is the Tor SOCKS proxy the caller
 /// resolved for onion servers; an onion address without one is refused
 /// before anything could look the name up.
@@ -311,7 +321,7 @@ fn connect(
     // circuit proves the endpoint holds it. A certificate on top adds
     // encryption inside an encrypted tunnel and authenticates nothing,
     // so it is not what is trusted here — the address is.
-    let stream: Box<dyn Stream> = if crate::chain::is_onion(&target.url) {
+    let stream: Box<dyn Stream> = if is_onion(target, &host) {
         let proxy =
             proxy.ok_or_else(|| ConnectError::Io(crate::chain::tor::no_route(&target.url)))?;
         // The embedded proxy asks for credentials; the SOCKS client
@@ -416,7 +426,7 @@ fn call_deadline(target: &Target) -> Duration {
 /// What the settings screen shows about this server's certificate.
 pub(crate) fn inspect_blocking(target: &Target) -> Result<Inspection, String> {
     let (tls_wanted, host, port) = parse(&target.url)?;
-    if crate::chain::is_onion(&target.url) {
+    if is_onion(target, &host) {
         return Ok(Inspection::Tor);
     }
     if !tls_wanted {
@@ -1025,6 +1035,22 @@ mod tests {
         // And without a route, the connection is refused before the
         // name could reach a resolver, whatever the case.
         let error = connect(&Target::new(shouted, None), None, &Arc::default())
+            .err()
+            .map(|e| e.to_string())
+            .expect("no route, no connection");
+        assert!(error.starts_with("tor: "), "{error}");
+    }
+
+    /// An onion in brackets is no address the URL parser reads, and the
+    /// Electrum reading of it names the onion all the same: it is taken
+    /// for one, inspected as one and never handed to a resolver.
+    #[test]
+    fn an_onion_in_brackets_is_still_an_onion() {
+        const ONION: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz234567";
+        let bracketed = Target::new(format!("ssl://[{ONION}.onion]:50002"), None);
+        assert!(!crate::chain::is_onion(&bracketed.url));
+        assert_eq!(inspect_blocking(&bracketed).unwrap(), Inspection::Tor);
+        let error = connect(&bracketed, None, &Arc::default())
             .err()
             .map(|e| e.to_string())
             .expect("no route, no connection");

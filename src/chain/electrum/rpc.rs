@@ -82,7 +82,7 @@ impl Connection {
     /// it, and an onion host without one is refused before any socket.
     pub(crate) async fn open(target: &Target, proxy: Option<&str>) -> Result<Self, String> {
         let (tls, host, port) = parse(&target.url)?;
-        let onion = crate::chain::is_onion(&target.url);
+        let onion = super::is_onion(target, &host);
         let timeout = if onion { TOR_TIMEOUT } else { TIMEOUT };
         let security = if tls {
             Security::Electrum {
