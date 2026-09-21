@@ -225,10 +225,15 @@ impl LineTooLong {
 
 /// Reads lines off a stream, never holding more than `limit` bytes of
 /// one: a server that sends a line without an end is cut off, not
-/// buffered. Cancel safe: what was read stays here between calls.
+/// buffered. Each byte is moved once whatever the lines are cut into:
+/// a server that sends a flood of empty lines costs their length, not
+/// its square. Cancel safe: what was read stays here between calls.
 pub(crate) struct LineReader<R> {
     inner: R,
     buffer: Vec<u8>,
+    /// Where the next line starts in `buffer`.
+    start: usize,
+    /// Where the search for its end goes on.
     scanned: usize,
     limit: usize,
 }
@@ -238,6 +243,7 @@ impl<R: AsyncRead + Unpin> LineReader<R> {
         LineReader {
             inner,
             buffer: Vec::new(),
+            start: 0,
             scanned: 0,
             limit,
         }
@@ -248,14 +254,18 @@ impl<R: AsyncRead + Unpin> LineReader<R> {
         loop {
             if let Some(offset) = self.buffer[self.scanned..].iter().position(|b| *b == b'\n') {
                 let end = self.scanned + offset;
-                let mut line: Vec<u8> = self.buffer.drain(..=end).collect();
-                line.pop();
+                let mut line = self.buffer[self.start..end].to_vec();
                 if line.last() == Some(&b'\r') {
                     line.pop();
                 }
-                self.scanned = 0;
+                self.start = end + 1;
+                self.scanned = self.start;
                 return Ok(Some(line));
             }
+            // No line end in what is held: the lines already handed out
+            // go, once, before more is read.
+            self.buffer.drain(..self.start);
+            self.start = 0;
             self.scanned = self.buffer.len();
             if self.buffer.len() > self.limit {
                 return Err(std::io::Error::new(
@@ -363,5 +373,31 @@ mod tests {
         assert_eq!(lines.next_line().await.unwrap().unwrap(), b"three");
         writer.write_all(&vec![b'x'; 8192]).await.unwrap();
         assert!(lines.next_line().await.is_err());
+    }
+
+    /// Many lines in one read come out one by one, whole, in order, the
+    /// last one completed by the next read; what was handed out is not
+    /// held against the limit.
+    #[tokio::test]
+    async fn many_lines_in_one_read_come_out_in_order() {
+        let (mut writer, reader) = tokio::io::duplex(1 << 20);
+        let mut lines = LineReader::new(reader, 64);
+        let mut sent = Vec::new();
+        for n in 0..20_000u32 {
+            sent.extend_from_slice(format!("{n}\n").as_bytes());
+        }
+        sent.extend_from_slice(b"\r\npart");
+        writer.write_all(&sent).await.unwrap();
+        for n in 0..20_000u32 {
+            assert_eq!(
+                lines.next_line().await.unwrap().unwrap(),
+                n.to_string().as_bytes()
+            );
+        }
+        assert_eq!(lines.next_line().await.unwrap().unwrap(), b"");
+        writer.write_all(b"ial\n").await.unwrap();
+        assert_eq!(lines.next_line().await.unwrap().unwrap(), b"partial");
+        drop(writer);
+        assert!(lines.next_line().await.unwrap().is_none());
     }
 }
