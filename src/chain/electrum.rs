@@ -31,6 +31,9 @@ use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncReque
 
 use super::tls::{self, ConnectError, Verdict};
 
+pub(crate) mod address;
+pub(crate) mod rpc;
+
 /// Requests per Electrum batch call.
 const BATCH_SIZE: usize = 10;
 /// Socket timeout, each read and each write. Without it a stalled

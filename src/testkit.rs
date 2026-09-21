@@ -14,6 +14,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+use bdk_wallet::bitcoin::consensus::encode::serialize_hex;
+use bdk_wallet::bitcoin::{OutPoint, Transaction, Txid};
+
 use crate::chain::BackendConfig;
 
 /// A P2WPKH script over twenty bytes of `n`: nobody's key.
@@ -34,6 +37,66 @@ pub(crate) fn scripthash(script_hex: &str) -> String {
 
 // --- a fake Electrum server -------------------------------------------------
 
+/// How the fake answers one request.
+enum Answer {
+    Line(Value),
+    /// The start of an answer, and nothing more.
+    Stall,
+    /// Bytes without a line end.
+    Flood(usize),
+}
+
+/// A block header at `height`, in hex, whose time is 1 700 000 000 plus
+/// the height: made up, and enough for what reads a time off it.
+pub(crate) fn header_at(height: u32) -> String {
+    use bdk_wallet::bitcoin::block::{Header, Version};
+    use bdk_wallet::bitcoin::hashes::Hash;
+    use bdk_wallet::bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+    serialize_hex(&Header {
+        version: Version::TWO,
+        prev_blockhash: BlockHash::all_zeros(),
+        merkle_root: TxMerkleNode::all_zeros(),
+        time: 1_700_000_000 + height,
+        bits: CompactTarget::from_consensus(0x207f_ffff),
+        nonce: 0,
+    })
+}
+
+/// A transaction spending `inputs` to `outputs`, each a script in hex
+/// and an amount. Nothing in it comes from a key: no signature, no
+/// witness, only what anyone can write.
+pub(crate) fn transaction(inputs: &[OutPoint], outputs: &[(&str, u64)]) -> Transaction {
+    use bdk_wallet::bitcoin::absolute::LockTime;
+    use bdk_wallet::bitcoin::transaction::Version;
+    use bdk_wallet::bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+    Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: inputs
+            .iter()
+            .map(|outpoint| TxIn {
+                previous_output: *outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            })
+            .collect(),
+        output: outputs
+            .iter()
+            .map(|(script, sats)| TxOut {
+                value: Amount::from_sat(*sats),
+                script_pubkey: ScriptBuf::from_hex(script).unwrap(),
+            })
+            .collect(),
+    }
+}
+
+/// An outpoint of a transaction nobody has: `n` repeated as its txid.
+pub(crate) fn nowhere(n: u8, vout: u32) -> OutPoint {
+    use bdk_wallet::bitcoin::hashes::Hash;
+    OutPoint::new(Txid::from_byte_array([n; 32]), vout)
+}
+
 #[derive(Default)]
 pub(crate) struct ElectrumState {
     pub statuses: HashMap<String, Option<String>>,
@@ -43,6 +106,25 @@ pub(crate) struct ElectrumState {
     pub unsubscribed: Vec<String>,
     pub silent: bool,
     pub version: &'static str,
+    /// Histories by script hash: txid and height, oldest first, 0 for
+    /// the mempool, the way servers list them.
+    pub histories: HashMap<String, Vec<(Txid, i64)>>,
+    /// Coins by script hash: txid, output, height and value.
+    pub unspent: HashMap<String, Vec<(Txid, u32, i64, u64)>>,
+    /// Transactions by txid, in hex. A txid may be made to answer with
+    /// another transaction's bytes.
+    pub txs: HashMap<Txid, String>,
+    /// Methods answered with this error message instead.
+    pub refuse: HashMap<&'static str, String>,
+    /// A method whose answer starts and never ends: the connection
+    /// answers nothing more after it.
+    pub stall: Option<&'static str>,
+    /// A method answered with this many bytes and no line end.
+    pub flood: Option<(&'static str, usize)>,
+    /// Every method asked for, in order, over every connection.
+    pub asked: Vec<String>,
+    /// Connections the client closed.
+    pub closed: usize,
 }
 
 #[derive(Clone)]
@@ -80,34 +162,33 @@ impl FakeElectrum {
             state.connections.push((Vec::new(), push));
             state.connections.len() - 1
         };
+        let mut stalled = false;
         loop {
             tokio::select! {
                 line = lines.next_line() => {
-                    let Ok(Some(line)) = line else { return };
+                    let Ok(Some(line)) = line else {
+                        state.lock().unwrap().closed += 1;
+                        return;
+                    };
                     let request: Value = serde_json::from_str(&line).unwrap();
-                    let result = {
+                    let method = request["method"].as_str().unwrap().to_owned();
+                    let answer = {
                         let mut state = state.lock().unwrap();
-                        if state.silent {
+                        state.asked.push(method.clone());
+                        if state.silent || stalled {
                             continue;
                         }
-                        match request["method"].as_str().unwrap() {
-                            "server.version" => json!(["fake 1.0", state.version]),
-                            "blockchain.headers.subscribe" => json!({ "height": state.height, "hex": "00" }),
-                            "blockchain.scripthash.subscribe" => {
-                                let scripthash = request["params"][0].as_str().unwrap().to_owned();
-                                state.connections[index].0.push(scripthash.clone());
-                                json!(state.statuses.get(&scripthash).cloned().flatten())
-                            }
-                            "blockchain.scripthash.unsubscribe" => {
-                                let scripthash = request["params"][0].as_str().unwrap().to_owned();
-                                state.unsubscribed.push(scripthash);
-                                json!(true)
-                            }
-                            _ => Value::Null,
-                        }
+                        Self::answer(&mut state, index, &request, &method)
                     };
-                    let answer = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result });
-                    if writer.write_all(format!("{answer}\n").as_bytes()).await.is_err() {
+                    let bytes = match answer {
+                        Answer::Line(answer) => format!("{answer}\n").into_bytes(),
+                        Answer::Stall => {
+                            stalled = true;
+                            format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":", request["id"]).into_bytes()
+                        }
+                        Answer::Flood(size) => vec![b'x'; size],
+                    };
+                    if writer.write_all(&bytes).await.is_err() {
                         return;
                     }
                 }
@@ -122,6 +203,97 @@ impl FakeElectrum {
                 },
             }
         }
+    }
+
+    fn answer(state: &mut ElectrumState, index: usize, request: &Value, method: &str) -> Answer {
+        if state.stall == Some(method) {
+            return Answer::Stall;
+        }
+        if let Some((flooded, size)) = state.flood
+            && flooded == method
+        {
+            return Answer::Flood(size);
+        }
+        let id = &request["id"];
+        let refusal = |message: &str| {
+            Answer::Line(json!({
+                "jsonrpc": "2.0", "id": id, "error": { "code": 1, "message": message },
+            }))
+        };
+        if let Some(message) = state.refuse.get(method) {
+            return refusal(message);
+        }
+        let param = request["params"][0].clone();
+        let scripthash = param.as_str().unwrap_or_default().to_owned();
+        let result = match method {
+            "server.version" => json!(["fake 1.0", state.version]),
+            "blockchain.headers.subscribe" => json!({ "height": state.height, "hex": "00" }),
+            "blockchain.scripthash.subscribe" => {
+                state.connections[index].0.push(scripthash.clone());
+                json!(state.statuses.get(&scripthash).cloned().flatten())
+            }
+            "blockchain.scripthash.unsubscribe" => {
+                state.unsubscribed.push(scripthash);
+                json!(true)
+            }
+            "blockchain.scripthash.get_history" => Value::Array(
+                state
+                    .histories
+                    .get(&scripthash)
+                    .into_iter()
+                    .flatten()
+                    .map(|(txid, height)| json!({ "tx_hash": txid.to_string(), "height": height }))
+                    .collect(),
+            ),
+            "blockchain.scripthash.listunspent" => Value::Array(
+                state
+                    .unspent
+                    .get(&scripthash)
+                    .into_iter()
+                    .flatten()
+                    .map(|(txid, vout, height, value)| {
+                        json!({ "tx_hash": txid.to_string(), "tx_pos": vout, "height": height, "value": value })
+                    })
+                    .collect(),
+            ),
+            "blockchain.transaction.get" => {
+                let found = param
+                    .as_str()
+                    .and_then(|txid| txid.parse::<Txid>().ok())
+                    .and_then(|txid| state.txs.get(&txid).cloned());
+                match found {
+                    Some(hex) => json!(hex),
+                    None => return refusal("No such mempool or blockchain transaction"),
+                }
+            }
+            "blockchain.block.header" => json!(header_at(param.as_u64().unwrap_or(0) as u32)),
+            _ => Value::Null,
+        };
+        Answer::Line(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+    }
+
+    pub(crate) fn add_tx(&self, tx: &Transaction) {
+        self.state
+            .lock()
+            .unwrap()
+            .txs
+            .insert(tx.compute_txid(), serialize_hex(tx));
+    }
+
+    pub(crate) fn set_history(&self, script_hex: &str, history: &[(Txid, i64)]) {
+        self.state
+            .lock()
+            .unwrap()
+            .histories
+            .insert(scripthash(script_hex), history.to_vec());
+    }
+
+    pub(crate) fn set_unspent(&self, script_hex: &str, coins: &[(Txid, u32, i64, u64)]) {
+        self.state
+            .lock()
+            .unwrap()
+            .unspent
+            .insert(scripthash(script_hex), coins.to_vec());
     }
 
     pub(crate) fn backend(&self) -> BackendConfig {

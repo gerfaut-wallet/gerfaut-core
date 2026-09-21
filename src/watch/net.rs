@@ -1,6 +1,7 @@
-//! The sockets of the live watcher: TCP, the Tor proxy in front of it
-//! when the host is a hidden service, and TLS on top when the address
-//! asks for it.
+//! The sockets of the live watcher, and of the Electrum client that
+//! reads a single address ([`crate::chain::electrum::rpc`]): TCP, the
+//! Tor proxy in front of it when the host is a hidden service, and TLS
+//! on top when the address asks for it.
 //!
 //! A sync opens its connections through `reqwest` and `electrum-client`.
 //! Neither can hold a socket open and wait on it, so the watcher opens
@@ -200,6 +201,28 @@ fn describe_io(error: &std::io::Error) -> String {
     }
 }
 
+/// What [`LineReader`] fails with when a line runs past its limit,
+/// inside the `io::Error`, so a caller can tell it from a failure of
+/// the connection.
+#[derive(Debug)]
+pub(crate) struct LineTooLong;
+
+impl std::fmt::Display for LineTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the server sent a line without an end")
+    }
+}
+
+impl std::error::Error for LineTooLong {}
+
+impl LineTooLong {
+    pub(crate) fn is(error: &std::io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<LineTooLong>())
+    }
+}
+
 /// Reads lines off a stream, never holding more than `limit` bytes of
 /// one: a server that sends a line without an end is cut off, not
 /// buffered. Cancel safe: what was read stays here between calls.
@@ -235,8 +258,9 @@ impl<R: AsyncRead + Unpin> LineReader<R> {
             }
             self.scanned = self.buffer.len();
             if self.buffer.len() > self.limit {
-                return Err(std::io::Error::other(
-                    "the server sent a line without an end",
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    LineTooLong,
                 ));
             }
             let mut chunk = [0u8; 4096];

@@ -350,10 +350,8 @@ pub(crate) async fn sync_engine(
 }
 
 /// Fetches the state of a single watched address from one endpoint,
-/// within the deadline of a scan.
-///
-/// Only Esplora backends can serve this today; an Electrum endpoint is
-/// reported as unavailable with an actionable message.
+/// within the deadline of a scan: the same state from an Esplora or an
+/// Electrum server.
 pub(crate) async fn fetch_address_state(
     endpoint: &Endpoint,
     address: &str,
@@ -369,9 +367,13 @@ pub(crate) async fn fetch_address_state(
             )
             .await
         }
-        Endpoint::Electrum(_) => Err("single-address wallets need an Esplora backend for now; \
-             switch the backend or import a descriptor"
-            .to_owned()),
+        Endpoint::Electrum(target) => {
+            within(
+                scan_deadline(endpoint),
+                electrum::address::fetch_state(target, address, network, proxy),
+            )
+            .await
+        }
     }
 }
 
@@ -524,8 +526,13 @@ pub(crate) async fn fetch_address_history(
             )
             .await
         }
-        Endpoint::Electrum(_) => Err("single-address wallets need an Esplora backend for now;              switch the backend or import a descriptor"
-            .to_owned()),
+        Endpoint::Electrum(target) => {
+            within(
+                scan_deadline(endpoint),
+                electrum::address::fetch_history(target, address, network, from, proxy),
+            )
+            .await
+        }
     }
 }
 

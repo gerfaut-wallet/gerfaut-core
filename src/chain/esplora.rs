@@ -247,6 +247,7 @@ fn find_cause<'e>(
 
 /// One round of address history: the transactions fetched and, when
 /// older ones remain, the cursor to continue from.
+#[derive(Debug)]
 pub(crate) struct HistoryRound {
     pub txs: Vec<AddressTx>,
     /// Txid to pass as `from` to fetch the next round; `None` when the
@@ -321,7 +322,7 @@ pub(crate) async fn fetch_address_history(
     history_round(client, &address, &our_script, network, Some(from), None).await
 }
 
-fn parse_address(address: &str, network: Network) -> Result<Address, String> {
+pub(crate) fn parse_address(address: &str, network: Network) -> Result<Address, String> {
     address
         .parse::<Address<_>>()
         .map_err(|e| format!("invalid address: {e}"))?
@@ -464,7 +465,10 @@ fn to_address_tx(
     }
 }
 
-fn script_address(script: &bdk_wallet::bitcoin::ScriptBuf, network: Network) -> Option<String> {
+pub(crate) fn script_address(
+    script: &bdk_wallet::bitcoin::ScriptBuf,
+    network: Network,
+) -> Option<String> {
     Address::from_script(script, network.to_bitcoin())
         .ok()
         .map(|a| a.to_string())
