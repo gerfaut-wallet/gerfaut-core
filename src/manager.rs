@@ -504,6 +504,7 @@ impl WalletManager {
                     return Err(CoreError::WalletNotFound(id.to_owned()));
                 }
                 payload.unclaimed.retain(|news| news.wallet_id != id);
+                payload.announced.retain(|told| told.wallet_id != id);
                 let premium = &mut payload.settings.premium;
                 if premium.has_key() && premium.is_consented(id) {
                     premium.queue_unwatch(id);

@@ -48,7 +48,8 @@ The first release: the library both Gerfaut apps are built on.
   saw for the first time, so an app can announce both.
 - Live alerts on the wallet manager. It starts the watch, syncs the wallet
   that moved, and hands out each transaction to announce once when it
-  enters the mempool and once when it confirms. A fee bump is not
+  enters the mempool and once when it confirms. A payment from one watched
+  wallet to another is announced for each of them. A fee bump is not
   announced again. A replacement that pays the wallet much less, or sends
   much more out, gets its own alert for what it moves. An incoming payment
   already announced as pending is announced as dropped when it leaves the

@@ -130,8 +130,21 @@ pub enum TxStage {
 /// [`crate::WalletManager::claim_announcements`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Announced {
+    /// The wallet it was made for: a transaction between two watched
+    /// wallets is news for each. Empty in a record written before
+    /// announcements were kept by wallet, which then stands for every
+    /// wallet, so that nothing it covered is said again.
+    #[serde(default)]
+    pub wallet_id: String,
     pub txid: String,
     pub stage: TxStage,
+}
+
+impl Announced {
+    /// Whether this record covers an announcement for this wallet.
+    pub(crate) fn covers(&self, wallet_id: &str) -> bool {
+        self.wallet_id.is_empty() || self.wallet_id == wallet_id
+    }
 }
 
 /// A transaction a sync found worth announcing, kept until a caller

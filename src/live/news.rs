@@ -11,6 +11,11 @@
 //! sync's result with nothing listed as new, never swallows a
 //! transaction. It waits in the vault for the next claim.
 //!
+//! News is kept by wallet, and so is the record of what was announced:
+//! a payment from one watched wallet to another is said for each, going
+//! out of the first and coming into the second, once per wallet and
+//! stage. Everything below is read wallet by wallet.
+//!
 //! # Replacements
 //!
 //! A sender who bumps the fee of a payment replaces it with another
@@ -138,18 +143,19 @@ pub(crate) const UNCLAIMED_MAX: usize = 500;
 /// would have it all said the day the alerts are turned on.
 pub(crate) const UNCLAIMED_FOR: u64 = 12 * 3600;
 
-/// Whether this transaction was announced at exactly this stage.
-fn announced_as(payload: &VaultPayload, txid: &str, stage: TxStage) -> bool {
+/// Whether this transaction was announced for this wallet at exactly
+/// this stage.
+fn announced_as(payload: &VaultPayload, wallet_id: &str, txid: &str, stage: TxStage) -> bool {
     payload
         .announced
         .iter()
-        .any(|entry| entry.txid == txid && entry.stage == stage)
+        .any(|entry| entry.covers(wallet_id) && entry.txid == txid && entry.stage == stage)
 }
 
 /// Whether this transaction is announced at the mempool stage, or
 /// waiting to be, for this wallet.
 fn pending_said(payload: &VaultPayload, wallet_id: &str, txid: &str) -> bool {
-    announced_as(payload, txid, TxStage::Mempool)
+    announced_as(payload, wallet_id, txid, TxStage::Mempool)
         || payload.unclaimed.iter().any(|entry| {
             entry.wallet_id == wallet_id && entry.txid == txid && entry.stage == TxStage::Mempool
         })
@@ -183,6 +189,7 @@ fn replace(payload: &mut VaultPayload, wallet_id: &str, replaced: &Seen, by: &Se
         None => remember(
             payload,
             [Announced {
+                wallet_id: wallet_id.to_owned(),
                 txid: by.txid.clone(),
                 stage: TxStage::Mempool,
             }],
@@ -190,12 +197,13 @@ fn replace(payload: &mut VaultPayload, wallet_id: &str, replaced: &Seen, by: &Se
     }
 }
 
-/// Whether this transaction was announced at this stage already. A
-/// confirmation announced covers its arrival too: nobody is told a
-/// transaction is pending after being told it confirmed.
-pub(crate) fn told(payload: &VaultPayload, txid: &str, stage: TxStage) -> bool {
+/// Whether this transaction was announced for this wallet at this stage
+/// already. A confirmation announced covers its arrival too: nobody is
+/// told a transaction is pending after being told it confirmed.
+pub(crate) fn told(payload: &VaultPayload, wallet_id: &str, txid: &str, stage: TxStage) -> bool {
     payload.announced.iter().any(|entry| {
-        entry.txid == txid
+        entry.covers(wallet_id)
+            && entry.txid == txid
             && (entry.stage == stage
                 || (stage == TxStage::Mempool && entry.stage == TxStage::Confirmed))
     })
@@ -220,7 +228,7 @@ pub(crate) fn push(
     stage: TxStage,
     now: u64,
 ) {
-    if told(payload, txid, stage) {
+    if told(payload, wallet_id, txid, stage) {
         return;
     }
     let waiting = payload.unclaimed.iter().any(|entry| {
@@ -307,8 +315,8 @@ pub(crate) fn record(
         if unsay_arrival(payload, wallet_id, &old.txid) {
             continue;
         }
-        let said_pending = announced_as(payload, &old.txid, TxStage::Mempool)
-            && !announced_as(payload, &old.txid, TxStage::Confirmed);
+        let said_pending = announced_as(payload, wallet_id, &old.txid, TxStage::Mempool)
+            && !announced_as(payload, wallet_id, &old.txid, TxStage::Confirmed);
         if !said_pending || old.net_sats <= 0 {
             continue;
         }
@@ -352,7 +360,8 @@ pub(crate) fn claim(
             return true;
         }
         let already = announced.iter().any(|told| {
-            told.txid == entry.txid
+            told.covers(wallet_id)
+                && told.txid == entry.txid
                 && (told.stage == entry.stage
                     || (entry.stage == TxStage::Mempool && told.stage == TxStage::Confirmed))
         });
@@ -369,6 +378,7 @@ pub(crate) fn claim(
     remember(
         payload,
         claimed.iter().map(|tx| Announced {
+            wallet_id: tx.wallet_id.clone(),
             txid: tx.txid.clone(),
             stage: tx.stage,
         }),
@@ -500,6 +510,132 @@ mod tests {
             stages(&claim(&mut payload, "w", 10, NOW)),
             [("pending", TxStage::Confirmed)]
         );
+    }
+
+    /// One watched wallet pays another: the transaction is news for
+    /// each, going out of one and coming into the other, at each stage,
+    /// once per wallet, whichever claims first. If it vanishes, the
+    /// wallet it was paying is told, and only that one.
+    #[test]
+    fn a_transfer_between_two_wallets_is_said_for_each() {
+        let mut payload = VaultPayload::default();
+        let out = seen("t", -40_500, false);
+        let into = seen("t", 40_000, false);
+        record(
+            &mut payload,
+            "a",
+            false,
+            &arrived(std::slice::from_ref(&out)),
+            NOW,
+        );
+        record(
+            &mut payload,
+            "b",
+            false,
+            &arrived(std::slice::from_ref(&into)),
+            NOW,
+        );
+        let said_b = claim(&mut payload, "b", 10, NOW);
+        let said_a = claim(&mut payload, "a", 10, NOW);
+        assert_eq!(stages(&said_a), [("t", TxStage::Mempool)]);
+        assert_eq!(stages(&said_b), [("t", TxStage::Mempool)]);
+        assert_eq!((said_a[0].net_sats, said_b[0].net_sats), (-40_500, 40_000));
+        // Seen again by either: said already, for each.
+        record(
+            &mut payload,
+            "a",
+            false,
+            &arrived(std::slice::from_ref(&out)),
+            NOW,
+        );
+        record(
+            &mut payload,
+            "b",
+            false,
+            &arrived(std::slice::from_ref(&into)),
+            NOW,
+        );
+        assert!(claim(&mut payload, "a", 10, NOW).is_empty());
+        assert!(claim(&mut payload, "b", 10, NOW).is_empty());
+
+        let confirm = |tx: &Seen| Seen {
+            confirmed: true,
+            ..tx.clone()
+        };
+        record(&mut payload, "a", false, &confirmed(&[confirm(&out)]), NOW);
+        assert_eq!(
+            stages(&claim(&mut payload, "a", 10, NOW)),
+            [("t", TxStage::Confirmed)]
+        );
+        record(&mut payload, "b", false, &confirmed(&[confirm(&into)]), NOW);
+        assert_eq!(
+            stages(&claim(&mut payload, "b", 10, NOW)),
+            [("t", TxStage::Confirmed)]
+        );
+        for wallet in ["a", "b"] {
+            record(
+                &mut payload,
+                wallet,
+                false,
+                &confirmed(&[confirm(&out)]),
+                NOW,
+            );
+            assert!(claim(&mut payload, wallet, 10, NOW).is_empty(), "{wallet}");
+        }
+
+        // Another transfer, evicted before it confirms.
+        let mut payload = VaultPayload::default();
+        let out = seen("u", -10_500, false);
+        let into = seen("u", 10_000, false);
+        record(
+            &mut payload,
+            "a",
+            false,
+            &arrived(std::slice::from_ref(&out)),
+            NOW,
+        );
+        record(
+            &mut payload,
+            "b",
+            false,
+            &arrived(std::slice::from_ref(&into)),
+            NOW,
+        );
+        claim(&mut payload, "a", 10, NOW);
+        claim(&mut payload, "b", 10, NOW);
+        let gone = |tx: &Seen| Moves {
+            pending_before: vec![tx.clone()],
+            gone: vec![tx.clone()],
+            ..Moves::default()
+        };
+        record(&mut payload, "a", false, &gone(&out), NOW);
+        record(&mut payload, "b", false, &gone(&into), NOW);
+        assert!(claim(&mut payload, "a", 10, NOW).is_empty());
+        assert_eq!(
+            stages(&claim(&mut payload, "b", 10, NOW)),
+            [("u", TxStage::Dropped)]
+        );
+    }
+
+    /// A record written before announcements were kept by wallet names
+    /// none: it covers every wallet, and nothing it covered is said
+    /// again.
+    #[test]
+    fn a_record_from_before_wallets_covers_every_wallet() {
+        let mut stored = serde_json::to_value(VaultPayload::default()).unwrap();
+        stored["announced"] = serde_json::json!([{ "txid": "old", "stage": "mempool" }]);
+        let mut payload: VaultPayload = serde_json::from_value(stored).unwrap();
+        assert_eq!(payload.announced[0].wallet_id, "");
+        for wallet in ["a", "b"] {
+            record(
+                &mut payload,
+                wallet,
+                false,
+                &arrived(&[seen("old", 1, false)]),
+                NOW,
+            );
+            assert!(claim(&mut payload, wallet, 10, NOW).is_empty(), "{wallet}");
+        }
     }
 
     /// Arrived and confirmed before anyone claimed: said once, as

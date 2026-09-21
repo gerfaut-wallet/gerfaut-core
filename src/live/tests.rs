@@ -274,6 +274,82 @@ async fn an_opening_sync_racing_the_catch_up_announces_once() {
     }
 }
 
+/// One wallet of the vault pays another: each is told, the first of a
+/// payment going out and the second of one coming in, when it enters
+/// the mempool and when it confirms, once each, whichever claims first.
+#[tokio::test]
+async fn a_transfer_between_two_wallets_is_announced_for_each() {
+    use bdk_wallet::bitcoin::{Address, ScriptBuf};
+
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, payer) = watching(dir.path(), server.backend()).await;
+    let theirs = crate::testkit::script(5);
+    let other = Address::from_script(
+        &ScriptBuf::from_hex(&theirs).unwrap(),
+        bdk_wallet::bitcoin::Network::Signet,
+    )
+    .unwrap()
+    .to_string();
+    let payee = manager
+        .add_wallet(
+            "Savings",
+            &crate::input::parse_input(&other).unwrap(),
+            Network::Signet,
+        )
+        .await
+        .unwrap()
+        .id;
+
+    let funding = transaction(&[nowhere(1, 0)], &[(ADDRESS_SCRIPT, 50_000)]);
+    server.add_tx(&funding);
+    server.set_history(ADDRESS_SCRIPT, &[(funding.compute_txid(), 90)]);
+    for wallet in [&payer, &payee] {
+        manager.sync_wallet(wallet).await.unwrap();
+    }
+
+    let transfer = transaction(
+        &[bdk_wallet::bitcoin::OutPoint::new(
+            funding.compute_txid(),
+            0,
+        )],
+        &[(theirs.as_str(), 40_000), (ADDRESS_SCRIPT, 9_000)],
+    );
+    let moved = transfer.compute_txid();
+    server.add_tx(&transfer);
+    for height in [0, 95] {
+        server.set_history(
+            ADDRESS_SCRIPT,
+            &[(funding.compute_txid(), 90), (moved, height)],
+        );
+        server.set_history(&theirs, &[(moved, height)]);
+        let stage = if height == 0 {
+            TxStage::Mempool
+        } else {
+            TxStage::Confirmed
+        };
+        // The payee claims first once, the payer the other time.
+        let order = if height == 0 {
+            [&payee, &payer]
+        } else {
+            [&payer, &payee]
+        };
+        for wallet in order {
+            let claimed = sync_and_claim(&manager, wallet).await;
+            assert_eq!(
+                staged(&claimed),
+                [(moved.to_string(), stage)],
+                "{wallet} at {height}"
+            );
+            let net = if *wallet == payer { -41_000 } else { 40_000 };
+            assert_eq!(claimed[0].net_sats, net);
+        }
+        for wallet in [&payer, &payee] {
+            assert!(sync_and_claim(&manager, wallet).await.is_empty());
+        }
+    }
+}
+
 // --- a server that forges changes ---------------------------------------------
 
 /// The next sync of `wallet` the watch hands out, and how long it took
