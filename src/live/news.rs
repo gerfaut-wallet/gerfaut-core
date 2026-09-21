@@ -18,14 +18,16 @@
 //! replacement would be one more identical notification. So a new
 //! unconfirmed transaction that spends an output a pending transaction
 //! of the wallet spent, one already announced at the mempool stage,
-//! and that moves the wallet the same way (in, or out), is recorded as
-//! announced and not said. Whichever of them confirms is said once, as
-//! confirmed.
+//! and that moves the wallet the same way (in, or out) and by nearly as
+//! much, is recorded as announced and not said. Whichever of them
+//! confirms is said once, as confirmed. A replacement that moves the
+//! wallet by much less, or sends much more out, is no fee bump: it is
+//! said as a transaction of its own.
 //!
 //! An incoming payment announced at the mempool stage that leaves the
-//! wallet with no transaction paying the wallet in its place, replaced
-//! by one that pays elsewhere or evicted, is news of its own:
-//! [`TxStage::Dropped`], said once.
+//! wallet with nothing paying it nearly as much in its place, replaced
+//! by one that pays elsewhere, one that pays the wallet a few sats, or
+//! evicted, is news of its own: [`TxStage::Dropped`], said once.
 //!
 //! Every function here works on the payload, under the lock of the
 //! caller, and does no I/O.
@@ -57,11 +59,24 @@ impl Seen {
         }
     }
 
-    /// Whether the two move the wallet the same way.
-    fn same_way_as(&self, other: &Seen) -> bool {
-        self.net_sats.signum() == other.net_sats.signum()
+    /// Whether this transaction, which spends what `old` spent, is a fee
+    /// bump of it: it moves the wallet the same way, and by nearly as
+    /// much. A sender who pays the fee out of the amount takes a little
+    /// from it with each bump, a tenth at most and never more than
+    /// [`BUMP_ALLOWANCE_SATS`]. One who cuts a payment down to a few
+    /// sats, so that something still pays the wallet, has not bumped a
+    /// fee, and neither has a replacement that sends much more out.
+    fn bumps(&self, old: &Seen) -> bool {
+        let allowance = (old.net_sats.unsigned_abs() / 10).min(BUMP_ALLOWANCE_SATS);
+        self.net_sats.signum() == old.net_sats.signum()
+            && i128::from(self.net_sats) >= i128::from(old.net_sats) - i128::from(allowance)
     }
 }
+
+/// The most a fee bump may take from what a transaction moves, in
+/// satoshis: well past the fee of a replacement, and far short of what
+/// is worth stealing.
+const BUMP_ALLOWANCE_SATS: u64 = 10_000;
 
 /// What one sync of a wallet moved.
 #[derive(Debug, Clone, Default)]
@@ -271,9 +286,9 @@ pub(crate) fn record(
             );
             continue;
         }
-        // A replacement of what was announced, the same way: said.
+        // A fee bump of what was announced: said.
         let replaced = conflicting(&before, tx)
-            .find(|old| old.same_way_as(tx) && pending_said(payload, wallet_id, &old.txid));
+            .find(|old| tx.bumps(old) && pending_said(payload, wallet_id, &old.txid));
         match replaced {
             Some(old) => replace(payload, wallet_id, old, tx),
             None => push(
@@ -297,7 +312,7 @@ pub(crate) fn record(
         if !said_pending || old.net_sats <= 0 {
             continue;
         }
-        let paid_instead = conflicting(&arrived, old).any(|tx| tx.net_sats > 0);
+        let paid_instead = conflicting(&arrived, old).any(|tx| tx.bumps(old));
         if !paid_instead {
             push(
                 payload,
@@ -625,6 +640,108 @@ mod tests {
         };
         record(&mut payload, "w", false, &unsaid, NOW);
         assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+    }
+
+    /// The sender replaces a payment with one that still pays the
+    /// wallet, but a few sats: that is no fee bump. The replacement is
+    /// said for what it pays, and the payment announced is said to be
+    /// dropped. So is a cut past what a fee bump takes, even when most
+    /// of the payment is left.
+    #[test]
+    fn a_replacement_that_cuts_a_payment_is_said() {
+        for (kept, cut_to) in [(1_000_000, 1), (1_000_000, 985_000), (50_000, 44_000)] {
+            let mut payload = VaultPayload::default();
+            let a = seen("a", kept, false);
+            record(
+                &mut payload,
+                "w",
+                false,
+                &arrived(std::slice::from_ref(&a)),
+                NOW,
+            );
+            assert_eq!(
+                stages(&claim(&mut payload, "w", 10, NOW)),
+                [("a", TxStage::Mempool)]
+            );
+            let cut = replacing(&a, "b", cut_to, false);
+            let moves = Moves {
+                new: vec![cut],
+                pending_before: vec![a.clone()],
+                gone: vec![a],
+                ..Moves::default()
+            };
+            record(&mut payload, "w", false, &moves, NOW);
+            let claimed = claim(&mut payload, "w", 10, NOW);
+            assert_eq!(
+                stages(&claimed),
+                [("b", TxStage::Mempool), ("a", TxStage::Dropped)],
+                "{kept} cut to {cut_to}"
+            );
+            assert_eq!(claimed[0].net_sats, cut_to);
+            assert_eq!(claimed[1].net_sats, kept);
+        }
+    }
+
+    /// Cut before anyone claimed the payment: one notice, for what the
+    /// replacement pays, and nothing to take back.
+    #[test]
+    fn a_cut_before_the_payment_was_said_is_said_once() {
+        let mut payload = VaultPayload::default();
+        let a = seen("a", 1_000_000, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(std::slice::from_ref(&a)),
+            NOW,
+        );
+        let moves = Moves {
+            new: vec![replacing(&a, "b", 1, false)],
+            pending_before: vec![a.clone()],
+            gone: vec![a],
+            ..Moves::default()
+        };
+        record(&mut payload, "w", false, &moves, NOW);
+        let claimed = claim(&mut payload, "w", 10, NOW);
+        assert_eq!(stages(&claimed), [("b", TxStage::Mempool)]);
+        assert_eq!(claimed[0].net_sats, 1);
+    }
+
+    /// A spend bumped from the change is not said again. One replaced
+    /// by a transaction that sends far more out is said: whoever holds
+    /// the keys redirected it.
+    #[test]
+    fn a_spend_replaced_by_a_larger_one_is_said() {
+        let mut payload = VaultPayload::default();
+        let out = seen("out", -20_000, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(std::slice::from_ref(&out)),
+            NOW,
+        );
+        assert_eq!(claim(&mut payload, "w", 10, NOW).len(), 1);
+        let bumped = replacing(&out, "bumped", -21_000, false);
+        let moves = Moves {
+            new: vec![bumped.clone()],
+            pending_before: vec![out.clone()],
+            gone: vec![out],
+            ..Moves::default()
+        };
+        record(&mut payload, "w", false, &moves, NOW);
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+        let drained = replacing(&bumped, "drained", -900_000, false);
+        let moves = Moves {
+            new: vec![drained.clone()],
+            pending_before: vec![bumped.clone()],
+            gone: vec![bumped],
+            ..Moves::default()
+        };
+        record(&mut payload, "w", false, &moves, NOW);
+        let claimed = claim(&mut payload, "w", 10, NOW);
+        assert_eq!(stages(&claimed), [("drained", TxStage::Mempool)]);
+        assert_eq!(claimed[0].net_sats, -900_000);
     }
 
     /// Replaced by a transaction that pays the wallet and is already in

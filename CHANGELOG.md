@@ -44,11 +44,15 @@ The first release: the library both Gerfaut apps are built on.
   saw for the first time, so an app can announce both.
 - Live alerts on the wallet manager. It starts the watch, syncs the wallet
   that moved, and hands out each transaction to announce once when it
-  enters the mempool and once when it confirms. The record of what was
+  enters the mempool and once when it confirms. A fee bump is not
+  announced again. A replacement that pays the wallet much less, or sends
+  much more out, gets its own alert for what it moves. An incoming payment
+  already announced as pending is announced as dropped when it leaves the
+  mempool, or when such a replacement cuts it down. The record of what was
   announced is kept in the vault, so a restart or a second caller never
   repeats one. Settings and wallets change under a running watch without a
-  call from the app, and a host whose timers sleep can ask for a check of
-  the connection from an alarm.
+  call from the app, and a host whose timers sleep can ask for a connection
+  check from an alarm.
 - The premium client reads a wallet the server refused: `watching` is false
   and `refusal` says why, in the list and in a `wallet_refused` event. A
   single address can be registered like a descriptor.

@@ -331,6 +331,28 @@ async fn a_bump_that_stops_paying_is_announced_as_dropped_once() {
     assert!(sync_and_claim(&manager, &wallet).await.is_empty());
 }
 
+/// The sender replaces the payment with one that leaves the address a
+/// single sat: no fee bump. The replacement is announced for what it
+/// pays, and the payment announced first as dropped.
+#[tokio::test]
+async fn a_replacement_that_cuts_the_payment_is_announced() {
+    let server = FakeMempool::start(false, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = paid(&server, dir.path()).await;
+    server.state.lock().unwrap().address_txs = vec![esplora_payment(0x12, 0x22, 1, false)];
+    let claimed = sync_and_claim(&manager, &wallet).await;
+    assert_eq!(
+        staged(&claimed),
+        [
+            (txid(0x12), TxStage::Mempool),
+            (txid(0x11), TxStage::Dropped)
+        ]
+    );
+    assert_eq!(claimed[0].net_sats, 1);
+    assert_eq!(claimed[1].net_sats, 50_000);
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+}
+
 /// Replaced by a transaction that pays the address and is already in a
 /// block: one confirmation, and nothing vanished.
 #[tokio::test]

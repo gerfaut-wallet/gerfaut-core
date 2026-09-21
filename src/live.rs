@@ -386,9 +386,11 @@ impl WalletManager {
     /// A fee bump comes out as nothing. A new unconfirmed transaction
     /// that spends an output a pending one of the wallet spent, one
     /// that came out at the mempool stage, and that moves the wallet the
-    /// same way, in or out, is recorded as said. Whichever of them
-    /// confirms comes out once, confirmed; if the replacement stops
-    /// paying the wallet, the payment comes out as dropped.
+    /// same way, in or out, and by nearly as much, is recorded as said.
+    /// Whichever of them confirms comes out once, confirmed. A
+    /// replacement that pays the wallet much less, or sends much more
+    /// out, comes out as a transaction of its own, and an incoming
+    /// payment it cut down, or stopped paying, comes out as dropped.
     ///
     /// A wallet's first sync records nothing: its whole history is an
     /// import, not news. What was pending then is news when it
