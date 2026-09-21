@@ -224,8 +224,11 @@ pub(crate) struct Timings {
     pub quiet: Duration,
     /// The longest a burst may hold a report back.
     pub burst: Duration,
-    /// The shortest time between two reports of the same wallet: what
-    /// a server that floods notifications can cost, at most.
+    /// The shortest time between two reports of the same wallet. Short:
+    /// a confirmation often follows the arrival it confirms by a second,
+    /// and waits for it. What a server that floods notifications costs
+    /// is held down further on, where the syncs run: one at a time per
+    /// wallet, and less and less often when they find nothing.
     pub gap: Duration,
     pub keepalive: Duration,
     /// How long a ping may go unanswered.
@@ -255,9 +258,9 @@ impl Timings {
     pub(crate) fn of(config: &WatchConfig) -> Self {
         let keepalive = config.keepalive_secs.unwrap_or(240).clamp(30, 540);
         Timings {
-            quiet: Duration::from_millis(600),
+            quiet: Duration::from_millis(300),
             burst: Duration::from_secs(2),
-            gap: Duration::from_secs(5),
+            gap: Duration::from_secs(1),
             keepalive: Duration::from_secs(u64::from(keepalive)),
             pong: Duration::from_secs(20),
             backoff_first: Duration::from_secs(2),

@@ -453,6 +453,74 @@ async fn a_payment_to_an_address_the_wallet_never_showed_is_announced() {
     assert_eq!(histories, 13 + 20);
 }
 
+// --- how soon ---------------------------------------------------------------------
+
+/// The next transaction the watch hands out.
+async fn next_announcement(events: &mut LiveEvents) -> LiveTx {
+    loop {
+        match tokio::time::timeout(WAIT, events.next()).await {
+            Ok(Some(LiveEvent::Transaction(tx))) => return tx,
+            Ok(Some(LiveEvent::SyncFailed { message, .. })) => panic!("the sync failed: {message}"),
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the watch stopped"),
+            Err(_) => panic!("nothing announced within {WAIT:?}"),
+        }
+    }
+}
+
+/// With the watch's own timings, not the short ones of the other tests:
+/// a payment enters the mempool right after the watch caught up, and a
+/// block takes it half a second after it was announced. The server
+/// pushes each change, and each is announced within about a second of
+/// the push, however soon it follows the one before.
+#[tokio::test]
+async fn an_arrival_and_its_confirmation_are_announced_within_a_second() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), server.backend()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    let pace = crate::watch::Timings::of(&manager.watch_config().await);
+    let mut events = manager.live_start_with(Some(pace)).await.unwrap();
+    assert!(caught_up(&mut events, &wallet).await.is_empty());
+
+    let payment = transaction(&[nowhere(4, 0)], &[(ADDRESS_SCRIPT, 12_000)]);
+    let paid = payment.compute_txid();
+    server.add_tx(&payment);
+    server.set_history(ADDRESS_SCRIPT, &[(paid, 0)]);
+    let pushed = std::time::Instant::now();
+    server.set_status(ADDRESS_SCRIPT, "in the mempool");
+    let arrival = next_announcement(&mut events).await;
+    let arrived_in = pushed.elapsed();
+    assert_eq!(staged(&[arrival]), [(paid.to_string(), TxStage::Mempool)]);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    server.state.lock().unwrap().height = 101;
+    server.set_history(ADDRESS_SCRIPT, &[(paid, 101)]);
+    let pushed = std::time::Instant::now();
+    server.push(
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": "blockchain.headers.subscribe",
+            "params": [{ "height": 101, "hex": crate::testkit::header_at(101) }],
+        })
+        .to_string(),
+    );
+    server.set_status(ADDRESS_SCRIPT, "in a block");
+    let confirmation = next_announcement(&mut events).await;
+    let confirmed_in = pushed.elapsed();
+    assert_eq!(
+        staged(&[confirmation]),
+        [(paid.to_string(), TxStage::Confirmed)]
+    );
+    println!("announced {arrived_in:?} and {confirmed_in:?} after the push");
+    let second = Duration::from_millis(1_500);
+    assert!(arrived_in < second, "the arrival took {arrived_in:?}");
+    assert!(
+        confirmed_in < second,
+        "the confirmation took {confirmed_in:?}"
+    );
+    manager.live_stop().await;
+}
+
 // --- a server that forges changes ---------------------------------------------
 
 /// The next sync of `wallet` the watch hands out, and how long it took
