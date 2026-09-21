@@ -126,6 +126,19 @@ pub struct Announced {
     pub stage: TxStage,
 }
 
+/// A transaction a sync found worth announcing, kept until a caller
+/// claims it: see [`crate::WalletManager::claim_announcements`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unclaimed {
+    pub wallet_id: String,
+    pub txid: String,
+    /// Net effect on the wallet, in satoshis.
+    pub net_sats: i64,
+    pub stage: TxStage,
+    /// When the sync found it, unix seconds.
+    pub found_at: u64,
+}
+
 /// Everything the vault persists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultPayload {
@@ -137,6 +150,12 @@ pub struct VaultPayload {
     /// restart. Absent from vaults written before live alerts.
     #[serde(default)]
     pub announced: Vec<Announced>,
+    /// What syncs found worth announcing and nobody has claimed yet,
+    /// oldest first. Written with the sync that found it, whoever ran
+    /// that sync, so nothing found is lost when that caller announces
+    /// nothing.
+    #[serde(default)]
+    pub unclaimed: Vec<Unclaimed>,
 }
 
 impl Default for VaultPayload {
@@ -146,6 +165,7 @@ impl Default for VaultPayload {
             settings: Settings::default(),
             wallets: Vec::new(),
             announced: Vec::new(),
+            unclaimed: Vec::new(),
         }
     }
 }

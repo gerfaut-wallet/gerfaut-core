@@ -139,7 +139,7 @@ impl std::ops::Deref for WalletManager {
     }
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -503,6 +503,7 @@ impl WalletManager {
                 if payload.wallets.len() == before {
                     return Err(CoreError::WalletNotFound(id.to_owned()));
                 }
+                payload.unclaimed.retain(|news| news.wallet_id != id);
                 let premium = &mut payload.settings.premium;
                 if premium.has_key() && premium.is_consented(id) {
                     premium.queue_unwatch(id);
@@ -724,9 +725,10 @@ impl WalletManager {
     /// One sync of a wallet at a time, whoever asks: the app, a
     /// background job, the live watch. A caller that arrives while one
     /// runs waits for it, and takes its result instead of asking the
-    /// backend the same question again. What that sync found was
-    /// reported to the caller that ran it, so the one that waited is
-    /// told of nothing new: every transaction is reported once.
+    /// backend the same question again, with nothing listed as new:
+    /// the lists went to the caller that ran it. What that sync found
+    /// worth announcing is in the vault for whoever claims it
+    /// ([`Self::claim_announcements`]), so neither caller can lose it.
     async fn sync_wallet_with(&self, id: &str, from_scratch: bool) -> CoreResult<SyncReport> {
         let arrived = Instant::now();
         let slot = match self.syncing.lock() {
@@ -852,6 +854,14 @@ impl WalletManager {
                     if let Some(staged) = staged {
                         merge_changeset(&mut state, &meta.id, staged)?;
                     }
+                    crate::live::news::record(
+                        &mut state.payload,
+                        &meta.id,
+                        meta.last_sync.is_none(),
+                        &new_txs,
+                        &confirmed_txs,
+                        now_secs(),
+                    );
                     let report = SyncReport {
                         wallet_id: meta.id.clone(),
                         new_tx_count: new_txs.len() as u32,
@@ -904,6 +914,14 @@ impl WalletManager {
                         keep_older_history(&mut watch, previous);
                     }
                     let tx_count_after = watch.txs.len() as u32;
+                    crate::live::news::record(
+                        &mut state.payload,
+                        &meta.id,
+                        meta.last_sync.is_none(),
+                        &new_txs,
+                        &confirmed_txs,
+                        now_secs(),
+                    );
                     let report = SyncReport {
                         wallet_id: meta.id.clone(),
                         new_tx_count: new_txs.len() as u32,

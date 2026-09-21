@@ -18,8 +18,13 @@
 //!   and later its first confirmation. Each is handed out once, and
 //!   the record of that lives in the vault: a restart, a second
 //!   isolate or a background job syncing on its own never makes it
-//!   twice. A caller that announces from a sync report of its own
-//!   takes it through [`WalletManager::claim_announcements`] first.
+//!   twice.
+//! - Every sync, whoever runs it, records what it found in the vault
+//!   ([`news`]), and nothing of it goes out until someone claims it.
+//!   The watch claims after each sync it runs. A host that runs a sync
+//!   of its own claims after it with
+//!   [`WalletManager::claim_announcements`] and announces what it gets:
+//!   the contract is written there.
 //! - Settings and wallets change under a running watch without any
 //!   call from the app: the backend, the network, Tor, an accepted
 //!   certificate, a wallet added or removed, the scripts a sync
@@ -54,11 +59,15 @@ use tokio::task::JoinSet;
 use crate::error::CoreResult;
 use crate::manager::{ManagerState, WalletManager};
 use crate::network::Network;
-use crate::store::{Announced, TxStage};
+use crate::store::TxStage;
 use crate::wallet::snapshot::SyncReport;
 use crate::watch::{
     ChangeReason, LiveWatch, WatchConfig, WatchEvent, WatchEvents, WatchStatus, WatchedWallet,
 };
+
+pub(crate) mod news;
+#[cfg(test)]
+mod tests;
 
 /// Announcements remembered. Past this the oldest are forgotten, which
 /// costs nothing: a sync reports a transaction once, and the record
@@ -71,6 +80,8 @@ const EVENT_QUEUE: usize = 256;
 /// comes from one server and the sync reads another, which may hear of
 /// the transaction a moment later.
 const RETRIES: [Duration; 2] = [Duration::from_secs(3), Duration::from_secs(10)];
+/// Transactions claimed, and handed out, at a time.
+const CLAIM_BATCH: usize = 32;
 /// Syncs the watch runs at once. A wallet that takes long to sync holds
 /// one of them and never the others; a backend, often a public one, is
 /// never asked for every wallet at the same moment.
@@ -156,9 +167,8 @@ impl Asked {
     }
 }
 
-/// What a sync the watch ran came to: its report, and whether it was
-/// the wallet's first, or why it failed.
-type Synced = Result<(SyncReport, bool), String>;
+/// What a sync the watch ran came to: its report, or why it failed.
+type Synced = Result<SyncReport, String>;
 
 /// Resolves once the watch is asked to stop, or its handle is gone.
 async fn stopped(halted: &mut watch::Receiver<bool>) {
@@ -328,62 +338,63 @@ impl WalletManager {
         (config, wallets, reading)
     }
 
-    /// Of what a sync report lists, what nobody has announced yet, now
-    /// recorded as announced. The record is in the vault, so the answer
-    /// holds across restarts and across every caller of this process: a
-    /// transaction is handed out once when it shows up and once when it
-    /// confirms, whoever asks first.
+    /// What the syncs of `report.wallet_id` found worth announcing and
+    /// nobody has claimed yet, now recorded as announced. Only the
+    /// wallet of `report` is read: every sync, whoever ran it, recorded
+    /// its findings in the vault, and they are handed out here to the
+    /// first caller that asks. The record is in the vault, so this
+    /// holds across restarts and across every caller of the process.
+    ///
+    /// What comes out, once per transaction and stage:
+    ///
+    /// - [`TxStage::Mempool`]: a transaction seen for the first time,
+    ///   not yet in a block.
+    /// - [`TxStage::Confirmed`]: its first confirmation, or a
+    ///   transaction first seen already in a block. One seen and
+    ///   confirmed before anyone claimed it comes out once, confirmed.
+    ///
+    /// A wallet's first sync records nothing: its whole history is an
+    /// import, not news. What was pending then is news when it
+    /// confirms.
+    ///
+    /// # Contract for a host
+    ///
+    /// - Claim after every sync you run, [`WalletManager::sync_wallet`],
+    ///   [`WalletManager::rescan_wallet`] and each report of
+    ///   [`WalletManager::sync_all`], whatever the report lists. A
+    ///   report with nothing listed may come from a sync that ran for
+    ///   another caller, and what it found waits here.
+    /// - Announce everything returned, or drop it on purpose (alerts
+    ///   off, a disguised app): nothing returned is ever returned
+    ///   again. Whoever claims announces.
+    /// - Do not leave out the wallets you saw synced for the first
+    ///   time: the core already did, and what you would leave out may
+    ///   be news another sync of that wallet found meanwhile.
+    /// - Claims race safely. The live watch claims after each of its
+    ///   own syncs; a host sync and a watch sync of the same wallet,
+    ///   at the same moment, announce each transaction exactly once
+    ///   between them.
+    /// - What nobody claims is kept twelve hours, then forgotten: a host
+    ///   that syncs with its alerts off claims all the same, and drops
+    ///   what it gets, or all of it is said the day they are turned on.
     pub async fn claim_announcements(&self, report: &SyncReport) -> CoreResult<Vec<LiveTx>> {
-        let stage_of = |confirmed: bool| {
-            if confirmed {
-                TxStage::Confirmed
-            } else {
-                TxStage::Mempool
-            }
-        };
-        let listed = report
-            .new_txs
-            .iter()
-            .map(|tx| (tx, stage_of(tx.confirmed)))
-            .chain(
-                report
-                    .confirmed_txs
-                    .iter()
-                    .map(|tx| (tx, TxStage::Confirmed)),
-            );
+        self.claim_news(&report.wallet_id, usize::MAX).await
+    }
+
+    /// Takes up to `max` pieces of the news waiting for a wallet.
+    async fn claim_news(&self, wallet_id: &str, max: usize) -> CoreResult<Vec<LiveTx>> {
+        let now = crate::manager::now_secs();
         let mut state = self.state.lock().await;
-        let mut claimed: Vec<LiveTx> = Vec::new();
-        for (tx, stage) in listed {
-            let told = |entry: &Announced| {
-                entry.txid == tx.txid && (entry.stage == stage || entry.stage == TxStage::Confirmed)
-            };
-            if state.payload.announced.iter().any(told)
-                || claimed
-                    .iter()
-                    .any(|c| c.txid == tx.txid && c.stage == stage)
-            {
-                continue;
-            }
-            claimed.push(LiveTx {
-                wallet_id: report.wallet_id.clone(),
-                txid: tx.txid.clone(),
-                net_sats: tx.net_sats,
-                stage,
-            });
+        if max == 0 || news::waiting(&state.payload, wallet_id, now) == 0 {
+            return Ok(Vec::new());
         }
-        if claimed.is_empty() {
-            return Ok(claimed);
-        }
-        state.commit(|payload| {
-            payload.announced.extend(claimed.iter().map(|tx| Announced {
-                txid: tx.txid.clone(),
-                stage: tx.stage,
-            }));
-            let excess = payload.announced.len().saturating_sub(ANNOUNCED_MAX);
-            payload.announced.drain(..excess);
-            Ok(())
-        })?;
-        Ok(claimed)
+        state.commit(|payload| Ok(news::claim(payload, wallet_id, max, now)))
+    }
+
+    /// How much news waits for a wallet.
+    async fn news_waiting(&self, wallet_id: &str) -> usize {
+        let now = crate::manager::now_secs();
+        news::waiting(&self.state.lock().await.payload, wallet_id, now)
     }
 
     /// Turns what the watch says into events: syncs the wallets it
@@ -476,18 +487,34 @@ impl WalletManager {
         halted: &mut watch::Receiver<bool>,
     ) -> bool {
         match outcome {
-            Ok((report, first_sync)) => {
-                // A wallet that was never synced holds its whole
-                // history as "new": that is an import, not news.
-                if let Ok(claimed) = self.claim_announcements(&report).await
-                    && !first_sync
-                {
+            Ok(report) => {
+                // Room is made in the queue before anything is claimed,
+                // and what is claimed goes into that room at once: a
+                // watch that stops, or a host that stops reading,
+                // leaves the news in the vault, never claimed and lost.
+                loop {
+                    let waiting = self.news_waiting(wallet_id).await.min(CLAIM_BATCH);
+                    if waiting == 0 {
+                        break;
+                    }
+                    let room = tokio::select! {
+                        room = events.reserve_many(waiting) => room,
+                        () = stopped(halted) => return false,
+                    };
+                    let Ok(mut room) = room else {
+                        return false;
+                    };
+                    let Ok(claimed) = self.claim_news(wallet_id, waiting).await else {
+                        break;
+                    };
+                    let all = claimed.len() < waiting;
                     for tx in claimed {
-                        // What was claimed is owed: handed over even
-                        // when the watch stops meanwhile.
-                        if events.send(LiveEvent::Transaction(tx)).await.is_err() {
-                            return false;
+                        if let Some(slot) = room.next() {
+                            slot.send(LiveEvent::Transaction(tx));
                         }
+                    }
+                    if all {
+                        break;
                     }
                 }
                 deliver(events, LiveEvent::WalletSynced { report }, halted).await
@@ -508,12 +535,6 @@ impl WalletManager {
 
     /// The sync a change asked for, run under one of the permits.
     async fn live_sync(self, wallet_id: String, asked: Asked, permits: Arc<Semaphore>) -> Synced {
-        let first_sync = self
-            .list_wallets(None)
-            .await
-            .iter()
-            .find(|meta| meta.id == wallet_id)
-            .is_none_or(|meta| meta.last_sync.is_none());
         let sync = async || {
             let _permit = permits.acquire().await;
             if asked.rescan {
@@ -528,14 +549,15 @@ impl WalletManager {
                 &outcome,
                 Ok(report) if report.new_txs.is_empty() && report.confirmed_txs.is_empty()
             );
-            if asked.reason != ChangeReason::Activity || !found_nothing {
+            if asked.reason != ChangeReason::Activity
+                || !found_nothing
+                || self.news_waiting(&wallet_id).await > 0
+            {
                 break;
             }
             tokio::time::sleep(delay).await;
             outcome = sync().await;
         }
-        outcome
-            .map(|report| (report, first_sync))
-            .map_err(|error| error.to_string())
+        outcome.map_err(|error| error.to_string())
     }
 }

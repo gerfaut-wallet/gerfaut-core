@@ -11,7 +11,9 @@ use tokio::sync::mpsc;
 
 use super::*;
 use crate::chain::tor::{TorMode, TorSettings};
-use crate::testkit::{FakeElectrum, FakeMempool, script, scripthash};
+use crate::testkit::{
+    ADDRESS, ADDRESS_SCRIPT, FakeElectrum, FakeMempool, esplora_payment, script, scripthash,
+};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -643,25 +645,8 @@ fn a_backoff_doubles_up_to_its_cap() {
 
 // --- the manager ---------------------------------------------------------------
 
-/// The BIP-173 test vector address, and its script.
-const ADDRESS: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
-const ADDRESS_SCRIPT: &str = "0014751e76e8199196d454941c45d1b3a323f1433bd6";
-
 fn payment(confirmed: bool) -> Value {
-    json!({
-        "txid": "11".repeat(32), "version": 2, "locktime": 0, "size": 110, "weight": 440, "fee": 200,
-        "vin": [{
-            "txid": "22".repeat(32), "vout": 0, "scriptsig": "", "sequence": 4294967293u32,
-            "is_coinbase": false,
-            "prevout": { "scriptpubkey": script(9), "value": 60_000 },
-        }],
-        "vout": [{ "scriptpubkey": ADDRESS_SCRIPT, "value": 50_000 }],
-        "status": if confirmed {
-            json!({ "confirmed": true, "block_height": 501, "block_hash": "33".repeat(32), "block_time": 1_700_000_000 })
-        } else {
-            json!({ "confirmed": false })
-        },
-    })
+    esplora_payment(0x11, 0x22, 50_000, confirmed)
 }
 
 async fn next_live(events: &mut crate::live::LiveEvents) -> crate::live::LiveEvent {
@@ -794,14 +779,34 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
             .unwrap()
             .is_empty()
     );
-    // Something never said is handed out, once.
-    let mut other = said.clone();
-    other.new_txs[0].txid = "44".repeat(32);
-    other.confirmed_txs.clear();
-    assert_eq!(reopened.claim_announcements(&other).await.unwrap().len(), 1);
+    // Something never said is handed out, once, to whoever claims it
+    // after the sync that found it, whether or not that is the caller
+    // that ran the sync.
+    let mut second = payment(false);
+    second["txid"] = json!("44".repeat(32));
+    second["vin"][0]["txid"] = json!("55".repeat(32));
+    server.state.lock().unwrap().address_txs = vec![second, payment(true)];
+    let found = reopened.sync_wallet(&wallet.id).await.unwrap();
+    assert_eq!(found.new_txs.len(), 1);
+    let nothing_listed = crate::wallet::snapshot::SyncReport {
+        new_tx_count: 0,
+        new_txs: Vec::new(),
+        confirmed_txs: Vec::new(),
+        ..found
+    };
+    let claimed = reopened.claim_announcements(&nothing_listed).await.unwrap();
+    assert_eq!(
+        claimed,
+        vec![LiveTx {
+            wallet_id: wallet.id.clone(),
+            txid: "44".repeat(32),
+            net_sats: 50_000,
+            stage: TxStage::Mempool,
+        }]
+    );
     assert!(
         reopened
-            .claim_announcements(&other)
+            .claim_announcements(&nothing_listed)
             .await
             .unwrap()
             .is_empty()

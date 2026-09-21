@@ -19,6 +19,36 @@ use bdk_wallet::bitcoin::{OutPoint, Transaction, Txid};
 
 use crate::chain::BackendConfig;
 
+/// The BIP-173 test vector address, and its script: public material,
+/// watched by the tests that need an address.
+pub(crate) const ADDRESS: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+pub(crate) const ADDRESS_SCRIPT: &str = "0014751e76e8199196d454941c45d1b3a323f1433bd6";
+
+/// A payment of `sats` to [`ADDRESS`], as Esplora lists it: `txid` and
+/// the transaction it spends are that byte repeated, and it spends
+/// output 0 of the latter, 60 000 sats of nobody's. Two payments that
+/// spend the same byte replace one another.
+pub(crate) fn esplora_payment(txid: u8, spends: u8, sats: u64, confirmed: bool) -> Value {
+    json!({
+        "txid": format!("{txid:02x}").repeat(32), "version": 2, "locktime": 0, "size": 110,
+        "weight": 440, "fee": 60_000 - sats,
+        "vin": [{
+            "txid": format!("{spends:02x}").repeat(32), "vout": 0, "scriptsig": "",
+            "sequence": 4294967293u32, "is_coinbase": false,
+            "prevout": { "scriptpubkey": script(9), "value": 60_000 },
+        }],
+        "vout": [{ "scriptpubkey": ADDRESS_SCRIPT, "value": sats }],
+        "status": if confirmed {
+            json!({
+                "confirmed": true, "block_height": 501, "block_hash": "33".repeat(32),
+                "block_time": 1_700_000_000,
+            })
+        } else {
+            json!({ "confirmed": false })
+        },
+    })
+}
+
 /// A P2WPKH script over twenty bytes of `n`: nobody's key.
 pub(crate) fn script(n: u8) -> String {
     format!("0014{}", format!("{n:02x}").repeat(20))
