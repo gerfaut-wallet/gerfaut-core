@@ -22,6 +22,8 @@ pub mod network;
 pub mod premium;
 pub mod price;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod testkit;
 pub mod updates;
 pub mod wallet;
 pub mod watch;
