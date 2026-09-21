@@ -852,6 +852,101 @@ async fn a_descriptor_wallet_is_watched_past_what_it_revealed() {
     assert!(manager.watch_list(Network::Mainnet).await.is_empty());
 }
 
+// --- stopping -------------------------------------------------------------------
+
+/// How long a stop may take to show, whatever the server does.
+const PROMPT: Duration = Duration::from_secs(2);
+
+async fn within(what: &str, limit: Duration, holds: impl Fn() -> bool) {
+    let started = std::time::Instant::now();
+    while !holds() {
+        assert!(started.elapsed() < limit, "never {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A server that stops in the middle of an answer holds nothing up:
+/// the watch stops at once, its events end, its connection is closed.
+#[tokio::test]
+async fn a_watch_stops_at_once_while_the_server_stalls() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().stall = Some("blockchain.scripthash.subscribe");
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            keepalive: Duration::from_secs(3600),
+            ..timings()
+        }),
+    );
+    within("asked to subscribe", WAIT, || {
+        server.was_asked("blockchain.scripthash.subscribe")
+    })
+    .await;
+    let started = std::time::Instant::now();
+    watch.stop();
+    assert_eq!(watch.status(), WatchStatus::default());
+    assert!(
+        tokio::time::timeout(PROMPT, async { while events.next().await.is_some() {} })
+            .await
+            .is_ok(),
+        "the events of a stopped watch end"
+    );
+    within("closed the connection", PROMPT, || server.closed() == 1).await;
+    assert!(started.elapsed() < PROMPT);
+}
+
+/// The live watch stops at once while one of its syncs waits on a
+/// server stalled mid-answer: the sync is abandoned with its
+/// connection, the events end, and the wallet can be synced again.
+#[tokio::test]
+async fn live_stop_abandons_a_sync_the_server_stalls() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager =
+        crate::WalletManager::open(dir.path(), crate::store::VaultKey::Raw([7; 32])).unwrap();
+    manager.set_active_network(Network::Signet).await.unwrap();
+    manager
+        .set_backend(Network::Signet, server.backend())
+        .await
+        .unwrap();
+    let parsed = crate::input::parse_input(ADDRESS).unwrap();
+    let wallet = manager
+        .add_wallet("Watched", &parsed, Network::Signet)
+        .await
+        .unwrap();
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    within("subscribed", WAIT, || {
+        server
+            .subscriptions()
+            .iter()
+            .flatten()
+            .any(|hash| *hash == scripthash(ADDRESS_SCRIPT))
+    })
+    .await;
+    server.state.lock().unwrap().stall = Some("blockchain.scripthash.get_history");
+    server.set_status(ADDRESS_SCRIPT, "aa");
+    within("asked for the history", WAIT, || {
+        server.was_asked("blockchain.scripthash.get_history")
+    })
+    .await;
+
+    let started = std::time::Instant::now();
+    manager.live_stop().await;
+    assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
+    assert_eq!(manager.live_status().await, WatchStatus::default());
+    assert!(
+        tokio::time::timeout(PROMPT, async { while events.next().await.is_some() {} })
+            .await
+            .is_ok(),
+        "the events of a stopped watch end"
+    );
+    // The watch's connection and the sync's.
+    within("closed both connections", PROMPT, || server.closed() == 2).await;
+    server.state.lock().unwrap().stall = None;
+    manager.sync_wallet(&wallet.id).await.unwrap();
+}
+
 // --- live -----------------------------------------------------------------------
 
 const SIGNET_ELECTRUM: &str = "ssl://signet-electrumx.wakiyamap.dev:50002";

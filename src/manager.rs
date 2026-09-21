@@ -116,9 +116,13 @@ pub struct Shared {
     /// Recent failed unlock attempts, kept apart from the vault lock so
     /// an unlock never waits on a sync.
     attempts: Mutex<LockAttempts>,
-    /// The live watch, while one runs. Taken before the state lock,
-    /// never after it.
-    pub(crate) live: Mutex<Option<crate::live::Running>>,
+    /// The live watch, while one runs. Held for a few instructions,
+    /// never across an await: stopping the watch never waits on
+    /// anything.
+    pub(crate) live: std::sync::Mutex<Option<crate::live::Running>>,
+    /// Counts the readings of what the watch should follow, so an older
+    /// one never replaces a newer one on the running watch.
+    pub(crate) watch_setups: std::sync::atomic::AtomicU64,
     /// One sync at a time per wallet, and when the last one ended.
     syncing: std::sync::Mutex<HashMap<String, SyncSlot>>,
 }
@@ -164,7 +168,8 @@ impl WalletManager {
                     data_dir,
                 }),
                 attempts: Mutex::new(attempts),
-                live: Mutex::new(None),
+                live: std::sync::Mutex::new(None),
+                watch_setups: std::sync::atomic::AtomicU64::new(0),
                 syncing: std::sync::Mutex::new(HashMap::new()),
             }),
         })

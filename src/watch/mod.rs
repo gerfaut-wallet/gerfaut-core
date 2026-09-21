@@ -262,6 +262,8 @@ enum Command {
 pub struct LiveWatch {
     commands: mpsc::UnboundedSender<Command>,
     status: watch::Receiver<WatchStatus>,
+    /// Set once to stop the watcher, whatever it is waiting on.
+    halt: watch::Sender<bool>,
 }
 
 impl std::fmt::Debug for Command {
@@ -322,8 +324,16 @@ impl LiveWatch {
             fixed_timings,
         };
         hub.watched = Watched::new(wallets);
-        tokio::spawn(supervise(hub));
-        (LiveWatch { commands, status }, WatchEvents { events })
+        let (halt, halted) = watch::channel(false);
+        tokio::spawn(watcher(hub, halted));
+        (
+            LiveWatch {
+                commands,
+                status,
+                halt,
+            },
+            WatchEvents { events },
+        )
     }
 
     /// Replaces the list of what is watched: after a sync, a wallet
@@ -350,11 +360,18 @@ impl LiveWatch {
     }
 
     pub fn status(&self) -> WatchStatus {
+        if *self.halt.borrow() {
+            return WatchStatus::default();
+        }
         self.status.borrow().clone()
     }
 
-    /// Stops the watcher and closes its connection. Idempotent.
+    /// Stops the watcher and closes its connection, at once: the task
+    /// is dropped wherever it waits, a connection being opened, a
+    /// server that stopped answering, a Tor circuit being built.
+    /// Idempotent.
     pub fn stop(&self) {
+        let _ = self.halt.send(true);
         let _ = self.commands.send(Command::Stop);
     }
 }
@@ -858,7 +875,20 @@ fn candidates(config: &WatchConfig) -> Result<Vec<Endpoint>, String> {
     Ok(endpoints)
 }
 
-async fn supervise(mut hub: Hub) {
+/// The task of a watcher: the supervisor, cut short the moment the
+/// handle asks it to stop, wherever it waits. Whatever it held, sockets
+/// included, is dropped there and then.
+async fn watcher(mut hub: Hub, mut halted: watch::Receiver<bool>) {
+    tokio::select! {
+        () = supervise(&mut hub) => {}
+        // A dropped handle stops the watcher too.
+        _ = halted.wait_for(|halt| *halt) => {}
+    }
+    hub.watched = Watched::default();
+    hub.set_status(|status| *status = WatchStatus::default());
+}
+
+async fn supervise(hub: &mut Hub) {
     let mut backoff = Backoff {
         next: Duration::ZERO,
     };
@@ -874,7 +904,7 @@ async fn supervise(mut hub: Hub) {
         }
         let started = Instant::now();
         let exit = match candidates(&hub.config) {
-            Ok(endpoints) => run_once(&mut hub, &endpoints, &mut no_push).await,
+            Ok(endpoints) => run_once(hub, &endpoints, &mut no_push).await,
             Err(detail) => Exit::Lost(detail),
         };
         match exit {
@@ -915,8 +945,6 @@ async fn supervise(mut hub: Hub) {
             }
         }
     }
-    hub.watched = Watched::default();
-    hub.set_status(|status| *status = WatchStatus::default());
 }
 
 /// One pass over the candidates: the first that holds a session keeps

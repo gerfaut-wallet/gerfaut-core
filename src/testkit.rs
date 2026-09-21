@@ -296,6 +296,16 @@ impl FakeElectrum {
             .insert(scripthash(script_hex), coins.to_vec());
     }
 
+    /// Connections the client has closed so far.
+    pub(crate) fn closed(&self) -> usize {
+        self.state.lock().unwrap().closed
+    }
+
+    /// Whether a request of this method has arrived.
+    pub(crate) fn was_asked(&self, method: &str) -> bool {
+        self.state.lock().unwrap().asked.iter().any(|m| m == method)
+    }
+
     pub(crate) fn backend(&self) -> BackendConfig {
         BackendConfig::CustomElectrum {
             url: format!("tcp://{}", self.address),
