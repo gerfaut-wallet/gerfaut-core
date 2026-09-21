@@ -157,6 +157,35 @@ pub(crate) struct ElectrumState {
     pub closed: usize,
 }
 
+impl ElectrumState {
+    /// The header at `height`, in hex: the signet genesis block at 0,
+    /// so a descriptor wallet's chain meets the server's there, and above
+    /// it the header of [`header_at`], whose merkle root is the txid of
+    /// the transaction a history puts at that height, if any: the one
+    /// transaction of its block.
+    fn header(&self, height: u32) -> String {
+        use bdk_wallet::bitcoin::TxMerkleNode;
+        use bdk_wallet::bitcoin::block::Header;
+        use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
+        use bdk_wallet::bitcoin::hashes::Hash;
+        if height == 0 {
+            let genesis =
+                bdk_wallet::bitcoin::constants::genesis_block(bdk_wallet::bitcoin::Network::Signet);
+            return serialize_hex(&genesis.header);
+        }
+        let mut header: Header = deserialize_hex(&header_at(height)).unwrap();
+        if let Some((txid, _)) = self
+            .histories
+            .values()
+            .flatten()
+            .find(|(_, mined)| *mined == i64::from(height))
+        {
+            header.merkle_root = TxMerkleNode::from_byte_array(txid.to_byte_array());
+        }
+        serialize_hex(&header)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct FakeElectrum {
     pub address: SocketAddr,
@@ -268,7 +297,23 @@ impl FakeElectrum {
         let scripthash = param.as_str().unwrap_or_default().to_owned();
         let result = match method {
             "server.version" => json!(["fake 1.0", state.version]),
-            "blockchain.headers.subscribe" => json!({ "height": state.height, "hex": "00" }),
+            "blockchain.headers.subscribe" => {
+                json!({ "height": state.height, "hex": state.header(state.height) })
+            }
+            "blockchain.block.headers" => {
+                let start = param.as_u64().unwrap_or(0) as u32;
+                let count = request["params"][1].as_u64().unwrap_or(0) as u32;
+                let end = start.saturating_add(count).min(state.height + 1);
+                let hex: String = (start..end).map(|height| state.header(height)).collect();
+                json!({ "count": end.saturating_sub(start), "hex": hex, "max": 2016 })
+            }
+            // The only transaction of its block, whose merkle root is
+            // its txid: an empty branch proves it.
+            "blockchain.transaction.get_merkle" => json!({
+                "block_height": request["params"][1].as_u64().unwrap_or(0),
+                "merkle": [],
+                "pos": 0,
+            }),
             "blockchain.scripthash.subscribe" => {
                 state.connections[index].0.push(scripthash.clone());
                 json!(state.statuses.get(&scripthash).cloned().flatten())
@@ -307,7 +352,7 @@ impl FakeElectrum {
                     None => return refusal("No such mempool or blockchain transaction"),
                 }
             }
-            "blockchain.block.header" => json!(header_at(param.as_u64().unwrap_or(0) as u32)),
+            "blockchain.block.header" => json!(state.header(param.as_u64().unwrap_or(0) as u32)),
             _ => Value::Null,
         };
         Answer::Line(json!({ "jsonrpc": "2.0", "id": id, "result": result }))

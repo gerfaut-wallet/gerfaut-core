@@ -5,6 +5,7 @@ use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::address::Address;
 use bdk_wallet::bitcoin::{Script, Txid};
 use bdk_wallet::chain::ChainPosition;
+use bdk_wallet::chain::spk_client::FullScanRequest;
 
 use crate::error::{CoreError, CoreResult};
 use crate::live::news::{Moves, Seen};
@@ -154,8 +155,8 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
 /// coins (a spend shows there first), the receive addresses within the
 /// gap limit past the last revealed one, the change addresses the same
 /// way, and then the used, empty ones, newest first. A script past the
-/// revealed range is marked: only a full scan looks that far, so a
-/// change seen there asks for one.
+/// revealed range is marked: a change seen there asks for a full scan,
+/// the one sync that reads change addresses past the revealed ones.
 ///
 /// The list stops at [`crate::watch::MAX_SCRIPTS_PER_WALLET`], all a
 /// watch takes of one wallet, and nothing past it is derived: this runs
@@ -226,6 +227,30 @@ pub(crate) fn watch_scripts(
         }
     }
     scripts
+}
+
+/// The full scan of the receive addresses the wallet has not revealed,
+/// from the next one on: what an incremental sync adds to its revealed
+/// scripts, so that a payment to an address the wallet never showed,
+/// one another app or the signing device handed out, is found by any
+/// sync and not only by a rescan. Run with the gap limit as its stop
+/// gap, it reads that many addresses when they are empty, and goes on
+/// past any that is not, the way a full scan does; what it finds is
+/// revealed when the response is applied. Change addresses are left
+/// out: the wallet makes those itself, and a spend that pays one is
+/// found through the coins it spends.
+pub(crate) fn receive_tail(wallet: &bdk_wallet::Wallet) -> FullScanRequest<KeychainKind> {
+    let next = wallet
+        .derivation_index(KeychainKind::External)
+        .map_or(0, |last| last.saturating_add(1));
+    let descriptor = wallet.public_descriptor(KeychainKind::External).clone();
+    FullScanRequest::builder()
+        .chain_tip(wallet.latest_checkpoint())
+        .spks_for_keychain(
+            KeychainKind::External,
+            bdk_wallet::chain::SpkIterator::new_with_range(descriptor, next..),
+        )
+        .build()
 }
 
 /// Whether the wallet holds a transaction still waiting for a block.

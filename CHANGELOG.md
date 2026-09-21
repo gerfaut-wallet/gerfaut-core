@@ -108,6 +108,14 @@ The first release: the library both Gerfaut apps are built on.
   configured on any network it goes through the same Tor proxy, and when
   Tor cannot be had it does not go at all, where it used to ask GitHub in
   the clear. It now runs from the wallet manager only.
+- A sync of a descriptor wallet also reads its receive addresses past the
+  last one it revealed, the way a full scan does: up to the gap limit, and
+  further past any that holds a transaction. A payment to an address the
+  wallet never showed, one another app or the signing device handed out,
+  is found and announced by the next sync, whoever runs it, where only a
+  rescan used to find it. With the default gap limit of 20, that costs a
+  sync 21 more requests on Esplora, and 2 more round trips carrying 20
+  requests on Electrum, plus the tip and the latest headers.
 - Switching a wallet off on the premium server withdraws the consent kept
   for it once the server has nothing left under its id, so removing the
   wallet later has nothing to tell the server.

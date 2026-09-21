@@ -826,7 +826,10 @@ impl WalletManager {
                 let request = if full {
                     EngineRequest::Full(engine.start_full_scan().build())
                 } else {
-                    EngineRequest::Incremental(engine.start_sync_with_revealed_spks().build())
+                    EngineRequest::Incremental(
+                        engine.start_sync_with_revealed_spks().build(),
+                        views::receive_tail(engine),
+                    )
                 };
                 (request, views::known(engine))
             };
@@ -838,7 +841,9 @@ impl WalletManager {
                     let engine = ensure_engine(&mut state, &meta.id)?;
                     let apply = match response {
                         EngineResponse::Full(update) => engine.apply_update(update),
-                        EngineResponse::Incremental(update) => engine.apply_update(update),
+                        EngineResponse::Incremental(update, tail) => engine
+                            .apply_update(update)
+                            .and_then(|()| engine.apply_update(tail)),
                     };
                     apply.map_err(|e| CoreError::Sync {
                         backend: endpoint.label(),

@@ -300,13 +300,21 @@ async fn within<T>(
 /// A prepared sync request for a descriptor wallet.
 pub(crate) enum EngineRequest {
     Full(FullScanRequest<KeychainKind>),
-    Incremental(SyncRequest<(KeychainKind, u32)>),
+    /// The scripts the wallet revealed, and a full scan of its receive
+    /// addresses from the first one it has not: where a payment to an
+    /// address it never showed lands, one another app or the signing
+    /// device handed out. That scan stops, as a full scan does, once
+    /// the gap limit of addresses in a row shows nothing.
+    Incremental(
+        SyncRequest<(KeychainKind, u32)>,
+        FullScanRequest<KeychainKind>,
+    ),
 }
 
 /// The matching response, to apply back onto the wallet.
 pub(crate) enum EngineResponse {
     Full(FullScanResponse<KeychainKind>),
-    Incremental(SyncResponse),
+    Incremental(SyncResponse, FullScanResponse<KeychainKind>),
 }
 
 /// Runs one sync attempt against one endpoint, within the deadline of
@@ -330,21 +338,24 @@ pub(crate) async fn sync_engine(
                 .await
                 .map(EngineResponse::Full)
         }
-        (Endpoint::Esplora(url), EngineRequest::Incremental(request)) => {
+        (Endpoint::Esplora(url), EngineRequest::Incremental(request, tail)) => {
             let client = esplora::client(url, proxy)?;
-            within(deadline, esplora::sync(&client, request))
-                .await
-                .map(EngineResponse::Incremental)
+            within(deadline, async {
+                let synced = esplora::sync(&client, request).await?;
+                let tail = esplora::full_scan(&client, tail, stop_gap).await?;
+                Ok(EngineResponse::Incremental(synced, tail))
+            })
+            .await
         }
         (Endpoint::Electrum(target), EngineRequest::Full(request)) => {
             electrum::full_scan(target, request, stop_gap, proxy, deadline)
                 .await
                 .map(EngineResponse::Full)
         }
-        (Endpoint::Electrum(target), EngineRequest::Incremental(request)) => {
-            electrum::sync(target, request, proxy, deadline)
+        (Endpoint::Electrum(target), EngineRequest::Incremental(request, tail)) => {
+            electrum::sync(target, request, tail, stop_gap, proxy, deadline)
                 .await
-                .map(EngineResponse::Incremental)
+                .map(|(synced, tail)| EngineResponse::Incremental(synced, tail))
         }
     }
 }

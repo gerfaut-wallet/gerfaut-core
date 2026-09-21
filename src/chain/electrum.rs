@@ -506,16 +506,26 @@ pub(crate) async fn full_scan(
     .await
 }
 
-/// A sync of the revealed scripts, within `deadline`.
+/// A sync of the revealed scripts, then the full scan of `tail`, the
+/// receive addresses past them, with `stop_gap`: both on one
+/// connection, within `deadline`. The scan asks for the histories of
+/// its addresses [`BATCH_SIZE`] at a time, two round trips for a gap
+/// limit of 20 when they are empty, plus the tip and the latest headers.
 pub(crate) async fn sync(
     target: &Target,
     request: SyncRequest<(KeychainKind, u32)>,
+    tail: FullScanRequest<KeychainKind>,
+    stop_gap: u32,
     proxy: Option<&str>,
     deadline: Duration,
-) -> Result<SyncResponse, String> {
+) -> Result<(SyncResponse, FullScanResponse<KeychainKind>), String> {
     let fail = failed(target);
     run(target, proxy, deadline, move |client| {
-        client.sync(request, BATCH_SIZE, true).map_err(fail)
+        let synced = client.sync(request, BATCH_SIZE, true).map_err(&fail)?;
+        let tail = client
+            .full_scan(tail, stop_gap as usize, BATCH_SIZE, true)
+            .map_err(&fail)?;
+        Ok((synced, tail))
     })
     .await
 }

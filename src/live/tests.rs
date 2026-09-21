@@ -350,6 +350,109 @@ async fn a_transfer_between_two_wallets_is_announced_for_each() {
     }
 }
 
+// --- addresses the wallet never showed ---------------------------------------
+
+/// BIP-84 test vector account, on testnet paths: public.
+const DESCRIPTOR: &str = "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)";
+
+/// The receive script at `index` of [`DESCRIPTOR`], in hex.
+fn receive_script(index: u32) -> String {
+    bdk_wallet::Wallet::create_single(DESCRIPTOR.to_owned())
+        .network(bdk_wallet::bitcoin::Network::Signet)
+        .create_wallet_no_persist()
+        .unwrap()
+        .peek_address(bdk_wallet::KeychainKind::External, index)
+        .script_pubkey()
+        .to_hex_string()
+}
+
+/// A payment of `sats` to `script`, at `height` (0 for the mempool),
+/// with the transaction it spends, both on the server.
+fn pay(server: &FakeElectrum, n: u8, script: &str, sats: u64, height: i64) -> String {
+    let parent = transaction(
+        &[nowhere(n, 0)],
+        &[(crate::testkit::script(9).as_str(), sats + 1_000)],
+    );
+    let payment = transaction(
+        &[bdk_wallet::bitcoin::OutPoint::new(parent.compute_txid(), 0)],
+        &[(script, sats)],
+    );
+    server.add_tx(&parent);
+    server.add_tx(&payment);
+    server.set_history(script, &[(payment.compute_txid(), height)]);
+    payment.compute_txid().to_string()
+}
+
+/// Someone pays the wallet at a receive address it never showed, one
+/// another app or the signing device handed out, while nothing runs:
+/// five past the next one it would show. The watch that starts next
+/// announces it, once; its confirmation and the next such payment are
+/// found by a plain sync, whoever runs it.
+#[tokio::test]
+async fn a_payment_to_an_address_the_wallet_never_showed_is_announced() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = WalletManager::open(dir.path(), key()).unwrap();
+    manager.set_active_network(Network::Signet).await.unwrap();
+    manager
+        .set_backend(Network::Signet, server.backend())
+        .await
+        .unwrap();
+    let wallet = manager
+        .add_wallet(
+            "Cold",
+            &crate::input::parse_input(DESCRIPTOR).unwrap(),
+            Network::Signet,
+        )
+        .await
+        .unwrap()
+        .id;
+    // Paid at its first address before the import, which finds it.
+    pay(&server, 1, &receive_script(0), 10_000, 90);
+    let import = manager.sync_wallet(&wallet).await.unwrap();
+    assert_eq!(import.new_txs.len(), 1);
+    assert!(
+        manager
+            .claim_announcements(&import)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let unseen = pay(&server, 2, &receive_script(6), 20_000, 0);
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    assert_eq!(
+        staged(&caught_up(&mut events, &wallet).await),
+        [(unseen.clone(), TxStage::Mempool)]
+    );
+    manager.live_stop().await;
+
+    // A new block takes it.
+    server.state.lock().unwrap().height = 101;
+    server.set_history(&receive_script(6), &[(unseen.parse().unwrap(), 101)]);
+    assert_eq!(
+        staged(&sync_and_claim(&manager, &wallet).await),
+        [(unseen, TxStage::Confirmed)]
+    );
+    let next = pay(&server, 3, &receive_script(12), 30_000, 0);
+    assert_eq!(
+        staged(&sync_and_claim(&manager, &wallet).await),
+        [(next, TxStage::Mempool)]
+    );
+
+    // What that costs a sync with nothing new: one history for each of
+    // the 13 addresses shown, and one for each of the 20 past them.
+    let asked_before = server.state.lock().unwrap().asked.len();
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    let asked: Vec<String> = server.state.lock().unwrap().asked[asked_before..].to_vec();
+    let histories = asked
+        .iter()
+        .filter(|method| *method == "blockchain.scripthash.get_history")
+        .count();
+    println!("a sync with nothing new asked {asked:?}");
+    assert_eq!(histories, 13 + 20);
+}
+
 // --- a server that forges changes ---------------------------------------------
 
 /// The next sync of `wallet` the watch hands out, and how long it took

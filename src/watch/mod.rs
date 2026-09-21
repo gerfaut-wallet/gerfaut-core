@@ -52,7 +52,8 @@
 //!   sent again.
 //! - [`WatchEvent::WalletChanged`] means "sync this wallet now". With
 //!   `rescan` set, the change was seen past the addresses the wallet
-//!   has revealed, where only a full scan looks.
+//!   has revealed: a sync reads receive addresses that far, and only a
+//!   full scan reads change addresses there.
 //! - Once the first connection is up and every script it covers has
 //!   been read once, every wallet is reported
 //!   ([`ChangeReason::Started`]): the sync that follows catches up on
@@ -123,7 +124,8 @@ pub struct WatchedScript {
     /// The script pubkey, in hex.
     pub script: String,
     /// Past the addresses the wallet has revealed: a change seen here
-    /// asks for a full scan, the only sync that looks this far.
+    /// asks for a full scan, the only sync that reads change addresses
+    /// this far.
     pub lookahead: bool,
 }
 
