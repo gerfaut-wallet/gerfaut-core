@@ -9,6 +9,7 @@ pub mod tor;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
@@ -269,6 +270,33 @@ fn automatic_endpoints(network: Network) -> CoreResult<Vec<Endpoint>> {
         .collect())
 }
 
+/// How long a whole sync attempt against one endpoint may take, every
+/// request together. Each request has a timeout of its own; this bounds
+/// their sum, which a server answering just fast enough to stay under
+/// every one of them would otherwise make endless. Past it the attempt
+/// is abandoned and the next endpoint tried.
+const SCAN_DEADLINE: Duration = Duration::from_secs(10 * 60);
+/// Through Tor, where everything is slower.
+const TOR_SCAN_DEADLINE: Duration = Duration::from_secs(20 * 60);
+
+fn scan_deadline(endpoint: &Endpoint) -> Duration {
+    if endpoint.is_onion() {
+        TOR_SCAN_DEADLINE
+    } else {
+        SCAN_DEADLINE
+    }
+}
+
+/// `work`, given up once `deadline` has passed.
+async fn within<T>(
+    deadline: Duration,
+    work: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(deadline, work)
+        .await
+        .unwrap_or_else(|_| Err(format!("no answer within {} s", deadline.as_secs())))
+}
+
 /// A prepared sync request for a descriptor wallet.
 pub(crate) enum EngineRequest {
     Full(FullScanRequest<KeychainKind>),
@@ -281,8 +309,10 @@ pub(crate) enum EngineResponse {
     Incremental(SyncResponse),
 }
 
-/// Runs one sync attempt against one endpoint. The error is a plain
-/// string: the caller owns retry logic and error wrapping.
+/// Runs one sync attempt against one endpoint, within the deadline of
+/// a scan. The error is a plain string: the caller owns retry logic and
+/// error wrapping. Dropping the future abandons the attempt, an
+/// Electrum connection included.
 ///
 /// `proxy`, here and below, is the Tor SOCKS proxy the caller resolved
 /// for this operation; `None` when no endpoint of the list is an onion.
@@ -292,43 +322,35 @@ pub(crate) async fn sync_engine(
     stop_gap: u32,
     proxy: Option<&str>,
 ) -> Result<EngineResponse, String> {
+    let deadline = scan_deadline(endpoint);
     match (endpoint, request) {
         (Endpoint::Esplora(url), EngineRequest::Full(request)) => {
             let client = esplora::client(url, proxy)?;
-            esplora::full_scan(&client, request, stop_gap)
+            within(deadline, esplora::full_scan(&client, request, stop_gap))
                 .await
                 .map(EngineResponse::Full)
         }
         (Endpoint::Esplora(url), EngineRequest::Incremental(request)) => {
             let client = esplora::client(url, proxy)?;
-            esplora::sync(&client, request)
+            within(deadline, esplora::sync(&client, request))
                 .await
                 .map(EngineResponse::Incremental)
         }
         (Endpoint::Electrum(target), EngineRequest::Full(request)) => {
-            let target = target.clone();
-            let proxy = proxy.map(str::to_owned);
-            tokio::task::spawn_blocking(move || {
-                electrum::full_scan_blocking(&target, request, stop_gap, proxy.as_deref())
-            })
-            .await
-            .map_err(|e| e.to_string())?
-            .map(EngineResponse::Full)
+            electrum::full_scan(target, request, stop_gap, proxy, deadline)
+                .await
+                .map(EngineResponse::Full)
         }
         (Endpoint::Electrum(target), EngineRequest::Incremental(request)) => {
-            let target = target.clone();
-            let proxy = proxy.map(str::to_owned);
-            tokio::task::spawn_blocking(move || {
-                electrum::sync_blocking(&target, request, proxy.as_deref())
-            })
-            .await
-            .map_err(|e| e.to_string())?
-            .map(EngineResponse::Incremental)
+            electrum::sync(target, request, proxy, deadline)
+                .await
+                .map(EngineResponse::Incremental)
         }
     }
 }
 
-/// Fetches the state of a single watched address from one endpoint.
+/// Fetches the state of a single watched address from one endpoint,
+/// within the deadline of a scan.
 ///
 /// Only Esplora backends can serve this today; an Electrum endpoint is
 /// reported as unavailable with an actionable message.
@@ -341,7 +363,11 @@ pub(crate) async fn fetch_address_state(
     match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client(url, proxy)?;
-            esplora::fetch_address_state(&client, address, network).await
+            within(
+                scan_deadline(endpoint),
+                esplora::fetch_address_state(&client, address, network),
+            )
+            .await
         }
         Endpoint::Electrum(_) => Err("single-address wallets need an Esplora backend for now; \
              switch the backend or import a descriptor"
@@ -361,17 +387,7 @@ pub(crate) async fn broadcast(
             let client = esplora::client(url, proxy)?;
             esplora::broadcast(&client, tx).await
         }
-        Endpoint::Electrum(target) => {
-            let target = target.clone();
-            let tx = tx.clone();
-            let proxy = proxy.map(str::to_owned);
-            tokio::task::spawn_blocking(move || {
-                electrum::broadcast_blocking(&target, &tx, proxy.as_deref())
-            })
-            .await
-            .map_err(|e| e.to_string())?
-            .map(|_| ())
-        }
+        Endpoint::Electrum(target) => electrum::broadcast(target, tx, proxy).await.map(|_| ()),
     }
 }
 
@@ -421,11 +437,7 @@ pub(crate) async fn inspect_certificate(
     url: String,
     pin: Option<String>,
 ) -> Result<electrum::Inspection, String> {
-    tokio::task::spawn_blocking(move || {
-        electrum::inspect_blocking(&electrum::Target::new(url, pin))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    electrum::inspect(&electrum::Target::new(url, pin)).await
 }
 
 /// What one endpoint knows about a coin about to be spent.
@@ -450,13 +462,7 @@ pub(crate) async fn fetch_prevout(
             })
         }
         Endpoint::Electrum(target) => {
-            let target = target.clone();
-            let proxy = proxy.map(str::to_owned);
-            let txout = tokio::task::spawn_blocking(move || {
-                electrum::fetch_prevout_blocking(&target, outpoint, proxy.as_deref())
-            })
-            .await
-            .map_err(|e| e.to_string())??;
+            let txout = electrum::fetch_prevout(target, outpoint, proxy).await?;
             Ok(PrevoutFacts { txout, spent: None })
         }
     }
@@ -490,13 +496,8 @@ pub(crate) async fn tx_standing(
             })
         }
         Endpoint::Electrum(target) => {
-            let target = target.clone();
-            let proxy = proxy.map(str::to_owned);
-            let (found, block_height, tip_height) = tokio::task::spawn_blocking(move || {
-                electrum::tx_standing_blocking(&target, &txid, &script, proxy.as_deref())
-            })
-            .await
-            .map_err(|e| e.to_string())??;
+            let (found, block_height, tip_height) =
+                electrum::tx_standing(target, txid, script, proxy).await?;
             Ok(TxStanding {
                 found,
                 block_height,
@@ -517,7 +518,11 @@ pub(crate) async fn fetch_address_history(
     match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client(url, proxy)?;
-            esplora::fetch_address_history(&client, address, network, from).await
+            within(
+                scan_deadline(endpoint),
+                esplora::fetch_address_history(&client, address, network, from),
+            )
+            .await
         }
         Endpoint::Electrum(_) => Err("single-address wallets need an Esplora backend for now;              switch the backend or import a descriptor"
             .to_owned()),

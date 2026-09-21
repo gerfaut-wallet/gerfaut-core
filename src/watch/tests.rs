@@ -914,14 +914,11 @@ async fn live_the_three_transports_see_signet_move() {
     let mut electrum = config(BackendConfig::CustomElectrum {
         url: SIGNET_ELECTRUM.to_owned(),
     });
-    let inspected = tokio::task::spawn_blocking(|| {
-        crate::chain::electrum::inspect_blocking(&crate::chain::electrum::Target::new(
-            SIGNET_ELECTRUM,
-            None,
-        ))
-    })
+    let inspected = crate::chain::electrum::inspect(&crate::chain::electrum::Target::new(
+        SIGNET_ELECTRUM,
+        None,
+    ))
     .await
-    .unwrap()
     .expect("the signet Electrum server answers");
     if let crate::chain::electrum::Inspection::Tls(crate::chain::tls::Verdict::Unknown {
         fingerprint,

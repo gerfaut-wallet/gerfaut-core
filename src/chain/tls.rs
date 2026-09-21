@@ -350,17 +350,39 @@ pub(crate) fn connect(
     pin: Option<&str>,
     timeout: Duration,
 ) -> Result<rustls::StreamOwned<ClientConnection, TcpStream>, ConnectError> {
+    let socket = tcp_connect(host, port, timeout)?;
+    handshake(host, pin, socket)
+}
+
+/// The same handshake over a socket the caller opened, so it can keep a
+/// handle on the socket and shut it down from another thread.
+pub(crate) fn handshake(
+    host: &str,
+    pin: Option<&str>,
+    mut socket: TcpStream,
+) -> Result<rustls::StreamOwned<ClientConnection, TcpStream>, ConnectError> {
     let handshake = Handshake::new(pin)?;
     let mut session = ClientConnection::new(handshake.config.clone(), server_name(host)?)
         .map_err(|e| ConnectError::Io(e.to_string()))?;
-
-    let mut socket = tcp_connect(host, port, timeout)?;
     // Finish the handshake now: a refused certificate is a connection
     // error, not a surprise on the first read.
     if let Err(error) = session.complete_io(&mut socket) {
         return Err(handshake.refusal(&error));
     }
+    Ok(rustls::StreamOwned::new(session, socket))
+}
 
+/// The handshake of an `ssl://` hidden service, over the circuit the
+/// caller opened: see [`onion_config`].
+pub(crate) fn onion_handshake(
+    host: &str,
+    mut socket: TcpStream,
+) -> Result<rustls::StreamOwned<ClientConnection, TcpStream>, ConnectError> {
+    let mut session = ClientConnection::new(onion_config()?, server_name(host)?)
+        .map_err(|e| ConnectError::Io(e.to_string()))?;
+    session
+        .complete_io(&mut socket)
+        .map_err(|e| ConnectError::Io(format!("TLS handshake failed: {e}")))?;
     Ok(rustls::StreamOwned::new(session, socket))
 }
 
@@ -519,7 +541,11 @@ pub(crate) fn inspect(
 }
 
 /// Connects to the first address the host resolves to that answers.
-fn tcp_connect(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, ConnectError> {
+pub(crate) fn tcp_connect(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<TcpStream, ConnectError> {
     let addresses = (host, port)
         .to_socket_addrs()
         .map_err(|e| ConnectError::Io(format!("{host} does not resolve: {e}")))?;

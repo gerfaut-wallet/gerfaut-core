@@ -1,18 +1,30 @@
 //! Electrum backend: descriptor wallet sync over the user's own server.
 //!
-//! The Electrum client is blocking; callers run these functions inside
-//! `spawn_blocking`.
+//! The Electrum client of BDK is blocking. Each operation runs on a
+//! thread of its own, never on the runtime's blocking pool: a call
+//! waiting on a server there would hold a runtime shutdown, and with it
+//! the exit of the app, for as long as the server takes. The caller
+//! awaits the thread under a deadline, and the moment it stops waiting,
+//! the deadline passed or its future dropped, the socket is shut down
+//! and the thread ends at its next read.
 //!
-//! TLS connections are opened by [`crate::chain::tls`] rather than by
-//! `electrum-client`, so the certificate a self-hosted server presents
-//! goes through Gerfaut's own verifier: a public authority, or the
-//! fingerprint the user accepted for that host.
+//! Every socket is opened here: TCP, the Tor proxy in front of it for a
+//! hidden service, and TLS by [`crate::chain::tls`], so the certificate
+//! a self-hosted server presents goes through Gerfaut's own verifier: a
+//! public authority, or the fingerprint the user accepted for that
+//! host. What the client reads goes through [`Guarded`], which cuts off
+//! a line longer than [`MAX_LINE`].
 
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bdk_electrum::BdkElectrumClient;
-use bdk_electrum::electrum_client::raw_client::{ElectrumSslStream, RawClient};
-use bdk_electrum::electrum_client::{self, Client, Config, ElectrumApi, Param, Socks5Config};
+use bdk_electrum::electrum_client::raw_client::RawClient;
+use bdk_electrum::electrum_client::socks::Socks5Stream;
+use bdk_electrum::electrum_client::{self, ElectrumApi, Param};
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
@@ -21,18 +33,28 @@ use super::tls::{self, ConnectError, Verdict};
 
 /// Requests per Electrum batch call.
 const BATCH_SIZE: usize = 10;
-/// Socket timeout. Without it a stalled server blocks the sync forever
-/// inside `spawn_blocking`, with no way to cancel.
-const TIMEOUT: Duration = Duration::from_secs(20);
+/// Socket timeout, each read and each write. Without it a stalled
+/// server holds a call until its deadline.
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(20);
 /// Onion endpoints get more room: Tor circuits are slow to build.
-const TOR_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const TOR_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest an operation of a few calls may take, all of them
+/// together: a broadcast, a lookup, a certificate check.
+const CALL_DEADLINE: Duration = Duration::from_secs(90);
+const TOR_CALL_DEADLINE: Duration = Duration::from_secs(4 * 60);
+/// The longest line read from a server. A whole transaction, hex
+/// encoded, fits with room to spare, and so does a history as long as
+/// the public servers hand out. A server that sends more without a
+/// line end is not speaking the protocol, and is cut off rather than
+/// buffered.
+pub(crate) const MAX_LINE: usize = 16 << 20;
 /// Name Gerfaut announces in `server.version`.
 pub(crate) const CLIENT_NAME: &str = "gerfaut";
 /// Protocol version asked for, as an exact range. `electrum-client`
 /// reads block headers in the 1.4 shape unless it negotiated the version
 /// itself, which it cannot do on a stream Gerfaut opened: pinning both
 /// sides to 1.4 keeps the wire and the parser in agreement.
-const PROTOCOL: &str = "1.4";
+pub(crate) const PROTOCOL: &str = "1.4";
 
 /// Default ports of the Electrum protocol.
 const SSL_PORT: u16 = 50002;
@@ -124,63 +146,216 @@ pub fn certificate_key(url: &str) -> String {
     }
 }
 
-/// A connected client, whichever transport carries it.
-enum Transport {
-    /// TLS opened by Gerfaut: the certificate check is ours.
-    Pinned(RawClient<ElectrumSslStream>),
-    /// Plain TCP or a Tor circuit, driven by the crate's own client.
-    Crate(Client),
+/// What abandons a connection from outside the thread that uses it: a
+/// flag every read and write checks, and a handle on the socket, shut
+/// down so that a read waiting on the server returns at once.
+#[derive(Debug, Default)]
+pub(crate) struct Cancel {
+    cancelled: AtomicBool,
+    socket: Mutex<Option<TcpStream>>,
 }
+
+impl Cancel {
+    /// Keeps a handle on the socket a connection was opened on. One
+    /// abandoned before this point is shut down here.
+    fn hold(&self, socket: &TcpStream) -> Result<(), ConnectError> {
+        let handle = socket
+            .try_clone()
+            .map_err(|e| ConnectError::Io(e.to_string()))?;
+        if let Ok(mut held) = self.socket.lock() {
+            *held = Some(handle);
+        }
+        if self.is_cancelled() {
+            self.abort();
+            return Err(ConnectError::Io(ABANDONED.to_owned()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn abort(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Ok(held) = self.socket.lock()
+            && let Some(socket) = held.as_ref()
+        {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+const ABANDONED: &str = "the call was abandoned";
+
+/// Aborts the connection it guards when dropped. The future awaiting a
+/// thread holds one, so a caller that stops waiting, for whatever
+/// reason, never leaves a thread talking to the server.
+struct AbortOnDrop(Arc<Cancel>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A stream the blocking client can read and write.
+trait Stream: Read + Write + Send {}
+impl<T: Read + Write + Send> Stream for T {}
+
+/// The stream every blocking connection is read through: it refuses to
+/// go on once the call is abandoned, cuts off a server that sends a
+/// line longer than `limit`, which the client would otherwise buffer
+/// whole, and one that sends more than [`MAX_READ`] in all: the client
+/// queues every notification a server pushes, unbounded.
+pub(crate) struct Guarded {
+    inner: Box<dyn Stream>,
+    cancel: Arc<Cancel>,
+    /// Bytes read since the last line end.
+    unended: usize,
+    limit: usize,
+    /// Bytes read since the connection opened.
+    total: usize,
+}
+
+/// The most one connection reads, every answer together: far past the
+/// full scan of any wallet a phone holds.
+const MAX_READ: usize = 256 << 20;
+
+impl Guarded {
+    fn new(inner: Box<dyn Stream>, cancel: Arc<Cancel>, limit: usize) -> Self {
+        Guarded {
+            inner,
+            cancel,
+            unended: 0,
+            limit,
+            total: 0,
+        }
+    }
+
+    fn check(&self) -> std::io::Result<()> {
+        if self.cancel.is_cancelled() {
+            // Not `Interrupted`: a reader retries that one.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                ABANDONED,
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Read for Guarded {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.check()?;
+        let read = self.inner.read(buf)?;
+        match buf[..read].iter().rposition(|byte| *byte == b'\n') {
+            Some(end) => self.unended = read - end - 1,
+            None => self.unended = self.unended.saturating_add(read),
+        }
+        if self.unended > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                too_long(self.limit),
+            ));
+        }
+        self.total = self.total.saturating_add(read);
+        if self.total > MAX_READ {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the server sent more than {} MiB on one connection",
+                    MAX_READ >> 20
+                ),
+            ));
+        }
+        Ok(read)
+    }
+}
+
+impl Write for Guarded {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.check()?;
+        self.inner.flush()
+    }
+}
+
+/// What a server that sent more than a line may hold is told it did.
+pub(crate) fn too_long(limit: usize) -> String {
+    format!("the server sent an answer longer than {} MiB", limit >> 20)
+}
+
+/// A connected client.
+pub(crate) type Connection = RawClient<Guarded>;
 
 /// Opens the connection. `proxy` is the Tor SOCKS proxy the caller
 /// resolved for onion servers; an onion address without one is refused
 /// before anything could look the name up.
-fn connect(target: &Target, proxy: Option<&str>) -> Result<Transport, ConnectError> {
+fn connect(
+    target: &Target,
+    proxy: Option<&str>,
+    cancel: &Arc<Cancel>,
+) -> Result<Connection, ConnectError> {
     let (tls_wanted, host, port) = parse(&target.url).map_err(ConnectError::Io)?;
+    let timeout = timeout_for(target);
 
     // Tor: the .onion address is the server's public key, and the
     // circuit proves the endpoint holds it. A certificate on top adds
     // encryption inside an encrypted tunnel and authenticates nothing,
     // so it is not what is trusted here — the address is.
-    if crate::chain::is_onion(&target.url) {
+    let stream: Box<dyn Stream> = if crate::chain::is_onion(&target.url) {
         let proxy =
             proxy.ok_or_else(|| ConnectError::Io(crate::chain::tor::no_route(&target.url)))?;
-        // The embedded proxy asks for credentials; this client takes
-        // them apart from the address rather than as a URL.
+        // The embedded proxy asks for credentials; the SOCKS client
+        // takes them apart from the address. The name goes to the proxy
+        // as spelled, and is resolved inside Tor.
         let (credentials, address) = crate::chain::tor::split_proxy(proxy);
-        let socks5 = match credentials {
-            Some((username, password)) => {
-                Socks5Config::with_credentials(address, username.to_owned(), password.to_owned())
-            }
-            None => Socks5Config::new(address),
+        let opened = match credentials {
+            Some((username, password)) => Socks5Stream::connect_with_password(
+                address,
+                (host.as_str(), port),
+                username,
+                password,
+                Some(timeout),
+            ),
+            None => Socks5Stream::connect(address, (host.as_str(), port), Some(timeout)),
         };
-        let config = Config::builder()
-            .socks5(Some(socks5))
-            .timeout(Some(TOR_TIMEOUT))
-            .validate_domain(false)
-            .build();
-        return Client::from_config(&target.url, config)
-            .map(Transport::Crate)
-            .map_err(|e| ConnectError::Io(describe(&e, TOR_TIMEOUT)));
-    }
-
-    if !tls_wanted {
-        let config = Config::builder().timeout(Some(TIMEOUT)).build();
-        return Client::from_config(&target.url, config)
-            .map(Transport::Crate)
-            .map_err(|e| ConnectError::Io(describe(&e, TIMEOUT)));
-    }
-
-    let stream = tls::connect(&host, port, target.pin.as_deref(), TIMEOUT)?;
-    let raw = RawClient::from(stream);
-    negotiate(&raw)?;
-    Ok(Transport::Pinned(raw))
+        let socket = opened
+            .map_err(|e| {
+                ConnectError::Io(format!(
+                    "could not connect through Tor: {}",
+                    describe_io(&e, timeout)
+                ))
+            })?
+            .into_inner();
+        cancel.hold(&socket)?;
+        if tls_wanted {
+            Box::new(tls::onion_handshake(&host, socket)?)
+        } else {
+            Box::new(socket)
+        }
+    } else {
+        let socket = tls::tcp_connect(&host, port, timeout)?;
+        cancel.hold(&socket)?;
+        if tls_wanted {
+            Box::new(tls::handshake(&host, target.pin.as_deref(), socket)?)
+        } else {
+            Box::new(socket)
+        }
+    };
+    let raw = RawClient::from(Guarded::new(stream, cancel.clone(), MAX_LINE));
+    negotiate(&raw, timeout)?;
+    Ok(raw)
 }
 
 /// `server.version` is the first call an Electrum server expects, and
-/// the one that fixes the protocol version. The crate does this itself
-/// on the connections it opens; on ours, we do it.
-fn negotiate(raw: &RawClient<ElectrumSslStream>) -> Result<(), ConnectError> {
+/// the one that fixes the protocol version.
+fn negotiate(raw: &Connection, timeout: Duration) -> Result<(), ConnectError> {
     raw.raw_call(
         "server.version",
         vec![
@@ -189,24 +364,50 @@ fn negotiate(raw: &RawClient<ElectrumSslStream>) -> Result<(), ConnectError> {
         ],
     )
     .map(|_| ())
-    .map_err(|e| ConnectError::Io(describe(&e, TIMEOUT)))
+    .map_err(|e| ConnectError::Io(describe(&e, timeout)))
 }
 
-/// Runs one operation against a connected client, whichever transport
-/// carries it: the same code over two concrete types.
-macro_rules! on_client {
-    ($target:expr, $proxy:expr, |$client:ident| $body:expr) => {
-        match connect($target, $proxy).map_err(|e| e.to_string())? {
-            Transport::Pinned(raw) => {
-                let $client = BdkElectrumClient::new(raw);
-                $body
-            }
-            Transport::Crate(inner) => {
-                let $client = BdkElectrumClient::new(inner);
-                $body
-            }
-        }
-    };
+/// A connected client, as BDK drives it.
+type Client = BdkElectrumClient<Connection>;
+
+/// Runs `operation` against `target` on a thread of its own, and waits
+/// for it at most `deadline`. Past it, or as soon as the future is
+/// dropped, the connection is shut down: the thread's next read fails
+/// and it ends, whatever the server does.
+async fn run<T: Send + 'static>(
+    target: &Target,
+    proxy: Option<&str>,
+    deadline: Duration,
+    operation: impl FnOnce(&Client) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let cancel = Arc::new(Cancel::default());
+    let _abort = AbortOnDrop(cancel.clone());
+    let (done, outcome) = tokio::sync::oneshot::channel();
+    let target = target.clone();
+    let proxy = proxy.map(str::to_owned);
+    std::thread::Builder::new()
+        .name("gerfaut-electrum".to_owned())
+        .spawn(move || {
+            let result = connect(&target, proxy.as_deref(), &cancel)
+                .map_err(|e| e.to_string())
+                .and_then(|raw| operation(&BdkElectrumClient::new(raw)));
+            let _ = done.send(result);
+        })
+        .map_err(|e| format!("could not start the connection: {e}"))?;
+    match tokio::time::timeout(deadline, outcome).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("the connection ended unexpectedly".to_owned()),
+        Err(_) => Err(format!("no answer within {} s", deadline.as_secs())),
+    }
+}
+
+/// The deadline of an operation of a few calls against this server.
+fn call_deadline(target: &Target) -> Duration {
+    if crate::chain::is_onion(&target.url) {
+        TOR_CALL_DEADLINE
+    } else {
+        CALL_DEADLINE
+    }
 }
 
 /// What the settings screen shows about this server's certificate.
@@ -223,25 +424,54 @@ pub(crate) fn inspect_blocking(target: &Target) -> Result<Inspection, String> {
         .map_err(|e| e.to_string())
 }
 
-pub(crate) fn full_scan_blocking(
+/// The same, on a thread of its own and within a deadline. The check
+/// opens a connection and closes it: nothing to abort on the way.
+pub(crate) async fn inspect(target: &Target) -> Result<Inspection, String> {
+    let deadline = call_deadline(target);
+    let target = target.clone();
+    let (done, outcome) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("gerfaut-electrum".to_owned())
+        .spawn(move || {
+            let _ = done.send(inspect_blocking(&target));
+        })
+        .map_err(|e| format!("could not start the connection: {e}"))?;
+    match tokio::time::timeout(deadline, outcome).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("the connection ended unexpectedly".to_owned()),
+        Err(_) => Err(format!("no answer within {} s", deadline.as_secs())),
+    }
+}
+
+/// A full scan, within `deadline`.
+pub(crate) async fn full_scan(
     target: &Target,
     request: FullScanRequest<KeychainKind>,
     stop_gap: u32,
     proxy: Option<&str>,
+    deadline: Duration,
 ) -> Result<FullScanResponse<KeychainKind>, String> {
-    on_client!(target, proxy, |client| client
-        .full_scan(request, stop_gap as usize, BATCH_SIZE, true)
-        .map_err(failed(target)))
+    let fail = failed(target);
+    run(target, proxy, deadline, move |client| {
+        client
+            .full_scan(request, stop_gap as usize, BATCH_SIZE, true)
+            .map_err(fail)
+    })
+    .await
 }
 
-pub(crate) fn sync_blocking(
+/// A sync of the revealed scripts, within `deadline`.
+pub(crate) async fn sync(
     target: &Target,
     request: SyncRequest<(KeychainKind, u32)>,
     proxy: Option<&str>,
+    deadline: Duration,
 ) -> Result<SyncResponse, String> {
-    on_client!(target, proxy, |client| client
-        .sync(request, BATCH_SIZE, true)
-        .map_err(failed(target)))
+    let fail = failed(target);
+    run(target, proxy, deadline, move |client| {
+        client.sync(request, BATCH_SIZE, true).map_err(fail)
+    })
+    .await
 }
 
 // --- errors ---------------------------------------------------------------
@@ -256,7 +486,7 @@ fn timeout_for(target: &Target) -> Duration {
 }
 
 /// The error of a call to `target`, as a sentence.
-fn failed(target: &Target) -> impl Fn(electrum_client::Error) -> String {
+fn failed(target: &Target) -> impl Fn(electrum_client::Error) -> String + use<> {
     let timeout = timeout_for(target);
     move |error| describe(&error, timeout)
 }
@@ -310,6 +540,8 @@ fn describe_io(error: &std::io::Error, timeout: Duration) -> String {
         | ErrorKind::BrokenPipe
         | ErrorKind::UnexpectedEof
         | ErrorKind::NotConnected => "the connection was closed".to_owned(),
+        // What [`Guarded`] says of a line too long: its own words.
+        ErrorKind::InvalidData => error.to_string(),
         _ => {
             // Name resolution has no kind of its own, and each platform
             // words it differently.
@@ -334,21 +566,26 @@ fn describe_io(error: &std::io::Error, timeout: Duration) -> String {
 
 // --- broadcast ------------------------------------------------------------
 
-pub(crate) fn broadcast_blocking(
+pub(crate) async fn broadcast(
     target: &Target,
     tx: &Transaction,
     proxy: Option<&str>,
 ) -> Result<Txid, String> {
-    on_client!(target, proxy, |client| client
-        .inner
-        .transaction_broadcast(tx)
-        .map_err(|e| broadcast_error(target, &e)))
+    let tx = tx.clone();
+    let timeout = timeout_for(target);
+    run(target, proxy, call_deadline(target), move |client| {
+        client
+            .inner
+            .transaction_broadcast(&tx)
+            .map_err(|e| broadcast_error(timeout, &e))
+    })
+    .await
 }
 
 /// Electrum returns the node's refusal as a protocol error whose
 /// message is the reason; keep that. Anything else is a failure to
 /// reach the node, described as such.
-fn broadcast_error(target: &Target, error: &electrum_client::Error) -> String {
+fn broadcast_error(timeout: Duration, error: &electrum_client::Error) -> String {
     match error {
         electrum_client::Error::Protocol(value) => {
             let text = value
@@ -358,7 +595,7 @@ fn broadcast_error(target: &Target, error: &electrum_client::Error) -> String {
                 .unwrap_or_else(|| value.to_string());
             crate::chain::esplora::node_message(&text)
         }
-        other => describe(other, timeout_for(target)),
+        other => describe(other, timeout),
     }
 }
 
@@ -366,53 +603,261 @@ fn broadcast_error(target: &Target, error: &electrum_client::Error) -> String {
 /// without the script's whole history, which is more than a preview
 /// needs: spent-ness stays unknown here and the node says so on
 /// broadcast.
-pub(crate) fn fetch_prevout_blocking(
+pub(crate) async fn fetch_prevout(
     target: &Target,
     outpoint: OutPoint,
     proxy: Option<&str>,
 ) -> Result<Option<TxOut>, String> {
-    on_client!(
+    let fail = failed(target);
+    run(
         target,
         proxy,
-        |client| match client.inner.transaction_get(&outpoint.txid) {
+        call_deadline(target),
+        move |client| match client.inner.transaction_get(&outpoint.txid) {
             Ok(tx) => Ok(tx.output.get(outpoint.vout as usize).cloned()),
             Err(electrum_client::Error::Protocol(_)) => Ok(None),
-            Err(error) => Err(failed(target)(error)),
-        }
+            Err(error) => Err(fail(error)),
+        },
     )
+    .await
 }
 
 /// Where a transaction stands, read off the history of one of its
 /// output scripts: height 0 means mempool, a height means confirmed,
 /// absence means the server does not have it.
-pub(crate) fn tx_standing_blocking(
+pub(crate) async fn tx_standing(
     target: &Target,
-    txid: &Txid,
-    script: &ScriptBuf,
+    txid: Txid,
+    script: ScriptBuf,
     proxy: Option<&str>,
 ) -> Result<(bool, Option<u32>, u32), String> {
-    on_client!(target, proxy, |client| {
+    let fail = failed(target);
+    run(target, proxy, call_deadline(target), move |client| {
         let tip = client
             .inner
             .block_headers_subscribe()
-            .map_err(failed(target))?
+            .map_err(&fail)?
             .height as u32;
-        let history = client
-            .inner
-            .script_get_history(script)
-            .map_err(failed(target))?;
-        let entry = history.iter().find(|entry| entry.tx_hash == *txid);
+        let history = client.inner.script_get_history(&script).map_err(&fail)?;
+        let entry = history.iter().find(|entry| entry.tx_hash == txid);
         Ok(match entry {
             None => (false, None, tip),
             Some(entry) if entry.height > 0 => (true, Some(entry.height as u32), tip),
             Some(_) => (true, None, tip),
         })
     })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader, Cursor};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
     use super::*;
+
+    /// A server that answers `server.version`, then starts its answer
+    /// to the next request and never finishes it. It says when that
+    /// request arrived, and when the client closed the connection.
+    fn stalling_server() -> (String, mpsc::Receiver<&'static str>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let (seen, heard) = mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut writer = stream.try_clone().unwrap();
+            let mut lines = BufReader::new(stream);
+            let mut line = String::new();
+            let _ = lines.read_line(&mut line);
+            let _ =
+                writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":[\"fake\",\"1.4\"]}\n");
+            line.clear();
+            let _ = lines.read_line(&mut line);
+            let _ = seen.send("asked");
+            let _ = writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"height\":");
+            // Held until the client goes: a read then ends one way or
+            // the other.
+            let mut rest = [0u8; 64];
+            while matches!(lines.get_mut().read(&mut rest), Ok(n) if n > 0) {}
+            let _ = seen.send("closed");
+        });
+        (url, heard)
+    }
+
+    /// What the server says next, within two seconds.
+    fn within(heard: &mpsc::Receiver<&'static str>, what: &'static str) {
+        assert_eq!(
+            heard.recv_timeout(Duration::from_secs(2)).ok(),
+            Some(what),
+            "the server never saw the client {what}"
+        );
+    }
+
+    /// A call is held to its deadline however the server stalls, and
+    /// the connection is shut down when it runs out: the thread does
+    /// not go on reading.
+    #[tokio::test]
+    async fn a_stalled_call_is_abandoned_at_its_deadline() {
+        let (url, heard) = stalling_server();
+        let started = Instant::now();
+        let outcome = run(
+            &Target::new(url, None),
+            None,
+            Duration::from_millis(500),
+            |client| {
+                client
+                    .inner
+                    .block_headers_subscribe()
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .await;
+        assert_eq!(outcome.err().as_deref(), Some("no answer within 0 s"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        within(&heard, "asked");
+        within(&heard, "closed");
+    }
+
+    /// The call runs on a thread of its own, not on the blocking pool: a
+    /// runtime dropped while it waits on a server does not wait with it,
+    /// and dropping its future closes the connection.
+    #[test]
+    fn a_runtime_shutdown_never_waits_on_an_electrum_call() {
+        let (url, heard) = stalling_server();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.spawn(async move {
+            let _ = run(
+                &Target::new(url, None),
+                None,
+                Duration::from_secs(3600),
+                |client| {
+                    client
+                        .inner
+                        .block_headers_subscribe()
+                        .map_err(|e| e.to_string())
+                },
+            )
+            .await;
+        });
+        within(&heard, "asked");
+        let dropped = Instant::now();
+        drop(runtime);
+        assert!(
+            dropped.elapsed() < Duration::from_secs(2),
+            "the runtime waited {:?}",
+            dropped.elapsed()
+        );
+        within(&heard, "closed");
+    }
+
+    /// Against a server that answers, the same path carries a call.
+    #[tokio::test]
+    async fn a_call_goes_through_the_guarded_connection() {
+        let server = crate::testkit::FakeElectrum::start().await;
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        run(&target, None, Duration::from_secs(10), |client| {
+            client.inner.ping().map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// An onion server is reached through the proxy, by name, with the
+    /// proxy's credentials; nothing looks the name up on the way.
+    #[tokio::test]
+    async fn an_onion_server_is_reached_through_the_proxy_by_name() {
+        use crate::chain::tor::socks;
+        const ONION: &str = "gerfautexample000000000000000000000000000000000000000.onion";
+        let server = crate::testkit::FakeElectrum::start().await;
+        let upstream = server.address;
+        let asked: Arc<Mutex<Vec<(String, u16)>>> = Arc::default();
+        let (listener, address) = socks::bind().await.unwrap();
+        let seen = asked.clone();
+        tokio::spawn(socks::serve(
+            listener,
+            socks::Credentials::new("user", "pass"),
+            move |host, port| {
+                seen.lock().unwrap().push((host, port));
+                async move { tokio::net::TcpStream::connect(upstream).await }
+            },
+        ));
+        let target = Target::new(format!("tcp://{ONION}:50001"), None);
+        let proxy = format!("user:pass@{address}");
+        run(&target, Some(&proxy), Duration::from_secs(10), |client| {
+            client.inner.ping().map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap();
+        assert_eq!(*asked.lock().unwrap(), vec![(ONION.to_owned(), 50001)]);
+        // Without a route, nothing is opened at all.
+        let refused = run(&target, None, Duration::from_secs(10), |_| Ok(())).await;
+        assert!(refused.unwrap_err().starts_with("tor: "));
+    }
+
+    /// An in-memory stream, for the reader on its own.
+    struct Memory(Cursor<Vec<u8>>);
+
+    impl Read for Memory {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Write for Memory {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A line past the limit is refused as it arrives, not buffered
+    /// whole; lines within it go through; an abandoned call reads
+    /// nothing more.
+    #[test]
+    fn a_line_past_the_limit_is_cut_off() {
+        let mut data = b"short\n".to_vec();
+        data.extend(std::iter::repeat_n(b'x', 64 * 1024));
+        let cancel = Arc::new(Cancel::default());
+        let guarded = Guarded::new(
+            Box::new(Memory(Cursor::new(data))),
+            cancel.clone(),
+            16 * 1024,
+        );
+        let mut reader = BufReader::with_capacity(1024, guarded);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "short\n");
+        line.clear();
+        let error = reader.read_line(&mut line).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            describe_io(&error, TIMEOUT),
+            "the server sent an answer longer than 0 MiB"
+        );
+        assert!(line.len() <= 16 * 1024 + 1024, "{} bytes held", line.len());
+
+        let cancel = Arc::new(Cancel::default());
+        let mut guarded = Guarded::new(
+            Box::new(Memory(Cursor::new(b"line\n".to_vec()))),
+            cancel.clone(),
+            MAX_LINE,
+        );
+        cancel.abort();
+        let error = guarded.read(&mut [0u8; 8]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert!(guarded.write(b"x").is_err());
+    }
 
     #[test]
     fn an_address_splits_into_transport_host_and_port() {
@@ -446,9 +891,9 @@ mod tests {
     /// server signed itself is described precisely and refused until it
     /// is accepted, then it carries real data, and a different
     /// certificate on the same host is refused again.
-    #[test]
+    #[tokio::test]
     #[ignore = "talks to public Electrum servers"]
-    fn a_self_signed_server_asks_once_and_then_serves() {
+    async fn a_self_signed_server_asks_once_and_then_serves() {
         let vouched = Target::new("ssl://electrum.blockstream.info:50002", None);
         assert_eq!(
             inspect_blocking(&vouched).unwrap(),
@@ -484,7 +929,8 @@ mod tests {
         let pizza: Txid = "a1075db55d416d3ca199f55b6084e2115b9345e16c5cf302fc80e9d5fbf5d48d"
             .parse()
             .unwrap();
-        let txout = fetch_prevout_blocking(&accepted, OutPoint::new(pizza, 0), None)
+        let txout = fetch_prevout(&accepted, OutPoint::new(pizza, 0), None)
+            .await
             .expect("an accepted certificate carries Electrum traffic")
             .expect("the server knows that transaction");
         assert_eq!(txout.value.to_sat(), 1_000_000_000_000);
@@ -562,7 +1008,7 @@ mod tests {
         );
         // And without a route, the connection is refused before the
         // name could reach a resolver, whatever the case.
-        let error = connect(&Target::new(shouted, None), None)
+        let error = connect(&Target::new(shouted, None), None, &Arc::default())
             .err()
             .map(|e| e.to_string())
             .expect("no route, no connection");
