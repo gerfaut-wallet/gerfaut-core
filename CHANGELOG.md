@@ -33,15 +33,17 @@ The first release: the library both Gerfaut apps are built on.
   with no Tor daemon installed.
 - A live watch. One connection to the configured backend stays open and
   says when a watched wallet moved, so the app syncs that wallet at once
-  instead of at the next scheduled sync. An Electrum server pushes every
-  script. A mempool instance pushes blocks and as many scripts as it allows
-  per connection, ten on the public ones, and the rest are polled. Any other
-  Esplora is polled once a minute, 240 requests an hour at most. The
-  connection takes the route a sync takes: Tor for an onion host, and never
-  around it, with the same certificate checks. The server learns what a sync
-  already tells it, plus how long the app stays connected. When a server
-  keeps reporting changes that no sync can find, each sync it asks for
-  waits longer than the last, up to ten minutes.
+  instead of waiting for the next scheduled sync. An Electrum server pushes
+  changes on up to 200 scripts per wallet, 2,000 in all, and the regular
+  syncs cover the rest. A mempool instance pushes blocks and as many
+  scripts as it allows per connection, ten on the public ones, and the rest
+  are polled. Any other Esplora is polled about once a minute, around 240
+  requests an hour. The connection takes the route a sync takes: Tor for
+  an onion host, and never around it, with the same certificate checks.
+  The server learns what a sync already tells it, plus how long the app
+  stays connected. When a server keeps reporting changes that no sync can
+  find, each sync it asks for waits longer than the last, up to ten
+  minutes.
 - A sync report lists the transactions it saw confirm, next to the ones it
   saw for the first time, so an app can announce both.
 - Live alerts on the wallet manager. It starts the watch, syncs the wallet

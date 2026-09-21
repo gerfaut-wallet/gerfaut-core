@@ -2,8 +2,8 @@
 //! push.
 //!
 //! A round is the tip hash and at most [`ROUND_BUDGET`] script
-//! lookups, one after the other, once a minute: 240 requests an hour
-//! at most, whatever the size of the wallets. blockstream.info, the
+//! lookups, one after the other, about once a minute: some 240 requests
+//! an hour, whatever the size of the wallets. blockstream.info, the
 //! public server this is for, allows an address 700 an hour, and the
 //! syncs need their share of that. The first [`HOT`] scripts of the
 //! list, the head of every wallet, are looked up every round; the
