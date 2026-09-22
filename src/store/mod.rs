@@ -138,6 +138,11 @@ pub struct Announced {
     pub wallet_id: String,
     pub txid: String,
     pub stage: TxStage,
+    /// The transaction announced first for the same payment, when this
+    /// one is a fee bump of it, however many bumps lie between: see
+    /// [`crate::live::LiveTx::replaces`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<String>,
 }
 
 impl Announced {
@@ -158,6 +163,10 @@ pub struct Unclaimed {
     pub stage: TxStage,
     /// When the sync found it, unix seconds.
     pub found_at: u64,
+    /// The transaction announced first for the same payment: see
+    /// [`crate::live::LiveTx::replaces`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<String>,
 }
 
 /// Everything the vault persists.

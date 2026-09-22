@@ -25,7 +25,11 @@
 //! of the wallet spent, one already announced at the mempool stage,
 //! and that moves the wallet the same way (in, or out) and by nearly as
 //! much, is recorded as announced and not said. Whichever of them
-//! confirms is said once, as confirmed. A replacement that moves the
+//! confirms is said once, as confirmed, and names in `replaces` the
+//! txid the payment was first announced under, however many bumps lie
+//! between, so the app can put the confirmation in place of the pending
+//! notice. A bumped payment that vanishes is said dropped under that
+//! same first txid. A replacement that moves the
 //! wallet by much less, or sends much more out, is no fee bump: it is
 //! said as a transaction of its own.
 //!
@@ -161,6 +165,28 @@ fn pending_said(payload: &VaultPayload, wallet_id: &str, txid: &str) -> bool {
         })
 }
 
+/// The txid the app was told of this transaction's payment under, for
+/// this wallet: its own, or the first one of the payment it is a fee
+/// bump of. `None` when it was never announced.
+fn announced_under(payload: &VaultPayload, wallet_id: &str, txid: &str) -> Option<String> {
+    payload
+        .announced
+        .iter()
+        .find(|entry| {
+            entry.covers(wallet_id)
+                && entry.txid == txid
+                && matches!(entry.stage, TxStage::Mempool | TxStage::Confirmed)
+        })
+        .map(|entry| entry.replaces.clone().unwrap_or_else(|| txid.to_owned()))
+}
+
+/// The first txid of the payment `txid` is a fee bump of, when it is
+/// one the core recognised and that payment was announced: what
+/// [`LiveTx::replaces`] carries.
+fn first_of(payload: &VaultPayload, wallet_id: &str, txid: &str) -> Option<String> {
+    announced_under(payload, wallet_id, txid).filter(|first| first != txid)
+}
+
 /// Takes the arrival of a transaction out of the news still waiting.
 /// True when there was one.
 fn unsay_arrival(payload: &mut VaultPayload, wallet_id: &str, txid: &str) -> bool {
@@ -186,14 +212,18 @@ fn replace(payload: &mut VaultPayload, wallet_id: &str, replaced: &Seen, by: &Se
             entry.txid = by.txid.clone();
             entry.net_sats = by.net_sats;
         }
-        None => remember(
-            payload,
-            [Announced {
-                wallet_id: wallet_id.to_owned(),
-                txid: by.txid.clone(),
-                stage: TxStage::Mempool,
-            }],
-        ),
+        None => {
+            let first = announced_under(payload, wallet_id, &replaced.txid);
+            remember(
+                payload,
+                [Announced {
+                    wallet_id: wallet_id.to_owned(),
+                    txid: by.txid.clone(),
+                    stage: TxStage::Mempool,
+                    replaces: first,
+                }],
+            )
+        }
     }
 }
 
@@ -219,13 +249,15 @@ fn expire(payload: &mut VaultPayload, now: u64) {
 
 /// Records one piece of news for a wallet, unless it was announced or
 /// is waiting already. A confirmation replaces the arrival of the same
-/// transaction still waiting: it is said once, as confirmed.
+/// transaction still waiting: it is said once, as confirmed. `replaces`
+/// is the first txid of the payment, when this one is a fee bump of it.
 pub(crate) fn push(
     payload: &mut VaultPayload,
     wallet_id: &str,
     txid: &str,
     net_sats: i64,
     stage: TxStage,
+    replaces: Option<String>,
     now: u64,
 ) {
     if told(payload, wallet_id, txid, stage) {
@@ -240,9 +272,16 @@ pub(crate) fn push(
     if waiting {
         return;
     }
+    let mut replaces = replaces;
     if stage == TxStage::Confirmed {
         payload.unclaimed.retain(|entry| {
-            !(entry.wallet_id == wallet_id && entry.txid == txid && entry.stage == TxStage::Mempool)
+            let arrival = entry.wallet_id == wallet_id
+                && entry.txid == txid
+                && entry.stage == TxStage::Mempool;
+            if arrival && replaces.is_none() {
+                replaces.clone_from(&entry.replaces);
+            }
+            !arrival
         });
     }
     payload.unclaimed.push(Unclaimed {
@@ -251,6 +290,7 @@ pub(crate) fn push(
         net_sats,
         stage,
         found_at: now,
+        replaces,
     });
     let excess = payload.unclaimed.len().saturating_sub(UNCLAIMED_MAX);
     payload.unclaimed.drain(..excess);
@@ -272,24 +312,32 @@ pub(crate) fn record(
         return;
     }
     for tx in &moves.confirmed {
+        let first = first_of(payload, wallet_id, &tx.txid);
         push(
             payload,
             wallet_id,
             &tx.txid,
             tx.net_sats,
             TxStage::Confirmed,
+            first,
             now,
         );
     }
     let before = by_spent(&moves.pending_before);
     for tx in &moves.new {
         if tx.confirmed {
+            // A fee bump seen for the first time in a block: its
+            // confirmation takes the place of the pending notice.
+            let first = conflicting(&before, tx)
+                .find(|old| tx.bumps(old))
+                .and_then(|old| announced_under(payload, wallet_id, &old.txid));
             push(
                 payload,
                 wallet_id,
                 &tx.txid,
                 tx.net_sats,
                 TxStage::Confirmed,
+                first,
                 now,
             );
             continue;
@@ -305,6 +353,7 @@ pub(crate) fn record(
                 &tx.txid,
                 tx.net_sats,
                 TxStage::Mempool,
+                None,
                 now,
             ),
         }
@@ -322,12 +371,17 @@ pub(crate) fn record(
         }
         let paid_instead = conflicting(&arrived, old).any(|tx| tx.bumps(old));
         if !paid_instead {
+            // Under the txid the app was told of, a fee bump the app
+            // never saw its own id for included.
+            let told_as =
+                announced_under(payload, wallet_id, &old.txid).unwrap_or_else(|| old.txid.clone());
             push(
                 payload,
                 wallet_id,
-                &old.txid,
+                &told_as,
                 old.net_sats,
                 TxStage::Dropped,
+                None,
                 now,
             );
         }
@@ -371,6 +425,7 @@ pub(crate) fn claim(
                 txid: entry.txid.clone(),
                 net_sats: entry.net_sats,
                 stage: entry.stage,
+                replaces: entry.replaces.clone(),
             });
         }
         false
@@ -381,6 +436,7 @@ pub(crate) fn claim(
             wallet_id: tx.wallet_id.clone(),
             txid: tx.txid.clone(),
             stage: tx.stage,
+            replaces: tx.replaces.clone(),
         }),
     );
     claimed
@@ -704,6 +760,143 @@ mod tests {
             [("d", TxStage::Confirmed)]
         );
         assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+    }
+
+    /// What each claim hands out, with the txid it replaces.
+    fn replacing_of(claimed: &[LiveTx]) -> Vec<(&str, TxStage, Option<&str>)> {
+        claimed
+            .iter()
+            .map(|tx| (tx.txid.as_str(), tx.stage, tx.replaces.as_deref()))
+            .collect()
+    }
+
+    /// A payment announced, then bumped once or twice, confirms under
+    /// the last txid: the confirmation names the first one announced,
+    /// never one between. A payment that was not bumped names none.
+    #[test]
+    fn a_bumped_payment_confirms_naming_the_first_txid() {
+        for bumps in [0usize, 1, 2] {
+            let mut payload = VaultPayload::default();
+            let a = seen("a", 50_000, false);
+            record(
+                &mut payload,
+                "w",
+                false,
+                &arrived(std::slice::from_ref(&a)),
+                NOW,
+            );
+            assert_eq!(
+                replacing_of(&claim(&mut payload, "w", 10, NOW)),
+                [("a", TxStage::Mempool, None)]
+            );
+            let mut current = a;
+            for (txid, sats) in [("b", 49_800), ("c", 49_600)].into_iter().take(bumps) {
+                let bump = replacing(&current, txid, sats, false);
+                let moves = Moves {
+                    new: vec![bump.clone()],
+                    pending_before: vec![current.clone()],
+                    gone: vec![current.clone()],
+                    ..Moves::default()
+                };
+                record(&mut payload, "w", false, &moves, NOW);
+                assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+                current = bump;
+            }
+            let mined = Seen {
+                confirmed: true,
+                ..current.clone()
+            };
+            record(&mut payload, "w", false, &confirmed(&[mined]), NOW);
+            let first = (bumps > 0).then_some("a");
+            assert_eq!(
+                replacing_of(&claim(&mut payload, "w", 10, NOW)),
+                [(current.txid.as_str(), TxStage::Confirmed, first)],
+                "{bumps} bumps"
+            );
+        }
+    }
+
+    /// Bumped straight into a block: the confirmation names the txid
+    /// announced as pending.
+    #[test]
+    fn a_bump_first_seen_in_a_block_names_the_first_txid() {
+        let mut payload = VaultPayload::default();
+        let a = seen("a", 50_000, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(std::slice::from_ref(&a)),
+            NOW,
+        );
+        claim(&mut payload, "w", 10, NOW);
+        let moves = Moves {
+            new: vec![replacing(&a, "b", 49_800, true)],
+            pending_before: vec![a.clone()],
+            gone: vec![a],
+            ..Moves::default()
+        };
+        record(&mut payload, "w", false, &moves, NOW);
+        assert_eq!(
+            replacing_of(&claim(&mut payload, "w", 10, NOW)),
+            [("b", TxStage::Confirmed, Some("a"))]
+        );
+    }
+
+    /// Bumped, then evicted: the payment is said dropped under the txid
+    /// the app was told of, the first one, not the bump's.
+    #[test]
+    fn a_bumped_payment_that_vanishes_is_dropped_under_the_first_txid() {
+        let mut payload = VaultPayload::default();
+        let a = seen("a", 50_000, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(std::slice::from_ref(&a)),
+            NOW,
+        );
+        claim(&mut payload, "w", 10, NOW);
+        let b = replacing(&a, "b", 49_800, false);
+        let moves = Moves {
+            new: vec![b.clone()],
+            pending_before: vec![a.clone()],
+            gone: vec![a],
+            ..Moves::default()
+        };
+        record(&mut payload, "w", false, &moves, NOW);
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+        let vanished = Moves {
+            pending_before: vec![b.clone()],
+            gone: vec![b],
+            ..Moves::default()
+        };
+        record(&mut payload, "w", false, &vanished, NOW);
+        let claimed = claim(&mut payload, "w", 10, NOW);
+        assert_eq!(replacing_of(&claimed), [("a", TxStage::Dropped, None)]);
+        assert_eq!(claimed[0].net_sats, 49_800);
+        record(&mut payload, "w", false, &vanished, NOW);
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+    }
+
+    /// A vault from before `replaces` was kept reads as naming none.
+    #[test]
+    fn records_from_before_replaces_read_as_none() {
+        let mut stored = serde_json::to_value(VaultPayload::default()).unwrap();
+        stored["announced"] = serde_json::json!([
+            { "wallet_id": "w", "txid": "a", "stage": "mempool" }
+        ]);
+        stored["unclaimed"] = serde_json::json!([
+            { "wallet_id": "w", "txid": "b", "net_sats": 1, "stage": "mempool", "found_at": NOW }
+        ]);
+        let payload: VaultPayload = serde_json::from_value(stored).unwrap();
+        assert_eq!(payload.announced[0].replaces, None);
+        assert_eq!(payload.unclaimed[0].replaces, None);
+        let tx: LiveTx = serde_json::from_value(serde_json::json!({
+            "wallet_id": "w", "txid": "a", "net_sats": 1, "stage": "confirmed"
+        }))
+        .unwrap();
+        assert_eq!(tx.replaces, None);
     }
 
     /// Replaced before anyone claimed the first: one notice, naming the

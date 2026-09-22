@@ -50,10 +50,13 @@ The first release: the library both Gerfaut apps are built on.
   that moved, and hands out each transaction to announce once when it
   enters the mempool and once when it confirms. A payment from one watched
   wallet to another is announced for each of them. A fee bump is not
-  announced again. A replacement that pays the wallet much less, or sends
-  much more out, gets its own alert for what it moves. An incoming payment
-  already announced as pending is announced as dropped when it leaves the
-  mempool, or when such a replacement cuts it down. The record of what was
+  announced again, and when it confirms, `replaces` names the txid the
+  payment was first announced under, so an app can keep one notice per
+  payment. A payment dropped after a bump is announced under that txid.
+  A replacement that pays the wallet much less, or sends much more out,
+  gets its own alert for what it moves. An incoming payment already
+  announced as pending is announced as dropped when it leaves the mempool,
+  or when such a replacement cuts it down. The record of what was
   announced is kept in the vault, so a restart or a second caller never
   repeats one. Settings and wallets change under a running watch without a
   call from the app, and a host whose timers sleep can ask for a connection

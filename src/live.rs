@@ -90,6 +90,13 @@ const CLAIM_BATCH: usize = 32;
 const SYNCS_AT_ONCE: usize = 2;
 
 /// One transaction to announce.
+///
+/// # Contract for a host
+///
+/// Use `replaces.unwrap_or(txid)` as the notification id. A fee bump
+/// confirms under a txid of its own, and `replaces` names the one the
+/// payment was first announced under, so the confirmation takes the
+/// place of the pending notice instead of showing beside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveTx {
     pub wallet_id: String,
@@ -97,6 +104,14 @@ pub struct LiveTx {
     /// Net effect on the wallet, in satoshis.
     pub net_sats: i64,
     pub stage: TxStage,
+    /// The txid this payment was first announced under, for this wallet,
+    /// when `txid` is a fee bump the core recognised of it, however many
+    /// bumps lie between: the first one announced, never an intermediate
+    /// one. `None` for a transaction announced under its own txid. A
+    /// [`TxStage::Dropped`] carries the txid the payment was announced
+    /// under as its `txid`, and no `replaces`.
+    #[serde(default)]
+    pub replaces: Option<String>,
 }
 
 /// What a running live watch says.

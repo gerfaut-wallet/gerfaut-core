@@ -665,6 +665,8 @@ async fn a_fee_bump_is_announced_once_and_confirms_once() {
     let claimed = sync_and_claim(&manager, &wallet).await;
     assert_eq!(staged(&claimed), [(txid(0x13), TxStage::Confirmed)]);
     assert_eq!(claimed[0].net_sats, 49_600);
+    // Under the txid it was first announced under, across both bumps.
+    assert_eq!(claimed[0].replaces, Some(txid(0x11)));
     assert!(sync_and_claim(&manager, &wallet).await.is_empty());
 }
 
@@ -684,6 +686,7 @@ async fn a_bump_that_stops_paying_is_announced_as_dropped_once() {
             txid: txid(0x11),
             net_sats: 50_000,
             stage: TxStage::Dropped,
+            replaces: None,
         }]
     );
     assert!(sync_and_claim(&manager, &wallet).await.is_empty());

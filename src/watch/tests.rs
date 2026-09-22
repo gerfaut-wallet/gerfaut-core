@@ -775,6 +775,7 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
             txid: "11".repeat(32),
             net_sats: 50_000,
             stage,
+            replaces: None,
         })
     };
     assert_eq!(next_live(&mut events).await, announced(TxStage::Mempool));
@@ -860,6 +861,7 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
             txid: "44".repeat(32),
             net_sats: 50_000,
             stage: TxStage::Mempool,
+            replaces: None,
         }]
     );
     assert!(
