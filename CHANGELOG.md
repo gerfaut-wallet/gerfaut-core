@@ -64,6 +64,20 @@ The first release: the library both Gerfaut apps are built on.
 - The premium client reads a wallet the server refused: `watching` is false
   and `refusal` says why, in the list and in a `wallet_refused` event. A
   single address can be registered like a descriptor.
+- Premium devices. The account key now only connects a device: the server
+  hands that device a token of its own, which the vault keeps and which is
+  never shown, logged or handed to the apps, and every later request
+  carries that token instead of the key. A new device sees nothing and
+  changes nothing until another device approves it, or for ten days; the
+  first device an account ever has gets full access at once. The wallet
+  manager connects this device, lists the others, approves and disconnects
+  them, changes the key, logs out, and hands out each waiting device once
+  for a local notification. A vault written before devices, with a key and
+  no token, connects on its own, once. A device the server disowned keeps
+  its key and waits for the user to connect it again. A debug build can
+  point the premium client at a local server with `GERFAUT_PREMIUM_URL` and
+  `GERFAUT_PREMIUM_PUBLIC_KEY`; a release build has no code that reads
+  them.
 - One sync of a wallet runs at a time. A caller that arrives while one runs
   waits for it and takes its result instead of asking the backend again.
 - On a phone, the built-in Tor client uses reduced channel padding, so a
