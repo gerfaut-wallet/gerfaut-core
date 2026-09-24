@@ -56,6 +56,8 @@ pub struct PremiumState {
     pub acknowledged_offline_until: Option<i64>,
     /// Wallets removed from this device while the server still watched
     /// them, in the order they went, until the server has been told.
+    /// The core alone writes it; a yes an app hands back for one of
+    /// them drops its removal.
     #[serde(default)]
     pub pending_unwatch: Vec<String>,
     /// This device's connection to the account: its id, its token, when
@@ -260,15 +262,26 @@ impl PremiumState {
     }
 
     /// `offered` as an app hands it back, with what the core alone
-    /// writes taken from `self`, the stored state: only the consents,
-    /// the queued removals and the dismissed banner are the app's.
+    /// writes taken from `self`, the stored state: only the consents and
+    /// the dismissed banner are the app's. A yes the copy says for a
+    /// wallet drops that wallet's queued removal, as
+    /// [`PremiumState::consent`] does; the rest of the queue is the
+    /// core's, since a copy read before this device moved to another
+    /// account would bring back the old account's removals, to go out
+    /// with the new account's token.
     pub(crate) fn with_app_part_of(&self, offered: PremiumState) -> PremiumState {
-        PremiumState {
+        let mut taken = PremiumState {
             watched: offered.watched,
             acknowledged_offline_until: offered.acknowledged_offline_until,
-            pending_unwatch: offered.pending_unwatch,
             ..self.clone()
-        }
+        };
+        let PremiumState {
+            watched,
+            pending_unwatch,
+            ..
+        } = &mut taken;
+        pending_unwatch.retain(|id| !watched.iter().any(|w| &w.wallet_id == id));
+        taken
     }
 }
 
@@ -493,18 +506,23 @@ mod tests {
         assert_eq!(state.key.as_deref(), Some("abcdefghijkmnpqr"));
     }
 
-    /// Of what an app hands back, only its own part is taken.
+    /// Of what an app hands back, only its own part is taken: the
+    /// removals queued stay the stored ones, but for a wallet the copy
+    /// says yes to again.
     #[test]
     fn only_the_app_part_of_a_state_handed_back_is_taken() {
-        let stored = PremiumState {
+        let mut stored = PremiumState {
             certificate: Some("eyJ2IjoxfQ.c2ln".to_owned()),
             key_saved: true,
             pending_key: Some(Secret::new("mnpq23456789abcd".to_owned())),
             ..connected()
         };
+        stored.queue_unwatch("w3");
+        stored.queue_unwatch("w4");
         let mut offered = PremiumState::default();
         offered.consent("w1", 100);
         offered.queue_unwatch("w2");
+        offered.consent("w4", 200);
         offered.acknowledged_offline_until = Some(9);
         offered.disconnected = true;
         let taken = stored.with_app_part_of(offered.clone());
@@ -512,7 +530,7 @@ mod tests {
             taken,
             PremiumState {
                 watched: offered.watched,
-                pending_unwatch: offered.pending_unwatch,
+                pending_unwatch: vec!["w3".to_owned()],
                 acknowledged_offline_until: Some(9),
                 ..stored
             }

@@ -1719,3 +1719,56 @@ async fn switching_accounts_tells_the_old_one_about_its_removals_first() {
     );
     assert_eq!(stored.key.as_deref(), Some(OTHER_KEY));
 }
+
+/// The removals queued for the server are the core's. A copy of the
+/// state read before this device moved to another account, handed back
+/// after, brings back none of the old account's: they would go to the
+/// new one, with its token. A yes a copy says for a wallet still drops
+/// that wallet's removal, since the server is to watch it again.
+#[tokio::test]
+async fn a_stale_copy_cannot_bring_back_the_old_account_removals() {
+    let (base_url, mut seen) = scripted(vec![
+        LOST.to_owned(),
+        connected_answer("full"),
+        deleted_answer(THIS_DEVICE),
+        licence_answer(fixtures::ACCOUNT_CERTIFICATE),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    let mut account = connected(PremiumState {
+        key: Some(KEY.to_owned()),
+        ..PremiumState::default()
+    });
+    account.queue_unwatch("w1");
+    store_premium(&manager, account).await;
+
+    let stale = manager.premium_state().await;
+    manager
+        .premium_connect(&base_url, OTHER_KEY, DevicePlatform::Linux)
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        seen.recv().await.unwrap();
+    }
+    assert!(stored_premium(&manager).await.pending_unwatch.is_empty());
+    manager.set_premium_state(stale).await.unwrap();
+    assert!(stored_premium(&manager).await.pending_unwatch.is_empty());
+    // Nothing to tell the new account: the server, gone now, is not
+    // asked.
+    assert_eq!(manager.premium_flush_unwatch(&base_url).await.unwrap(), 0);
+
+    let mut removed = stored_premium(&manager).await;
+    removed.consent("w2", 100);
+    removed.consent("w3", 100);
+    removed.queue_unwatch("w2");
+    removed.queue_unwatch("w3");
+    store_premium(&manager, removed).await;
+    let mut copy = manager.premium_state().await;
+    copy.consent("w2", 200);
+    copy.queue_unwatch("w4");
+    manager.set_premium_state(copy).await.unwrap();
+    let stored = stored_premium(&manager).await;
+    assert_eq!(stored.pending_unwatch, ["w3"]);
+    assert_eq!(stored.consented_at("w2"), Some(200));
+}

@@ -1806,12 +1806,17 @@ impl WalletManager {
     }
 
     /// Replaces what the apps keep in the premium account state: they
-    /// read it, change what they need, and hand it back. Three things
-    /// are theirs to write: the consents, the removals queued for the
-    /// server, and the dismissed banner. Whatever the copy says of the
-    /// rest is ignored. The key, the certificate, this device's
-    /// connection, whether the server disowned it, and what was sent
-    /// and not answered move only with the server's answer, through
+    /// read it, change what they need, and hand it back. Two things are
+    /// theirs to write: the consents and the dismissed banner. A yes for
+    /// a wallet also drops its removal still queued for the server, as
+    /// [`PremiumState::consent`] does. Whatever the copy says of the
+    /// rest is ignored, the queued removals included:
+    /// [`Self::remove_wallet`] queues them, and a copy read before this
+    /// device moved to another account would otherwise bring back the
+    /// old account's, to go out with the new account's token. The key,
+    /// the certificate, this device's connection, whether the server
+    /// disowned it, and what was sent and not answered move only with
+    /// the server's answer, through
     /// [`Self::premium_connect`], [`Self::premium_ensure_device`],
     /// [`Self::premium_refresh_licence`], [`Self::premium_change_key`],
     /// [`Self::premium_remove_device`], [`Self::premium_log_out`],
