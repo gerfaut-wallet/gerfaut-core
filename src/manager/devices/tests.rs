@@ -856,6 +856,98 @@ async fn the_same_key_again_connects_nothing_new() {
     assert!(!stored.disconnected);
 }
 
+/// The key this device is connected with, entered again while a
+/// connection to another account is under way, keeps the device where
+/// it is, whatever the server answers: that connection is over, its
+/// token waits to be dropped there, and nothing sends it again behind
+/// the user's back, which would move the device without the user
+/// confirming it.
+#[tokio::test]
+async fn the_same_key_again_ends_a_connection_to_another_account() {
+    let (base_url, mut seen) = scripted(vec![
+        LOST.to_owned(),
+        answer(
+            "200 OK",
+            &format!(r#"{{"device":{}}}"#, device_json(THIS_DEVICE, "full", true)),
+        ),
+        deleted_answer(NEW_DEVICE),
+        licence_answer(fixtures::VALID_CERTIFICATE),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    let moving = connected(PremiumState {
+        key: Some(KEY.to_owned()),
+        pending_connect: Some(crate::premium::PendingConnect::new(
+            OTHER_KEY.to_owned(),
+            NEW_TOKEN.to_owned(),
+            DevicePlatform::Linux,
+        )),
+        ..PremiumState::default()
+    });
+    let staying = PremiumState {
+        pending_connect: None,
+        ..moving.clone()
+    };
+
+    // The server cannot be reached: the connection is over all the same.
+    store_premium(&manager, moving.clone()).await;
+    let lost = manager
+        .premium_connect(&base_url, KEY, DevicePlatform::Linux)
+        .await
+        .unwrap_err();
+    assert!(matches!(premium_error(lost), PremiumError::Unreachable(_)));
+    assert!(seen.recv().await.unwrap().starts_with("GET /v1/devices/me"));
+    assert_eq!(
+        stored_premium(&manager).await,
+        PremiumState {
+            pending_logouts: vec![Secret::new(NEW_TOKEN.to_owned())],
+            ..staying.clone()
+        }
+    );
+
+    // The server answers: the device it already is comes back, and the
+    // server hears at once that the other connection is over.
+    store_premium(&manager, moving).await;
+    let device = manager
+        .premium_connect(&base_url, KEY, DevicePlatform::Linux)
+        .await
+        .unwrap();
+    assert_eq!(device.id, THIS_DEVICE);
+    let mut heard = Vec::new();
+    for _ in 0..3 {
+        let request = seen.recv().await.unwrap();
+        heard.push((
+            request.lines().next().unwrap().to_owned(),
+            bearer(&request).unwrap().to_owned(),
+        ));
+    }
+    let expected: Vec<(String, String)> = [
+        ("GET /v1/devices/me HTTP/1.1", TOKEN),
+        ("DELETE /v1/devices/me HTTP/1.1", NEW_TOKEN),
+        ("GET /v1/licence HTTP/1.1", TOKEN),
+    ]
+    .iter()
+    .map(|(line, bearer)| ((*line).to_owned(), (*bearer).to_owned()))
+    .collect();
+    assert_eq!(heard, expected);
+    assert_eq!(
+        stored_premium(&manager).await,
+        PremiumState {
+            certificate: Some(fixtures::VALID_CERTIFICATE.to_owned()),
+            ..staying
+        }
+    );
+    // Nothing left to send: the server, gone now, is not asked.
+    assert_eq!(
+        manager
+            .premium_ensure_device(&base_url, DevicePlatform::Linux)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
 /// Another key moves the device to that account: the server hears
 /// that the old connection is over, and nothing this device knew of
 /// the old account stays.

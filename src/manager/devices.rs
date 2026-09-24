@@ -47,7 +47,9 @@ impl WalletManager {
     /// account's first, and waits otherwise. A key entered again on a
     /// device it already connected connects nothing new, since a new
     /// device would wait where this one may not: the device it already
-    /// is comes back. Another key moves this device to that account:
+    /// is comes back, and a connection to another account still under
+    /// way is over, its token queued for the server to drop. Another
+    /// key moves this device to that account:
     /// the removals the old account has yet to hear of go first, with
     /// the old token, and what cannot go is dropped; then what the vault
     /// knew of the old account goes, its certificate and its checklist,
@@ -380,7 +382,7 @@ impl WalletManager {
         key: String,
         platform: DevicePlatform,
     ) -> CoreResult<Device> {
-        let stored = self.state.lock().await.payload.settings.premium.clone();
+        let mut stored = self.state.lock().await.payload.settings.premium.clone();
         let same_account = same_key(stored.key.as_deref(), Some(&key));
         // Moving on while a key change of this account is unanswered
         // would lose the new key, whoever asks: the user, or a
@@ -390,8 +392,25 @@ impl WalletManager {
             return Err(PremiumError::KeyChangePending.into());
         }
         if same_account && stored.has_device() {
+            // The key this device is connected with: a connection under
+            // way is over, whatever the server says next, or sent again
+            // later it would move this device behind the user's back.
+            // Its token, which the server may have made a device of,
+            // joins the ones to tell it about.
+            let abandoned = stored.pending_connect.take();
+            if let Some(abandoned) = &abandoned {
+                self.state.lock().await.commit(|payload| {
+                    let premium = &mut payload.settings.premium;
+                    premium.pending_connect = None;
+                    premium.queue_logout(abandoned.token());
+                    Ok(())
+                })?;
+            }
             match self.premium_client(base_url).await?.device_me().await {
                 Ok(device) => {
+                    if abandoned.is_some() {
+                        let _ = self.premium_flush_logouts(base_url).await;
+                    }
                     let _ = self.premium_refresh_licence(base_url).await;
                     return Ok(device);
                 }
