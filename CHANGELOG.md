@@ -74,21 +74,25 @@ The first release: the library both Gerfaut apps are built on.
   them, changes the key, logs out, and hands out each waiting device once
   for a local notification. A vault written before devices, with a key and
   no token, connects on its own, once. A device the server disowned, or
-  whose key already has every device the server takes, keeps its key and
-  waits for the user to connect it again; a rate limit is waited out
-  rather than met at every poll. A debug build can point the premium client
-  at a local server with `GERFAUT_PREMIUM_URL` and
-  `GERFAUT_PREMIUM_PUBLIC_KEY`; a release build has no code that reads
-  them.
+  whose key it refuses for good (for example a key that already has every
+  device the server takes), keeps its key and waits for the user to
+  connect it again. A rate limit holds back only the key that hit it,
+  until the wait ends, rather than being met at every poll. A debug build
+  can point the premium client at a local server with
+  `GERFAUT_PREMIUM_URL` and `GERFAUT_PREMIUM_PUBLIC_KEY`; a release build
+  has no code that reads them.
 - A lost answer from the premium server costs neither a key nor a device.
   The device token and the new key of a key change are drawn on the device
   and written to the vault before the request leaves, and the same request
   is sent again until the server answers it; the server takes it as the
   one it already carried out. While a key change is unanswered the apps
-  say so, and nothing that would lose the new key is allowed. A device
-  that logs out while the server is out of reach keeps its token queued,
-  never shown, until the server hears of it. Moving to another account
-  first tells the old one about its removed wallets, with its own token.
+  say so, and nothing that would lose the new key is allowed. If the
+  server disconnects the device in the meantime, the change was never
+  applied, and the device drops it. A device that logs out while the
+  server is out of reach keeps its token queued, never shown, until the
+  server hears of it. Moving to another account first tells the old one
+  about its removed wallets, with the old token, and none of those
+  removals ever goes to the new account.
 - One sync of a wallet runs at a time. A caller that arrives while one runs
   waits for it and takes its result instead of asking the backend again.
 - On a phone, the built-in Tor client uses reduced channel padding, so a
