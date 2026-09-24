@@ -109,18 +109,51 @@ pub enum VaultError {
 /// the screen does about them.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PremiumError {
-    /// The client has no account key, and the route needs one.
+    /// The client has no account key, and the route needs one: the
+    /// connection of a device, the one request the key goes with.
     #[error("no premium key")]
     NoKey,
 
-    /// The server does not know this key (HTTP 401, said in the
-    /// server's own error body; a bare 401 is a refusal instead).
+    /// This device holds no token, and the route needs one: it was
+    /// never connected with the key, or the server disowned it. Nothing
+    /// was sent.
+    #[error("this device is not connected to the Premium account")]
+    NoDevice,
+
+    /// The server does not know this key (HTTP 401 on the connection
+    /// of a device, said in the server's own error body; a bare 401 is
+    /// a refusal instead).
     #[error("the premium server does not know this key")]
     UnknownKey,
 
+    /// This device is connected and waits: for another device of the
+    /// account to approve it, or for `until`, unix seconds, when it gets
+    /// full access on its own. Until then the server shows it nothing
+    /// and lets it change nothing (HTTP 403 `device_pending`).
+    #[error("this device is waiting for approval")]
+    DevicePending { until: i64 },
+
+    /// The server no longer knows this device's token: another device
+    /// disconnected it, the key was changed, or the account is gone
+    /// (HTTP 401 `device_disconnected`). The manager drops the token
+    /// and keeps the key; connecting again is the user's call.
+    #[error("this device was disconnected from the Premium account")]
+    DeviceDisconnected,
+
+    /// The key went where a device token was due (HTTP 401
+    /// `device_required`): connect the device first.
+    #[error("connect this device with the Premium key first")]
+    DeviceRequired,
+
+    /// The key already has as many devices as the server takes (HTTP
+    /// 409 `too_many_devices`); the sentence is the server's own.
+    #[error("{0}")]
+    TooManyDevices(String),
+
     /// The key exists but has no paid time left, and the route changes
-    /// what is watched (HTTP 403, said in the server's own error body;
-    /// a bare 403 is a refusal instead).
+    /// what is watched (HTTP 403, said in the server's own error body
+    /// with no code of a device refusal; a bare 403 is a refusal
+    /// instead).
     #[error("this key has no paid time left")]
     NoPaidTime,
 

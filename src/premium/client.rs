@@ -1,27 +1,34 @@
 //! The HTTP client for the premium server, one method per route.
 //!
-//! JSON in, JSON out, one bearer key. The models here are the bodies
-//! the server's `docs/API.md` promises, decoded once for both apps.
-//! Errors are sorted by what the screen has to do about them: an
-//! unknown key sends the user back to the key field, a key with no paid
-//! time left to the renewal page, a refusal is shown in the server's own
-//! words, and a server that cannot be reached is the "watch is offline"
-//! banner rather than a dialog.
+//! JSON in, JSON out, one bearer credential. The account key goes with
+//! one request only, the connection of this device; every other route
+//! carries the token the server handed the device then. The models here
+//! are the bodies the server's `docs/API.md` promises, decoded once for
+//! both apps. Errors are sorted by what the screen has to do about them:
+//! an unknown key sends the user back to the key field, a key with no
+//! paid time left to the renewal page, a device still waiting to its
+//! "waiting for approval" card, a disowned one to "connect again", a
+//! refusal is shown in the server's own words, and a server that cannot
+//! be reached is the "watch is offline" banner rather than a dialog.
 //!
 //! Signed answers are verified before they are returned, a heartbeat
-//! and a certificate alike, with the key this crate embeds and never the
+//! and a certificate alike, with the key this build trusts and never the
 //! one the answer carries: a captive portal or a stale cache cannot tell
 //! an app it is watched or paid for. The HTTP client is the crate's own,
 //! so a `.onion` base URL goes through the Tor route the manager
 //! resolved.
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use url::Url;
 
+use super::device::{self, ConnectedDevice, Device, DevicePlatform};
 use super::licence::{self, Claims, Heartbeat, KEY_ALPHABET, LICENCE_PUBLIC_KEY_HEX};
 use crate::chain;
 use crate::error::{CoreError, CoreResult, PremiumError};
@@ -37,6 +44,49 @@ pub const TELEGRAM_BOT: &str = "GerfautAlertsBot";
 /// The topic is the only thing between the public and the account's
 /// notifications, so it is not something to type.
 const NTFY_TOPIC_SYMBOLS: usize = 24;
+
+/// The premium server this build talks to, and the hex of the key its
+/// signed answers are checked against: [`DEFAULT_BASE_URL`] and
+/// [`LICENCE_PUBLIC_KEY_HEX`]. A debug build takes
+/// `GERFAUT_PREMIUM_URL` and `GERFAUT_PREMIUM_PUBLIC_KEY` from the
+/// environment first, to run against a server of its own; a release
+/// build has no code that reads them. The apps call this where they
+/// used to name the production server, and every client checks
+/// signatures against the key it returns.
+pub fn endpoint() -> (String, String) {
+    let (url, public_key) = endpoint_overrides();
+    endpoint_from(url, public_key)
+}
+
+/// What the environment names in place of the production server.
+#[cfg(debug_assertions)]
+fn endpoint_overrides() -> (Option<String>, Option<String>) {
+    (
+        std::env::var("GERFAUT_PREMIUM_URL").ok(),
+        std::env::var("GERFAUT_PREMIUM_PUBLIC_KEY").ok(),
+    )
+}
+
+/// Nothing: a release build talks to the production server.
+#[cfg(not(debug_assertions))]
+fn endpoint_overrides() -> (Option<String>, Option<String>) {
+    (None, None)
+}
+
+/// The production endpoint, with what an override names in its place;
+/// a blank one names nothing.
+fn endpoint_from(url: Option<String>, public_key: Option<String>) -> (String, String) {
+    let pick = |value: Option<String>, default: &str| {
+        value
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| default.to_owned())
+    };
+    (
+        pick(url, DEFAULT_BASE_URL),
+        pick(public_key, LICENCE_PUBLIC_KEY_HEX),
+    )
+}
 
 // --- models ---------------------------------------------------------------
 
@@ -281,9 +331,31 @@ impl Event {
 
 // --- request and response bodies -----------------------------------------
 
-#[derive(Deserialize)]
+/// The server's error body: its sentence, and for the refusals the
+/// apps act on, a code and the fields that go with it.
 struct ErrorBody {
     error: String,
+    code: Option<String>,
+    pending_until: Option<i64>,
+}
+
+impl ErrorBody {
+    /// The body, when it is the server's envelope: a JSON object with a
+    /// sentence under `error`. A code or a field of another type than
+    /// the one promised reads as absent, and the sentence still counts.
+    fn read(body: &[u8]) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+        Some(ErrorBody {
+            error: value.get("error")?.as_str()?.to_owned(),
+            code: value
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            pending_until: value
+                .get("pending_until")
+                .and_then(serde_json::Value::as_i64),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -343,24 +415,65 @@ struct DeletedBody {
     deleted: bool,
 }
 
+#[derive(Serialize)]
+struct PlatformBody {
+    platform: DevicePlatform,
+}
+
+#[derive(Deserialize)]
+struct DeviceBody {
+    device: Device,
+}
+
+#[derive(Deserialize)]
+struct DevicesBody {
+    devices: Vec<Device>,
+}
+
+#[derive(Deserialize)]
+struct KeyBody {
+    key: String,
+}
+
 // --- client ---------------------------------------------------------------
 
-/// A client for one server and one account key.
+/// Told the token a request carried when the server answered that it
+/// no longer knows it: how the manager drops a disowned token whoever
+/// made the call.
+pub(crate) type DisownedHook =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// What a request carries to say whose it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Auth {
+    /// Nothing: a public route.
+    Public,
+    /// The account key: the connection of a device, and nothing else.
+    Key,
+    /// This device's token: every other account route.
+    Device,
+}
+
+/// A client for one server, one account key and one device token.
 #[derive(Clone)]
 pub struct PremiumClient {
     base_url: String,
     key: Option<String>,
+    /// The token the server handed this device when it connected.
+    token: Option<String>,
     /// Hex of the key signed answers are checked against.
     public_key_hex: String,
     http: reqwest::Client,
+    disowned: Option<DisownedHook>,
 }
 
 impl fmt::Debug for PremiumClient {
-    /// The key stays out of logs.
+    /// The key and the token stay out of logs.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PremiumClient")
             .field("base_url", &self.base_url)
             .field("key", &self.key.as_ref().map(|_| "set"))
+            .field("token", &self.token.as_ref().map(|_| "set"))
             .finish_non_exhaustive()
     }
 }
@@ -370,6 +483,10 @@ impl PremiumClient {
     /// the Tor route the manager resolved, `host:port` or
     /// `user:password@host:port`; an onion base URL without one is
     /// refused here, before anything could look the name up.
+    ///
+    /// The client holds no device token: the manager's
+    /// [`crate::WalletManager::premium_client`] builds one that does, and
+    /// every account route but [`Self::connect_device`] needs it.
     pub fn new(base_url: &str, key: Option<String>, proxy: Option<&str>) -> CoreResult<Self> {
         if chain::is_onion(base_url) && proxy.is_none() {
             let host = chain::host_of(base_url).unwrap_or_else(|| base_url.to_owned());
@@ -384,13 +501,16 @@ impl PremiumClient {
         ))
     }
 
-    /// A client over an HTTP client built elsewhere.
+    /// A client over an HTTP client built elsewhere. Signed answers are
+    /// checked against the key [`endpoint`] names.
     pub fn with_http(base_url: &str, key: Option<String>, http: reqwest::Client) -> Self {
         PremiumClient {
             base_url: base_url.trim_end_matches('/').to_owned(),
             key: key.map(|key| licence::normalize_key(&key)),
-            public_key_hex: LICENCE_PUBLIC_KEY_HEX.to_owned(),
+            token: None,
+            public_key_hex: endpoint().1,
             http,
+            disowned: None,
         }
     }
 
@@ -398,6 +518,19 @@ impl PremiumClient {
     /// not the production one.
     pub fn with_public_key(mut self, public_key_hex: &str) -> Self {
         self.public_key_hex = public_key_hex.to_owned();
+        self
+    }
+
+    /// Carries this device's token on every account route.
+    pub(crate) fn with_device_token(mut self, token: Option<String>) -> Self {
+        self.token = token;
+        self
+    }
+
+    /// Tells `hook` the token a request carried when the server
+    /// disowns it.
+    pub(crate) fn on_disowned(mut self, hook: DisownedHook) -> Self {
+        self.disowned = Some(hook);
         self
     }
 
@@ -414,17 +547,30 @@ impl PremiumClient {
         self.key = key.map(|key| licence::normalize_key(&key));
     }
 
+    /// Whether the client carries a device token.
+    pub fn has_device_token(&self) -> bool {
+        self.token.is_some()
+    }
+
+    pub(crate) fn device_token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
     // --- public routes ------------------------------------------------
 
     pub async fn health(&self) -> CoreResult<Health> {
-        let body = self.raw(self.http.get(self.url("/v1/health"))).await?;
+        let body = self
+            .send(self.http.get(self.url("/v1/health")), Auth::Public)
+            .await?;
         decode(&body)
     }
 
-    /// The server's signed heartbeat, verified against the embedded key
+    /// The server's signed heartbeat, verified against the trusted key
     /// and against `now_unix`, this device's clock.
     pub async fn heartbeat(&self, now_unix: i64) -> CoreResult<HeartbeatReport> {
-        let body = self.raw(self.http.get(self.url("/v1/heartbeat"))).await?;
+        let body = self
+            .send(self.http.get(self.url("/v1/heartbeat")), Auth::Public)
+            .await?;
         let parsed: HeartbeatBody<'_> = decode(&body)?;
         let payload = parsed.heartbeat.get().to_owned();
         let heartbeat =
@@ -437,21 +583,114 @@ impl PremiumClient {
         })
     }
 
+    // --- devices ------------------------------------------------------
+
+    /// Connects this device with the account key: the one request the
+    /// key goes with. The server answers with the device and a token of
+    /// its own, which [`crate::WalletManager::premium_connect`] keeps in
+    /// the vault; call that rather than this. The first device an
+    /// account ever has gets full access at once. Any later one waits,
+    /// and every other device is told it came. A key the server does
+    /// not know is [`PremiumError::UnknownKey`], one whose devices fill
+    /// every slot [`PremiumError::TooManyDevices`]. A token of another
+    /// shape than the server's is not taken.
+    pub async fn connect_device(&self, platform: DevicePlatform) -> CoreResult<ConnectedDevice> {
+        if platform == DevicePlatform::Other {
+            return Err(CoreError::InvalidInput {
+                kind: "device platform",
+                detail: "the server takes android, ios, windows, macos and linux".to_owned(),
+            });
+        }
+        let request = self
+            .http
+            .post(self.url("/v1/devices"))
+            .json(&PlatformBody { platform });
+        let body = self.send(request, Auth::Key).await?;
+        let connected: ConnectedDevice = decode(&body)?;
+        if !device::is_device_token(connected.token()) {
+            return Err(PremiumError::UnexpectedResponse(
+                "the server handed out a token of another shape".to_owned(),
+            )
+            .into());
+        }
+        Ok(connected)
+    }
+
+    /// This device, as the server sees it. Any device may ask, a waiting
+    /// one too.
+    pub async fn device_me(&self) -> CoreResult<Device> {
+        let body = self
+            .send(self.http.get(self.url("/v1/devices/me")), Auth::Device)
+            .await?;
+        decode::<DeviceBody>(&body).map(|b| b.device)
+    }
+
+    /// Every device of the account, oldest first. Full access only.
+    pub async fn devices(&self) -> CoreResult<Vec<Device>> {
+        let body = self
+            .send(self.http.get(self.url("/v1/devices")), Auth::Device)
+            .await?;
+        decode::<DevicesBody>(&body).map(|b| b.devices)
+    }
+
+    /// Gives a waiting device full access now. One that already has it
+    /// is [`PremiumError::Rejected`] in the server's words.
+    pub async fn approve_device(&self, id: &str) -> CoreResult<Device> {
+        let request = self.http.post(self.device_resource(id, &["approve"])?);
+        let body = self.send(request, Auth::Device).await?;
+        decode::<DeviceBody>(&body).map(|b| b.device)
+    }
+
+    /// Disconnects a device: refuses a waiting one, or takes full access
+    /// away from another. Confirmed by the server's own word, or not at
+    /// all.
+    pub async fn remove_device(&self, id: &str) -> CoreResult<()> {
+        let request = self.http.delete(self.device_resource(id, &[])?);
+        let body = self.send(request, Auth::Device).await?;
+        confirmed_deleted(&body)
+    }
+
+    /// Disconnects this device. Confirmed by the server's own word, or
+    /// not at all.
+    pub async fn log_out_device(&self) -> CoreResult<()> {
+        let request = self.http.delete(self.url("/v1/devices/me"));
+        let body = self.send(request, Auth::Device).await?;
+        confirmed_deleted(&body)
+    }
+
+    /// Replaces the account key. The old one stops working everywhere
+    /// at once, every other device is disconnected, and this one stays
+    /// connected. Returns the new key, normalized; an answer that does
+    /// not hold one of the right shape is
+    /// [`PremiumError::UnexpectedResponse`].
+    pub async fn change_key(&self) -> CoreResult<String> {
+        let request = self.http.post(self.url("/v1/account/key"));
+        let body = self.send(request, Auth::Device).await?;
+        let key = decode::<KeyBody>(&body)?.key;
+        if !licence::is_well_formed_key(&key) {
+            return Err(PremiumError::UnexpectedResponse(
+                "the server answered with a key of another shape".to_owned(),
+            )
+            .into());
+        }
+        Ok(licence::normalize_key(&key))
+    }
+
     // --- account ------------------------------------------------------
 
     pub async fn account(&self) -> CoreResult<Account> {
         let body = self
-            .raw(self.authorized(self.http.get(self.url("/v1/account")))?)
+            .send(self.http.get(self.url("/v1/account")), Auth::Device)
             .await?;
         decode(&body)
     }
 
-    /// The certificate, verified against the embedded key before it is
-    /// returned. Refused with [`PremiumError::NoPaidTime`] for a key
-    /// never paid for.
+    /// The certificate, verified against the trusted key before it is
+    /// returned. A waiting device may ask. Refused with
+    /// [`PremiumError::NoPaidTime`] for a key never paid for.
     pub async fn licence(&self) -> CoreResult<Licence> {
         let body = self
-            .raw(self.authorized(self.http.get(self.url("/v1/licence")))?)
+            .send(self.http.get(self.url("/v1/licence")), Auth::Device)
             .await?;
         let parsed: LicenceBody = decode(&body)?;
         let claims = licence::verify_certificate(&parsed.certificate, &self.public_key_hex)?;
@@ -469,22 +708,15 @@ impl PremiumClient {
     /// pay for. Confirmed by the server's own word, or not at all.
     pub async fn delete_account(&self) -> CoreResult<()> {
         let request = self.http.delete(self.url("/v1/account"));
-        let body = self.raw(self.authorized(request)?).await?;
-        let confirmed: DeletedBody = decode(&body)?;
-        if !confirmed.deleted {
-            return Err(PremiumError::UnexpectedResponse(
-                "the server did not confirm the deletion".to_owned(),
-            )
-            .into());
-        }
-        Ok(())
+        let body = self.send(request, Auth::Device).await?;
+        confirmed_deleted(&body)
     }
 
     // --- wallets ------------------------------------------------------
 
     pub async fn wallets(&self) -> CoreResult<Vec<WalletWatch>> {
         let body = self
-            .raw(self.authorized(self.http.get(self.url("/v1/wallets")))?)
+            .send(self.http.get(self.url("/v1/wallets")), Auth::Device)
             .await?;
         let mut wallets = decode::<WalletsBody>(&body)?.wallets;
         // A server that predates the flag leaves it false, which would
@@ -516,19 +748,19 @@ impl PremiumClient {
             .http
             .put(self.resource(&["v1", "wallets", id])?)
             .json(&WalletBody { name, input });
-        self.raw(self.authorized(request)?).await.map(drop)
+        self.send(request, Auth::Device).await.map(drop)
     }
 
     pub async fn delete_wallet(&self, id: &str) -> CoreResult<()> {
         let request = self.http.delete(self.resource(&["v1", "wallets", id])?);
-        self.raw(self.authorized(request)?).await.map(drop)
+        self.send(request, Auth::Device).await.map(drop)
     }
 
     // --- channels -----------------------------------------------------
 
     pub async fn channels(&self) -> CoreResult<Vec<Channel>> {
         let body = self
-            .raw(self.authorized(self.http.get(self.url("/v1/channels")))?)
+            .send(self.http.get(self.url("/v1/channels")), Auth::Device)
             .await?;
         decode::<ChannelsBody>(&body).map(|b| b.channels)
     }
@@ -547,7 +779,7 @@ impl PremiumClient {
             target,
             secret,
         });
-        let body = self.raw(self.authorized(request)?).await?;
+        let body = self.send(request, Auth::Device).await?;
         decode(&body)
     }
 
@@ -561,13 +793,13 @@ impl PremiumClient {
             .http
             .post(self.resource(&["v1", "channels", id, "confirm"])?)
             .json(&ConfirmBody { code });
-        let body = self.raw(self.authorized(request)?).await?;
+        let body = self.send(request, Auth::Device).await?;
         decode(&body)
     }
 
     pub async fn delete_channel(&self, id: &str) -> CoreResult<()> {
         let request = self.http.delete(self.resource(&["v1", "channels", id])?);
-        self.raw(self.authorized(request)?).await.map(drop)
+        self.send(request, Auth::Device).await.map(drop)
     }
 
     /// Sends a test message right away. The provider's refusal, if any,
@@ -576,7 +808,7 @@ impl PremiumClient {
         let request = self
             .http
             .post(self.resource(&["v1", "channels", id, "test"])?);
-        self.raw(self.authorized(request)?).await.map(drop)
+        self.send(request, Auth::Device).await.map(drop)
     }
 
     // --- events -------------------------------------------------------
@@ -585,7 +817,7 @@ impl PremiumClient {
     /// `limit` of them (the server caps it at 500).
     pub async fn events(&self, after: i64, limit: u32) -> CoreResult<Vec<Event>> {
         let request = self.http.get(self.url(&events_path(after, limit)));
-        let body = self.raw(self.authorized(request)?).await?;
+        let body = self.send(request, Auth::Device).await?;
         decode::<EventsBody>(&body).map(|b| b.events)
     }
 
@@ -625,15 +857,47 @@ impl PremiumClient {
         Ok(url.into())
     }
 
-    /// The request with the account key, or [`PremiumError::NoKey`].
-    fn authorized(&self, request: reqwest::RequestBuilder) -> CoreResult<reqwest::RequestBuilder> {
-        let key = self.key.as_deref().ok_or(PremiumError::NoKey)?;
-        Ok(request.bearer_auth(key))
+    /// The URL of one device of the account, and of a route under it.
+    /// `me` is refused as an id: it names this device's own route, and
+    /// the refusal of a device listed under that name would disconnect
+    /// the one that asked.
+    fn device_resource(&self, id: &str, tail: &[&str]) -> CoreResult<String> {
+        if id == "me" {
+            return Err(PremiumError::Rejected(
+                "the server named an id this app cannot use".to_owned(),
+            )
+            .into());
+        }
+        let mut segments = vec!["v1", "devices", id];
+        segments.extend_from_slice(tail);
+        self.resource(&segments)
     }
 
-    /// Sends the request and returns the body of a successful answer;
-    /// anything else becomes the error the status stands for.
-    async fn raw(&self, request: reqwest::RequestBuilder) -> CoreResult<Vec<u8>> {
+    /// Sends the request with what `auth` names, and returns the body of
+    /// a successful answer; anything else becomes the error the status
+    /// stands for. A route that needs a credential the client does not
+    /// hold never reaches the network: [`PremiumError::NoKey`] or
+    /// [`PremiumError::NoDevice`]. When the server disowns the token a
+    /// request carried, the hook hears of it before the error returns.
+    async fn send(&self, request: reqwest::RequestBuilder, auth: Auth) -> CoreResult<Vec<u8>> {
+        let request = match auth {
+            Auth::Public => request,
+            Auth::Key => request.bearer_auth(self.key.as_deref().ok_or(PremiumError::NoKey)?),
+            Auth::Device => {
+                request.bearer_auth(self.token.as_deref().ok_or(PremiumError::NoDevice)?)
+            }
+        };
+        let answer = self.raw(request, auth).await;
+        if let Err(CoreError::Premium(PremiumError::DeviceDisconnected)) = &answer
+            && auth == Auth::Device
+            && let (Some(hook), Some(token)) = (&self.disowned, &self.token)
+        {
+            hook(token.clone()).await;
+        }
+        answer
+    }
+
+    async fn raw(&self, request: reqwest::RequestBuilder, auth: Auth) -> CoreResult<Vec<u8>> {
         let response = request
             .send()
             .await
@@ -647,8 +911,19 @@ impl PremiumClient {
         if (200..300).contains(&status) {
             return Ok(body.to_vec());
         }
-        Err(refusal(status, retry_after, &body).into())
+        Err(refusal(status, retry_after, &body, auth).into())
     }
+}
+
+/// `{"id", "deleted": true}`, or the removal is not taken as done.
+fn confirmed_deleted(body: &[u8]) -> CoreResult<()> {
+    if !decode::<DeletedBody>(body)?.deleted {
+        return Err(PremiumError::UnexpectedResponse(
+            "the server did not confirm the deletion".to_owned(),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// The longest wait a `Retry-After` is believed for, in seconds. The
@@ -688,20 +963,31 @@ fn decode<'a, T: Deserialize<'a>>(body: &'a [u8]) -> CoreResult<T> {
 /// a login first answers, and neither says anything about what the
 /// server holds, a key it would no longer know least of all.
 ///
+/// Among the server's words, the code of a device refusal comes first,
+/// then its sentence: see [`device_refusal`]. A 401 in the server's
+/// words is an unknown key only where a key was sent; where a token was,
+/// it is a refusal like another unless it is the one that disowns the
+/// token, since reading more into it would have the app drop what the
+/// server may still honour.
+///
 /// The server sends `Retry-After` with every 429 that a wait resolves,
 /// and only with those: that is a rate limit. Its one other 429, five
 /// wrong codes on a channel, comes without the header and is a refusal
 /// in its own words, since waiting changes nothing there. A bare 429
 /// is somebody on the path asking for the same patience.
-fn refusal(status: u16, retry_after: Option<u64>, body: &[u8]) -> PremiumError {
-    let words = serde_json::from_slice::<ErrorBody>(body)
-        .ok()
-        .map(|b| b.error);
+fn refusal(status: u16, retry_after: Option<u64>, body: &[u8], auth: Auth) -> PremiumError {
+    let envelope = ErrorBody::read(body);
+    if (400..=499).contains(&status)
+        && let Some(named) = envelope.as_ref().and_then(device_refusal)
+    {
+        return named;
+    }
+    let words = envelope.map(|b| b.error);
     match status {
         429 if retry_after.is_some() || words.is_none() => {
             PremiumError::RateLimited { retry_after }
         }
-        401 if words.is_some() => PremiumError::UnknownKey,
+        401 if words.is_some() && auth != Auth::Device => PremiumError::UnknownKey,
         403 if words.is_some() => PremiumError::NoPaidTime,
         404 | 410 if words.is_some() => PremiumError::NotFound,
         400..=499 => PremiumError::Rejected(words.unwrap_or_else(|| format!("HTTP {status}"))),
@@ -710,6 +996,54 @@ fn refusal(status: u16, retry_after: Option<u64>, body: &[u8]) -> PremiumError {
             None => format!("HTTP {status}"),
         }),
     }
+}
+
+/// The device refusals the apps act on, by code, with the sentence the
+/// server words each in.
+const DEVICE_REFUSALS: [(&str, &str); 4] = [
+    (
+        "device_pending",
+        "this device is waiting for approval: approve it on another of your devices, or wait \
+         until it gets full access",
+    ),
+    (
+        "device_disconnected",
+        "this device was disconnected from the Premium account",
+    ),
+    (
+        "device_required",
+        "connect this device with the Premium key first",
+    ),
+    (
+        "too_many_devices",
+        "this key already has 10 devices; disconnect one from a device with full access",
+    ),
+];
+
+/// The device refusal an error body names: by its code when it carries
+/// one this build knows, by its exact sentence otherwise, and none for
+/// anything else. A wait whose end the body does not give is a refusal
+/// in the server's words, not a date made up here.
+fn device_refusal(envelope: &ErrorBody) -> Option<PremiumError> {
+    let known = |code: &str| DEVICE_REFUSALS.iter().any(|(known, _)| *known == code);
+    let code = match envelope.code.as_deref().filter(|code| known(code)) {
+        Some(code) => code,
+        None => {
+            DEVICE_REFUSALS
+                .iter()
+                .find(|(_, sentence)| *sentence == envelope.error)?
+                .0
+        }
+    };
+    Some(match code {
+        "device_pending" => match envelope.pending_until {
+            Some(until) => PremiumError::DevicePending { until },
+            None => PremiumError::Rejected(envelope.error.clone()),
+        },
+        "device_disconnected" => PremiumError::DeviceDisconnected,
+        "device_required" => PremiumError::DeviceRequired,
+        _ => PremiumError::TooManyDevices(envelope.error.clone()),
+    })
 }
 
 /// What went wrong on the way to the server, as a sentence.
@@ -834,8 +1168,17 @@ mod tests {
         }
     }
 
+    /// The token of the device the tests speak for.
+    const TOKEN: &str = "gdt1_q83vEjRWeJC6ze8SNFZ4kLrN7xI0VniQus3vEjRWeJA";
+    const KEY: &str = "abcdefghijkmnpqr";
+
     fn client(stub: &Stub, key: Option<&str>) -> PremiumClient {
         PremiumClient::new(&stub.base_url, key.map(str::to_owned), None).unwrap()
+    }
+
+    /// A connected device: the key, and the token it earned.
+    fn device(stub: &Stub) -> PremiumClient {
+        client(stub, Some(KEY)).with_device_token(Some(TOKEN.to_owned()))
     }
 
     fn premium_error(error: CoreError) -> PremiumError {
@@ -862,7 +1205,7 @@ mod tests {
     #[tokio::test]
     async fn a_server_supplied_id_is_one_path_segment_whatever_it_holds() {
         let mut stub = stub(200, "{}").await;
-        let client = client(&stub, Some("abcdefghijkmnpqr"));
+        let client = device(&stub);
 
         client.delete_wallet("a/b?c#d e").await.unwrap();
         let request = stub.request().await;
@@ -992,8 +1335,11 @@ mod tests {
             reqwest::Client::new(),
         );
         assert_eq!(client.key(), Some("abcdefghijkmnpqr"));
-        let shown = format!("{client:?}");
+        let client_with_token = client.clone().with_device_token(Some(TOKEN.to_owned()));
+        let shown = format!("{client:?} {client_with_token:?} {client_with_token:#?}");
         assert!(!shown.contains("abcdefghijkmnpqr"), "{shown}");
+        assert!(!shown.contains(TOKEN), "{shown}");
+        assert!(!shown.contains("q83v"), "{shown}");
         assert!(shown.contains(DEFAULT_BASE_URL));
         client.set_key(None);
         assert_eq!(client.key(), None);
@@ -1008,17 +1354,42 @@ mod tests {
         assert!(PremiumClient::new(DEFAULT_BASE_URL, None, None).is_ok());
     }
 
+    /// The key goes with the connection of the device, normalized, and
+    /// with nothing else; every other account route carries the token.
     #[tokio::test]
-    async fn the_bearer_key_is_sent_normalized() {
+    async fn the_key_goes_with_the_connection_and_the_token_with_the_rest() {
+        let mut connecting = stub(
+            201,
+            &format!(
+                r#"{{"device":{{"id":"0b4b1e1c-7d1e-4b6a-9d0e-1a2b3c4d5e6f","platform":"android","connected_at":1790000000,"access":"pending","pending_until":1790864000,"approved_at":null,"this_device":true}},"token":"{TOKEN}"}}"#
+            ),
+        )
+        .await;
+        let connected = client(&connecting, Some("ABCD-EFGH-IJKM-NPQR"))
+            .connect_device(DevicePlatform::Android)
+            .await
+            .unwrap();
+        assert_eq!(connected.device.id, "0b4b1e1c-7d1e-4b6a-9d0e-1a2b3c4d5e6f");
+        assert!(connected.device.is_pending());
+        assert_eq!(connected.device.pending_until, Some(1_790_864_000));
+        assert_eq!(connected.token(), TOKEN);
+        let request = connecting.request().await;
+        assert!(
+            request.starts_with("POST /v1/devices HTTP/1.1"),
+            "{request}"
+        );
+        assert_eq!(
+            header(&request, "authorization"),
+            Some("Bearer abcdefghijkmnpqr")
+        );
+        assert_eq!(body_of(&request), r#"{"platform":"android"}"#);
+
         let mut stub = stub(
             200,
             r#"{"active":true,"paid_until":1800000000,"wallets":2,"channels":1,"network":"bitcoin"}"#,
         )
         .await;
-        let account = client(&stub, Some("ABCD-EFGH-IJKM-NPQR"))
-            .account()
-            .await
-            .unwrap();
+        let account = device(&stub).account().await.unwrap();
         assert_eq!(
             account,
             Account {
@@ -1033,27 +1404,83 @@ mod tests {
         assert!(request.starts_with("GET /v1/account HTTP/1.1"), "{request}");
         assert_eq!(
             header(&request, "authorization"),
-            Some("Bearer abcdefghijkmnpqr")
+            Some(format!("Bearer {TOKEN}").as_str())
         );
+        assert!(!request.contains(KEY), "{request}");
+    }
+
+    /// A token of another shape than the server's is not taken: it would
+    /// be stored, then sent in a header on every request.
+    #[tokio::test]
+    async fn a_token_of_another_shape_is_not_taken() {
+        for token in [
+            "abcdefghijkmnpqr",
+            "gdt1_short",
+            "gdt1_AAAAAAAAAAAAAAAAAAAAAAAAAAAA\\r\\nX: 1",
+        ] {
+            let connecting = stub(
+                201,
+                &format!(
+                    r#"{{"device":{{"id":"d","platform":"linux","connected_at":1,"access":"full"}},"token":"{token}"}}"#
+                ),
+            )
+            .await;
+            assert!(
+                matches!(
+                    premium_error(
+                        client(&connecting, Some(KEY))
+                            .connect_device(DevicePlatform::Linux)
+                            .await
+                            .unwrap_err()
+                    ),
+                    PremiumError::UnexpectedResponse(_)
+                ),
+                "{token}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn an_account_route_without_a_key_never_reaches_the_network() {
+    async fn an_account_route_without_a_token_never_reaches_the_network() {
         // A port nothing listens on: reaching it would be an error of
         // another kind.
-        let client = PremiumClient::new("http://127.0.0.1:9", None, None).unwrap();
+        let keyed = PremiumClient::new("http://127.0.0.1:9", Some(KEY.to_owned()), None).unwrap();
+        assert!(!keyed.has_device_token());
+        for refused in [
+            keyed.account().await.unwrap_err(),
+            keyed.licence().await.unwrap_err(),
+            keyed.wallets().await.unwrap_err(),
+            keyed.put_wallet("w", "n", "wpkh(...)").await.unwrap_err(),
+            keyed.device_me().await.unwrap_err(),
+            keyed.devices().await.unwrap_err(),
+            keyed.approve_device("d").await.unwrap_err(),
+            keyed.remove_device("d").await.unwrap_err(),
+            keyed.log_out_device().await.unwrap_err(),
+            keyed.change_key().await.unwrap_err(),
+            keyed.delete_account().await.unwrap_err(),
+        ] {
+            assert_eq!(premium_error(refused), PremiumError::NoDevice);
+        }
+        // Without a key, not even a connection is asked for; a platform
+        // the server does not take is refused before the key is looked
+        // at.
+        let nobody = PremiumClient::new("http://127.0.0.1:9", None, None).unwrap();
         assert_eq!(
-            premium_error(client.account().await.unwrap_err()),
+            premium_error(
+                nobody
+                    .connect_device(DevicePlatform::Windows)
+                    .await
+                    .unwrap_err()
+            ),
             PremiumError::NoKey
         );
-        assert_eq!(
-            premium_error(client.wallets().await.unwrap_err()),
-            PremiumError::NoKey
-        );
-        assert_eq!(
-            premium_error(client.put_wallet("w", "n", "wpkh(...)").await.unwrap_err()),
-            PremiumError::NoKey
-        );
+        assert!(matches!(
+            keyed
+                .connect_device(DevicePlatform::Other)
+                .await
+                .unwrap_err(),
+            CoreError::InvalidInput { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1078,7 +1505,7 @@ mod tests {
         let request = public.request().await;
         assert!(request.starts_with("GET /v1/health HTTP/1.1"), "{request}");
         assert_eq!(header(&request, "authorization"), None);
-        let _ = client(&public, Some("abcdefghijkmnpqr")).health().await;
+        let _ = device(&public).health().await;
         assert_eq!(header(&public.request().await, "authorization"), None);
 
         // A server from before the counters were dropped still decodes:
@@ -1124,10 +1551,7 @@ mod tests {
             r#"{"wallets":[{"id":"w1","name":"Cold","script_kind":"p2wsh","watched_since":1789000000,"baseline_at":1789000100,"baseline_pending":false,"baseline_height":909000,"coins":3,"value_sats":150000000},{"id":"w2","name":"New","script_kind":"p2tr","watched_since":1790000000,"baseline_at":null,"baseline_pending":true,"baseline_height":null,"coins":0,"value_sats":0}]}"#,
         )
         .await;
-        let wallets = client(&stub_wallets, Some("abcdefghijkmnpqr"))
-            .wallets()
-            .await
-            .unwrap();
+        let wallets = device(&stub_wallets).wallets().await.unwrap();
         assert_eq!(wallets.len(), 2);
         assert_eq!(wallets[0].id, "w1");
         assert_eq!(wallets[0].baseline_height, Some(909_000));
@@ -1144,10 +1568,7 @@ mod tests {
             r#"{"channels":[{"id":"0b4b1e1c-7d1e-4b6a-9d0e-1a2b3c4d5e6f","kind":"ntfy","target":"abc…xyz","linked":true,"link_code":null,"link_url":null,"linked_name":null,"linked_at":1789000000,"enabled":true,"created_at":1789000000},{"id":"1c5c2f2d-8e2f-4c7b-8e1f-2b3c4d5e6f70","kind":"telegram","target":"","linked":false,"link_code":"0123456789ab","link_url":"https://t.me/GerfautAlertsBot","enabled":true,"created_at":1789000001},{"id":"2d6d3030-9f30-4d8c-9f20-3c4d5e6f7081","kind":"webhook","target":"https://hooks.example.org/gerfaut","linked":true,"link_code":null,"link_url":null,"enabled":false,"created_at":1789000002},{"id":"3e7e4141-a041-4e9d-a031-4d5e6f708192","kind":"telegram","target":"…4242","linked":true,"link_code":null,"link_url":null,"linked_name":"Alice","linked_at":1789000500,"enabled":true,"created_at":1789000003}]}"#,
         )
         .await;
-        let channels = client(&stub_channels, Some("abcdefghijkmnpqr"))
-            .channels()
-            .await
-            .unwrap();
+        let channels = device(&stub_channels).channels().await.unwrap();
         assert_eq!(channels.len(), 4);
         assert_eq!(channels[0].kind, ChannelKind::Ntfy);
         assert!(channels[0].linked);
@@ -1186,10 +1607,7 @@ mod tests {
             r#"{"wallets":[{"id":"w1","name":"Cold","script_kind":"p2wsh","watched_since":1789000000,"baseline_at":null,"baseline_height":null,"coins":0,"value_sats":0},{"id":"w2","name":"Warm","script_kind":"p2tr","watched_since":1789000000,"baseline_at":1789000100,"baseline_height":909000,"coins":1,"value_sats":5000}]}"#,
         )
         .await;
-        let wallets = client(&older, Some("abcdefghijkmnpqr"))
-            .wallets()
-            .await
-            .unwrap();
+        let wallets = device(&older).wallets().await.unwrap();
         assert!(wallets[0].baseline_pending, "no date means it is running");
         assert!(!wallets[1].baseline_pending, "a date means it finished");
     }
@@ -1201,10 +1619,7 @@ mod tests {
             r#"{"events":[{"id":41,"kind":"spend_detected","wallet":"w1","wallet_name":"Cold","at":1790000000,"data":{"txid":"aa","value_sats":5000,"inputs":1,"outputs":2,"height":null}},{"id":42,"kind":"timelock_due","wallet":"w1","wallet_name":"Cold","at":1790000100,"data":{"branch_id":"b","label":"Recovery","summary":"key B after 1 year","milestone":"7d","remaining_seconds":600000,"spendable_now":false}},{"id":43,"kind":"something_new","wallet":"w2","wallet_name":"New","at":1790000200,"data":{}}]}"#,
         )
         .await;
-        let events = client(&stub, Some("abcdefghijkmnpqr"))
-            .events(40, 50)
-            .await
-            .unwrap();
+        let events = device(&stub).events(40, 50).await.unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].kind, EventKind::SpendDetected);
         assert_eq!(events[0].data["value_sats"], 5000);
@@ -1231,10 +1646,7 @@ mod tests {
             r#"{"wallets":[{"id":"w1","name":"Busy","script_kind":"p2wpkh","watched_since":1789000000,"baseline_at":null,"baseline_pending":false,"watching":false,"refusal":{"code":"too_many_coins","message":"This wallet holds more than 5,000 coins."},"baseline_height":null,"coins":0,"value_sats":0},{"id":"w2","name":"Address","script_kind":"p2tr","watched_since":1789000000,"baseline_at":1789000100,"baseline_pending":false,"watching":true,"refusal":null,"baseline_height":909000,"coins":1,"value_sats":5000},{"id":"w3","name":"Old server","script_kind":"p2wsh","watched_since":1789000000,"baseline_at":1789000100,"baseline_height":909000,"coins":1,"value_sats":5000}]}"#,
         )
         .await;
-        let wallets = client(&listed, Some("abcdefghijkmnpqr"))
-            .wallets()
-            .await
-            .unwrap();
+        let wallets = device(&listed).wallets().await.unwrap();
         assert!(!wallets[0].watching);
         assert!(!wallets[0].baseline_pending, "no scan is coming");
         assert_eq!(
@@ -1252,10 +1664,7 @@ mod tests {
             r#"{"events":[{"id":7,"kind":"wallet_refused","wallet":"w1","wallet_name":"Busy","at":1790000000,"data":{"code":"too_many_coins","limit":5000,"message":"This wallet holds more than 5,000 coins."}},{"id":8,"kind":"wallet_refused","wallet":"w1","wallet_name":"Busy","at":1790000001,"data":{"code":"something_new","message":"No longer watched."}}]}"#,
         )
         .await;
-        let events = client(&logged, Some("abcdefghijkmnpqr"))
-            .events(0, 50)
-            .await
-            .unwrap();
+        let events = device(&logged).events(0, 50).await.unwrap();
         assert_eq!(events[0].kind, EventKind::WalletRefused);
         assert_eq!(
             events[0].wallet_refused(),
@@ -1271,20 +1680,29 @@ mod tests {
 
     #[tokio::test]
     async fn statuses_map_to_what_the_screen_does_about_them() {
+        // An unknown key is an answer about the key, on the one route
+        // that sends it.
         let unknown = stub(401, r#"{"error":"unknown key"}"#).await;
         assert_eq!(
             premium_error(
-                client(&unknown, Some("abcdefghijkmnpqr"))
-                    .account()
+                client(&unknown, Some(KEY))
+                    .connect_device(DevicePlatform::Linux)
                     .await
                     .unwrap_err()
             ),
             PremiumError::UnknownKey
         );
+        // Where a token went, the same words are not about a key, and
+        // are a refusal like another: nothing the app holds is dropped
+        // on their account.
+        assert_eq!(
+            premium_error(device(&unknown).account().await.unwrap_err()),
+            PremiumError::Rejected("unknown key".to_owned())
+        );
         let unpaid = stub(403, r#"{"error":"this key has no paid time left"}"#).await;
         assert_eq!(
             premium_error(
-                client(&unpaid, Some("abcdefghijkmnpqr"))
+                device(&unpaid)
                     .put_wallet("w1", "Cold", "wpkh(...)")
                     .await
                     .unwrap_err()
@@ -1297,7 +1715,7 @@ mod tests {
         let refused = stub(409, &format!(r#"{{"error":"{sentence}"}}"#)).await;
         assert_eq!(
             premium_error(
-                client(&refused, Some("abcdefghijkmnpqr"))
+                device(&refused)
                     .put_wallet("w1", "Cold", "addr(bc1q...)")
                     .await
                     .unwrap_err()
@@ -1307,12 +1725,7 @@ mod tests {
         // A refusal without the promised body still names its status.
         let bare = stub(405, "method not allowed").await;
         assert_eq!(
-            premium_error(
-                client(&bare, Some("abcdefghijkmnpqr"))
-                    .delete_channel("nope")
-                    .await
-                    .unwrap_err()
-            ),
+            premium_error(device(&bare).delete_channel("nope").await.unwrap_err()),
             PremiumError::Rejected("HTTP 405".to_owned())
         );
         // Nothing under that id, whether the server says so or says it
@@ -1321,12 +1734,7 @@ mod tests {
         for status in [404, 410] {
             let missing = stub(status, r#"{"error":"no such channel"}"#).await;
             assert_eq!(
-                premium_error(
-                    client(&missing, Some("abcdefghijkmnpqr"))
-                        .delete_channel("nope")
-                        .await
-                        .unwrap_err()
-                ),
+                premium_error(device(&missing).delete_channel("nope").await.unwrap_err()),
                 PremiumError::NotFound,
                 "HTTP {status}"
             );
@@ -1339,12 +1747,7 @@ mod tests {
         for status in [404, 410] {
             let portal = stub(status, "<html><body>Not Found</body></html>").await;
             assert_eq!(
-                premium_error(
-                    client(&portal, Some("abcdefghijkmnpqr"))
-                        .delete_channel("nope")
-                        .await
-                        .unwrap_err()
-                ),
+                premium_error(device(&portal).delete_channel("nope").await.unwrap_err()),
                 PremiumError::Rejected(format!("HTTP {status}")),
                 "HTTP {status}"
             );
@@ -1355,12 +1758,7 @@ mod tests {
         for status in [401, 403] {
             let portal = stub(status, "<html><body>Sign in to continue</body></html>").await;
             assert_eq!(
-                premium_error(
-                    client(&portal, Some("abcdefghijkmnpqr"))
-                        .delete_account()
-                        .await
-                        .unwrap_err()
-                ),
+                premium_error(device(&portal).delete_account().await.unwrap_err()),
                 PremiumError::Rejected(format!("HTTP {status}")),
                 "HTTP {status}"
             );
@@ -1376,12 +1774,7 @@ mod tests {
         ] {
             let limited = stub_with(429, header, r#"{"error":"too many requests"}"#).await;
             assert_eq!(
-                premium_error(
-                    client(&limited, Some("abcdefghijkmnpqr"))
-                        .delete_channel("nope")
-                        .await
-                        .unwrap_err()
-                ),
+                premium_error(device(&limited).delete_channel("nope").await.unwrap_err()),
                 PremiumError::RateLimited {
                     retry_after: Some(retry_after)
                 },
@@ -1395,12 +1788,7 @@ mod tests {
         for header in ["", "Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n"] {
             let portal = stub_with(429, header, "<html>Too Many Requests</html>").await;
             assert_eq!(
-                premium_error(
-                    client(&portal, Some("abcdefghijkmnpqr"))
-                        .delete_channel("nope")
-                        .await
-                        .unwrap_err()
-                ),
+                premium_error(device(&portal).delete_channel("nope").await.unwrap_err()),
                 PremiumError::RateLimited { retry_after: None },
                 "{header:?}"
             );
@@ -1443,7 +1831,7 @@ mod tests {
             r#"{"id":"w1","name":"Cold","script_kind":"p2wsh","watching":true}"#,
         )
         .await;
-        client(&put, Some("abcdefghijkmnpqr"))
+        device(&put)
             .put_wallet("w1", "Cold", "wsh(sortedmulti(2,A,B,C))")
             .await
             .unwrap();
@@ -1460,10 +1848,7 @@ mod tests {
         );
 
         let mut gone = stub(200, r#"{"id":"w1","watching":false}"#).await;
-        client(&gone, Some("abcdefghijkmnpqr"))
-            .delete_wallet("w1")
-            .await
-            .unwrap();
+        device(&gone).delete_wallet("w1").await.unwrap();
         assert!(
             gone.request()
                 .await
@@ -1478,7 +1863,7 @@ mod tests {
             r#"{"id":"1c5c2f2d-8e2f-4c7b-8e1f-2b3c4d5e6f70","kind":"telegram","target":"","linked":false,"link_code":"0123456789ab","link_url":"https://t.me/GerfautAlertsBot","enabled":true,"created_at":1789000001}"#,
         )
         .await;
-        let channel = client(&telegram, Some("abcdefghijkmnpqr"))
+        let channel = device(&telegram)
             .create_channel(ChannelKind::Telegram, None, None)
             .await
             .unwrap();
@@ -1495,7 +1880,7 @@ mod tests {
             r#"{"id":"2d6d3030-9f30-4d8c-9f20-3c4d5e6f7081","kind":"webhook","target":"https://hooks.example.org/g","linked":true,"link_code":null,"link_url":null,"enabled":true,"created_at":1789000002}"#,
         )
         .await;
-        client(&webhook, Some("abcdefghijkmnpqr"))
+        device(&webhook)
             .create_channel(
                 ChannelKind::Webhook,
                 Some("https://hooks.example.org/g"),
@@ -1515,10 +1900,7 @@ mod tests {
         );
 
         let mut tested = stub(200, r#"{"id":"x","sent":true}"#).await;
-        client(&tested, Some("abcdefghijkmnpqr"))
-            .test_channel("x")
-            .await
-            .unwrap();
+        device(&tested).test_channel("x").await.unwrap();
         assert!(
             tested
                 .request()
@@ -1536,7 +1918,7 @@ mod tests {
             r#"{"id":"4f8f5252-b152-4fae-b142-5e6f70819203","kind":"email","target":"a…@example.org","linked":true,"link_code":null,"link_url":null,"linked_name":null,"enabled":true,"created_at":1789000004}"#,
         )
         .await;
-        let channel = client(&confirmed, Some("abcdefghijkmnpqr"))
+        let channel = device(&confirmed)
             .confirm_channel("4f8f5252-b152-4fae-b142-5e6f70819203", "482913")
             .await
             .unwrap();
@@ -1551,14 +1933,14 @@ mod tests {
         );
         assert_eq!(
             header(&request, "authorization"),
-            Some("Bearer abcdefghijkmnpqr")
+            Some(format!("Bearer {TOKEN}").as_str())
         );
         assert_eq!(body_of(&request), r#"{"code":"482913"}"#);
 
         let wrong = stub(400, r#"{"error":"wrong or expired code"}"#).await;
         assert_eq!(
             premium_error(
-                client(&wrong, Some("abcdefghijkmnpqr"))
+                device(&wrong)
                     .confirm_channel("x", "000000")
                     .await
                     .unwrap_err()
@@ -1568,31 +1950,28 @@ mod tests {
         let exhausted = stub(429, r#"{"error":"too many tries"}"#).await;
         assert_eq!(
             premium_error(
-                client(&exhausted, Some("abcdefghijkmnpqr"))
+                device(&exhausted)
                     .confirm_channel("x", "000000")
                     .await
                     .unwrap_err()
             ),
             PremiumError::Rejected("too many tries".to_owned())
         );
-        // No key, no request.
+        // No token, no request.
         let nobody = PremiumClient::new("http://127.0.0.1:9", None, None).unwrap();
         assert_eq!(
             premium_error(nobody.confirm_channel("x", "1").await.unwrap_err()),
-            PremiumError::NoKey
+            PremiumError::NoDevice
         );
     }
 
-    /// Deleting the account is one request with the key, taken on the
+    /// Deleting the account is one request with the token, taken on the
     /// server's word alone: an answer that does not say `deleted` is
     /// not a deletion.
     #[tokio::test]
     async fn delete_account_is_confirmed_by_the_server_or_not_at_all() {
         let mut deleted = stub(200, r#"{"deleted":true}"#).await;
-        client(&deleted, Some("abcdefghijkmnpqr"))
-            .delete_account()
-            .await
-            .unwrap();
+        device(&deleted).delete_account().await.unwrap();
         let request = deleted.request().await;
         assert!(
             request.starts_with("DELETE /v1/account HTTP/1.1"),
@@ -1600,33 +1979,27 @@ mod tests {
         );
         assert_eq!(
             header(&request, "authorization"),
-            Some("Bearer abcdefghijkmnpqr")
+            Some(format!("Bearer {TOKEN}").as_str())
         );
 
         let unconfirmed = stub(200, r#"{"deleted":false}"#).await;
         assert!(matches!(
-            premium_error(
-                client(&unconfirmed, Some("abcdefghijkmnpqr"))
-                    .delete_account()
-                    .await
-                    .unwrap_err()
-            ),
+            premium_error(device(&unconfirmed).delete_account().await.unwrap_err()),
             PremiumError::UnexpectedResponse(_)
         ));
-        let unknown = stub(401, r#"{"error":"unknown key"}"#).await;
+        let disowned = stub(
+            401,
+            r#"{"error":"this device was disconnected from the Premium account","code":"device_disconnected"}"#,
+        )
+        .await;
         assert_eq!(
-            premium_error(
-                client(&unknown, Some("abcdefghijkmnpqr"))
-                    .delete_account()
-                    .await
-                    .unwrap_err()
-            ),
-            PremiumError::UnknownKey
+            premium_error(device(&disowned).delete_account().await.unwrap_err()),
+            PremiumError::DeviceDisconnected
         );
         let nobody = PremiumClient::new("http://127.0.0.1:9", None, None).unwrap();
         assert_eq!(
             premium_error(nobody.delete_account().await.unwrap_err()),
-            PremiumError::NoKey
+            PremiumError::NoDevice
         );
     }
 
@@ -1685,7 +2058,7 @@ mod tests {
             claims.exp
         );
         let stub = stub(200, &body).await;
-        let licence = client(&stub, Some("abcdefghijkmnpqr"))
+        let licence = device(&stub)
             .with_public_key(fixtures::SERVER_PUBLIC_KEY_HEX)
             .licence()
             .await
@@ -1696,12 +2069,7 @@ mod tests {
 
         // Signed by someone else: refused, whatever the body claims.
         assert!(matches!(
-            premium_error(
-                client(&stub, Some("abcdefghijkmnpqr"))
-                    .licence()
-                    .await
-                    .unwrap_err()
-            ),
+            premium_error(device(&stub).licence().await.unwrap_err()),
             PremiumError::InvalidCertificate(_)
         ));
     }
@@ -1752,5 +2120,435 @@ mod tests {
             serde_json::from_str::<EventKind>(r#""coins_gone""#).unwrap(),
             EventKind::CoinsGone
         );
+    }
+
+    const PENDING: &str = "this device is waiting for approval: approve it on another of your \
+                           devices, or wait until it gets full access";
+    const DISCONNECTED: &str = "this device was disconnected from the Premium account";
+    const REQUIRED: &str = "connect this device with the Premium key first";
+    const TOO_MANY: &str =
+        "this key already has 10 devices; disconnect one from a device with full access";
+
+    fn refused(status: u16, body: &str) -> PremiumError {
+        refusal(status, None, body.as_bytes(), Auth::Device)
+    }
+
+    /// Every device refusal the server words, read by its code.
+    #[test]
+    fn device_refusals_are_read_by_their_code() {
+        assert_eq!(
+            refused(
+                403,
+                &format!(
+                    r#"{{"error":"{PENDING}","code":"device_pending","pending_until":1790864000}}"#
+                )
+            ),
+            PremiumError::DevicePending {
+                until: 1_790_864_000
+            }
+        );
+        assert_eq!(
+            refused(
+                401,
+                &format!(r#"{{"error":"{DISCONNECTED}","code":"device_disconnected"}}"#)
+            ),
+            PremiumError::DeviceDisconnected
+        );
+        assert_eq!(
+            refusal(
+                401,
+                None,
+                format!(r#"{{"error":"{REQUIRED}","code":"device_required"}}"#).as_bytes(),
+                Auth::Key
+            ),
+            PremiumError::DeviceRequired
+        );
+        assert_eq!(
+            refusal(
+                409,
+                None,
+                format!(r#"{{"error":"{TOO_MANY}","code":"too_many_devices"}}"#).as_bytes(),
+                Auth::Key
+            ),
+            PremiumError::TooManyDevices(TOO_MANY.to_owned())
+        );
+        // The code decides, whatever the sentence says: a server that
+        // rewords one is still read.
+        assert_eq!(
+            refused(401, r#"{"error":"gone","code":"device_disconnected"}"#),
+            PremiumError::DeviceDisconnected
+        );
+        assert_eq!(
+            refused(
+                403,
+                r#"{"error":"wait","code":"device_pending","pending_until":7}"#
+            ),
+            PremiumError::DevicePending { until: 7 }
+        );
+        assert_eq!(
+            refused(
+                409,
+                r#"{"error":"eleven is too many","code":"too_many_devices"}"#
+            ),
+            PremiumError::TooManyDevices("eleven is too many".to_owned())
+        );
+    }
+
+    /// Without a code this build knows, the exact sentence names the
+    /// refusal; and anything else keeps the rules a status had before.
+    #[test]
+    fn a_device_refusal_without_its_code_is_read_by_its_sentence() {
+        assert_eq!(
+            refused(401, &format!(r#"{{"error":"{DISCONNECTED}"}}"#)),
+            PremiumError::DeviceDisconnected
+        );
+        assert_eq!(
+            refused(
+                401,
+                &format!(r#"{{"error":"{DISCONNECTED}","code":"something_new"}}"#)
+            ),
+            PremiumError::DeviceDisconnected
+        );
+        assert_eq!(
+            refused(401, &format!(r#"{{"error":"{REQUIRED}"}}"#)),
+            PremiumError::DeviceRequired
+        );
+        assert_eq!(
+            refused(409, &format!(r#"{{"error":"{TOO_MANY}"}}"#)),
+            PremiumError::TooManyDevices(TOO_MANY.to_owned())
+        );
+        assert_eq!(
+            refused(
+                403,
+                &format!(r#"{{"error":"{PENDING}","pending_until":9}}"#)
+            ),
+            PremiumError::DevicePending { until: 9 }
+        );
+        // A wait with no end given is shown in the server's words, not
+        // read as a date nobody sent, nor as unpaid time.
+        assert_eq!(
+            refused(
+                403,
+                &format!(r#"{{"error":"{PENDING}","code":"device_pending"}}"#)
+            ),
+            PremiumError::Rejected(PENDING.to_owned())
+        );
+        assert_eq!(
+            refused(
+                403,
+                &format!(
+                    r#"{{"error":"{PENDING}","code":"device_pending","pending_until":"soon"}}"#
+                )
+            ),
+            PremiumError::Rejected(PENDING.to_owned())
+        );
+        // A code this build does not know, with a sentence it does not
+        // know either: the rules of the status, as before.
+        assert_eq!(
+            refused(
+                403,
+                r#"{"error":"this key has no paid time left","code":"no_paid_time"}"#
+            ),
+            PremiumError::NoPaidTime
+        );
+        // A code of another type is no code, and the words still count.
+        assert_eq!(
+            refused(401, &format!(r#"{{"error":"{DISCONNECTED}","code":42}}"#)),
+            PremiumError::DeviceDisconnected
+        );
+        assert_eq!(
+            refused(404, r#"{"error":"no such device","code":42}"#),
+            PremiumError::NotFound
+        );
+    }
+
+    /// A code proves nothing without the server's envelope, and nothing
+    /// on a status that is not a refusal of the request.
+    #[test]
+    fn a_device_code_outside_the_server_envelope_proves_nothing() {
+        // No sentence: not the server's envelope.
+        assert_eq!(
+            refused(401, r#"{"code":"device_disconnected"}"#),
+            PremiumError::Rejected("HTTP 401".to_owned())
+        );
+        assert_eq!(
+            refused(401, "device_disconnected"),
+            PremiumError::Rejected("HTTP 401".to_owned())
+        );
+        // A bare 401 or 403 still settles nothing.
+        assert_eq!(
+            refused(401, "<html>Sign in</html>"),
+            PremiumError::Rejected("HTTP 401".to_owned())
+        );
+        assert_eq!(
+            refused(403, ""),
+            PremiumError::Rejected("HTTP 403".to_owned())
+        );
+        // A server failing is a server failing, whatever it names.
+        assert_eq!(
+            refused(
+                503,
+                &format!(r#"{{"error":"{DISCONNECTED}","code":"device_disconnected"}}"#)
+            ),
+            PremiumError::Unreachable(format!("HTTP 503: {DISCONNECTED}"))
+        );
+    }
+
+    /// Each device route goes where the contract says, with the token,
+    /// and an id the server handed out is one encoded segment.
+    #[tokio::test]
+    async fn device_routes_go_where_the_contract_says() {
+        let device_json = r#"{"id":"d/1","platform":"ios","connected_at":1790000000,"access":"full","pending_until":null,"approved_at":1790000100,"this_device":false}"#;
+        let mut one = stub(200, &format!(r#"{{"device":{device_json}}}"#)).await;
+        let me = device(&one).device_me().await.unwrap();
+        assert_eq!(me.platform, DevicePlatform::Ios);
+        let request = one.request().await;
+        assert!(
+            request.starts_with("GET /v1/devices/me HTTP/1.1"),
+            "{request}"
+        );
+        assert_eq!(
+            header(&request, "authorization"),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+
+        let approved = device(&one).approve_device("d/1").await.unwrap();
+        assert_eq!(approved.approved_at, Some(1_790_000_100));
+        let request = one.request().await;
+        assert!(
+            request.starts_with("POST /v1/devices/d%2F1/approve HTTP/1.1"),
+            "{request}"
+        );
+
+        let mut list = stub(
+            200,
+            &format!(
+                r#"{{"devices":[{device_json},{{"id":"d2","platform":"android","connected_at":1790000200,"access":"pending","pending_until":1790864200,"approved_at":null,"this_device":true}}]}}"#
+            ),
+        )
+        .await;
+        let devices = device(&list).devices().await.unwrap();
+        assert_eq!(devices.len(), 2);
+        assert!(devices[1].is_pending() && devices[1].this_device);
+        let request = list.request().await;
+        assert!(request.starts_with("GET /v1/devices HTTP/1.1"), "{request}");
+
+        let mut deleted = stub(200, r#"{"id":"d2","deleted":true}"#).await;
+        device(&deleted).remove_device("d2").await.unwrap();
+        let request = deleted.request().await;
+        assert!(
+            request.starts_with("DELETE /v1/devices/d2 HTTP/1.1"),
+            "{request}"
+        );
+        device(&deleted).log_out_device().await.unwrap();
+        let request = deleted.request().await;
+        assert!(
+            request.starts_with("DELETE /v1/devices/me HTTP/1.1"),
+            "{request}"
+        );
+        assert_eq!(
+            header(&request, "authorization"),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+
+        // Not confirmed, not done.
+        let unconfirmed = stub(200, r#"{"id":"d2","deleted":false}"#).await;
+        for outcome in [
+            device(&unconfirmed).remove_device("d2").await,
+            device(&unconfirmed).log_out_device().await,
+        ] {
+            assert!(matches!(
+                premium_error(outcome.unwrap_err()),
+                PremiumError::UnexpectedResponse(_)
+            ));
+        }
+        // Refusals in the server's words.
+        let missing = stub(404, r#"{"error":"no such device"}"#).await;
+        assert_eq!(
+            premium_error(device(&missing).remove_device("d9").await.unwrap_err()),
+            PremiumError::NotFound
+        );
+        let already = stub(400, r#"{"error":"this device already has full access"}"#).await;
+        assert_eq!(
+            premium_error(device(&already).approve_device("d1").await.unwrap_err()),
+            PremiumError::Rejected("this device already has full access".to_owned())
+        );
+        let waiting = stub(
+            403,
+            &format!(
+                r#"{{"error":"{PENDING}","code":"device_pending","pending_until":1790864000}}"#
+            ),
+        )
+        .await;
+        assert_eq!(
+            premium_error(device(&waiting).devices().await.unwrap_err()),
+            PremiumError::DevicePending {
+                until: 1_790_864_000
+            }
+        );
+    }
+
+    /// `me` names this device's own route: listed as the id of another
+    /// device, refusing that device would disconnect this one. It is
+    /// refused unsent, like the ids the path would swallow.
+    #[tokio::test]
+    async fn an_id_that_names_this_device_route_is_refused_unsent() {
+        let client = PremiumClient::new("http://127.0.0.1:9", Some(KEY.to_owned()), None)
+            .unwrap()
+            .with_device_token(Some(TOKEN.to_owned()));
+        let refusal =
+            PremiumError::Rejected("the server named an id this app cannot use".to_owned());
+        for id in ["me", "..", ".", ""] {
+            assert_eq!(
+                premium_error(client.remove_device(id).await.unwrap_err()),
+                refusal,
+                "{id:?}"
+            );
+            assert_eq!(
+                premium_error(client.approve_device(id).await.unwrap_err()),
+                refusal,
+                "{id:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn change_key_returns_the_new_key_normalized_or_nothing() {
+        let mut changed = stub(200, r#"{"key":"WXYZ-2345-6789-ABCD"}"#).await;
+        assert_eq!(
+            device(&changed).change_key().await.unwrap(),
+            "wxyz23456789abcd"
+        );
+        let request = changed.request().await;
+        assert!(
+            request.starts_with("POST /v1/account/key HTTP/1.1"),
+            "{request}"
+        );
+        assert_eq!(
+            header(&request, "authorization"),
+            Some(format!("Bearer {TOKEN}").as_str())
+        );
+        for body in [r#"{"key":"not a key"}"#, r#"{"key":""}"#, r#"{}"#] {
+            let odd = stub(200, body).await;
+            assert!(
+                matches!(
+                    premium_error(device(&odd).change_key().await.unwrap_err()),
+                    PremiumError::UnexpectedResponse(_)
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    /// The hook hears of the token a request carried when, and only
+    /// when, the server disowned it.
+    #[tokio::test]
+    async fn a_disowned_token_is_reported_to_the_hook() {
+        let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let hook: DisownedHook = {
+            let heard = heard.clone();
+            Arc::new(move |token| {
+                heard.lock().unwrap().push(token);
+                Box::pin(async {})
+            })
+        };
+        let disowned = stub(
+            401,
+            &format!(r#"{{"error":"{DISCONNECTED}","code":"device_disconnected"}}"#),
+        )
+        .await;
+        let refused = device(&disowned)
+            .on_disowned(hook.clone())
+            .wallets()
+            .await
+            .unwrap_err();
+        assert_eq!(premium_error(refused), PremiumError::DeviceDisconnected);
+        assert_eq!(*heard.lock().unwrap(), vec![TOKEN.to_owned()]);
+
+        // Any other refusal, and a route that carried no token, are not
+        // the token disowned.
+        let unpaid = stub(403, r#"{"error":"this key has no paid time left"}"#).await;
+        let _ = device(&unpaid).on_disowned(hook.clone()).wallets().await;
+        let _ = device(&disowned)
+            .on_disowned(hook.clone())
+            .connect_device(DevicePlatform::Linux)
+            .await;
+        let _ = device(&disowned).on_disowned(hook).health().await;
+        assert_eq!(heard.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_endpoint_override_replaces_what_it_names_and_nothing_else() {
+        let production = (
+            DEFAULT_BASE_URL.to_owned(),
+            LICENCE_PUBLIC_KEY_HEX.to_owned(),
+        );
+        assert_eq!(endpoint_from(None, None), production);
+        assert_eq!(
+            endpoint_from(Some("  ".to_owned()), Some(String::new())),
+            production
+        );
+        assert_eq!(
+            endpoint_from(
+                Some(" http://127.0.0.1:8080 ".to_owned()),
+                Some(fixtures::SERVER_PUBLIC_KEY_HEX.to_owned())
+            ),
+            (
+                "http://127.0.0.1:8080".to_owned(),
+                fixtures::SERVER_PUBLIC_KEY_HEX.to_owned()
+            )
+        );
+        assert_eq!(
+            endpoint_from(Some("http://127.0.0.1:8080".to_owned()), None).1,
+            LICENCE_PUBLIC_KEY_HEX
+        );
+    }
+
+    /// What [`endpoint`] returns, in a process whose environment names
+    /// a local server. Run by the test below, in a process of its own,
+    /// so no test changes the environment of the others.
+    #[test]
+    #[ignore = "run by the_environment_is_read_by_debug_builds_only"]
+    fn endpoint_in_its_own_process() {
+        let (url, public_key) = endpoint();
+        let client = PremiumClient::with_http(&url, None, reqwest::Client::new());
+        println!("endpoint {url} {public_key} {}", client.public_key_hex);
+    }
+
+    /// A debug build reads the override from the environment, and a
+    /// release build does not, however the environment is set: this
+    /// test runs in both (`cargo test` and `cargo test --release`), and
+    /// asks a process of its own, started with the override set.
+    #[test]
+    fn the_environment_is_read_by_debug_builds_only() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "premium::client::tests::endpoint_in_its_own_process",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("GERFAUT_PREMIUM_URL", "http://127.0.0.1:8080")
+            .env(
+                "GERFAUT_PREMIUM_PUBLIC_KEY",
+                fixtures::SERVER_PUBLIC_KEY_HEX,
+            )
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let said = String::from_utf8_lossy(&output.stdout);
+        let expected = if cfg!(debug_assertions) {
+            format!(
+                "endpoint http://127.0.0.1:8080 {0} {0}",
+                fixtures::SERVER_PUBLIC_KEY_HEX
+            )
+        } else {
+            format!(
+                "endpoint {DEFAULT_BASE_URL} {0} {0}",
+                LICENCE_PUBLIC_KEY_HEX
+            )
+        };
+        assert!(said.contains(&expected), "{said}");
     }
 }

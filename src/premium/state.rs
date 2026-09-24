@@ -10,8 +10,17 @@
 //! because removing a wallet here must remove it there and cannot wait
 //! for the network; and how long the "watch is offline" banner was told
 //! to keep quiet.
+//!
+//! Since a key only connects a device, the device's own credential sits
+//! beside the key: the token the server handed this device, which every
+//! request but the connection carries. Then what the screens remember
+//! about the account's safety: whether the server disowned this device,
+//! whether the user saved the key, whether the checklist was put away,
+//! and which waiting devices a notification already announced.
 
 use serde::{Deserialize, Serialize};
+
+use super::device::DeviceCredential;
 
 /// A wallet the user agreed to have watched by the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +53,27 @@ pub struct PremiumState {
     /// them, in the order they went, until the server has been told.
     #[serde(default)]
     pub pending_unwatch: Vec<String>,
+    /// This device's connection to the account: its id, its token, when
+    /// it connected. `None` until the key connects it, and again once
+    /// the server disowned it. The core alone writes it.
+    #[serde(default)]
+    pub device: Option<DeviceCredential>,
+    /// The server disowned this device: another device disconnected it,
+    /// the key was changed elsewhere, or the key no longer opens the
+    /// account. The key stays, and connecting again waits for the user
+    /// to ask. The core alone writes it.
+    #[serde(default)]
+    pub disconnected: bool,
+    /// The user said the key is saved somewhere safe.
+    #[serde(default)]
+    pub key_saved: bool,
+    /// The "Protect your Premium account" card was hidden.
+    #[serde(default)]
+    pub checklist_hidden: bool,
+    /// Waiting devices a local notification already announced, so each
+    /// is announced once.
+    #[serde(default)]
+    pub announced_devices: Vec<String>,
 }
 
 impl PremiumState {
@@ -98,11 +128,174 @@ impl PremiumState {
     pub fn unwatched(&mut self, wallet_id: &str) {
         self.pending_unwatch.retain(|w| w != wallet_id);
     }
+
+    /// Whether this device holds a connection to the account.
+    pub fn has_device(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Whether `token` is the one this device holds.
+    pub(crate) fn holds_token(&self, token: &str) -> bool {
+        self.device.as_ref().is_some_and(|d| d.token() == token)
+    }
+
+    /// The server no longer knows `token`: the connection it belonged
+    /// to is gone, the key stays. Only that token is dropped: one stored
+    /// since, by a connection made meanwhile, is not touched. Returns
+    /// whether anything changed.
+    pub(crate) fn disown(&mut self, token: &str) -> bool {
+        if !self.holds_token(token) {
+            return false;
+        }
+        self.device = None;
+        self.disconnected = true;
+        true
+    }
+
+    /// This device leaves the account: the key, its connection, its
+    /// certificate and what the screens remembered about it go. The
+    /// consents stay, so the same key entered again asks nothing twice,
+    /// and so do the removals the server has yet to hear of.
+    pub(crate) fn forget_account(&mut self) {
+        self.key = None;
+        self.certificate = None;
+        self.acknowledged_offline_until = None;
+        self.device = None;
+        self.disconnected = false;
+        self.key_saved = false;
+        self.checklist_hidden = false;
+        self.announced_devices.clear();
+    }
+
+    /// Records the waiting devices a notification has announced.
+    /// `pending` is every device that waits, as the latest list shows
+    /// them: the record becomes that, so a device that no longer waits
+    /// leaves it. Returns the ones it did not hold before, in the order
+    /// given: the devices to announce now, each handed out once.
+    pub(crate) fn mark_announced(&mut self, pending: &[String]) -> Vec<String> {
+        let mut record: Vec<String> = Vec::with_capacity(pending.len());
+        for id in pending {
+            if !record.contains(id) {
+                record.push(id.clone());
+            }
+        }
+        let fresh = record
+            .iter()
+            .filter(|id| !self.announced_devices.contains(id))
+            .cloned()
+            .collect();
+        self.announced_devices = record;
+        fresh
+    }
+
+    /// Blanks the device token: the state as an app is handed it.
+    pub(crate) fn redact(&mut self) {
+        self.device = self.device.as_ref().map(DeviceCredential::redacted);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TOKEN: &str = "gdt1_q83vEjRWeJC6ze8SNFZ4kLrN7xI0VniQus3vEjRWeJA";
+    const OTHER_TOKEN: &str = "gdt1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    fn connected() -> PremiumState {
+        PremiumState {
+            key: Some("abcdefghijkmnpqr".to_owned()),
+            device: Some(DeviceCredential::new("d1".to_owned(), TOKEN.to_owned(), 5)),
+            ..PremiumState::default()
+        }
+    }
+
+    /// A vault written before devices existed holds a key and no token.
+    /// It reads unchanged, as a device never connected, not as one the
+    /// server disowned.
+    #[test]
+    fn a_vault_from_before_devices_reads_as_never_connected() {
+        let state: PremiumState = serde_json::from_str(
+            r#"{"key":"abcdefghijkmnpqr","certificate":"eyJ2IjoxfQ.c2ln","watched":[{"wallet_id":"w1","consented_at":100}],"acknowledged_offline_until":null,"pending_unwatch":["w2"]}"#,
+        )
+        .unwrap();
+        assert!(state.has_key());
+        assert!(!state.has_device());
+        assert!(!state.disconnected);
+        assert!(!state.key_saved);
+        assert!(!state.checklist_hidden);
+        assert!(state.announced_devices.is_empty());
+        assert_eq!(state.pending_unwatch, vec!["w2".to_owned()]);
+        assert!(state.is_consented("w1"));
+    }
+
+    #[test]
+    fn a_disowned_token_goes_and_a_newer_one_stays() {
+        let mut state = connected();
+        assert!(
+            !state.disown(OTHER_TOKEN),
+            "not the token this device holds"
+        );
+        assert!(state.has_device());
+        assert!(!state.disconnected);
+        assert!(state.disown(TOKEN));
+        assert!(!state.has_device());
+        assert!(state.disconnected);
+        assert!(state.has_key(), "the key stays");
+        assert!(!state.disown(TOKEN), "nothing left to drop");
+    }
+
+    #[test]
+    fn leaving_the_account_keeps_the_consents_and_the_removals() {
+        let mut state = PremiumState {
+            certificate: Some("eyJ2IjoxfQ.c2ln".to_owned()),
+            acknowledged_offline_until: Some(500),
+            disconnected: true,
+            key_saved: true,
+            checklist_hidden: true,
+            announced_devices: vec!["d2".to_owned()],
+            ..connected()
+        };
+        state.consent("w1", 100);
+        state.queue_unwatch("w2");
+        state.forget_account();
+        let mut expected = PremiumState::default();
+        expected.consent("w1", 100);
+        expected.queue_unwatch("w2");
+        assert_eq!(state, expected);
+    }
+
+    #[test]
+    fn each_waiting_device_is_announced_once_and_forgotten_once_it_stops_waiting() {
+        let ids = |list: &[&str]| list.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let mut state = PremiumState::default();
+        assert_eq!(
+            state.mark_announced(&ids(&["d1", "d2"])),
+            ids(&["d1", "d2"])
+        );
+        assert_eq!(state.mark_announced(&ids(&["d1", "d2"])), ids(&[]));
+        // d1 was approved or refused: it leaves the record. d3 is new,
+        // and named twice is announced once.
+        assert_eq!(
+            state.mark_announced(&ids(&["d2", "d3", "d3"])),
+            ids(&["d3"])
+        );
+        assert_eq!(state.announced_devices, ids(&["d2", "d3"]));
+        assert_eq!(state.mark_announced(&[]), ids(&[]));
+        assert!(state.announced_devices.is_empty());
+    }
+
+    #[test]
+    fn the_state_an_app_is_handed_has_no_token() {
+        let mut state = connected();
+        let shown = format!("{state:?}");
+        assert!(!shown.contains(TOKEN), "{shown}");
+        state.redact();
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains(TOKEN), "{json}");
+        assert!(!state.holds_token(TOKEN));
+        assert_eq!(state.device.as_ref().unwrap().id, "d1");
+        assert!(state.has_device());
+    }
 
     #[test]
     fn a_removal_waits_once_and_leaves_when_told() {
@@ -164,11 +357,18 @@ mod tests {
             }],
             acknowledged_offline_until: Some(500),
             pending_unwatch: Vec::new(),
+            device: Some(DeviceCredential::new("d1".to_owned(), TOKEN.to_owned(), 7)),
+            disconnected: false,
+            key_saved: true,
+            checklist_hidden: false,
+            announced_devices: vec!["d2".to_owned()],
         };
         let json = serde_json::to_string(&state).unwrap();
         assert_eq!(
             json,
-            r#"{"key":"abcdefghijkmnpqr","certificate":"eyJ2IjoxfQ.c2ln","watched":[{"wallet_id":"w1","consented_at":100}],"acknowledged_offline_until":500,"pending_unwatch":[]}"#
+            format!(
+                r#"{{"key":"abcdefghijkmnpqr","certificate":"eyJ2IjoxfQ.c2ln","watched":[{{"wallet_id":"w1","consented_at":100}}],"acknowledged_offline_until":500,"pending_unwatch":[],"device":{{"id":"d1","token":"{TOKEN}","connected_at":7}},"disconnected":false,"key_saved":true,"checklist_hidden":false,"announced_devices":["d2"]}}"#
+            )
         );
         assert_eq!(serde_json::from_str::<PremiumState>(&json).unwrap(), state);
     }

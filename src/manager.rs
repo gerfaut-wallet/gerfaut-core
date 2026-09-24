@@ -45,6 +45,8 @@ use crate::wallet::snapshot::{
 use crate::wallet::views;
 use crate::wallet::{AddressTx, AddressWatchState};
 
+mod devices;
+
 /// Vault file name inside the data directory.
 const VAULT_FILE: &str = "gerfaut.vault";
 /// The failed unlock attempts, beside the vault: a count and a time,
@@ -125,6 +127,15 @@ pub struct Shared {
     pub(crate) watch_setups: std::sync::atomic::AtomicU64,
     /// One sync at a time per wallet, and when the last one ended.
     syncing: std::sync::Mutex<HashMap<String, SyncSlot>>,
+    /// Held across a change of this device's premium connection, the
+    /// network call included: two connections made at once would leave
+    /// the server with a device nobody holds, and a log out racing a
+    /// connection could bring back the key it removed.
+    premium_changes: Mutex<()>,
+    /// The key the premium clients built here check signed answers
+    /// against, in place of the one [`crate::premium::endpoint`] names.
+    #[cfg(test)]
+    premium_public_key: std::sync::Mutex<Option<String>>,
 }
 
 /// The last sync of a wallet to finish, behind the lock a sync of that
@@ -144,6 +155,12 @@ pub(crate) fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Whether two premium keys are the same account key, however each was
+/// typed; two absent keys are the same absence.
+fn same_key(a: Option<&str>, b: Option<&str>) -> bool {
+    a.map(crate::premium::licence::normalize_key) == b.map(crate::premium::licence::normalize_key)
 }
 
 impl WalletManager {
@@ -171,6 +188,9 @@ impl WalletManager {
                 live: std::sync::Mutex::new(None),
                 watch_setups: std::sync::atomic::AtomicU64::new(0),
                 syncing: std::sync::Mutex::new(HashMap::new()),
+                premium_changes: Mutex::new(()),
+                #[cfg(test)]
+                premium_public_key: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -178,12 +198,15 @@ impl WalletManager {
     // --- settings ------------------------------------------------------
 
     /// The settings as the apps may see them: the lock's hash stays in
-    /// the vault, the apps only need to know a lock exists and its kind.
+    /// the vault, the apps only need to know a lock exists and its kind,
+    /// and the premium device token stays too, as in
+    /// [`Self::premium_state`].
     pub async fn settings(&self) -> Settings {
         let mut settings = self.state.lock().await.payload.settings.clone();
         if let Some(lock) = &mut settings.app_lock {
             lock.secret = None;
         }
+        settings.premium.redact();
         settings
     }
 
@@ -1765,22 +1788,47 @@ impl WalletManager {
 
     // --- premium -------------------------------------------------------
 
-    /// The premium account as the vault keeps it.
+    /// The premium account as the vault keeps it, the device token
+    /// blanked: it never leaves the core. The rest is as stored, and
+    /// [`PremiumState::device`] still says whether this device is
+    /// connected.
     pub async fn premium_state(&self) -> PremiumState {
-        self.state.lock().await.payload.settings.premium.clone()
+        let mut premium = self.state.lock().await.payload.settings.premium.clone();
+        premium.redact();
+        premium
     }
 
     /// Replaces the premium account state, whole: the apps read it,
-    /// change what they need, and hand it back.
+    /// change what they need, and hand it back. What the core alone
+    /// writes, this device's connection and whether the server disowned
+    /// it, stays as stored while the key does: the copy an app holds
+    /// has no token to give back, and may predate a connection or a
+    /// disconnection made meanwhile. A state handed back with another
+    /// key, or none, has no connection: a device connects with a key,
+    /// and connecting with that one is [`Self::premium_connect`]'s
+    /// business. Changing the key goes through that function,
+    /// [`Self::premium_change_key`] and [`Self::premium_log_out`].
     pub async fn set_premium_state(&self, premium: PremiumState) -> CoreResult<()> {
         self.state.lock().await.commit(|payload| {
+            let stored = &payload.settings.premium;
+            let mut premium = premium;
+            if same_key(premium.key.as_deref(), stored.key.as_deref()) {
+                premium.device = stored.device.clone();
+                premium.disconnected = stored.disconnected;
+            } else {
+                premium.device = None;
+                premium.disconnected = false;
+            }
             payload.settings.premium = premium;
             Ok(())
         })
     }
 
     /// A client for the premium server at `base_url`, carrying the
-    /// stored key.
+    /// stored key and this device's token. A token the server disowns
+    /// through it, whoever makes the call, is dropped from the vault
+    /// before the error comes back, and the key stays: see
+    /// [`PremiumError::DeviceDisconnected`].
     ///
     /// The client goes through Tor when the base URL is an onion, and
     /// when the backend of the active network is one: a person who
@@ -1791,13 +1839,24 @@ impl WalletManager {
     /// falls back to the clear. A clearnet backend with a clearnet base
     /// URL never probes for Tor.
     pub async fn premium_client(&self, base_url: &str) -> CoreResult<PremiumClient> {
-        let key = self.state.lock().await.payload.settings.premium.key.clone();
-        self.premium_client_with_key(base_url, key).await
+        let (key, token) = {
+            let state = self.state.lock().await;
+            let premium = &state.payload.settings.premium;
+            (
+                premium.key.clone(),
+                premium.device.as_ref().map(|d| d.token().to_owned()),
+            )
+        };
+        Ok(self
+            .premium_client_with_key(base_url, key)
+            .await?
+            .with_device_token(token)
+            .on_disowned(self.premium_disowned_hook()))
     }
 
     /// [`Self::premium_client`] carrying `key` instead of the stored
-    /// one: for the licence check of a key just typed, before anything
-    /// is stored. The route is decided the same way.
+    /// one, and no device token: for connecting a key just typed,
+    /// before anything is stored. The route is decided the same way.
     pub async fn premium_client_with_key(
         &self,
         base_url: &str,
@@ -1809,11 +1868,41 @@ impl WalletManager {
         } else {
             None
         };
-        PremiumClient::new(base_url, key, proxy.as_deref())
+        let client = PremiumClient::new(base_url, key, proxy.as_deref())?;
+        #[cfg(test)]
+        let client = match self.premium_public_key.lock().unwrap().clone() {
+            Some(public_key) => client.with_public_key(&public_key),
+            None => client,
+        };
+        Ok(client)
+    }
+
+    /// What drops a token the server disowned: the stored one, if it is
+    /// still that token. The manager is held weakly, so a client kept
+    /// past it keeps nothing alive. A vault that cannot be written keeps
+    /// the token, and the next call hears the same answer and tries
+    /// again.
+    fn premium_disowned_hook(&self) -> crate::premium::client::DisownedHook {
+        let shared = std::sync::Arc::downgrade(&self.shared);
+        std::sync::Arc::new(move |token: String| {
+            let shared = shared.clone();
+            Box::pin(async move {
+                let Some(shared) = shared.upgrade() else {
+                    return;
+                };
+                let mut state = shared.state.lock().await;
+                if state.payload.settings.premium.holds_token(&token) {
+                    let _ = state.commit(|payload| {
+                        payload.settings.premium.disown(&token);
+                        Ok(())
+                    });
+                }
+            })
+        })
     }
 
     /// Confirms a channel with the code the server sent to it, through
-    /// the client [`Self::premium_client`] builds: the same key, the
+    /// the client [`Self::premium_client`] builds: the same token, the
     /// same route.
     pub async fn premium_confirm_channel(
         &self,
@@ -1828,18 +1917,20 @@ impl WalletManager {
     }
 
     /// Deletes the account on the server, then forgets it here: the
-    /// key, the certificate, the consents, the dismissed banner. A key
-    /// with nothing behind it is not worth keeping, and the next key
-    /// entered starts from nothing. Nothing is forgotten unless the
-    /// server confirmed, or no longer knows the key at all: an account
-    /// deleted from another device, or purged, is as gone as one
-    /// deleted here, and keeping its key would only make every later
-    /// call fail. Any other refusal leaves the vault as it was.
+    /// key, the token, the certificate, the consents, the dismissed
+    /// banner. A key with nothing behind it is not worth keeping, and
+    /// the next key entered starts from nothing. Nothing is forgotten
+    /// unless the server confirmed. A token the server disowns is not
+    /// that: an account deleted from another device disowns it, and so
+    /// does a device disconnected from one that is still there, which
+    /// this device can no longer tell apart. The token goes, the key
+    /// stays, and [`Self::premium_log_out`] is what forgets the rest.
     pub async fn premium_delete_account(&self, base_url: &str) -> CoreResult<()> {
-        match self.premium_client(base_url).await?.delete_account().await {
-            Ok(()) | Err(CoreError::Premium(PremiumError::UnknownKey)) => {}
-            Err(e) => return Err(e),
-        }
+        let _change = self.premium_changes.lock().await;
+        self.premium_client(base_url)
+            .await?
+            .delete_account()
+            .await?;
         self.state.lock().await.commit(|payload| {
             payload.settings.premium = PremiumState::default();
             Ok(())
@@ -1848,23 +1939,23 @@ impl WalletManager {
 
     /// Tells the server to stop watching a wallet that stays on this
     /// device: the switch in the settings turned off. The yes goes with
-    /// it once the server has nothing under that id: told, answered
-    /// that there is nothing there ([`PremiumError::NotFound`]), or a
-    /// key it no longer knows. A wallet the server does not watch
-    /// needs no consent on file; one left behind would have a later
-    /// removal queue a message the server has already heard, and the
-    /// screens say the server is told when it has nothing to hear.
-    /// Switching the wallet back on asks the question again, as it
-    /// should: the descriptor leaves the device only on a yes said for
-    /// that sending. Any other answer leaves everything as it was: a
-    /// server that cannot be reached, one that refuses for lack of
-    /// paid time, a rate limit or any refusal of its own says nothing
-    /// about what it still holds, and the wallet is still watched
-    /// there, the yes still standing here, until it is told again.
+    /// it once the server has nothing under that id: told, or answered
+    /// that there is nothing there ([`PremiumError::NotFound`]). A
+    /// wallet the server does not watch needs no consent on file; one
+    /// left behind would have a later removal queue a message the
+    /// server has already heard, and the screens say the server is told
+    /// when it has nothing to hear. Switching the wallet back on asks
+    /// the question again, as it should: the descriptor leaves the
+    /// device only on a yes said for that sending. Any other answer
+    /// leaves everything as it was: a server that cannot be reached,
+    /// one that refuses for lack of paid time, a device that waits or
+    /// was disowned, a rate limit or any refusal of its own says
+    /// nothing about what it still holds, and the wallet is still
+    /// watched there, the yes still standing here, until it is told
+    /// again.
     pub async fn premium_unwatch_wallet(&self, base_url: &str, id: &str) -> CoreResult<()> {
         match self.premium_client(base_url).await?.delete_wallet(id).await {
-            Ok(()) | Err(CoreError::Premium(PremiumError::NotFound | PremiumError::UnknownKey)) => {
-            }
+            Ok(()) | Err(CoreError::Premium(PremiumError::NotFound)) => {}
             Err(e) => return Err(e),
         }
         self.state.lock().await.commit(|payload| {
@@ -1878,21 +1969,22 @@ impl WalletManager {
     /// Tells the server about the wallets removed from this device
     /// since it last heard, one `DELETE` each in the order they went,
     /// through the client [`Self::premium_client`] builds. A wallet the
-    /// server has nothing under, or a key it no longer knows, counts as
-    /// told. A wallet the server refuses stays queued and the round
+    /// server has nothing under counts as told. A wallet the server
+    /// refuses stays queued and the round
     /// goes on to the next: a refusal is about that one id, and one
     /// the server never accepts must not hold every wallet behind it.
     /// Any other answer ends the round where it stands: a server that
     /// cannot be reached, and a rate limit, which is about this client
     /// and would turn away every request behind it as well. Either way what was told is
     /// forgotten, the rest waits for the next call, and the first
-    /// error is returned. Nothing to tell costs no connection. Returns
-    /// how many removals still wait.
+    /// error is returned. Nothing to tell, or no connected device to
+    /// tell it with, costs no connection. Returns how many removals
+    /// still wait.
     pub async fn premium_flush_unwatch(&self, base_url: &str) -> CoreResult<usize> {
         let pending = {
             let state = self.state.lock().await;
             let premium = &state.payload.settings.premium;
-            if !premium.has_key() {
+            if !premium.has_key() || !premium.has_device() {
                 return Ok(premium.pending_unwatch.len());
             }
             premium.pending_unwatch.clone()
@@ -1906,9 +1998,8 @@ impl WalletManager {
         for id in &pending {
             match client.delete_wallet(id).await {
                 Ok(()) => told.push(id.clone()),
-                // Nothing under that id: the state we wanted. A key the
-                // server does not know has no wallets either.
-                Err(CoreError::Premium(PremiumError::NotFound | PremiumError::UnknownKey)) => {
+                // Nothing under that id: the state we wanted.
+                Err(CoreError::Premium(PremiumError::NotFound)) => {
                     told.push(id.clone());
                 }
                 // A refusal says nothing about what the server holds,
@@ -2358,6 +2449,41 @@ mod tests {
 
     async fn manager(dir: &std::path::Path) -> WalletManager {
         WalletManager::open(dir, key()).unwrap()
+    }
+
+    /// The token of the device the premium tests speak for.
+    pub(crate) const TOKEN: &str = "gdt1_q83vEjRWeJC6ze8SNFZ4kLrN7xI0VniQus3vEjRWeJA";
+
+    /// `premium` on a device the key connected.
+    pub(crate) fn connected(premium: PremiumState) -> PremiumState {
+        PremiumState {
+            device: Some(crate::premium::DeviceCredential::new(
+                "0f3b7c2e-1a2b-4c3d-8e9f-a0b1c2d3e4f5".to_owned(),
+                TOKEN.to_owned(),
+                1_790_000_000,
+            )),
+            ..premium
+        }
+    }
+
+    /// Writes the premium state as it is, the device's connection
+    /// included, which [`WalletManager::set_premium_state`] leaves to the
+    /// core.
+    pub(crate) async fn store_premium(manager: &WalletManager, premium: PremiumState) {
+        manager
+            .state
+            .lock()
+            .await
+            .commit(|payload| {
+                payload.settings.premium = premium;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The premium state as the vault holds it, token included.
+    pub(crate) async fn stored_premium(manager: &WalletManager) -> PremiumState {
+        manager.state.lock().await.payload.settings.premium.clone()
     }
 
     #[tokio::test]
@@ -3054,7 +3180,7 @@ mod tests {
         for id in ["w1", "w2", "w3"] {
             premium.queue_unwatch(id);
         }
-        manager.set_premium_state(premium).await.unwrap();
+        store_premium(&manager, connected(premium)).await;
 
         let outcome = manager.premium_flush_unwatch(&base_url).await;
         assert!(
@@ -3106,7 +3232,7 @@ mod tests {
         for id in ["w1", "w2"] {
             premium.queue_unwatch(id);
         }
-        manager.set_premium_state(premium).await.unwrap();
+        store_premium(&manager, connected(premium)).await;
 
         let outcome = manager.premium_flush_unwatch(&base_url).await;
         assert!(
@@ -3159,7 +3285,7 @@ mod tests {
         for id in ["w1", "w2", "w3", "w4"] {
             premium.queue_unwatch(id);
         }
-        manager.set_premium_state(premium).await.unwrap();
+        store_premium(&manager, connected(premium)).await;
 
         let outcome = manager.premium_flush_unwatch(&base_url).await;
         assert!(
@@ -3206,7 +3332,7 @@ mod tests {
         for id in ["w1", "w2", "w3"] {
             premium.queue_unwatch(id);
         }
-        manager.set_premium_state(premium).await.unwrap();
+        store_premium(&manager, connected(premium)).await;
 
         let outcome = manager.premium_flush_unwatch(&base_url).await;
         assert!(
@@ -3234,11 +3360,12 @@ mod tests {
     }
 
     /// Switching a wallet off withdraws the yes once the server has
-    /// nothing under its id: told, already unknown, or a key it no
-    /// longer knows. Removing the wallet after that queues nothing,
-    /// since the server has nothing to hear. A refusal for lack of
-    /// paid time, a rate limit, or a server that cannot be reached,
-    /// leaves the yes in place, and a removal still queues its message.
+    /// nothing under its id: told, or already unknown. Removing the
+    /// wallet after that queues nothing, since the server has nothing
+    /// to hear. A refusal for lack of paid time, words about a key the
+    /// request never carried, a rate limit, or a server that cannot be
+    /// reached, leaves the yes in place, and a removal still queues its
+    /// message.
     #[tokio::test]
     async fn switching_a_wallet_off_withdraws_the_yes_once_the_server_has_heard() {
         let (base_url, mut seen) = answering(vec![
@@ -3264,7 +3391,7 @@ mod tests {
         for id in [meta.id.as_str(), "w2", "w3", "w4", "w5", "w6"] {
             premium.consent(id, 100);
         }
-        manager.set_premium_state(premium).await.unwrap();
+        store_premium(&manager, connected(premium)).await;
 
         // Told: the yes goes, and the removal that follows has nothing
         // to queue.
@@ -3282,18 +3409,23 @@ mod tests {
         assert!(premium.pending_unwatch.is_empty(), "{premium:?}");
         assert!(!premium.is_consented(&meta.id));
 
-        // Already unknown to the server, or a key it no longer knows:
-        // as unwatched as told.
+        // Already unknown to the server: as unwatched as told.
         manager
             .premium_unwatch_wallet(&base_url, "w2")
             .await
             .unwrap();
         assert!(!manager.premium_state().await.is_consented("w2"));
-        manager
+        // "unknown key" where a token went is not about a key, and
+        // proves nothing about the wallet: the yes stands.
+        let unknown = manager
             .premium_unwatch_wallet(&base_url, "w3")
             .await
-            .unwrap();
-        assert!(!manager.premium_state().await.is_consented("w3"));
+            .unwrap_err();
+        assert!(
+            matches!(&unknown, CoreError::Premium(PremiumError::Rejected(words)) if words == "unknown key"),
+            "{unknown}"
+        );
+        assert!(manager.premium_state().await.is_consented("w3"));
 
         // Refused for lack of paid time: still watched, the yes stands.
         let refused = manager
@@ -3329,8 +3461,8 @@ mod tests {
         );
         let premium = manager.premium_state().await;
         assert!(premium.is_consented("w4") && premium.is_consented("w5"));
-        assert!(premium.is_consented("w6"));
-        assert_eq!(premium.watched.len(), 3);
+        assert!(premium.is_consented("w3") && premium.is_consented("w6"));
+        assert_eq!(premium.watched.len(), 4);
 
         // The yes withdrawn, the question is asked again: a new yes
         // starts a fresh date.
@@ -4312,93 +4444,111 @@ mod tests {
         (format!("http://{address}"), receiver)
     }
 
-    /// The account the vault keeps: a key, a certificate, a consent, a
-    /// banner dismissed.
+    /// The account the vault keeps: a key, the device it connected, a
+    /// certificate, a consent, a banner dismissed.
     fn premium_account() -> PremiumState {
-        let mut premium = PremiumState {
+        let mut premium = connected(PremiumState {
             key: Some("abcdefghijkmnpqr".to_owned()),
             certificate: Some("not.checked.here".to_owned()),
             acknowledged_offline_until: Some(1_800_000_000),
             pending_unwatch: Vec::new(),
             ..PremiumState::default()
-        };
+        });
         premium.consent("w1", 1_790_000_000);
         premium
     }
 
-    /// Deleting the account is one request with the stored key, and the
-    /// vault forgets the account only once the server said it did.
+    /// Deleting the account is one request with the stored token, and
+    /// the vault forgets the account only once the server said it did.
     #[tokio::test]
     async fn premium_delete_account_forgets_the_account_once_the_server_confirms() {
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(dir.path()).await;
 
-        // No key: nothing to delete, and nothing is asked.
+        // Not connected: nothing to delete, and nothing is asked.
         let (base_url, mut seen) = premium_answering(200, r#"{"deleted":true}"#).await;
         let error = manager.premium_delete_account(&base_url).await.unwrap_err();
         assert!(
-            matches!(error, CoreError::Premium(crate::error::PremiumError::NoKey)),
+            matches!(error, CoreError::Premium(PremiumError::NoDevice)),
             "{error}"
         );
         assert!(seen.try_recv().is_err());
 
-        manager.set_premium_state(premium_account()).await.unwrap();
+        store_premium(&manager, premium_account()).await;
         manager.premium_delete_account(&base_url).await.unwrap();
         let request = seen.recv().await.unwrap();
         assert!(
             request.starts_with("DELETE /v1/account HTTP/1.1"),
             "{request}"
         );
-        assert!(request.contains("Bearer abcdefghijkmnpqr"), "{request}");
-        assert_eq!(manager.premium_state().await, PremiumState::default());
+        assert!(request.contains(&format!("Bearer {TOKEN}")), "{request}");
+        assert!(!request.contains("abcdefghijkmnpqr"), "{request}");
+        assert_eq!(stored_premium(&manager).await, PremiumState::default());
         // Forgotten on disk as well.
         drop(manager);
         let reopened = WalletManager::open(dir.path(), key()).unwrap();
-        assert_eq!(reopened.premium_state().await, PremiumState::default());
+        assert_eq!(stored_premium(&reopened).await, PremiumState::default());
 
         // The server did not confirm: the account stays.
         let refusing = tempfile::tempdir().unwrap();
         let kept = WalletManager::open(refusing.path(), key()).unwrap();
-        kept.set_premium_state(premium_account()).await.unwrap();
+        store_premium(&kept, premium_account()).await;
         let (base_url, _) = premium_answering(503, r#"{"error":"node unreachable"}"#).await;
         assert!(kept.premium_delete_account(&base_url).await.is_err());
-        assert_eq!(kept.premium_state().await, premium_account());
+        assert_eq!(stored_premium(&kept).await, premium_account());
     }
 
-    /// A key the server no longer knows, deleted from another device
-    /// or purged, is as gone as one deleted here: the vault forgets it
-    /// rather than keep a key that would fail every call from now on.
-    /// Any other refusal is not that, and the account stays.
+    /// A disowned token is not a deleted account: the account may be
+    /// there still, and only this device lost it. The token goes, the
+    /// key and the rest stay. Any other refusal keeps everything.
     #[tokio::test]
-    async fn premium_delete_account_forgets_a_key_the_server_no_longer_knows() {
+    async fn premium_delete_account_keeps_the_account_the_server_did_not_delete() {
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(dir.path()).await;
-        manager.set_premium_state(premium_account()).await.unwrap();
-        let (base_url, mut seen) = premium_answering(401, r#"{"error":"unknown key"}"#).await;
-        manager.premium_delete_account(&base_url).await.unwrap();
+        store_premium(&manager, premium_account()).await;
+        let (base_url, mut seen) = premium_answering(
+            401,
+            r#"{"error":"this device was disconnected from the Premium account","code":"device_disconnected"}"#,
+        )
+        .await;
+        let error = manager.premium_delete_account(&base_url).await.unwrap_err();
+        assert!(
+            matches!(error, CoreError::Premium(PremiumError::DeviceDisconnected)),
+            "{error}"
+        );
         let request = seen.recv().await.unwrap();
         assert!(
             request.starts_with("DELETE /v1/account HTTP/1.1"),
             "{request}"
         );
-        assert_eq!(manager.premium_state().await, PremiumState::default());
-        // Forgotten on disk as well.
+        let disowned = PremiumState {
+            device: None,
+            disconnected: true,
+            ..premium_account()
+        };
+        assert_eq!(stored_premium(&manager).await, disowned);
+        // On disk as well.
         drop(manager);
         let reopened = WalletManager::open(dir.path(), key()).unwrap();
-        assert_eq!(reopened.premium_state().await, PremiumState::default());
+        assert_eq!(stored_premium(&reopened).await, disowned);
+
+        // Words about a key the request never carried: kept whole.
+        let refusing = tempfile::tempdir().unwrap();
+        let kept = WalletManager::open(refusing.path(), key()).unwrap();
+        store_premium(&kept, premium_account()).await;
+        let (base_url, _) = premium_answering(401, r#"{"error":"unknown key"}"#).await;
+        assert!(kept.premium_delete_account(&base_url).await.is_err());
+        assert_eq!(stored_premium(&kept).await, premium_account());
 
         // Any other answer, a server without the route among them:
         // not gone, and kept.
-        let refusing = tempfile::tempdir().unwrap();
-        let kept = WalletManager::open(refusing.path(), key()).unwrap();
-        kept.set_premium_state(premium_account()).await.unwrap();
         let (base_url, _) = premium_answering(404, r#"{"error":"no such route"}"#).await;
         let error = kept.premium_delete_account(&base_url).await.unwrap_err();
         assert!(
             matches!(error, CoreError::Premium(PremiumError::NotFound)),
             "{error}"
         );
-        assert_eq!(kept.premium_state().await, premium_account());
+        assert_eq!(stored_premium(&kept).await, premium_account());
 
         // A 401 without the server's envelope is a portal asking for a
         // login, not the server disowning the key: kept as well.
@@ -4408,14 +4558,14 @@ mod tests {
             matches!(&error, CoreError::Premium(PremiumError::Rejected(words)) if words == "HTTP 401"),
             "{error}"
         );
-        assert_eq!(kept.premium_state().await, premium_account());
+        assert_eq!(stored_premium(&kept).await, premium_account());
     }
 
     #[tokio::test]
-    async fn premium_confirm_channel_goes_through_the_stored_key() {
+    async fn premium_confirm_channel_goes_through_the_stored_token() {
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(dir.path()).await;
-        manager.set_premium_state(premium_account()).await.unwrap();
+        store_premium(&manager, premium_account()).await;
         let (base_url, mut seen) = premium_answering(
             200,
             r#"{"id":"4f8f5252-b152-4fae-b142-5e6f70819203","kind":"email","target":"a…@example.org","linked":true,"link_code":null,"link_url":null,"linked_name":null,"enabled":true,"created_at":1789000004}"#,
@@ -4433,7 +4583,8 @@ mod tests {
             ),
             "{request}"
         );
-        assert!(request.contains("Bearer abcdefghijkmnpqr"), "{request}");
+        assert!(request.contains(&format!("Bearer {TOKEN}")), "{request}");
+        assert!(!request.contains("abcdefghijkmnpqr"), "{request}");
         assert!(request.ends_with(r#"{"code":"482913"}"#), "{request}");
     }
 
