@@ -132,10 +132,12 @@ pub struct Shared {
     /// the server with a device nobody holds, and a log out racing a
     /// connection could bring back the key it removed.
     premium_changes: Mutex<()>,
-    /// Until when the server asked not to be sent a connection again: a
-    /// rate limit [`Self::premium_ensure_device`] waits out rather than
-    /// meet again at every poll.
-    premium_connect_after: std::sync::Mutex<Option<Instant>>,
+    /// Until when the server asked not to be sent a connection of a key
+    /// again, and that key: a rate limit
+    /// [`Self::premium_ensure_device`] waits out rather than meet again
+    /// at every poll. The server counts connections by key, so the wait
+    /// holds back a connection of that key and no other.
+    premium_connect_after: std::sync::Mutex<Option<(Instant, String)>>,
     /// The key the premium clients built here check signed answers
     /// against, in place of the one [`crate::premium::endpoint`] names.
     #[cfg(test)]

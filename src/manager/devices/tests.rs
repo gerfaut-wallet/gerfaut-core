@@ -1200,20 +1200,25 @@ async fn another_key_drops_the_connection_under_way() {
     assert_eq!(queued, [abandoned.as_str()]);
 }
 
+/// A rate limit that names a wait of two minutes.
+fn rate_limited() -> String {
+    let limited = r#"{"error":"too many connections, try again later"}"#;
+    format!(
+        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{limited}",
+        limited.len()
+    )
+}
+
 /// Once the server has said the key has every device it takes, the key
 /// is not sent again behind the user's back: the device reads as
 /// disconnected, with the server's sentence. A rate limit is waited
 /// out, without a request, for the time the server named.
 #[tokio::test]
 async fn the_key_is_not_sent_again_after_a_rate_limit_or_a_full_account() {
-    let limited = r#"{"error":"too many connections, try again later"}"#;
     let full = "this key already has 10 devices; disconnect one from a device with full access";
     let (base_url, mut seen) = scripted(vec![
-        format!(
-            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: {}\r\n\
-             Connection: close\r\n\r\n{limited}",
-            limited.len()
-        ),
+        rate_limited(),
         answer(
             "409 Conflict",
             &format!(r#"{{"error":"{full}","code":"too_many_devices"}}"#),
@@ -1269,6 +1274,74 @@ async fn the_key_is_not_sent_again_after_a_rate_limit_or_a_full_account() {
             .await
             .unwrap(),
         None
+    );
+}
+
+/// A rate limit holds back the connection it met and no other. Once
+/// that connection is over, because the user logged out or entered
+/// another key the server refused, nothing is owed and nothing answers
+/// with a wait; a connection of another key whose answer was lost is
+/// sent again at once.
+#[tokio::test]
+async fn a_rate_limit_holds_back_only_the_connection_it_met() {
+    let (base_url, mut seen) = scripted(vec![
+        rate_limited(),
+        rate_limited(),
+        answer("401 Unauthorized", r#"{"error":"unknown key"}"#),
+        LOST.to_owned(),
+        connected_answer("full"),
+        licence_answer(fixtures::VALID_CERTIFICATE),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    let ensure = || manager.premium_ensure_device(&base_url, DevicePlatform::Linux);
+    let rate_limit = PremiumError::RateLimited {
+        retry_after: Some(120),
+    };
+
+    // An old vault's connection meets a rate limit, then the user logs
+    // out: nothing is owed any more.
+    store_premium(&manager, old_vault()).await;
+    assert_eq!(premium_error(ensure().await.unwrap_err()), rate_limit);
+    seen.recv().await.unwrap();
+    manager.premium_log_out(&base_url).await.unwrap();
+    assert_eq!(ensure().await.unwrap(), None);
+
+    // The user's own connection meets one, then another key is refused:
+    // nothing is owed either.
+    let limited = manager
+        .premium_connect(&base_url, KEY, DevicePlatform::Linux)
+        .await
+        .unwrap_err();
+    assert_eq!(premium_error(limited), rate_limit);
+    seen.recv().await.unwrap();
+    let unknown = manager
+        .premium_connect(&base_url, OTHER_KEY, DevicePlatform::Linux)
+        .await
+        .unwrap_err();
+    assert_eq!(premium_error(unknown), PremiumError::UnknownKey);
+    seen.recv().await.unwrap();
+    assert_eq!(ensure().await.unwrap(), None);
+    assert!(seen.try_recv().is_err(), "nothing was sent meanwhile");
+
+    // The first key's wait still runs, and a connection of the other key,
+    // whose answer was lost, is sent again at once all the same.
+    assert!(
+        manager
+            .premium_connect(&base_url, OTHER_KEY, DevicePlatform::Linux)
+            .await
+            .is_err()
+    );
+    let (_, token) = connect_body(&seen.recv().await.unwrap());
+    let device = ensure().await.unwrap().expect("connected");
+    assert_eq!(device.id, NEW_DEVICE);
+    let replayed = seen.recv().await.unwrap();
+    assert_eq!(bearer(&replayed), Some(OTHER_KEY));
+    assert_eq!(connect_body(&replayed).1, token);
+    assert_eq!(
+        stored_premium(&manager).await.key.as_deref(),
+        Some(OTHER_KEY)
     );
 }
 

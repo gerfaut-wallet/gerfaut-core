@@ -88,21 +88,15 @@ impl WalletManager {
     /// knows, a key with every device it takes: each leaves the device
     /// disconnected until the user connects it again, with
     /// [`Self::premium_connect`]. A rate limit is waited out: until the
-    /// wait the server named is over, this answers
-    /// [`PremiumError::RateLimited`] with what is left of it, without a
-    /// request.
+    /// wait the server named is over, a connection of the key it met
+    /// answers [`PremiumError::RateLimited`] with what is left of it,
+    /// without a request. Nothing owed is `None`, whatever wait runs.
     pub async fn premium_ensure_device(
         &self,
         base_url: &str,
         platform: DevicePlatform,
     ) -> CoreResult<Option<Device>> {
         let _change = self.premium_changes.lock().await;
-        if let Some(wait) = self.connect_wait() {
-            return Err(PremiumError::RateLimited {
-                retry_after: Some(wait.as_secs().max(1)),
-            }
-            .into());
-        }
         let (key, platform) = {
             let state = self.state.lock().await;
             let premium = &state.payload.settings.premium;
@@ -114,6 +108,12 @@ impl WalletManager {
                 _ => return Ok(None),
             }
         };
+        if let Some(wait) = self.connect_wait(&key) {
+            return Err(PremiumError::RateLimited {
+                retry_after: Some(wait.as_secs().max(1)),
+            }
+            .into());
+        }
         self.connect(base_url, key, platform).await.map(Some)
     }
 
@@ -511,7 +511,7 @@ impl WalletManager {
     /// settles it drops the connection under way, and one about the
     /// stored key disconnects this device; an answer lost on the way
     /// keeps it, to be sent again as it was; a rate limit also holds
-    /// back the next automatic try for the wait it named.
+    /// back the next automatic try of that key for the wait it named.
     async fn after_refused_connect(
         &self,
         request: &PendingConnect,
@@ -520,7 +520,8 @@ impl WalletManager {
     ) -> CoreResult<()> {
         if let CoreError::Premium(PremiumError::RateLimited { retry_after }) = error {
             let wait = retry_after.map_or(CONNECT_WAIT_UNNAMED, Duration::from_secs);
-            *self.premium_connect_after.lock().unwrap() = Some(Instant::now() + wait);
+            *self.premium_connect_after.lock().unwrap() =
+                Some((Instant::now() + wait, request.key().to_owned()));
         }
         if !settles_connect(error) {
             return Ok(());
@@ -550,14 +551,19 @@ impl WalletManager {
         })
     }
 
-    /// How long a connection still waits on the rate limit it met.
-    fn connect_wait(&self) -> Option<Duration> {
+    /// How long a connection of `key` still waits on the rate limit it
+    /// met. A connection of another key waits on nothing: the server
+    /// counts connections by key.
+    fn connect_wait(&self, key: &str) -> Option<Duration> {
         let mut after = self.premium_connect_after.lock().unwrap();
-        let wait = after.and_then(|at| at.checked_duration_since(Instant::now()));
-        if wait.is_none() {
-            *after = None;
+        let (until, limited) = after.as_ref()?;
+        match until.checked_duration_since(Instant::now()) {
+            Some(wait) => same_key(Some(limited), Some(key)).then_some(wait),
+            None => {
+                *after = None;
+                None
+            }
         }
-        wait
     }
 
     /// Tells the server that the connection holding `token` is over.
