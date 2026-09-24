@@ -55,8 +55,10 @@ impl WalletManager {
     /// knew of the old account goes, its certificate and its checklist,
     /// and the server is told the old connection is over, now or later.
     /// A key change of the old account that did not finish refuses the
-    /// move, [`PremiumError::KeyChangePending`]: moving on would lose
-    /// the only copy of its new key.
+    /// move while this device holds its token,
+    /// [`PremiumError::KeyChangePending`]: moving on would lose the only
+    /// copy of its new key. Without the token, the change was never
+    /// applied, and connecting ends it.
     ///
     /// With the stored key, a refusal that the server knows no such key,
     /// or that the key has every device it takes, leaves this device
@@ -142,9 +144,20 @@ impl WalletManager {
     /// Refuses a waiting device, or disconnects one with full access.
     /// When `id` is this device's own, its token is dropped once the
     /// server confirmed, the key stays, and the device reads as
-    /// disowned: connecting again is the user's call.
+    /// disowned: connecting again is the user's call. Removing this
+    /// device while a key change did not finish is refused, as logging
+    /// out is, [`PremiumError::KeyChangePending`]: the new key may
+    /// already be the account's, and this device the only one left to
+    /// finish the change.
     pub async fn premium_remove_device(&self, base_url: &str, id: &str) -> CoreResult<()> {
         let _change = self.premium_changes.lock().await;
+        {
+            let state = self.state.lock().await;
+            let premium = &state.payload.settings.premium;
+            if premium.key_change_pending() && premium.device.as_ref().is_some_and(|d| d.id == id) {
+                return Err(PremiumError::KeyChangePending.into());
+            }
+        }
         self.premium_client(base_url)
             .await?
             .remove_device(id)
@@ -266,17 +279,27 @@ impl WalletManager {
     /// answer lost on the way keeps it. The key the server applied is
     /// returned even when the vault cannot record it: the vault still
     /// holds it as the change under way, and the next try completes it.
+    ///
+    /// A device without its token sends nothing,
+    /// [`PremiumError::NoDevice`], and a change under way ends there:
+    /// the server applies a change only for a device it keeps, and keeps
+    /// that device after, so this one's was never applied.
     pub async fn premium_change_key(&self, base_url: &str) -> CoreResult<String> {
         let _change = self.premium_changes.lock().await;
-        let pending = self
-            .state
-            .lock()
-            .await
-            .payload
-            .settings
-            .premium
-            .pending_key
-            .clone();
+        let (pending, connected) = {
+            let state = self.state.lock().await;
+            let premium = &state.payload.settings.premium;
+            (premium.pending_key.clone(), premium.has_device())
+        };
+        if !connected {
+            if pending.is_some() {
+                self.state.lock().await.commit(|payload| {
+                    payload.settings.premium.pending_key = None;
+                    Ok(())
+                })?;
+            }
+            return Err(PremiumError::NoDevice.into());
+        }
         let key = match pending {
             Some(key) => key.expose().to_owned(),
             None => {
@@ -386,9 +409,15 @@ impl WalletManager {
         let same_account = same_key(stored.key.as_deref(), Some(&key));
         // Moving on while a key change of this account is unanswered
         // would lose the new key, whoever asks: the user, or a
-        // connection to another account sent again. Logging out stays
-        // open when this device can no longer finish the change.
-        if !same_account && stored.key.is_some() && stored.key_change_pending() {
+        // connection to another account sent again. Moving on stays
+        // open, as logging out does, when this device can no longer
+        // finish the change: without its token, the change was never
+        // applied.
+        if !same_account
+            && stored.key.is_some()
+            && stored.key_change_pending()
+            && stored.has_device()
+        {
             return Err(PremiumError::KeyChangePending.into());
         }
         if same_account && stored.has_device() {
@@ -488,8 +517,11 @@ impl WalletManager {
                 premium.key_saved = false;
                 premium.checklist_hidden = false;
                 premium.announced_devices.clear();
-                premium.pending_key = None;
             }
+            // No key change is left to finish: this device either had no
+            // token, and its change was never applied, or it moves to
+            // another account, which it may not while one could finish.
+            premium.pending_key = None;
             if let Some(previous) = premium.device.replace(credential.clone())
                 && previous.token() != credential.token()
             {
@@ -622,10 +654,17 @@ fn settles_connect(error: &CoreError) -> bool {
 }
 
 /// Whether a failed key change was settled by the server without the
-/// new key: refused in its own words, or by a device that may not ask.
-/// A token disowned since, a server that could not be reached or
-/// answered something unreadable, or no token to send it with, may
-/// hide a change an earlier try made: the new key is kept.
+/// new key: refused in its own words, asked by a device that may not
+/// ask, or asked with a token the server no longer knows, or with none.
+/// The server applies a change only for a device it still has, and
+/// keeps that device after as the account's only one, which nothing
+/// but this device can then remove: it does not while the change is
+/// under way, see [`WalletManager::premium_log_out`] and
+/// [`WalletManager::premium_remove_device`], and an account deleted
+/// has no key left to lose. So a token gone means no try of this
+/// change was applied. A server that could not be reached, or answered
+/// something unreadable, may hide a change an earlier try made: the
+/// new key is kept.
 fn settles_key_change(error: &CoreError) -> bool {
     matches!(
         error,
@@ -633,7 +672,9 @@ fn settles_key_change(error: &CoreError) -> bool {
             | CoreError::Premium(
                 PremiumError::Rejected(_)
                     | PremiumError::DevicePending { .. }
+                    | PremiumError::DeviceDisconnected
                     | PremiumError::DeviceRequired
+                    | PremiumError::NoDevice
                     | PremiumError::NotFound
             )
     )

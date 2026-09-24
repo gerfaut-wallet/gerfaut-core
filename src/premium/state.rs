@@ -93,9 +93,11 @@ pub struct PremiumState {
     /// stored before it left. The server may have made it the account's
     /// already, and the key above may be dead: the apps say the change
     /// did not finish, offer to try again, which sends this same key,
-    /// and do not offer to copy the key meanwhile. Blanked in the copy
-    /// the apps get; see [`PremiumState::key_change_pending`]. The core
-    /// alone writes it.
+    /// and do not offer to copy the key meanwhile. Kept only with this
+    /// device's token: a change the server applied kept this device,
+    /// so one whose token is gone was never applied. Blanked in the
+    /// copy the apps get; see [`PremiumState::key_change_pending`]. The
+    /// core alone writes it.
     #[serde(default)]
     pub pending_key: Option<Secret>,
     /// Tokens of this device's past connections that the server could
@@ -191,14 +193,17 @@ impl PremiumState {
 
     /// The server no longer knows `token`: the connection it belonged
     /// to is gone, the key stays. Only that token is dropped: one stored
-    /// since, by a connection made meanwhile, is not touched. Returns
-    /// whether anything changed.
+    /// since, by a connection made meanwhile, is not touched. A key
+    /// change under way goes with it: the server applies one only for
+    /// a device it keeps, and keeps that device after, so this one's
+    /// change was never applied. Returns whether anything changed.
     pub(crate) fn disown(&mut self, token: &str) -> bool {
         if !self.holds_token(token) {
             return false;
         }
         self.device = None;
         self.disconnected = true;
+        self.pending_key = None;
         true
     }
 
@@ -303,16 +308,21 @@ mod tests {
 
     #[test]
     fn a_disowned_token_goes_and_a_newer_one_stays() {
-        let mut state = connected();
+        let mut state = PremiumState {
+            pending_key: Some(Secret::new("mnpq23456789abcd".to_owned())),
+            ..connected()
+        };
         assert!(
             !state.disown(OTHER_TOKEN),
             "not the token this device holds"
         );
         assert!(state.has_device());
         assert!(!state.disconnected);
+        assert!(state.key_change_pending());
         assert!(state.disown(TOKEN));
         assert!(!state.has_device());
         assert!(state.disconnected);
+        assert!(!state.key_change_pending(), "the change went with it");
         assert!(state.has_key(), "the key stays");
         assert!(!state.disown(TOKEN), "nothing left to drop");
     }

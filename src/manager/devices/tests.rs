@@ -1546,6 +1546,125 @@ async fn a_key_change_whose_answer_was_lost_sends_the_same_key_again() {
     assert_eq!(stored.key.as_deref(), Some(sent.as_str()));
 }
 
+/// The server applies a key change only for a device it keeps, and
+/// keeps that device after: a device without its token never had its
+/// change applied. A change asked with no token sends nothing and
+/// leaves nothing under way, and one under way ends with the token,
+/// whichever call hears that the token is gone.
+#[tokio::test]
+async fn a_key_change_ends_with_the_token_it_needed() {
+    let (base_url, mut seen) = scripted(vec![
+        answer("401 Unauthorized", DISOWNED),
+        answer("401 Unauthorized", DISOWNED),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    let account = connected(PremiumState {
+        key: Some(KEY.to_owned()),
+        ..PremiumState::default()
+    });
+    let disowned = PremiumState {
+        device: None,
+        disconnected: true,
+        ..account.clone()
+    };
+    let under_way = Some(Secret::new(OTHER_KEY.to_owned()));
+
+    // No token: nothing leaves, and nothing is kept, not even a change
+    // a vault still holds from before.
+    for pending_key in [None, under_way.clone()] {
+        store_premium(
+            &manager,
+            PremiumState {
+                pending_key,
+                ..disowned.clone()
+            },
+        )
+        .await;
+        let refused = manager.premium_change_key(&base_url).await.unwrap_err();
+        assert_eq!(premium_error(refused), PremiumError::NoDevice);
+        assert_eq!(stored_premium(&manager).await, disowned);
+    }
+    assert!(seen.try_recv().is_err(), "nothing was sent");
+
+    // The token was disowned before the change reached the server.
+    store_premium(&manager, account.clone()).await;
+    let refused = manager.premium_change_key(&base_url).await.unwrap_err();
+    assert_eq!(premium_error(refused), PremiumError::DeviceDisconnected);
+    assert!(
+        seen.recv()
+            .await
+            .unwrap()
+            .starts_with("POST /v1/account/key HTTP/1.1")
+    );
+    assert_eq!(stored_premium(&manager).await, disowned);
+
+    // Another call hears that the token is gone: the change under way
+    // goes with it.
+    store_premium(
+        &manager,
+        PremiumState {
+            pending_key: under_way,
+            ..account
+        },
+    )
+    .await;
+    let refused = manager.premium_devices(&base_url).await.unwrap_err();
+    assert_eq!(premium_error(refused), PremiumError::DeviceDisconnected);
+    assert_eq!(stored_premium(&manager).await, disowned);
+}
+
+/// A key change this device can no longer finish holds nothing back:
+/// connecting again works, with the same key or another. While the
+/// token is there, this device cannot remove itself from the account,
+/// just as it cannot log out: it may be the last place that holds the
+/// new key.
+#[tokio::test]
+async fn a_key_change_without_a_token_holds_nothing_back() {
+    let (base_url, mut seen) = scripted(vec![
+        connected_answer("pending"),
+        licence_answer(fixtures::VALID_CERTIFICATE),
+        connected_answer("pending"),
+        licence_answer(fixtures::VALID_CERTIFICATE),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    let stuck = PremiumState {
+        key: Some(KEY.to_owned()),
+        disconnected: true,
+        pending_key: Some(Secret::new("mnpq23456789abcd".to_owned())),
+        ..PremiumState::default()
+    };
+
+    for key in [KEY, OTHER_KEY] {
+        store_premium(&manager, stuck.clone()).await;
+        manager
+            .premium_connect(&base_url, key, DevicePlatform::Linux)
+            .await
+            .unwrap();
+        assert_eq!(bearer(&seen.recv().await.unwrap()), Some(key));
+        seen.recv().await.unwrap();
+        let stored = stored_premium(&manager).await;
+        assert_eq!(stored.key.as_deref(), Some(key));
+        assert_eq!(stored.device.as_ref().unwrap().token(), NEW_TOKEN);
+        assert!(!stored.key_change_pending() && !stored.disconnected);
+    }
+
+    let unfinished = connected(PremiumState {
+        pending_key: Some(Secret::new("mnpq23456789abcd".to_owned())),
+        ..stuck
+    });
+    store_premium(&manager, unfinished.clone()).await;
+    let refused = manager
+        .premium_remove_device(&base_url, THIS_DEVICE)
+        .await
+        .unwrap_err();
+    assert_eq!(premium_error(refused), PremiumError::KeyChangePending);
+    assert_eq!(stored_premium(&manager).await, unfinished);
+}
+
 /// Moving to another account tells the old one about its removed
 /// wallets first, with its own token; what cannot be told is dropped,
 /// not sent to the new account. The old token is then dropped there.
