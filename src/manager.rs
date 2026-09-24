@@ -1860,6 +1860,17 @@ impl WalletManager {
                 premium.device.as_ref().map(|d| d.token().to_owned()),
             )
         };
+        self.premium_client_for(base_url, key, token).await
+    }
+
+    /// [`Self::premium_client`] carrying the key and the token a caller
+    /// read beside what they go with.
+    async fn premium_client_for(
+        &self,
+        base_url: &str,
+        key: Option<String>,
+        token: Option<String>,
+    ) -> CoreResult<PremiumClient> {
         Ok(self
             .premium_client_with_key(base_url, key)
             .await?
@@ -2002,19 +2013,28 @@ impl WalletManager {
     /// error is returned. Nothing to tell, or no connected device to
     /// tell it with, costs no connection. Returns how many removals
     /// still wait.
+    ///
+    /// The removals and the token they go with are read together, and
+    /// what the server answered settles them only while this device
+    /// still holds that token: once it has moved to another account,
+    /// the queue is that account's, and the old one's answers told it
+    /// nothing.
     pub async fn premium_flush_unwatch(&self, base_url: &str) -> CoreResult<usize> {
-        let pending = {
+        let (pending, key, token) = {
             let state = self.state.lock().await;
             let premium = &state.payload.settings.premium;
-            if !premium.has_key() || !premium.has_device() {
-                return Ok(premium.pending_unwatch.len());
-            }
-            premium.pending_unwatch.clone()
+            let token = match &premium.device {
+                Some(device) if premium.has_key() => device.token().to_owned(),
+                _ => return Ok(premium.pending_unwatch.len()),
+            };
+            (premium.pending_unwatch.clone(), premium.key.clone(), token)
         };
         if pending.is_empty() {
             return Ok(0);
         }
-        let client = self.premium_client(base_url).await?;
+        let client = self
+            .premium_client_for(base_url, key, Some(token.clone()))
+            .await?;
         let mut told = Vec::new();
         let mut failure = None;
         for id in &pending {
@@ -2044,8 +2064,10 @@ impl WalletManager {
         }
         let left = self.state.lock().await.commit(|payload| {
             let premium = &mut payload.settings.premium;
-            for id in &told {
-                premium.unwatched(id);
+            if premium.holds_token(&token) {
+                for id in &told {
+                    premium.unwatched(id);
+                }
             }
             Ok(premium.pending_unwatch.len())
         })?;

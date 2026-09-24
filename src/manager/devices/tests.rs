@@ -37,36 +37,66 @@ async fn scripted(answers: Vec<String>) -> (String, UnboundedReceiver<String>) {
     tokio::spawn(async move {
         for answer in answers {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let n = stream.read(&mut chunk).await.unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                bytes.extend_from_slice(&chunk[..n]);
-                let text = String::from_utf8_lossy(&bytes);
-                if let Some(end) = text.find("\r\n\r\n") {
-                    let length = text[..end]
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                        .unwrap_or(0);
-                    if bytes.len() >= end + 4 + length {
-                        break;
-                    }
-                }
-            }
-            let _ = sender.send(String::from_utf8_lossy(&bytes).into_owned());
+            let _ = sender.send(read_request(&mut stream).await);
             let _ = stream.write_all(answer.as_bytes()).await;
             let _ = stream.shutdown().await;
         }
     });
     (format!("http://{address}"), seen)
+}
+
+/// A premium server that takes one request, hands it to the test, and
+/// gives `answer` only once the test lets it go.
+async fn held(
+    answer: String,
+) -> (
+    String,
+    UnboundedReceiver<String>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, seen) = tokio::sync::mpsc::unbounded_channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let _ = sender.send(read_request(&mut stream).await);
+        let _ = released.await;
+        let _ = stream.write_all(answer.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    });
+    (format!("http://{address}"), seen, release)
+}
+
+/// One request, head and body, as it came.
+async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut chunk).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some(end) = text.find("\r\n\r\n") {
+            let length = text[..end]
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if bytes.len() >= end + 4 + length {
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn answer(status: &str, body: &str) -> String {
@@ -1771,4 +1801,48 @@ async fn a_stale_copy_cannot_bring_back_the_old_account_removals() {
     let stored = stored_premium(&manager).await;
     assert_eq!(stored.pending_unwatch, ["w3"]);
     assert_eq!(stored.consented_at("w2"), Some(200));
+}
+
+/// A flush of removals answers for the account it spoke to. When this
+/// device moves to another account while the old one's answer is on its
+/// way, the new account's removals stay queued, one under the same id
+/// among them: the old account's answer told the new one nothing.
+#[tokio::test]
+async fn a_flush_answers_for_the_account_it_spoke_to() {
+    let (base_url, mut seen, release) = held(answer("200 OK", "{}")).await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    let mut account = connected(PremiumState {
+        key: Some(KEY.to_owned()),
+        ..PremiumState::default()
+    });
+    account.queue_unwatch("w1");
+    store_premium(&manager, account).await;
+
+    let flush = manager.premium_flush_unwatch(&base_url);
+    tokio::pin!(flush);
+    let request = tokio::select! {
+        request = seen.recv() => request.unwrap(),
+        outcome = &mut flush => panic!("the flush ended before its answer: {outcome:?}"),
+    };
+    assert!(
+        request.starts_with("DELETE /v1/wallets/w1 HTTP/1.1"),
+        "{request}"
+    );
+    assert_eq!(bearer(&request), Some(TOKEN));
+
+    let mut moved = PremiumState {
+        key: Some(OTHER_KEY.to_owned()),
+        device: Some(crate::premium::DeviceCredential::new(
+            NEW_DEVICE.to_owned(),
+            NEW_TOKEN.to_owned(),
+            1_790_000_500,
+        )),
+        ..PremiumState::default()
+    };
+    moved.queue_unwatch("w1");
+    store_premium(&manager, moved.clone()).await;
+    release.send(()).unwrap();
+    assert_eq!(flush.await.unwrap(), 1);
+    assert_eq!(stored_premium(&manager).await, moved);
 }
