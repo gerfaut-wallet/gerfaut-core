@@ -1846,3 +1846,59 @@ async fn a_flush_answers_for_the_account_it_spoke_to() {
     assert_eq!(flush.await.unwrap(), 1);
     assert_eq!(stored_premium(&manager).await, moved);
 }
+
+/// Whatever the server refuses a stored key with, and would refuse
+/// again, leaves the device disconnected, with the server's words when
+/// it gave some: a server from before devices, with no route for them,
+/// a request it will not take, a key it will not connect. The key is
+/// not sent again behind the user's back, with a new token each time.
+#[tokio::test]
+async fn a_stored_key_refused_for_good_is_not_sent_again() {
+    let platforms = "platform must be android, ios, windows, macos or linux";
+    let (base_url, mut seen) = scripted(vec![
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+        answer("400 Bad Request", &format!(r#"{{"error":"{platforms}"}}"#)),
+        answer(
+            "403 Forbidden",
+            r#"{"error":"this key has no paid time left"}"#,
+        ),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+
+    for (refusal, reason) in [
+        (
+            PremiumError::Rejected("HTTP 404".to_owned()),
+            Some("HTTP 404"),
+        ),
+        (
+            PremiumError::Rejected(platforms.to_owned()),
+            Some(platforms),
+        ),
+        (PremiumError::NoPaidTime, None),
+    ] {
+        store_premium(&manager, old_vault()).await;
+        let refused = manager
+            .premium_ensure_device(&base_url, DevicePlatform::Linux)
+            .await
+            .unwrap_err();
+        assert_eq!(premium_error(refused), refusal);
+        assert!(seen.recv().await.unwrap().starts_with("POST /v1/devices"));
+        let stored = stored_premium(&manager).await;
+        assert!(
+            stored.disconnected && !stored.connect_pending(),
+            "{refusal}"
+        );
+        assert_eq!(stored.disconnected_reason.as_deref(), reason);
+        assert_eq!(stored.key.as_deref(), Some(KEY), "the key stays");
+        assert_eq!(
+            manager
+                .premium_ensure_device(&base_url, DevicePlatform::Linux)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+    assert!(seen.try_recv().is_err(), "sent once each");
+}

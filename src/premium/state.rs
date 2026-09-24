@@ -72,9 +72,12 @@ pub struct PremiumState {
     #[serde(default)]
     pub disconnected: bool,
     /// Why the server would not connect this device, in its own words,
-    /// when it said: the key already has as many devices as it takes.
-    /// `None` for a device disowned or a key no longer known, whose
-    /// sentences the apps write themselves. The core alone writes it.
+    /// when it gave some: the key already has as many devices as it
+    /// takes, or any other refusal it worded; `HTTP 404` and the like
+    /// for a bare status. `None` for a device disowned or a key no
+    /// longer known, whose sentences the apps write themselves, and for
+    /// a refusal the core names but not in the server's words. The core
+    /// alone writes it.
     #[serde(default)]
     pub disconnected_reason: Option<String>,
     /// The user said the key is saved somewhere safe.

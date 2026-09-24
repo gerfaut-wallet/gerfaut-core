@@ -60,9 +60,11 @@ impl WalletManager {
     /// copy of its new key. Without the token, the change was never
     /// applied, and connecting ends it.
     ///
-    /// With the stored key, a refusal that the server knows no such key,
-    /// or that the key has every device it takes, leaves this device
-    /// disconnected, with the server's sentence for the second.
+    /// With the stored key, any refusal the server would give again
+    /// leaves this device disconnected, with the server's words when it
+    /// gave some: a key it no longer knows, a key with every device it
+    /// takes, a server with no route for devices. A rate limit and a
+    /// failure of the server's own are not that.
     pub async fn premium_connect(
         &self,
         base_url: &str,
@@ -89,12 +91,13 @@ impl WalletManager {
     ///
     /// It never sends the key behind the user's back once the server
     /// has said no. A device the server disowned, a key it no longer
-    /// knows, a key with every device it takes: each leaves the device
-    /// disconnected until the user connects it again, with
-    /// [`Self::premium_connect`]. A rate limit is waited out: until the
-    /// wait the server named is over, a connection of the key it met
-    /// answers [`PremiumError::RateLimited`] with what is left of it,
-    /// without a request. Nothing owed is `None`, whatever wait runs.
+    /// knows, a key with every device it takes, any other refusal it
+    /// would give again: each leaves the device disconnected until the
+    /// user connects it again, with [`Self::premium_connect`]. A rate
+    /// limit is waited out: until the wait the server named is over, a
+    /// connection of the key it met answers
+    /// [`PremiumError::RateLimited`] with what is left of it, without a
+    /// request. Nothing owed is `None`, whatever wait runs.
     pub async fn premium_ensure_device(
         &self,
         base_url: &str,
@@ -559,10 +562,11 @@ impl WalletManager {
     }
 
     /// What a failed connection leaves in the vault. A refusal that
-    /// settles it drops the connection under way, and one about the
-    /// stored key disconnects this device; an answer lost on the way
-    /// keeps it, to be sent again as it was; a rate limit also holds
-    /// back the next automatic try of that key for the wait it named.
+    /// settles it drops the connection under way, and one the server
+    /// would give the stored key again disconnects this device; an
+    /// answer lost on the way keeps it, to be sent again as it was; a
+    /// rate limit also holds back the next automatic try of that key
+    /// for the wait it named.
     async fn after_refused_connect(
         &self,
         request: &PendingConnect,
@@ -577,9 +581,13 @@ impl WalletManager {
         if !settles_connect(error) {
             return Ok(());
         }
+        // The stored key, refused for good: sent again on its own, it
+        // would meet the same answer, with a new token each time.
+        let disconnect = stored_key && refused_for_good(error);
         let reason = match error {
-            CoreError::Premium(PremiumError::TooManyDevices(words)) => Some(Some(words.clone())),
-            CoreError::Premium(PremiumError::UnknownKey) => Some(None),
+            CoreError::Premium(
+                PremiumError::TooManyDevices(words) | PremiumError::Rejected(words),
+            ) => Some(words.clone()),
             _ => None,
         };
         self.state.lock().await.commit(|payload| {
@@ -591,10 +599,7 @@ impl WalletManager {
             {
                 premium.pending_connect = None;
             }
-            if let Some(reason) = reason
-                && stored_key
-                && !premium.has_device()
-            {
+            if disconnect && !premium.has_device() {
                 premium.disconnected = true;
                 premium.disconnected_reason = reason;
             }
@@ -634,22 +639,36 @@ impl WalletManager {
     }
 }
 
-/// Whether a failed connection was settled by the server, so that the
-/// same request would get the same answer: anything else, a server
-/// that could not be reached or answered something unreadable, may
-/// have made the device, and the request is sent again.
+/// Whether a failed connection was settled, so that the same request
+/// would get the same answer: refused here before it left, or by the
+/// server for good. Anything else, a server that could not be reached
+/// or answered something unreadable, may have made the device, and the
+/// request is sent again.
 fn settles_connect(error: &CoreError) -> bool {
+    refused_for_good(error)
+        || matches!(
+            error,
+            CoreError::InvalidInput { .. } | CoreError::Premium(PremiumError::NoKey)
+        )
+}
+
+/// Whether the server refused a connection with an answer of its own
+/// that the same request would meet again: every refusal but a rate
+/// limit, which a wait lifts, and a failure of the server's own, which
+/// reads as [`PremiumError::Unreachable`].
+fn refused_for_good(error: &CoreError) -> bool {
     matches!(
         error,
-        CoreError::InvalidInput { .. }
-            | CoreError::Premium(
-                PremiumError::UnknownKey
-                    | PremiumError::TooManyDevices(_)
-                    | PremiumError::Rejected(_)
-                    | PremiumError::DeviceRequired
-                    | PremiumError::NotFound
-                    | PremiumError::NoKey
-            )
+        CoreError::Premium(
+            PremiumError::UnknownKey
+                | PremiumError::TooManyDevices(_)
+                | PremiumError::Rejected(_)
+                | PremiumError::DeviceRequired
+                | PremiumError::DevicePending { .. }
+                | PremiumError::DeviceDisconnected
+                | PremiumError::NoPaidTime
+                | PremiumError::NotFound
+        )
     )
 }
 
