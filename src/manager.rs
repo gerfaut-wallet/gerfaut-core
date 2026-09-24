@@ -1798,28 +1798,37 @@ impl WalletManager {
         premium
     }
 
-    /// Replaces the premium account state, whole: the apps read it,
-    /// change what they need, and hand it back. What the core alone
-    /// writes, this device's connection and whether the server disowned
-    /// it, stays as stored while the key does: the copy an app holds
-    /// has no token to give back, and may predate a connection or a
-    /// disconnection made meanwhile. A state handed back with another
-    /// key, or none, has no connection: a device connects with a key,
-    /// and connecting with that one is [`Self::premium_connect`]'s
-    /// business. Changing the key goes through that function,
-    /// [`Self::premium_change_key`] and [`Self::premium_log_out`].
+    /// Replaces what the apps keep in the premium account state: they
+    /// read it, change what they need, and hand it back. The account's
+    /// credentials are not theirs to write, and whatever the copy says
+    /// of them is ignored: the key, the certificate, this device's
+    /// connection and whether the server disowned it stay as stored.
+    /// Those move only with the server's answer, through
+    /// [`Self::premium_connect`], [`Self::premium_ensure_device`],
+    /// [`Self::premium_refresh_licence`], [`Self::premium_change_key`],
+    /// [`Self::premium_remove_device`], [`Self::premium_log_out`] and
+    /// [`Self::premium_delete_account`], or when a call hears that the
+    /// token is disowned. A copy read before one of those and handed
+    /// back after it can then neither bring back a key that was logged
+    /// out or replaced, nor drop the one that replaced it. What the
+    /// account's safety card remembers has setters of its own, for the
+    /// same reason: a stale copy must not mark a key just changed as
+    /// saved. See [`Self::premium_set_key_saved`],
+    /// [`Self::premium_hide_checklist`] and
+    /// [`Self::premium_mark_announced`].
     pub async fn set_premium_state(&self, premium: PremiumState) -> CoreResult<()> {
         self.state.lock().await.commit(|payload| {
             let stored = &payload.settings.premium;
-            let mut premium = premium;
-            if same_key(premium.key.as_deref(), stored.key.as_deref()) {
-                premium.device = stored.device.clone();
-                premium.disconnected = stored.disconnected;
-            } else {
-                premium.device = None;
-                premium.disconnected = false;
-            }
-            payload.settings.premium = premium;
+            payload.settings.premium = PremiumState {
+                key: stored.key.clone(),
+                certificate: stored.certificate.clone(),
+                device: stored.device.clone(),
+                disconnected: stored.disconnected,
+                key_saved: stored.key_saved,
+                checklist_hidden: stored.checklist_hidden,
+                announced_devices: stored.announced_devices.clone(),
+                ..premium
+            };
             Ok(())
         })
     }
@@ -3110,7 +3119,7 @@ mod tests {
             ..PremiumState::default()
         };
         premium.consent(&meta.id, 100);
-        manager.set_premium_state(premium).await.unwrap();
+        store_premium(&manager, premium).await;
         manager.remove_wallet(&meta.id).await.unwrap();
         let premium = manager.premium_state().await;
         assert_eq!(premium.pending_unwatch, vec![meta.id.clone()]);
@@ -3199,13 +3208,14 @@ mod tests {
         );
 
         // Nothing waiting: no connection is even attempted.
-        manager
-            .set_premium_state(PremiumState {
+        store_premium(
+            &manager,
+            connected(PremiumState {
                 key: Some("abcdefghijkmnpqr".to_owned()),
                 ..PremiumState::default()
-            })
-            .await
-            .unwrap();
+            }),
+        )
+        .await;
         assert_eq!(manager.premium_flush_unwatch(&base_url).await.unwrap(), 0);
     }
 
@@ -3481,7 +3491,7 @@ mod tests {
             ..PremiumState::default()
         };
         premium.consent("w1", 100);
-        manager.set_premium_state(premium.clone()).await.unwrap();
+        store_premium(&manager, premium.clone()).await;
 
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         assert_eq!(manager.premium_state().await, premium);

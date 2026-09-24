@@ -326,7 +326,7 @@ async fn an_old_vault_connects_once() {
         None
     );
 
-    manager.set_premium_state(old_vault()).await.unwrap();
+    store_premium(&manager, old_vault()).await;
     let (base_url, mut seen) = scripted(vec![
         connected_answer("full"),
         licence_answer(fixtures::ACCOUNT_CERTIFICATE),
@@ -839,7 +839,7 @@ async fn two_calls_at_once_connect_one_device() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     let manager = premium_manager(dir.path());
-    manager.set_premium_state(old_vault()).await.unwrap();
+    store_premium(&manager, old_vault()).await;
 
     let (first, second) = tokio::join!(
         manager.premium_ensure_device(&base_url, DevicePlatform::Linux),
@@ -899,8 +899,8 @@ async fn waiting_devices_are_announced_once() {
 }
 
 /// The token never reaches an app: not in the state it reads, not in
-/// the settings, not in a debug print. What it hands back cannot drop
-/// or replace it either, unless it hands back another key.
+/// the settings, not in a debug print. What it hands back cannot drop,
+/// replace or move the account's credentials either.
 #[tokio::test]
 async fn the_token_never_reaches_an_app() {
     let dir = tempfile::tempdir().unwrap();
@@ -927,31 +927,97 @@ async fn the_token_never_reaches_an_app() {
     assert!(state.has_device(), "the app still knows it is connected");
     assert_eq!(state.device.as_ref().unwrap().id, THIS_DEVICE);
 
-    // Handed back with the token blanked, and the banner dismissed:
-    // the stored token stays.
+    // Handed back with the token blanked, the banner dismissed, and
+    // everything the app has no say in changed: only the banner moves.
     let mut handed_back = state.clone();
     handed_back.acknowledged_offline_until = Some(5);
     handed_back.disconnected = true;
+    handed_back.certificate = Some(fixtures::EXPIRED_CERTIFICATE.to_owned());
+    handed_back.key = Some(OTHER_KEY.to_owned());
     manager.set_premium_state(handed_back).await.unwrap();
-    let stored = stored_premium(&manager).await;
-    assert_eq!(stored.device, account.device);
-    assert!(!stored.disconnected);
-    assert_eq!(stored.acknowledged_offline_until, Some(5));
-
-    // Handed back with the key spelled another way: the same key.
-    let mut respelled = manager.premium_state().await;
-    respelled.key = Some("ABCD-EFGH-IJKM-NPQR".to_owned());
-    manager.set_premium_state(respelled).await.unwrap();
-    assert_eq!(stored_premium(&manager).await.device, account.device);
-
-    // Another key, or none: no connection goes with it.
-    let mut other = manager.premium_state().await;
-    other.key = Some(OTHER_KEY.to_owned());
-    manager.set_premium_state(other).await.unwrap();
-    assert!(!stored_premium(&manager).await.has_device());
-    store_premium(&manager, account).await;
+    assert_eq!(
+        stored_premium(&manager).await,
+        PremiumState {
+            acknowledged_offline_until: Some(5),
+            ..account.clone()
+        }
+    );
     let mut forgotten = manager.premium_state().await;
     forgotten.key = None;
+    forgotten.device = None;
     manager.set_premium_state(forgotten).await.unwrap();
-    assert!(!stored_premium(&manager).await.has_device());
+    assert_eq!(stored_premium(&manager).await.key.as_deref(), Some(KEY));
+    assert_eq!(stored_premium(&manager).await.device, account.device);
+}
+
+/// A copy of the state read before the key changed, or before a log
+/// out, and handed back after it, brings back neither the old key nor
+/// the old token, and drops neither the new key nor the certificate
+/// that came with it.
+#[tokio::test]
+async fn a_stale_copy_cannot_bring_back_a_key_or_a_token() {
+    let (base_url, _) = scripted(vec![
+        answer("200 OK", r#"{"key":"WXYZ-2345-6789-ABCD"}"#),
+        licence_answer(fixtures::ACCOUNT_CERTIFICATE),
+        answer(
+            "200 OK",
+            &format!(r#"{{"id":"{THIS_DEVICE}","deleted":true}}"#),
+        ),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    let mut account = connected(PremiumState {
+        key: Some(KEY.to_owned()),
+        certificate: Some(fixtures::VALID_CERTIFICATE.to_owned()),
+        key_saved: true,
+        announced_devices: vec!["d2".to_owned()],
+        ..PremiumState::default()
+    });
+    account.consent("w1", 100);
+    store_premium(&manager, account).await;
+
+    // Read, then the key changes, then the copy comes back with the
+    // banner dismissed. The old key was saved; the new one is not, and
+    // the copy cannot say it is.
+    let mut stale = manager.premium_state().await;
+    manager.premium_change_key(&base_url).await.unwrap();
+    let changed = stored_premium(&manager).await;
+    stale.acknowledged_offline_until = Some(5);
+    manager.set_premium_state(stale).await.unwrap();
+    let stored = stored_premium(&manager).await;
+    assert_eq!(stored.key.as_deref(), Some(OTHER_KEY));
+    assert!(!stored.key_saved);
+    assert!(stored.announced_devices.is_empty());
+    assert_eq!(
+        stored.certificate.as_deref(),
+        Some(fixtures::ACCOUNT_CERTIFICATE)
+    );
+    assert_eq!(stored.device.as_ref().unwrap().token(), TOKEN);
+    assert_eq!(
+        stored,
+        PremiumState {
+            acknowledged_offline_until: Some(5),
+            ..changed
+        }
+    );
+
+    // Read, then this device logs out, then the copy comes back: the
+    // account stays gone, and nothing connects it behind the user's
+    // back.
+    let stale = manager.premium_state().await;
+    manager.premium_log_out(&base_url).await.unwrap();
+    manager.set_premium_state(stale).await.unwrap();
+    let stored = stored_premium(&manager).await;
+    assert_eq!(stored.key, None);
+    assert_eq!(stored.certificate, None);
+    assert!(!stored.has_device() && !stored.disconnected);
+    assert!(stored.is_consented("w1"));
+    assert_eq!(
+        manager
+            .premium_ensure_device("http://127.0.0.1:9", DevicePlatform::Linux)
+            .await
+            .unwrap(),
+        None
+    );
 }
