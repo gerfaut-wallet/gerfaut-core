@@ -132,6 +132,10 @@ pub struct Shared {
     /// the server with a device nobody holds, and a log out racing a
     /// connection could bring back the key it removed.
     premium_changes: Mutex<()>,
+    /// Until when the server asked not to be sent a connection again: a
+    /// rate limit [`Self::premium_ensure_device`] waits out rather than
+    /// meet again at every poll.
+    premium_connect_after: std::sync::Mutex<Option<Instant>>,
     /// The key the premium clients built here check signed answers
     /// against, in place of the one [`crate::premium::endpoint`] names.
     #[cfg(test)]
@@ -189,6 +193,7 @@ impl WalletManager {
                 watch_setups: std::sync::atomic::AtomicU64::new(0),
                 syncing: std::sync::Mutex::new(HashMap::new()),
                 premium_changes: Mutex::new(()),
+                premium_connect_after: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 premium_public_key: std::sync::Mutex::new(None),
             }),
@@ -1799,14 +1804,16 @@ impl WalletManager {
     }
 
     /// Replaces what the apps keep in the premium account state: they
-    /// read it, change what they need, and hand it back. The account's
-    /// credentials are not theirs to write, and whatever the copy says
-    /// of them is ignored: the key, the certificate, this device's
-    /// connection and whether the server disowned it stay as stored.
-    /// Those move only with the server's answer, through
+    /// read it, change what they need, and hand it back. Three things
+    /// are theirs to write: the consents, the removals queued for the
+    /// server, and the dismissed banner. Whatever the copy says of the
+    /// rest is ignored. The key, the certificate, this device's
+    /// connection, whether the server disowned it, and what was sent
+    /// and not answered move only with the server's answer, through
     /// [`Self::premium_connect`], [`Self::premium_ensure_device`],
     /// [`Self::premium_refresh_licence`], [`Self::premium_change_key`],
-    /// [`Self::premium_remove_device`], [`Self::premium_log_out`] and
+    /// [`Self::premium_remove_device`], [`Self::premium_log_out`],
+    /// [`Self::premium_flush_logouts`] and
     /// [`Self::premium_delete_account`], or when a call hears that the
     /// token is disowned. A copy read before one of those and handed
     /// back after it can then neither bring back a key that was logged
@@ -1818,17 +1825,7 @@ impl WalletManager {
     /// [`Self::premium_mark_announced`].
     pub async fn set_premium_state(&self, premium: PremiumState) -> CoreResult<()> {
         self.state.lock().await.commit(|payload| {
-            let stored = &payload.settings.premium;
-            payload.settings.premium = PremiumState {
-                key: stored.key.clone(),
-                certificate: stored.certificate.clone(),
-                device: stored.device.clone(),
-                disconnected: stored.disconnected,
-                key_saved: stored.key_saved,
-                checklist_hidden: stored.checklist_hidden,
-                announced_devices: stored.announced_devices.clone(),
-                ..premium
-            };
+            payload.settings.premium = payload.settings.premium.with_app_part_of(premium);
             Ok(())
         })
     }
@@ -1934,6 +1931,8 @@ impl WalletManager {
     /// does a device disconnected from one that is still there, which
     /// this device can no longer tell apart. The token goes, the key
     /// stays, and [`Self::premium_log_out`] is what forgets the rest.
+    /// The tokens of past connections still to be dropped by the server,
+    /// another account's among them, stay queued.
     pub async fn premium_delete_account(&self, base_url: &str) -> CoreResult<()> {
         let _change = self.premium_changes.lock().await;
         self.premium_client(base_url)
@@ -1941,7 +1940,14 @@ impl WalletManager {
             .delete_account()
             .await?;
         self.state.lock().await.commit(|payload| {
-            payload.settings.premium = PremiumState::default();
+            let gone = std::mem::take(&mut payload.settings.premium);
+            // Tokens of past connections, other accounts' among them,
+            // are still to be dropped by the server.
+            let premium = &mut payload.settings.premium;
+            premium.pending_logouts = gone.pending_logouts;
+            if let Some(pending) = &gone.pending_connect {
+                premium.queue_logout(pending.token());
+            }
             Ok(())
         })
     }

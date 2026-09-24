@@ -150,6 +150,13 @@ pub enum PremiumError {
     #[error("{0}")]
     TooManyDevices(String),
 
+    /// A key change was sent and not answered, and what was asked would
+    /// lose the new key: the server may already hold it, and nothing
+    /// else does. Trying the change again completes it. Nothing was
+    /// sent.
+    #[error("the key change did not finish; try again to complete it")]
+    KeyChangePending,
+
     /// The key exists but has no paid time left, and the route changes
     /// what is watched (HTTP 403, said in the server's own error body
     /// with no code of a device refusal; a bare 403 is a refusal

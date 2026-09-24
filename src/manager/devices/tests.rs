@@ -6,8 +6,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::error::{CoreError, PremiumError};
 use crate::manager::WalletManager;
 use crate::manager::tests::{TOKEN, connected, store_premium, stored_premium};
-use crate::premium::licence::fixtures;
-use crate::premium::{DeviceAccess, DevicePlatform, PremiumState};
+use crate::premium::licence::{self, fixtures};
+use crate::premium::{DeviceAccess, DevicePlatform, PremiumState, Secret};
 use crate::store::VaultKey;
 
 const KEY: &str = "abcdefghijkmnpqr";
@@ -122,6 +122,16 @@ fn body_of(request: &str) -> &str {
     request.split_once("\r\n\r\n").map_or("", |(_, body)| body)
 }
 
+/// The platform and the token a connection named, the token checked for
+/// the server's shape.
+fn connect_body(request: &str) -> (String, String) {
+    let body: serde_json::Value = serde_json::from_str(body_of(request)).unwrap();
+    assert_eq!(body.as_object().unwrap().len(), 2, "{body}");
+    let token = body["token"].as_str().unwrap().to_owned();
+    assert!(crate::premium::device::is_device_token(&token), "{token}");
+    (body["platform"].as_str().unwrap().to_owned(), token)
+}
+
 /// A vault from before devices: a key, its certificate, a consent.
 fn old_vault() -> PremiumState {
     let mut premium = PremiumState {
@@ -167,7 +177,7 @@ async fn the_first_device_connects_and_keeps_key_and_token_together() {
         "{connect}"
     );
     assert_eq!(bearer(&connect), Some(KEY));
-    assert_eq!(body_of(&connect), r#"{"platform":"linux"}"#);
+    assert_eq!(connect_body(&connect).0, "linux");
     let licence = seen.recv().await.unwrap();
     assert!(licence.starts_with("GET /v1/licence HTTP/1.1"), "{licence}");
     assert_eq!(bearer(&licence), Some(NEW_TOKEN));
@@ -217,12 +227,7 @@ async fn a_later_device_connects_and_waits() {
         .unwrap();
     assert!(device.is_pending());
     assert_eq!(device.pending_until, Some(1_790_864_000));
-    assert!(
-        seen.recv()
-            .await
-            .unwrap()
-            .contains(r#"{"platform":"android"}"#)
-    );
+    assert_eq!(connect_body(&seen.recv().await.unwrap()).0, "android");
     seen.recv().await.unwrap();
     assert_eq!(
         stored_premium(&manager).await.certificate.as_deref(),
@@ -298,7 +303,10 @@ async fn a_connection_the_server_did_not_make_stores_nothing() {
         PremiumError::TooManyDevices(words) if words.starts_with("this key already has 10 devices")
     ));
 
-    // The server is gone.
+    assert_eq!(stored_premium(&manager).await, PremiumState::default());
+
+    // The server is gone: the key is not the account's in the vault,
+    // and the connection waits to be sent again as it was.
     let unreached = manager
         .premium_connect(&base_url, KEY, DevicePlatform::Linux)
         .await
@@ -307,7 +315,10 @@ async fn a_connection_the_server_did_not_make_stores_nothing() {
         premium_error(unreached),
         PremiumError::Unreachable(_)
     ));
-    assert_eq!(stored_premium(&manager).await, PremiumState::default());
+    let stored = stored_premium(&manager).await;
+    assert_eq!(stored.key, None);
+    assert!(!stored.has_device());
+    assert!(stored.connect_pending());
 }
 
 /// A vault from before devices holds a key and no token: it connects
@@ -340,7 +351,7 @@ async fn an_old_vault_connects_once() {
     assert_eq!(device.id, NEW_DEVICE);
     let connect = seen.recv().await.unwrap();
     assert_eq!(bearer(&connect), Some(KEY));
-    assert_eq!(body_of(&connect), r#"{"platform":"macos"}"#);
+    assert_eq!(connect_body(&connect).0, "macos");
     seen.recv().await.unwrap();
 
     let stored = stored_premium(&manager).await;
@@ -647,18 +658,87 @@ async fn logging_out_clears_the_account_even_when_the_server_is_away() {
     assert_eq!(bearer(&request), Some(TOKEN));
     assert_eq!(stored_premium(&manager).await, left);
 
-    // The server is gone now: the account is cleared all the same.
+    // A token the server no longer knows is as good as told.
+    let (disowning, _) = scripted(vec![answer("401 Unauthorized", DISOWNED)]).await;
     store_premium(&manager, account.clone()).await;
-    manager.premium_log_out(&base_url).await.unwrap();
+    manager.premium_log_out(&disowning).await.unwrap();
     assert_eq!(stored_premium(&manager).await, left);
-    // And a server that refuses changes nothing to that either.
-    let (base_url, _) = scripted(vec![answer("401 Unauthorized", DISOWNED)]).await;
+
+    // The server is gone now: the account is cleared all the same, and
+    // the token, still live there, waits to be dropped, never shown.
     store_premium(&manager, account).await;
     manager.premium_log_out(&base_url).await.unwrap();
-    assert_eq!(stored_premium(&manager).await, left);
+    let stored = stored_premium(&manager).await;
+    assert_eq!(
+        stored,
+        PremiumState {
+            pending_logouts: vec![Secret::new(TOKEN.to_owned())],
+            ..left.clone()
+        }
+    );
+    assert!(!format!("{:?}", manager.premium_state().await).contains(TOKEN));
     drop(manager);
     let reopened = premium_manager(dir.path());
+    assert_eq!(stored_premium(&reopened).await, stored);
+
+    // Next time the server is there, it hears of it, and a token it no
+    // longer knows counts as told too.
+    let (base_url, mut seen) = scripted(vec![answer(
+        "200 OK",
+        &format!(r#"{{"id":"{THIS_DEVICE}","deleted":true}}"#),
+    )])
+    .await;
+    assert_eq!(reopened.premium_flush_logouts(&base_url).await.unwrap(), 0);
+    let request = seen.recv().await.unwrap();
+    assert!(
+        request.starts_with("DELETE /v1/devices/me HTTP/1.1"),
+        "{request}"
+    );
+    assert_eq!(bearer(&request), Some(TOKEN));
     assert_eq!(stored_premium(&reopened).await, left);
+    // Nothing left: no request.
+    assert_eq!(reopened.premium_flush_logouts(&base_url).await.unwrap(), 0);
+}
+
+/// Tokens the server could not be told about leave one by one: a
+/// refusal keeps its token and goes on, a server gone stops the round.
+#[tokio::test]
+async fn logouts_the_server_missed_are_told_later() {
+    let second = "gdt1_c2Vjb25kIHRva2VuIG9mIGEgcGFzdCBjb25uZWN0aW9u";
+    let third = "gdt1_dGhpcmQgdG9rZW4gb2YgYSBwYXN0IGNvbm5lY3Rpb24";
+    let (base_url, mut seen) = scripted(vec![
+        answer("400 Bad Request", r#"{"error":"not now"}"#),
+        answer("401 Unauthorized", DISOWNED),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    let mut premium = PremiumState::default();
+    for token in [TOKEN, second, third] {
+        premium.queue_logout(token);
+    }
+    store_premium(&manager, premium).await;
+
+    let outcome = manager.premium_flush_logouts(&base_url).await;
+    assert!(
+        matches!(&outcome, Err(CoreError::Premium(PremiumError::Rejected(words))) if words == "not now"),
+        "{outcome:?}"
+    );
+    assert_eq!(bearer(&seen.recv().await.unwrap()), Some(TOKEN));
+    assert_eq!(bearer(&seen.recv().await.unwrap()), Some(second));
+    let left: Vec<String> = stored_premium(&manager)
+        .await
+        .pending_logouts
+        .iter()
+        .map(|t| t.expose().to_owned())
+        .collect();
+    assert_eq!(left, [TOKEN, third]);
+    // The server is gone: the round stops at the first, both wait.
+    assert!(matches!(
+        manager.premium_flush_logouts(&base_url).await,
+        Err(CoreError::Premium(PremiumError::Unreachable(_)))
+    ));
+    assert_eq!(stored_premium(&manager).await.pending_logouts.len(), 2);
 }
 
 /// Removing another device leaves this one connected; removing this
@@ -1020,4 +1100,338 @@ async fn a_stale_copy_cannot_bring_back_a_key_or_a_token() {
             .unwrap(),
         None
     );
+}
+
+/// What a server answers when the answer is lost on the way: nothing.
+const LOST: &str = "";
+
+fn deleted_answer(id: &str) -> String {
+    answer("200 OK", &format!(r#"{{"id":"{id}","deleted":true}}"#))
+}
+
+/// A connection whose answer was lost is sent again as it was, same
+/// token, same platform, whoever sends it again: the server answers it
+/// with the device it made, and no second device is drawn.
+#[tokio::test]
+async fn a_lost_connection_is_sent_again_as_it_was() {
+    let (base_url, mut seen) = scripted(vec![
+        LOST.to_owned(),
+        LOST.to_owned(),
+        connected_answer("full"),
+        licence_answer(fixtures::VALID_CERTIFICATE),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+
+    let lost = manager
+        .premium_connect(&base_url, KEY, DevicePlatform::Linux)
+        .await
+        .unwrap_err();
+    assert!(matches!(premium_error(lost), PremiumError::Unreachable(_)));
+    let (platform, token) = connect_body(&seen.recv().await.unwrap());
+    assert_eq!(platform, "linux");
+    let stored = stored_premium(&manager).await;
+    assert!(stored.connect_pending() && stored.key.is_none());
+    assert!(manager.premium_state().await.connect_pending());
+
+    // The user tries again, from what the screen says is another
+    // platform: the very same request leaves.
+    assert!(
+        manager
+            .premium_connect(&base_url, "ABCD-EFGH-IJKM-NPQR", DevicePlatform::Windows)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        connect_body(&seen.recv().await.unwrap()),
+        (platform.clone(), token.clone())
+    );
+
+    // The app's next call sends it once more, and this time it lands.
+    let device = manager
+        .premium_ensure_device(&base_url, DevicePlatform::Macos)
+        .await
+        .unwrap()
+        .expect("connected");
+    assert_eq!(device.id, NEW_DEVICE);
+    let replayed = seen.recv().await.unwrap();
+    assert_eq!(bearer(&replayed), Some(KEY));
+    assert_eq!(connect_body(&replayed), (platform, token));
+    seen.recv().await.unwrap();
+    let stored = stored_premium(&manager).await;
+    assert!(!stored.connect_pending());
+    assert_eq!(stored.key.as_deref(), Some(KEY));
+    assert!(stored.has_device());
+}
+
+/// A connection under way for one key is over when another key is
+/// entered: its token, which the server may have made a device of,
+/// waits to be dropped there, and the new key gets a token of its own.
+#[tokio::test]
+async fn another_key_drops_the_connection_under_way() {
+    let (base_url, mut seen) = scripted(vec![
+        LOST.to_owned(),
+        connected_answer("full"),
+        licence_answer(fixtures::VALID_CERTIFICATE),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    assert!(
+        manager
+            .premium_connect(&base_url, KEY, DevicePlatform::Linux)
+            .await
+            .is_err()
+    );
+    let (_, abandoned) = connect_body(&seen.recv().await.unwrap());
+
+    manager
+        .premium_connect(&base_url, OTHER_KEY, DevicePlatform::Linux)
+        .await
+        .unwrap();
+    let connect = seen.recv().await.unwrap();
+    assert_eq!(bearer(&connect), Some(OTHER_KEY));
+    assert_ne!(connect_body(&connect).1, abandoned);
+    let stored = stored_premium(&manager).await;
+    assert_eq!(stored.key.as_deref(), Some(OTHER_KEY));
+    assert!(!stored.connect_pending());
+    let queued: Vec<&str> = stored.pending_logouts.iter().map(Secret::expose).collect();
+    assert_eq!(queued, [abandoned.as_str()]);
+}
+
+/// Once the server has said the key has every device it takes, the key
+/// is not sent again behind the user's back: the device reads as
+/// disconnected, with the server's sentence. A rate limit is waited
+/// out, without a request, for the time the server named.
+#[tokio::test]
+async fn the_key_is_not_sent_again_after_a_rate_limit_or_a_full_account() {
+    let limited = r#"{"error":"too many connections, try again later"}"#;
+    let full = "this key already has 10 devices; disconnect one from a device with full access";
+    let (base_url, mut seen) = scripted(vec![
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{limited}",
+            limited.len()
+        ),
+        answer(
+            "409 Conflict",
+            &format!(r#"{{"error":"{full}","code":"too_many_devices"}}"#),
+        ),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    store_premium(&manager, old_vault()).await;
+
+    let refused = manager
+        .premium_ensure_device(&base_url, DevicePlatform::Linux)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        premium_error(refused),
+        PremiumError::RateLimited {
+            retry_after: Some(120)
+        }
+    );
+    let (_, token) = connect_body(&seen.recv().await.unwrap());
+    assert!(stored_premium(&manager).await.connect_pending());
+    // Asked again at once: the wait is not over, and nothing is sent.
+    let waiting = manager
+        .premium_ensure_device(&base_url, DevicePlatform::Linux)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        premium_error(waiting),
+        PremiumError::RateLimited { retry_after: Some(seconds) } if (1..=120).contains(&seconds)
+    ));
+    assert!(seen.try_recv().is_err());
+
+    // The wait is over: the same request, and a full account.
+    *manager.premium_connect_after.lock().unwrap() = None;
+    let refused = manager
+        .premium_ensure_device(&base_url, DevicePlatform::Linux)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        premium_error(refused),
+        PremiumError::TooManyDevices(full.to_owned())
+    );
+    assert_eq!(connect_body(&seen.recv().await.unwrap()).1, token);
+    let stored = stored_premium(&manager).await;
+    assert!(stored.disconnected && !stored.connect_pending());
+    assert_eq!(stored.disconnected_reason.as_deref(), Some(full));
+    assert_eq!(stored.key.as_deref(), Some(KEY), "the key stays");
+    // From now on, nothing is sent until the user asks.
+    assert_eq!(
+        manager
+            .premium_ensure_device(&base_url, DevicePlatform::Linux)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// A key change whose answer was lost keeps its new key in the vault:
+/// the apps say it did not finish, nothing that would lose that key is
+/// allowed, and trying again sends the same key. A refusal in the
+/// server's words drops it.
+#[tokio::test]
+async fn a_key_change_whose_answer_was_lost_sends_the_same_key_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    store_premium(
+        &manager,
+        connected(PremiumState {
+            key: Some(KEY.to_owned()),
+            certificate: Some(fixtures::VALID_CERTIFICATE.to_owned()),
+            key_saved: true,
+            ..PremiumState::default()
+        }),
+    )
+    .await;
+
+    let (base_url, mut seen) = scripted(vec![LOST.to_owned()]).await;
+    let lost = manager.premium_change_key(&base_url).await.unwrap_err();
+    assert!(matches!(premium_error(lost), PremiumError::Unreachable(_)));
+    let request = seen.recv().await.unwrap();
+    let body: serde_json::Value = serde_json::from_str(body_of(&request)).unwrap();
+    let sent = body["key"].as_str().unwrap().to_owned();
+    assert!(licence::is_well_formed_key(&sent), "{sent}");
+    let stored = stored_premium(&manager).await;
+    assert_eq!(
+        stored.pending_key.as_ref().map(Secret::expose),
+        Some(sent.as_str())
+    );
+    assert_eq!(
+        stored.key.as_deref(),
+        Some(KEY),
+        "not the account's yet here"
+    );
+    // The apps see that it did not finish, not the key.
+    let shown = manager.premium_state().await;
+    assert!(shown.key_change_pending());
+    assert!(!format!("{shown:?}").contains(&sent));
+    assert!(!serde_json::to_string(&shown).unwrap().contains(&sent));
+
+    // Nothing that would lose the new key: no log out, no other account.
+    for refused in [
+        manager.premium_log_out(&base_url).await.unwrap_err(),
+        manager
+            .premium_connect(&base_url, OTHER_KEY, DevicePlatform::Linux)
+            .await
+            .unwrap_err(),
+    ] {
+        assert_eq!(premium_error(refused), PremiumError::KeyChangePending);
+    }
+    // Nor a connection to another account sent again on its own.
+    let mut elsewhere = stored_premium(&manager).await;
+    elsewhere.pending_connect = Some(crate::premium::PendingConnect::new(
+        OTHER_KEY.to_owned(),
+        NEW_TOKEN.to_owned(),
+        DevicePlatform::Linux,
+    ));
+    store_premium(&manager, elsewhere).await;
+    let replay = manager
+        .premium_ensure_device(&base_url, DevicePlatform::Linux)
+        .await
+        .unwrap_err();
+    assert_eq!(premium_error(replay), PremiumError::KeyChangePending);
+    assert!(stored_premium(&manager).await.key_change_pending());
+    let mut settled = stored_premium(&manager).await;
+    settled.pending_connect = None;
+    store_premium(&manager, settled).await;
+    assert!(seen.try_recv().is_err(), "nothing was sent");
+
+    // Trying again sends the same key, and the server confirms it.
+    let (base_url, mut seen) = scripted(vec![
+        answer(
+            "200 OK",
+            &format!(r#"{{"key":"{}"}}"#, licence::format_key(&sent)),
+        ),
+        licence_answer(fixtures::ACCOUNT_CERTIFICATE),
+    ])
+    .await;
+    let shown_key = manager.premium_change_key(&base_url).await.unwrap();
+    assert_eq!(shown_key, licence::format_key(&sent));
+    let again = seen.recv().await.unwrap();
+    assert_eq!(body_of(&again), format!(r#"{{"key":"{sent}"}}"#));
+    let stored = stored_premium(&manager).await;
+    assert_eq!(stored.key.as_deref(), Some(sent.as_str()));
+    assert!(!stored.key_change_pending() && !stored.key_saved);
+    assert_eq!(
+        stored.certificate.as_deref(),
+        Some(fixtures::ACCOUNT_CERTIFICATE)
+    );
+
+    // A refusal in the server's words settles it: the change is dropped,
+    // the key stays what it was.
+    let (base_url, _) = scripted(vec![answer(
+        "409 Conflict",
+        r#"{"error":"this key is already in use"}"#,
+    )])
+    .await;
+    let refused = manager.premium_change_key(&base_url).await.unwrap_err();
+    assert_eq!(
+        premium_error(refused),
+        PremiumError::Rejected("this key is already in use".to_owned())
+    );
+    let stored = stored_premium(&manager).await;
+    assert!(!stored.key_change_pending());
+    assert_eq!(stored.key.as_deref(), Some(sent.as_str()));
+}
+
+/// Moving to another account tells the old one about its removed
+/// wallets first, with its own token; what cannot be told is dropped,
+/// not sent to the new account. The old token is then dropped there.
+#[tokio::test]
+async fn switching_accounts_tells_the_old_one_about_its_removals_first() {
+    let (base_url, mut seen) = scripted(vec![
+        answer("200 OK", "{}"),
+        LOST.to_owned(),
+        connected_answer("full"),
+        deleted_answer(THIS_DEVICE),
+        licence_answer(fixtures::ACCOUNT_CERTIFICATE),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    let mut account = connected(PremiumState {
+        key: Some(KEY.to_owned()),
+        ..PremiumState::default()
+    });
+    account.queue_unwatch("w1");
+    account.queue_unwatch("w2");
+    store_premium(&manager, account).await;
+
+    manager
+        .premium_connect(&base_url, OTHER_KEY, DevicePlatform::Linux)
+        .await
+        .unwrap();
+    let mut heard = Vec::new();
+    for _ in 0..5 {
+        let request = seen.recv().await.unwrap();
+        heard.push((
+            request.lines().next().unwrap().to_owned(),
+            bearer(&request).unwrap().to_owned(),
+        ));
+    }
+    let expected: Vec<(String, String)> = [
+        ("DELETE /v1/wallets/w1 HTTP/1.1", TOKEN),
+        ("DELETE /v1/wallets/w2 HTTP/1.1", TOKEN),
+        ("POST /v1/devices HTTP/1.1", OTHER_KEY),
+        ("DELETE /v1/devices/me HTTP/1.1", TOKEN),
+        ("GET /v1/licence HTTP/1.1", NEW_TOKEN),
+    ]
+    .iter()
+    .map(|(line, bearer)| ((*line).to_owned(), (*bearer).to_owned()))
+    .collect();
+    assert_eq!(heard, expected);
+    let stored = stored_premium(&manager).await;
+    assert!(stored.pending_unwatch.is_empty(), "w2 was dropped");
+    assert!(
+        stored.pending_logouts.is_empty(),
+        "the old token was dropped there"
+    );
+    assert_eq!(stored.key.as_deref(), Some(OTHER_KEY));
 }

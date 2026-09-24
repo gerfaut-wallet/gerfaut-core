@@ -187,6 +187,90 @@ impl fmt::Debug for ConnectedDevice {
     }
 }
 
+/// A string the core keeps and never shows: a device token, or a key
+/// not yet the account's. [`fmt::Debug`] masks it, and the copy of the
+/// state the apps are handed has it blanked; they can tell it is there,
+/// never what it is.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    pub(crate) fn new(value: String) -> Self {
+        Secret(value)
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// The same, blanked: what an app may hold.
+    pub(crate) fn redacted(&self) -> Self {
+        Secret(String::new())
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("hidden")
+    }
+}
+
+/// A connection sent to the server and not answered yet: the key it
+/// went with, the token this device drew for itself, and the platform
+/// it named. Written to the vault before the request leaves, so a lost
+/// answer is settled by sending the very same request again, which the
+/// server takes as the connection it already made rather than a second
+/// device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingConnect {
+    key: Secret,
+    token: Secret,
+    pub platform: DevicePlatform,
+}
+
+impl PendingConnect {
+    pub(crate) fn new(key: String, token: String, platform: DevicePlatform) -> Self {
+        PendingConnect {
+            key: Secret::new(key),
+            token: Secret::new(token),
+            platform,
+        }
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        self.key.expose()
+    }
+
+    pub(crate) fn token(&self) -> &str {
+        self.token.expose()
+    }
+
+    pub(crate) fn redacted(&self) -> Self {
+        PendingConnect {
+            key: self.key.redacted(),
+            token: self.token.redacted(),
+            platform: self.platform,
+        }
+    }
+}
+
+/// A fresh device token, drawn from the operating system's generator in
+/// the shape the server hands out: `gdt1_` and 32 random bytes in
+/// base64url. A random bearer string, and nothing a signature could be
+/// made with.
+pub(crate) fn draw_device_token() -> crate::CoreResult<String> {
+    use rand::TryRngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|e| crate::CoreError::Internal(format!("no randomness to draw a token: {e}")))?;
+    Ok(format!(
+        "gdt1_{}",
+        data_encoding::BASE64URL_NOPAD.encode(&bytes)
+    ))
+}
+
 /// Whether a token has the shape the server hands out: `gdt1_` and at
 /// least 128 bits in base64url. Anything else, a header breaker among
 /// them, is not stored.
@@ -315,6 +399,41 @@ mod tests {
         let shown = format!("{connected:?}");
         assert!(!shown.contains(TOKEN), "{shown}");
         assert_eq!(connected.credential(), credential);
+    }
+
+    #[test]
+    fn a_drawn_token_has_the_server_shape_and_is_new_each_time() {
+        let token = draw_device_token().unwrap();
+        assert!(is_device_token(&token), "{token}");
+        assert_eq!(token.len(), "gdt1_".len() + 43);
+        assert_ne!(token, draw_device_token().unwrap());
+    }
+
+    #[test]
+    fn a_secret_stays_out_of_debug_output() {
+        let pending = PendingConnect::new(
+            "abcdefghijkmnpqr".to_owned(),
+            TOKEN.to_owned(),
+            DevicePlatform::Linux,
+        );
+        let shown = format!("{pending:?} {pending:#?}");
+        assert!(!shown.contains(TOKEN), "{shown}");
+        assert!(!shown.contains("abcdefghijkmnpqr"), "{shown}");
+        assert_eq!(pending.token(), TOKEN);
+        assert_eq!(pending.key(), "abcdefghijkmnpqr");
+        let blank = pending.redacted();
+        assert_eq!((blank.key(), blank.token()), ("", ""));
+        assert_eq!(blank.platform, DevicePlatform::Linux);
+        // In the vault, the values themselves.
+        let json = serde_json::to_string(&pending).unwrap();
+        assert_eq!(
+            json,
+            format!(r#"{{"key":"abcdefghijkmnpqr","token":"{TOKEN}","platform":"linux"}}"#)
+        );
+        assert_eq!(
+            serde_json::from_str::<PendingConnect>(&json).unwrap(),
+            pending
+        );
     }
 
     #[test]

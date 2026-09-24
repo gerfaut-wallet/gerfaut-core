@@ -57,6 +57,9 @@ serde = { version = "1", features = ["derive"] }
 # is over bytes, not over a value re-serialized this side.
 serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
+# Says what the core gave up on, for whatever logger the app installs;
+# the version the tree already pulls in, so nothing new is compiled.
+log = "0.4"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
 chacha20poly1305 = "0.10"
 argon2 = "0.5"

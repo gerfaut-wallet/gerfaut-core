@@ -416,8 +416,14 @@ struct DeletedBody {
 }
 
 #[derive(Serialize)]
-struct PlatformBody {
+struct ConnectBody<'a> {
     platform: DevicePlatform,
+    token: &'a str,
+}
+
+#[derive(Serialize)]
+struct NewKeyBody<'a> {
+    key: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -586,25 +592,37 @@ impl PremiumClient {
     // --- devices ------------------------------------------------------
 
     /// Connects this device with the account key: the one request the
-    /// key goes with. The server answers with the device and a token of
-    /// its own, which [`crate::WalletManager::premium_connect`] keeps in
-    /// the vault; call that rather than this. The first device an
+    /// key goes with. `token` is the device's own, drawn here and kept
+    /// in the vault before the request leaves; the same request sent
+    /// again is answered with the device it already made, so a lost
+    /// answer costs nothing. [`crate::WalletManager::premium_connect`]
+    /// does all that; call it rather than this. The first device an
     /// account ever has gets full access at once. Any later one waits,
     /// and every other device is told it came. A key the server does
     /// not know is [`PremiumError::UnknownKey`], one whose devices fill
     /// every slot [`PremiumError::TooManyDevices`]. A token of another
-    /// shape than the server's is not taken.
-    pub async fn connect_device(&self, platform: DevicePlatform) -> CoreResult<ConnectedDevice> {
+    /// shape than the server's is not taken, whichever side drew it.
+    pub async fn connect_device(
+        &self,
+        platform: DevicePlatform,
+        token: &str,
+    ) -> CoreResult<ConnectedDevice> {
         if platform == DevicePlatform::Other {
             return Err(CoreError::InvalidInput {
                 kind: "device platform",
                 detail: "the server takes android, ios, windows, macos and linux".to_owned(),
             });
         }
+        if !device::is_device_token(token) {
+            return Err(CoreError::InvalidInput {
+                kind: "device token",
+                detail: "not of the shape the server hands out".to_owned(),
+            });
+        }
         let request = self
             .http
             .post(self.url("/v1/devices"))
-            .json(&PlatformBody { platform });
+            .json(&ConnectBody { platform, token });
         let body = self.send(request, Auth::Key).await?;
         let connected: ConnectedDevice = decode(&body)?;
         if !device::is_device_token(connected.token()) {
@@ -658,13 +676,28 @@ impl PremiumClient {
         confirmed_deleted(&body)
     }
 
-    /// Replaces the account key. The old one stops working everywhere
-    /// at once, every other device is disconnected, and this one stays
-    /// connected. Returns the new key, normalized; an answer that does
-    /// not hold one of the right shape is
-    /// [`PremiumError::UnexpectedResponse`].
-    pub async fn change_key(&self) -> CoreResult<String> {
-        let request = self.http.post(self.url("/v1/account/key"));
+    /// Replaces the account key with `key`, drawn here and kept in the
+    /// vault before the request leaves; the same request sent again is
+    /// answered with the key the account already has. The old key stops
+    /// working everywhere at once, every other device is disconnected,
+    /// and this one stays connected.
+    /// [`crate::WalletManager::premium_change_key`] does all that; call
+    /// it rather than this. Returns the account's key as the server
+    /// says it is now, normalized; an answer that does not hold one of
+    /// the right shape is [`PremiumError::UnexpectedResponse`].
+    pub async fn change_key(&self, key: &str) -> CoreResult<String> {
+        if !licence::is_well_formed_key(key) {
+            return Err(CoreError::InvalidInput {
+                kind: "premium key",
+                detail: "a key is sixteen symbols, shown as xxxx-xxxx-xxxx-xxxx".to_owned(),
+            });
+        }
+        let request = self
+            .http
+            .post(self.url("/v1/account/key"))
+            .json(&NewKeyBody {
+                key: &licence::normalize_key(key),
+            });
         let body = self.send(request, Auth::Device).await?;
         let key = decode::<KeyBody>(&body)?.key;
         if !licence::is_well_formed_key(&key) {
@@ -1171,6 +1204,8 @@ mod tests {
     /// The token of the device the tests speak for.
     const TOKEN: &str = "gdt1_q83vEjRWeJC6ze8SNFZ4kLrN7xI0VniQus3vEjRWeJA";
     const KEY: &str = "abcdefghijkmnpqr";
+    /// The key a key change asks for.
+    const NEW_KEY: &str = "wxyz23456789abcd";
 
     fn client(stub: &Stub, key: Option<&str>) -> PremiumClient {
         PremiumClient::new(&stub.base_url, key.map(str::to_owned), None).unwrap()
@@ -1366,7 +1401,7 @@ mod tests {
         )
         .await;
         let connected = client(&connecting, Some("ABCD-EFGH-IJKM-NPQR"))
-            .connect_device(DevicePlatform::Android)
+            .connect_device(DevicePlatform::Android, TOKEN)
             .await
             .unwrap();
         assert_eq!(connected.device.id, "0b4b1e1c-7d1e-4b6a-9d0e-1a2b3c4d5e6f");
@@ -1382,7 +1417,10 @@ mod tests {
             header(&request, "authorization"),
             Some("Bearer abcdefghijkmnpqr")
         );
-        assert_eq!(body_of(&request), r#"{"platform":"android"}"#);
+        assert_eq!(
+            body_of(&request),
+            format!(r#"{{"platform":"android","token":"{TOKEN}"}}"#)
+        );
 
         let mut stub = stub(
             200,
@@ -1429,7 +1467,7 @@ mod tests {
                 matches!(
                     premium_error(
                         client(&connecting, Some(KEY))
-                            .connect_device(DevicePlatform::Linux)
+                            .connect_device(DevicePlatform::Linux, TOKEN)
                             .await
                             .unwrap_err()
                     ),
@@ -1456,7 +1494,7 @@ mod tests {
             keyed.approve_device("d").await.unwrap_err(),
             keyed.remove_device("d").await.unwrap_err(),
             keyed.log_out_device().await.unwrap_err(),
-            keyed.change_key().await.unwrap_err(),
+            keyed.change_key(NEW_KEY).await.unwrap_err(),
             keyed.delete_account().await.unwrap_err(),
         ] {
             assert_eq!(premium_error(refused), PremiumError::NoDevice);
@@ -1468,7 +1506,7 @@ mod tests {
         assert_eq!(
             premium_error(
                 nobody
-                    .connect_device(DevicePlatform::Windows)
+                    .connect_device(DevicePlatform::Windows, TOKEN)
                     .await
                     .unwrap_err()
             ),
@@ -1476,7 +1514,7 @@ mod tests {
         );
         assert!(matches!(
             keyed
-                .connect_device(DevicePlatform::Other)
+                .connect_device(DevicePlatform::Other, TOKEN)
                 .await
                 .unwrap_err(),
             CoreError::InvalidInput { .. }
@@ -1686,7 +1724,7 @@ mod tests {
         assert_eq!(
             premium_error(
                 client(&unknown, Some(KEY))
-                    .connect_device(DevicePlatform::Linux)
+                    .connect_device(DevicePlatform::Linux, TOKEN)
                     .await
                     .unwrap_err()
             ),
@@ -2416,7 +2454,7 @@ mod tests {
     async fn change_key_returns_the_new_key_normalized_or_nothing() {
         let mut changed = stub(200, r#"{"key":"WXYZ-2345-6789-ABCD"}"#).await;
         assert_eq!(
-            device(&changed).change_key().await.unwrap(),
+            device(&changed).change_key(NEW_KEY).await.unwrap(),
             "wxyz23456789abcd"
         );
         let request = changed.request().await;
@@ -2428,11 +2466,27 @@ mod tests {
             header(&request, "authorization"),
             Some(format!("Bearer {TOKEN}").as_str())
         );
+        assert_eq!(body_of(&request), format!(r#"{{"key":"{NEW_KEY}"}}"#));
+        // A key or a token of the wrong shape never leaves.
+        let nowhere = PremiumClient::new("http://127.0.0.1:9", Some(KEY.to_owned()), None)
+            .unwrap()
+            .with_device_token(Some(TOKEN.to_owned()));
+        assert!(matches!(
+            nowhere.change_key("not a key").await.unwrap_err(),
+            CoreError::InvalidInput { .. }
+        ));
+        assert!(matches!(
+            nowhere
+                .connect_device(DevicePlatform::Linux, "gdt1_short")
+                .await
+                .unwrap_err(),
+            CoreError::InvalidInput { .. }
+        ));
         for body in [r#"{"key":"not a key"}"#, r#"{"key":""}"#, r#"{}"#] {
             let odd = stub(200, body).await;
             assert!(
                 matches!(
-                    premium_error(device(&odd).change_key().await.unwrap_err()),
+                    premium_error(device(&odd).change_key(NEW_KEY).await.unwrap_err()),
                     PremiumError::UnexpectedResponse(_)
                 ),
                 "{body}"
@@ -2471,7 +2525,7 @@ mod tests {
         let _ = device(&unpaid).on_disowned(hook.clone()).wallets().await;
         let _ = device(&disowned)
             .on_disowned(hook.clone())
-            .connect_device(DevicePlatform::Linux)
+            .connect_device(DevicePlatform::Linux, TOKEN)
             .await;
         let _ = device(&disowned).on_disowned(hook).health().await;
         assert_eq!(heard.lock().unwrap().len(), 1);

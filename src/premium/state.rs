@@ -17,10 +17,15 @@
 //! about the account's safety: whether the server disowned this device,
 //! whether the user saved the key, whether the checklist was put away,
 //! and which waiting devices a notification already announced.
+//!
+//! Last, what was sent and not answered: a connection and a key change
+//! the vault records before the request leaves, so a lost answer costs
+//! neither a key nor a device nobody holds, and the tokens of devices
+//! that logged out while the server could not be told.
 
 use serde::{Deserialize, Serialize};
 
-use super::device::DeviceCredential;
+use super::device::{DeviceCredential, PendingConnect, Secret};
 
 /// A wallet the user agreed to have watched by the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +69,12 @@ pub struct PremiumState {
     /// to ask. The core alone writes it.
     #[serde(default)]
     pub disconnected: bool,
+    /// Why the server would not connect this device, in its own words,
+    /// when it said: the key already has as many devices as it takes.
+    /// `None` for a device disowned or a key no longer known, whose
+    /// sentences the apps write themselves. The core alone writes it.
+    #[serde(default)]
+    pub disconnected_reason: Option<String>,
     /// The user said the key is saved somewhere safe.
     #[serde(default)]
     pub key_saved: bool,
@@ -74,6 +85,25 @@ pub struct PremiumState {
     /// is announced once.
     #[serde(default)]
     pub announced_devices: Vec<String>,
+    /// A connection sent and not answered: sent again as it was until
+    /// the server answers it. The core alone writes it.
+    #[serde(default)]
+    pub pending_connect: Option<PendingConnect>,
+    /// A key change sent and not answered: the new key, drawn here and
+    /// stored before it left. The server may have made it the account's
+    /// already, and the key above may be dead: the apps say the change
+    /// did not finish, offer to try again, which sends this same key,
+    /// and do not offer to copy the key meanwhile. Blanked in the copy
+    /// the apps get; see [`PremiumState::key_change_pending`]. The core
+    /// alone writes it.
+    #[serde(default)]
+    pub pending_key: Option<Secret>,
+    /// Tokens of this device's past connections that the server could
+    /// not be told to drop, until it is: see
+    /// [`crate::WalletManager::premium_flush_logouts`]. Never shown.
+    /// The core alone writes it.
+    #[serde(default)]
+    pub pending_logouts: Vec<Secret>,
 }
 
 impl PremiumState {
@@ -134,6 +164,26 @@ impl PremiumState {
         self.device.is_some()
     }
 
+    /// Whether a key change was sent and not answered: the apps say
+    /// `The key change did not finish. Try again to complete it.` and
+    /// hide "Copy key" until it is.
+    pub fn key_change_pending(&self) -> bool {
+        self.pending_key.is_some()
+    }
+
+    /// Whether a connection of this device was sent and not answered.
+    pub fn connect_pending(&self) -> bool {
+        self.pending_connect.is_some()
+    }
+
+    /// Queues the token of a connection the server has to be told is
+    /// over, once.
+    pub(crate) fn queue_logout(&mut self, token: &str) {
+        if !token.is_empty() && !self.pending_logouts.iter().any(|t| t.expose() == token) {
+            self.pending_logouts.push(Secret::new(token.to_owned()));
+        }
+    }
+
     /// Whether `token` is the one this device holds.
     pub(crate) fn holds_token(&self, token: &str) -> bool {
         self.device.as_ref().is_some_and(|d| d.token() == token)
@@ -155,16 +205,23 @@ impl PremiumState {
     /// This device leaves the account: the key, its connection, its
     /// certificate and what the screens remembered about it go. The
     /// consents stay, so the same key entered again asks nothing twice,
-    /// and so do the removals the server has yet to hear of.
+    /// and so do the removals the server has yet to hear of. The token
+    /// of a connection sent and not answered joins the ones the server
+    /// is still to be told about: it may have made a device of it.
     pub(crate) fn forget_account(&mut self) {
+        if let Some(pending) = self.pending_connect.take() {
+            self.queue_logout(pending.token());
+        }
         self.key = None;
         self.certificate = None;
         self.acknowledged_offline_until = None;
         self.device = None;
         self.disconnected = false;
+        self.disconnected_reason = None;
         self.key_saved = false;
         self.checklist_hidden = false;
         self.announced_devices.clear();
+        self.pending_key = None;
     }
 
     /// Records the waiting devices a notification has announced.
@@ -188,9 +245,25 @@ impl PremiumState {
         fresh
     }
 
-    /// Blanks the device token: the state as an app is handed it.
+    /// Blanks every secret but the key: the state as an app is handed
+    /// it.
     pub(crate) fn redact(&mut self) {
         self.device = self.device.as_ref().map(DeviceCredential::redacted);
+        self.pending_connect = self.pending_connect.as_ref().map(PendingConnect::redacted);
+        self.pending_key = self.pending_key.as_ref().map(Secret::redacted);
+        self.pending_logouts = self.pending_logouts.iter().map(Secret::redacted).collect();
+    }
+
+    /// `offered` as an app hands it back, with what the core alone
+    /// writes taken from `self`, the stored state: only the consents,
+    /// the queued removals and the dismissed banner are the app's.
+    pub(crate) fn with_app_part_of(&self, offered: PremiumState) -> PremiumState {
+        PremiumState {
+            watched: offered.watched,
+            acknowledged_offline_until: offered.acknowledged_offline_until,
+            pending_unwatch: offered.pending_unwatch,
+            ..self.clone()
+        }
     }
 }
 
@@ -359,17 +432,100 @@ mod tests {
             pending_unwatch: Vec::new(),
             device: Some(DeviceCredential::new("d1".to_owned(), TOKEN.to_owned(), 7)),
             disconnected: false,
+            disconnected_reason: None,
             key_saved: true,
             checklist_hidden: false,
             announced_devices: vec!["d2".to_owned()],
+            pending_connect: Some(PendingConnect::new(
+                "wxyz23456789abcd".to_owned(),
+                OTHER_TOKEN.to_owned(),
+                super::super::DevicePlatform::Linux,
+            )),
+            pending_key: Some(Secret::new("mnpq23456789abcd".to_owned())),
+            pending_logouts: vec![Secret::new(OTHER_TOKEN.to_owned())],
         };
         let json = serde_json::to_string(&state).unwrap();
         assert_eq!(
             json,
             format!(
-                r#"{{"key":"abcdefghijkmnpqr","certificate":"eyJ2IjoxfQ.c2ln","watched":[{{"wallet_id":"w1","consented_at":100}}],"acknowledged_offline_until":500,"pending_unwatch":[],"device":{{"id":"d1","token":"{TOKEN}","connected_at":7}},"disconnected":false,"key_saved":true,"checklist_hidden":false,"announced_devices":["d2"]}}"#
+                r#"{{"key":"abcdefghijkmnpqr","certificate":"eyJ2IjoxfQ.c2ln","watched":[{{"wallet_id":"w1","consented_at":100}}],"acknowledged_offline_until":500,"pending_unwatch":[],"device":{{"id":"d1","token":"{TOKEN}","connected_at":7}},"disconnected":false,"disconnected_reason":null,"key_saved":true,"checklist_hidden":false,"announced_devices":["d2"],"pending_connect":{{"key":"wxyz23456789abcd","token":"{OTHER_TOKEN}","platform":"linux"}},"pending_key":"mnpq23456789abcd","pending_logouts":["{OTHER_TOKEN}"]}}"#
             )
         );
         assert_eq!(serde_json::from_str::<PremiumState>(&json).unwrap(), state);
+    }
+
+    /// Every secret the state holds, and nothing else, is blanked in the
+    /// copy an app gets, and none of them shows in a debug print. The
+    /// app still sees that each is there.
+    #[test]
+    fn every_secret_is_blanked_for_the_apps_and_hidden_from_debug() {
+        let mut state = PremiumState {
+            pending_connect: Some(PendingConnect::new(
+                "wxyz23456789abcd".to_owned(),
+                OTHER_TOKEN.to_owned(),
+                super::super::DevicePlatform::Linux,
+            )),
+            pending_key: Some(Secret::new("mnpq23456789abcd".to_owned())),
+            pending_logouts: vec![Secret::new(OTHER_TOKEN.to_owned())],
+            ..connected()
+        };
+        let shown = format!("{state:?}");
+        for secret in [TOKEN, OTHER_TOKEN, "wxyz23456789abcd", "mnpq23456789abcd"] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+        state.redact();
+        let json = serde_json::to_string(&state).unwrap();
+        for secret in [TOKEN, OTHER_TOKEN, "wxyz23456789abcd", "mnpq23456789abcd"] {
+            assert!(!json.contains(secret), "{json}");
+        }
+        assert!(state.key_change_pending() && state.connect_pending());
+        assert_eq!(state.pending_logouts.len(), 1);
+        assert_eq!(state.key.as_deref(), Some("abcdefghijkmnpqr"));
+    }
+
+    /// Of what an app hands back, only its own part is taken.
+    #[test]
+    fn only_the_app_part_of_a_state_handed_back_is_taken() {
+        let stored = PremiumState {
+            certificate: Some("eyJ2IjoxfQ.c2ln".to_owned()),
+            key_saved: true,
+            pending_key: Some(Secret::new("mnpq23456789abcd".to_owned())),
+            ..connected()
+        };
+        let mut offered = PremiumState::default();
+        offered.consent("w1", 100);
+        offered.queue_unwatch("w2");
+        offered.acknowledged_offline_until = Some(9);
+        offered.disconnected = true;
+        let taken = stored.with_app_part_of(offered.clone());
+        assert_eq!(
+            taken,
+            PremiumState {
+                watched: offered.watched,
+                pending_unwatch: offered.pending_unwatch,
+                acknowledged_offline_until: Some(9),
+                ..stored
+            }
+        );
+    }
+
+    #[test]
+    fn a_logout_is_queued_once_and_a_pending_connection_joins_it_on_leaving() {
+        let mut state = PremiumState {
+            pending_connect: Some(PendingConnect::new(
+                "abcdefghijkmnpqr".to_owned(),
+                OTHER_TOKEN.to_owned(),
+                super::super::DevicePlatform::Linux,
+            )),
+            ..connected()
+        };
+        state.queue_logout(TOKEN);
+        state.queue_logout(TOKEN);
+        state.queue_logout("");
+        assert_eq!(state.pending_logouts.len(), 1);
+        state.forget_account();
+        let queued: Vec<&str> = state.pending_logouts.iter().map(Secret::expose).collect();
+        assert_eq!(queued, [TOKEN, OTHER_TOKEN]);
+        assert!(!state.connect_pending());
     }
 }

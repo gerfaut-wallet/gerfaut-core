@@ -8,31 +8,57 @@
 //! everything that answer settles: a key and the token it earned go in
 //! together or not at all. The apps call these and compose nothing
 //! themselves.
+//!
+//! An answer can be lost on the way: a phone in a tunnel, a slow Tor
+//! circuit, a timeout. A connection or a key change the server made and
+//! this device never heard of would cost a device nobody holds, or the
+//! only copy of the new key. So this side draws the secret itself, the
+//! device token or the new key, writes it to the vault before the
+//! request leaves, and sends that very request again until an answer
+//! settles it: the server takes the same request twice as the one it
+//! already carried out.
+
+use std::time::{Duration, Instant};
 
 use crate::error::{CoreError, CoreResult, PremiumError};
+use crate::premium::device::{self, PendingConnect, Secret};
 use crate::premium::licence;
 use crate::premium::{Device, DevicePlatform, Licence};
 
 use super::{WalletManager, same_key};
 
+/// How long a connection waits after a rate limit that named no wait.
+const CONNECT_WAIT_UNNAMED: Duration = Duration::from_secs(300);
+
 impl WalletManager {
     /// Connects this device with `key`, which replaces the old
-    /// activation. The key's shape is checked first; then it goes to
-    /// the server, the one request it ever goes with, and the key and
-    /// the token that came back are stored in one write, only once the
-    /// server has answered. The certificate is fetched after that, which
-    /// a waiting device may do: when it cannot be had, for a key never
-    /// paid for or a server gone quiet, the device stays connected and
-    /// [`Self::premium_refresh_licence`] says why.
+    /// activation. The key's shape is checked first. This device then
+    /// draws its token, and stores it with the key as a connection
+    /// under way before the request leaves; the key and the token are
+    /// the account's in the vault only once the server has answered. A
+    /// connection whose answer was lost is sent again as it was, same
+    /// token, rather than drawn anew: the server answers it with the
+    /// device it already made. The certificate is fetched after that,
+    /// which a waiting device may do: when it cannot be had, for a key
+    /// never paid for or a server gone quiet, the device stays connected
+    /// and [`Self::premium_refresh_licence`] says why.
     ///
     /// The device that comes back has full access when it is the
     /// account's first, and waits otherwise. A key entered again on a
     /// device it already connected connects nothing new, since a new
     /// device would wait where this one may not: the device it already
-    /// is comes back. Another key moves this device to that account;
-    /// what the vault knew of the last one goes, its certificate and
-    /// its checklist, and the server is told, as far as it can be
-    /// reached, that the old connection is over.
+    /// is comes back. Another key moves this device to that account:
+    /// the removals the old account has yet to hear of go first, with
+    /// the old token, and what cannot go is dropped; then what the vault
+    /// knew of the old account goes, its certificate and its checklist,
+    /// and the server is told the old connection is over, now or later.
+    /// A key change of the old account that did not finish refuses the
+    /// move, [`PremiumError::KeyChangePending`]: moving on would lose
+    /// the only copy of its new key.
+    ///
+    /// With the stored key, a refusal that the server knows no such key,
+    /// or that the key has every device it takes, leaves this device
+    /// disconnected, with the server's sentence for the second.
     pub async fn premium_connect(
         &self,
         base_url: &str,
@@ -45,52 +71,50 @@ impl WalletManager {
                 detail: "a key is sixteen symbols, shown as xxxx-xxxx-xxxx-xxxx".to_owned(),
             });
         }
+        let key = licence::normalize_key(key);
         let _change = self.premium_changes.lock().await;
-        self.connect(base_url, licence::normalize_key(key), platform)
-            .await
+        self.connect(base_url, key, platform).await
     }
 
-    /// Connects this device with the stored key when it holds one and
-    /// no token: a vault written before devices existed. The apps call
-    /// it before any premium call; it connects once, and returns the
-    /// device it connected, or `None` when there was nothing to do. A
-    /// device the server disowned is not connected again behind the
-    /// user's back: that is theirs to ask, with [`Self::premium_connect`].
+    /// Connects this device when the vault says it should be and is not:
+    /// a connection sent and not answered is sent again as it was, and a
+    /// stored key with no token, a vault written before devices existed,
+    /// is connected. The apps call it before any premium call; it
+    /// returns the device it connected, or `None` when there was
+    /// nothing to do.
     ///
-    /// A stored key the server no longer knows, changed on another
-    /// device or its account gone, is recorded as disowned, and the
-    /// error comes back: asking again at every call would not change
-    /// the answer.
+    /// It never sends the key behind the user's back once the server
+    /// has said no. A device the server disowned, a key it no longer
+    /// knows, a key with every device it takes: each leaves the device
+    /// disconnected until the user connects it again, with
+    /// [`Self::premium_connect`]. A rate limit is waited out: until the
+    /// wait the server named is over, this answers
+    /// [`PremiumError::RateLimited`] with what is left of it, without a
+    /// request.
     pub async fn premium_ensure_device(
         &self,
         base_url: &str,
         platform: DevicePlatform,
     ) -> CoreResult<Option<Device>> {
         let _change = self.premium_changes.lock().await;
-        let key = {
+        if let Some(wait) = self.connect_wait() {
+            return Err(PremiumError::RateLimited {
+                retry_after: Some(wait.as_secs().max(1)),
+            }
+            .into());
+        }
+        let (key, platform) = {
             let state = self.state.lock().await;
             let premium = &state.payload.settings.premium;
-            match &premium.key {
-                Some(key) if !premium.has_device() && !premium.disconnected => {
-                    licence::normalize_key(key)
+            match (&premium.pending_connect, &premium.key) {
+                (Some(pending), _) => (pending.key().to_owned(), pending.platform),
+                (None, Some(key)) if !premium.has_device() && !premium.disconnected => {
+                    (licence::normalize_key(key), platform)
                 }
                 _ => return Ok(None),
             }
         };
-        match self.connect(base_url, key.clone(), platform).await {
-            Ok(device) => Ok(Some(device)),
-            Err(error @ CoreError::Premium(PremiumError::UnknownKey)) => {
-                self.state.lock().await.commit(|payload| {
-                    let premium = &mut payload.settings.premium;
-                    if !premium.has_device() && same_key(premium.key.as_deref(), Some(&key)) {
-                        premium.disconnected = true;
-                    }
-                    Ok(())
-                })?;
-                Err(error)
-            }
-            Err(error) => Err(error),
-        }
+        self.connect(base_url, key, platform).await.map(Some)
     }
 
     /// This device, as the server sees it: whether it has full access,
@@ -140,55 +164,164 @@ impl WalletManager {
         })
     }
 
-    /// Logs this device out of the account: the server is told, as far
-    /// as it can be reached, and whatever it answers, the key, the token
-    /// and the certificate leave the vault, with what the screens
-    /// remembered about the account. The consents stay, so the same key
-    /// entered again asks nothing twice. What "Forget this key" did,
-    /// and the server now hears of it.
+    /// Logs this device out of the account: the server is told, and
+    /// whatever it answers, the key, the token and the certificate leave
+    /// the vault, with what the screens remembered about the account.
+    /// The consents stay, so the same key entered again asks nothing
+    /// twice. A server that could not be told keeps the token live: it
+    /// waits, never shown, for [`Self::premium_flush_logouts`]. What
+    /// "Forget this key" did, and the server now hears of it.
+    ///
+    /// A key change that did not finish is refused,
+    /// [`PremiumError::KeyChangePending`], while this device could still
+    /// finish it: the new key may already be the account's, and this
+    /// vault would be the last place that holds it.
     pub async fn premium_log_out(&self, base_url: &str) -> CoreResult<()> {
         let _change = self.premium_changes.lock().await;
-        let token = self
+        let token = {
+            let state = self.state.lock().await;
+            let premium = &state.payload.settings.premium;
+            if premium.key_change_pending() && premium.has_device() {
+                return Err(PremiumError::KeyChangePending.into());
+            }
+            premium.device.as_ref().map(|d| d.token().to_owned())
+        };
+        let told = match &token {
+            Some(token) => self.revoke(base_url, token).await.is_ok(),
+            None => true,
+        };
+        self.state.lock().await.commit(|payload| {
+            let premium = &mut payload.settings.premium;
+            premium.forget_account();
+            if let Some(token) = token.as_deref().filter(|_| !told) {
+                premium.queue_logout(token);
+            }
+            Ok(())
+        })
+    }
+
+    /// Tells the server about the connections this device dropped while
+    /// it could not be reached, one `DELETE /v1/devices/me` each with
+    /// the token that connection held. A token the server no longer
+    /// knows counts as told. A refusal keeps its token and the round
+    /// goes on; a server that cannot be reached, or a rate limit, ends
+    /// the round, and the first error is returned. Nothing to tell
+    /// costs no connection. The apps call it on start and with the
+    /// heartbeat. Returns how many are still to tell.
+    pub async fn premium_flush_logouts(&self, base_url: &str) -> CoreResult<usize> {
+        let tokens: Vec<String> = {
+            let state = self.state.lock().await;
+            let premium = &state.payload.settings.premium;
+            premium
+                .pending_logouts
+                .iter()
+                .map(|t| t.expose().to_owned())
+                .collect()
+        };
+        if tokens.is_empty() {
+            return Ok(0);
+        }
+        let mut told = Vec::new();
+        let mut failure = None;
+        for token in &tokens {
+            match self.revoke(base_url, token).await {
+                Ok(()) => told.push(token.clone()),
+                Err(error @ CoreError::Premium(PremiumError::Rejected(_))) => {
+                    failure.get_or_insert(error);
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    break;
+                }
+            }
+        }
+        let left = self.state.lock().await.commit(|payload| {
+            let premium = &mut payload.settings.premium;
+            premium
+                .pending_logouts
+                .retain(|t| !told.iter().any(|done| done == t.expose()));
+            Ok(premium.pending_logouts.len())
+        })?;
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(left),
+        }
+    }
+
+    /// Replaces the account key. The old one stops working everywhere at
+    /// once, every other device is disconnected, and this one stays
+    /// connected with its token. Returns the new key, formatted to be
+    /// shown: it is shown nowhere else, ever.
+    ///
+    /// The new key is drawn here and stored as a change under way before
+    /// the request leaves. While it is, the apps say the change did not
+    /// finish, and trying again sends that same key: the server answers
+    /// it with the key the account already has. Once the server has
+    /// answered, the key is the account's in the vault, not saved yet,
+    /// and the certificate, whose subject changes with the key, is
+    /// fetched again; one that cannot be had leaves the last one, whose
+    /// dates still hold. A refusal that settles it drops the change; an
+    /// answer lost on the way keeps it. The key the server applied is
+    /// returned even when the vault cannot record it: the vault still
+    /// holds it as the change under way, and the next try completes it.
+    pub async fn premium_change_key(&self, base_url: &str) -> CoreResult<String> {
+        let _change = self.premium_changes.lock().await;
+        let pending = self
             .state
             .lock()
             .await
             .payload
             .settings
             .premium
-            .device
-            .as_ref()
-            .map(|d| d.token().to_owned());
-        if let Some(token) = token {
-            self.log_out_token(base_url, &token).await;
-        }
-        self.state.lock().await.commit(|payload| {
-            payload.settings.premium.forget_account();
-            Ok(())
-        })
-    }
-
-    /// Replaces the account key. The old one stops working everywhere at
-    /// once, every other device is disconnected, and this one stays
-    /// connected with its token. The new key is stored as soon as the
-    /// server gave it, marked as not saved yet, and the certificate,
-    /// whose subject changes with the key, is fetched again; one that
-    /// cannot be had leaves the last one, whose dates still hold.
-    /// Returns the new key, formatted to be shown: it is shown nowhere
-    /// else, ever.
-    pub async fn premium_change_key(&self, base_url: &str) -> CoreResult<String> {
-        let _change = self.premium_changes.lock().await;
-        let key = self.premium_client(base_url).await?.change_key().await?;
-        self.state.lock().await.commit(|payload| {
+            .pending_key
+            .clone();
+        let key = match pending {
+            Some(key) => key.expose().to_owned(),
+            None => {
+                let key = licence::draw_account_key()?;
+                self.state.lock().await.commit(|payload| {
+                    payload.settings.premium.pending_key = Some(Secret::new(key.clone()));
+                    Ok(())
+                })?;
+                key
+            }
+        };
+        let answer = match self.premium_client(base_url).await {
+            Ok(client) => client.change_key(&key).await,
+            Err(error) => Err(error),
+        };
+        let applied = match answer {
+            Ok(applied) => applied,
+            Err(error) => {
+                if settles_key_change(&error) {
+                    self.state.lock().await.commit(|payload| {
+                        let premium = &mut payload.settings.premium;
+                        if premium.pending_key.as_ref().map(Secret::expose) == Some(key.as_str()) {
+                            premium.pending_key = None;
+                        }
+                        Ok(())
+                    })?;
+                }
+                return Err(error);
+            }
+        };
+        let recorded = self.state.lock().await.commit(|payload| {
             let premium = &mut payload.settings.premium;
-            premium.key = Some(key.clone());
+            premium.key = Some(applied.clone());
+            premium.pending_key = None;
             premium.key_saved = false;
             // Every other device is gone, and with them what was
             // announced of them.
             premium.announced_devices.clear();
             Ok(())
-        })?;
+        });
+        if let Err(error) = recorded {
+            log::warn!(
+                "the new premium key could not be recorded, and is kept as a change under way: {error}"
+            );
+        }
         let _ = self.premium_refresh_licence(base_url).await;
-        Ok(licence::format_key(&key))
+        Ok(licence::format_key(&applied))
     }
 
     /// Fetches the certificate again, for the paid time a renewal added
@@ -247,12 +380,16 @@ impl WalletManager {
         key: String,
         platform: DevicePlatform,
     ) -> CoreResult<Device> {
-        let connected_already = {
-            let state = self.state.lock().await;
-            let premium = &state.payload.settings.premium;
-            premium.has_device() && same_key(premium.key.as_deref(), Some(&key))
-        };
-        if connected_already {
+        let stored = self.state.lock().await.payload.settings.premium.clone();
+        let same_account = same_key(stored.key.as_deref(), Some(&key));
+        // Moving on while a key change of this account is unanswered
+        // would lose the new key, whoever asks: the user, or a
+        // connection to another account sent again. Logging out stays
+        // open when this device can no longer finish the change.
+        if !same_account && stored.key.is_some() && stored.key_change_pending() {
+            return Err(PremiumError::KeyChangePending.into());
+        }
+        if same_account && stored.has_device() {
             match self.premium_client(base_url).await?.device_me().await {
                 Ok(device) => {
                     let _ = self.premium_refresh_licence(base_url).await;
@@ -264,52 +401,217 @@ impl WalletManager {
                 Err(error) => return Err(error),
             }
         }
-        let connected = self
-            .premium_client_with_key(base_url, Some(key.clone()))
-            .await?
-            .connect_device(platform)
-            .await?;
+
+        // The connection under way for this key, sent again as it was, or
+        // a new one, stored before it leaves. One under way for another
+        // key is over: its token, which the server may have made a device
+        // of, joins the ones to tell it about.
+        let request = match stored.pending_connect.clone() {
+            Some(pending) if same_key(Some(pending.key()), Some(&key)) => pending,
+            abandoned => {
+                let fresh =
+                    PendingConnect::new(key.clone(), device::draw_device_token()?, platform);
+                self.state.lock().await.commit(|payload| {
+                    let premium = &mut payload.settings.premium;
+                    if let Some(abandoned) = &abandoned {
+                        premium.queue_logout(abandoned.token());
+                    }
+                    premium.pending_connect = Some(fresh.clone());
+                    Ok(())
+                })?;
+                fresh
+            }
+        };
+
+        // Moving to another account: the old one hears of its removals
+        // with its own token before that token goes.
+        let switching = stored.key.is_some() && !same_account;
+        if switching
+            && stored.has_device()
+            && !stored.pending_unwatch.is_empty()
+            && let Err(error) = self.premium_flush_unwatch(base_url).await
+        {
+            log::warn!(
+                "the previous premium account could not be told about every removed wallet: {error}"
+            );
+        }
+
+        let answer = match self
+            .premium_client_with_key(base_url, Some(request.key().to_owned()))
+            .await
+        {
+            Ok(client) => {
+                client
+                    .connect_device(request.platform, request.token())
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let connected = match answer {
+            Ok(connected) => connected,
+            Err(error) => {
+                self.after_refused_connect(&request, same_account, &error)
+                    .await?;
+                return Err(error);
+            }
+        };
+        *self.premium_connect_after.lock().unwrap() = None;
+
         let credential = connected.credential();
         let committed = self.state.lock().await.commit(|payload| {
             let premium = &mut payload.settings.premium;
+            let mut dropped = 0;
             if !same_key(premium.key.as_deref(), Some(&key)) {
                 // Another account: nothing this device knew of the last
                 // one holds for this one.
+                dropped = std::mem::take(&mut premium.pending_unwatch).len();
                 premium.certificate = None;
                 premium.key_saved = false;
                 premium.checklist_hidden = false;
                 premium.announced_devices.clear();
+                premium.pending_key = None;
             }
-            let previous = premium.device.replace(credential);
+            if let Some(previous) = premium.device.replace(credential.clone())
+                && previous.token() != credential.token()
+            {
+                premium.queue_logout(previous.token());
+            }
+            if premium
+                .pending_connect
+                .as_ref()
+                .is_some_and(|p| p.token() == request.token())
+            {
+                premium.pending_connect = None;
+            }
             premium.key = Some(key.clone());
             premium.disconnected = false;
+            premium.disconnected_reason = None;
             premium.acknowledged_offline_until = None;
-            Ok(previous)
+            Ok(dropped)
         });
         match committed {
-            Ok(Some(previous)) => self.log_out_token(base_url, previous.token()).await,
-            Ok(None) => {}
+            Ok(0) => {}
+            Ok(dropped) => log::warn!(
+                "{dropped} wallet removals the previous premium account never heard of were dropped"
+            ),
             Err(error) => {
                 // The server holds a device nobody will: it goes.
-                self.log_out_token(base_url, connected.token()).await;
+                let _ = self.revoke(base_url, connected.token()).await;
                 return Err(error);
             }
+        }
+        if switching {
+            let _ = self.premium_flush_logouts(base_url).await;
         }
         let _ = self.premium_refresh_licence(base_url).await;
         Ok(connected.device)
     }
 
-    /// Tells the server, as far as it can be reached, that the device
-    /// holding `token` leaves. Nothing waits on the answer: whatever it
-    /// is, what the caller does next is the same.
-    async fn log_out_token(&self, base_url: &str, token: &str) {
-        if let Ok(client) = self.premium_client_with_key(base_url, None).await {
-            let _ = client
-                .with_device_token(Some(token.to_owned()))
-                .log_out_device()
-                .await;
+    /// What a failed connection leaves in the vault. A refusal that
+    /// settles it drops the connection under way, and one about the
+    /// stored key disconnects this device; an answer lost on the way
+    /// keeps it, to be sent again as it was; a rate limit also holds
+    /// back the next automatic try for the wait it named.
+    async fn after_refused_connect(
+        &self,
+        request: &PendingConnect,
+        stored_key: bool,
+        error: &CoreError,
+    ) -> CoreResult<()> {
+        if let CoreError::Premium(PremiumError::RateLimited { retry_after }) = error {
+            let wait = retry_after.map_or(CONNECT_WAIT_UNNAMED, Duration::from_secs);
+            *self.premium_connect_after.lock().unwrap() = Some(Instant::now() + wait);
+        }
+        if !settles_connect(error) {
+            return Ok(());
+        }
+        let reason = match error {
+            CoreError::Premium(PremiumError::TooManyDevices(words)) => Some(Some(words.clone())),
+            CoreError::Premium(PremiumError::UnknownKey) => Some(None),
+            _ => None,
+        };
+        self.state.lock().await.commit(|payload| {
+            let premium = &mut payload.settings.premium;
+            if premium
+                .pending_connect
+                .as_ref()
+                .is_some_and(|p| p.token() == request.token())
+            {
+                premium.pending_connect = None;
+            }
+            if let Some(reason) = reason
+                && stored_key
+                && !premium.has_device()
+            {
+                premium.disconnected = true;
+                premium.disconnected_reason = reason;
+            }
+            Ok(())
+        })
+    }
+
+    /// How long a connection still waits on the rate limit it met.
+    fn connect_wait(&self) -> Option<Duration> {
+        let mut after = self.premium_connect_after.lock().unwrap();
+        let wait = after.and_then(|at| at.checked_duration_since(Instant::now()));
+        if wait.is_none() {
+            *after = None;
+        }
+        wait
+    }
+
+    /// Tells the server that the connection holding `token` is over.
+    /// Done when it says so, or that it no longer knows the token.
+    async fn revoke(&self, base_url: &str, token: &str) -> CoreResult<()> {
+        let client = self
+            .premium_client_with_key(base_url, None)
+            .await?
+            .with_device_token(Some(token.to_owned()));
+        match client.log_out_device().await {
+            Ok(())
+            | Err(CoreError::Premium(PremiumError::DeviceDisconnected | PremiumError::NotFound)) => {
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
+}
+
+/// Whether a failed connection was settled by the server, so that the
+/// same request would get the same answer: anything else, a server
+/// that could not be reached or answered something unreadable, may
+/// have made the device, and the request is sent again.
+fn settles_connect(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::InvalidInput { .. }
+            | CoreError::Premium(
+                PremiumError::UnknownKey
+                    | PremiumError::TooManyDevices(_)
+                    | PremiumError::Rejected(_)
+                    | PremiumError::DeviceRequired
+                    | PremiumError::NotFound
+                    | PremiumError::NoKey
+            )
+    )
+}
+
+/// Whether a failed key change was settled by the server without the
+/// new key: refused in its own words, or by a device that may not ask.
+/// A token disowned since, a server that could not be reached or
+/// answered something unreadable, or no token to send it with, may
+/// hide a change an earlier try made: the new key is kept.
+fn settles_key_change(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::InvalidInput { .. }
+            | CoreError::Premium(
+                PremiumError::Rejected(_)
+                    | PremiumError::DevicePending { .. }
+                    | PremiumError::DeviceRequired
+                    | PremiumError::NotFound
+            )
+    )
 }
 
 #[cfg(test)]

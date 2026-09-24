@@ -56,6 +56,24 @@ pub fn format_key(key: &str) -> String {
         .join("-")
 }
 
+/// A fresh account key, drawn from the operating system's generator:
+/// sixteen symbols of [`KEY_ALPHABET`], each from five random bits, so
+/// every symbol is as likely as the next. What the server would draw
+/// for a key change, drawn here so that the vault holds it before the
+/// request leaves. A random name for an account, nothing that holds or
+/// could spend a coin.
+pub(crate) fn draw_account_key() -> CoreResult<String> {
+    use rand::TryRngCore;
+    let mut bytes = [0u8; KEY_SYMBOLS];
+    rand::rngs::OsRng.try_fill_bytes(&mut bytes).map_err(|e| {
+        crate::error::CoreError::Internal(format!("no randomness to draw a key: {e}"))
+    })?;
+    Ok(bytes
+        .iter()
+        .map(|b| KEY_ALPHABET[usize::from(*b & 31)] as char)
+        .collect())
+}
+
 /// Whether a typed key has the shape of one; not whether it exists.
 pub fn is_well_formed_key(key: &str) -> bool {
     let compact = normalize_key(key);
@@ -324,6 +342,14 @@ mod tests {
         assert!(!is_well_formed_key("abcd-efgh-ijkm-npq0"));
         assert!(!is_well_formed_key("abcd-efgh-ijkm-npq1"));
         assert!(!is_well_formed_key(""));
+    }
+
+    #[test]
+    fn a_drawn_account_key_is_well_formed_and_new_each_time() {
+        let key = draw_account_key().unwrap();
+        assert!(is_well_formed_key(&key), "{key}");
+        assert_eq!(key, normalize_key(&key));
+        assert_ne!(key, draw_account_key().unwrap());
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub use client::{
     Account, Channel, ChannelKind, Event, EventKind, Health, HeartbeatReport, Licence,
     PremiumClient, WalletWatch, endpoint,
 };
-pub use device::{ConnectedDevice, Device, DeviceAccess, DeviceCredential, DevicePlatform};
+pub use device::{
+    ConnectedDevice, Device, DeviceAccess, DeviceCredential, DevicePlatform, PendingConnect, Secret,
+};
 pub use licence::{Claims, Heartbeat, LicenceState};
 pub use state::{PremiumState, WatchedWallet};
