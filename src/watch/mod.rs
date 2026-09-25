@@ -148,22 +148,23 @@ pub struct WatchedWallet {
 
 /// Why a wallet is reported. Reasons heard together are kept as the
 /// greatest, in the order below: a block asks only for what waits for
-/// one, and must not narrow a start or a reconnection heard with it,
-/// which ask for the whole wallet.
+/// one, and a change on one script only for that script, and neither
+/// may narrow a start or a reconnection heard with them, which ask for
+/// the whole wallet and never wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeReason {
     /// A block arrived while the wallet held an unconfirmed
     /// transaction.
     NewBlock,
+    /// The backend reported a change on one of the wallet's scripts.
+    Activity,
     /// The watch started, or started over under a new configuration:
     /// what happened before it listened is unknown.
     Started,
     /// The connection was lost and reopened, and the transport cannot
     /// say what happened meanwhile.
     Reconnected,
-    /// The backend reported a change on one of the wallet's scripts.
-    Activity,
 }
 
 /// What the watcher says.

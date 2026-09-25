@@ -754,7 +754,10 @@ async fn a_burst_is_one_report_and_a_flood_is_held_to_the_gap() {
     );
     let due = debounce.take_due(start + Duration::from_millis(61), &timings);
     assert_eq!(due.len(), 1);
-    assert_eq!(due[0].1.reason, ChangeReason::Activity);
+    // The reconnection, which asks for the whole wallet, is what the
+    // report says: a change heard with it must not turn it into the
+    // sync of a change.
+    assert_eq!(due[0].1.reason, ChangeReason::Reconnected);
     assert!(due[0].1.rescan);
     // A mark of the whole wallet swallows the scripts named before.
     assert_eq!(due[0].1.scripts, None);

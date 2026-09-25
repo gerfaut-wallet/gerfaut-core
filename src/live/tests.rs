@@ -930,3 +930,32 @@ fn a_block_does_not_narrow_a_catch_up() {
     let pushed = Asked::of(ChangeReason::Activity, Vec::new());
     assert_eq!(pushed.and(block()).reach(), Reach::Checked);
 }
+
+/// A change pushed on one script, heard in the same burst as a start or
+/// a reconnection over a transport that cannot name what it missed: the
+/// sync that follows still reads the whole wallet as a catch-up does,
+/// unconfirmed transactions listed, and never waits as a change the
+/// syncs keep finding nothing behind may.
+#[test]
+fn a_pushed_change_does_not_narrow_a_catch_up() {
+    let script = ScriptBuf::from_bytes(vec![0x51]);
+    let pushed = || Asked::of(ChangeReason::Activity, vec![script.to_hex_string()]);
+    let mut futile = Futile::default();
+    for _ in 0..10 {
+        futile.settle("w", &pushed(), false);
+    }
+    for whole in [ChangeReason::Started, ChangeReason::Reconnected] {
+        let asked = Asked::of(whole, Vec::new());
+        for merged in [asked.clone().and(pushed()), pushed().and(asked)] {
+            assert_eq!(merged.reach(), Reach::Complete);
+            assert_eq!(futile.hold("w", &merged, &timings()), Duration::ZERO);
+        }
+    }
+    // Named scripts heard with a catch-up that names its own stay a
+    // sync of those scripts.
+    let named = Asked::of(ChangeReason::Started, vec!["00".to_owned()]).and(pushed());
+    assert_eq!(
+        named.reach(),
+        Reach::Scripts(vec![ScriptBuf::from_bytes(vec![0x00]), script])
+    );
+}
