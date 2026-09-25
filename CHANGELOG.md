@@ -229,3 +229,10 @@ The first release: the library both Gerfaut apps are built on.
 - A node's refusal of a broadcast is shown in at most 200 characters,
   control characters dropped, as other sentences from a server already
   were. A server could fill the screen with a page of text of its own.
+- The transaction preview adds amounts with overflow checks, so values no
+  transaction can carry no longer crash a debug build or wrap around into
+  a fee in a release one, and outputs worth more than known inputs are
+  said to be just that. A time lock is flagged only when an input's
+  sequence turns it on, and until the right block: a transaction locked
+  to height 1,000 was shown free at a tip of 999, one block before the
+  network takes it.

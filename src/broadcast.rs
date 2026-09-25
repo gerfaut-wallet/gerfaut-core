@@ -668,12 +668,19 @@ pub fn build_preview(
         })
         .collect();
 
+    // Checked: the values are the transaction's own word, and those of
+    // coins nothing else vouches for are the PSBT author's. Past every
+    // bitcoin there is, a sum means nothing.
     let in_total: Option<u64> = inputs
         .iter()
         .map(|i| i.value_sats)
-        .try_fold(0u64, |acc, v| v.map(|v| acc + v));
-    let out_total: u64 = outputs.iter().map(|o| o.value_sats).sum();
-    let fee_sats = in_total.and_then(|total| total.checked_sub(out_total));
+        .try_fold(0u64, |acc, v| v.and_then(|v| acc.checked_add(v)));
+    let out_total: Option<u64> = outputs
+        .iter()
+        .try_fold(0u64, |acc, o| acc.checked_add(o.value_sats));
+    let fee_sats = in_total
+        .zip(out_total)
+        .and_then(|(total, out)| total.checked_sub(out));
     let vsize = tx.vsize() as u64;
     let fee_rate_sat_vb = fee_sats.map(|fee| fee as f64 / vsize as f64);
 
@@ -779,7 +786,16 @@ pub fn build_preview(
             ));
         }
     }
+    // Every input's value known and the sum fine, and still no fee:
+    // the outputs pay more than the inputs bring.
+    let overspends = inputs.iter().all(|i| i.value_sats.is_some()) && fee_sats.is_none();
     match (fee_sats, fee_rate_sat_vb, in_total) {
+        (None, _, _) if overspends => warnings.push(TxWarning::new(
+            TxWarningKind::FeeUnknown,
+            "The outputs pay more than the inputs bring: the network will refuse this \
+             transaction."
+                .to_owned(),
+        )),
         (None, _, _) => warnings.push(TxWarning::new(
             TxWarningKind::FeeUnknown,
             "The fee is unknown: the value of at least one input could not be \
@@ -809,11 +825,15 @@ pub fn build_preview(
         _ => {}
     }
     let locktime = tx.lock_time.to_consensus_u32();
-    let locked = if tx.lock_time.is_block_height() {
-        tip_height.is_some_and(|tip| locktime > tip + 1)
-    } else {
-        u64::from(locktime) > now_secs
-    };
+    // A lock binds only when an input's sequence leaves it on, and a
+    // height lock lets the transaction into the block after the one it
+    // names: into the mempool at a tip of `locktime`, not before.
+    let locked = tx.is_lock_time_enabled()
+        && if tx.lock_time.is_block_height() {
+            tip_height.is_some_and(|tip| locktime > tip)
+        } else {
+            u64::from(locktime) > now_secs
+        };
     if locked {
         warnings.push(TxWarning::new(
             TxWarningKind::Locked,
@@ -996,6 +1016,64 @@ mod tests {
         assert_eq!(
             loose_of(&spending(ScriptBuf::new(), vec![schnorr])).as_deref(),
             Some("SIGHASH_SINGLE")
+        );
+    }
+
+    /// Output values no transaction can carry neither panic the preview
+    /// nor wrap around into a fee; and outputs worth more than known
+    /// inputs are called what they are.
+    #[test]
+    fn preview_sums_never_overflow() {
+        let mut tx = signed_tx();
+        tx.output = vec![
+            TxOut {
+                value: Amount::from_sat(u64::MAX / 2 + 1),
+                script_pubkey: p2wpkh(9),
+            },
+            TxOut {
+                value: Amount::from_sat(u64::MAX / 2 + 1),
+                script_pubkey: p2wpkh(9),
+            },
+        ];
+        let decoded = decode_transaction(&encode::serialize_hex(&tx)).unwrap();
+        let facts: Vec<InputFacts> = tx
+            .input
+            .iter()
+            .map(|_| InputFacts {
+                prevout: Some(TxOut {
+                    value: Amount::from_sat(u64::MAX),
+                    script_pubkey: p2wpkh(1),
+                }),
+                ..Default::default()
+            })
+            .collect();
+        let preview = build_preview(&decoded, Network::Signet, &facts, &[], Some(100), 0);
+        assert_eq!(preview.fee_sats, None);
+
+        let mut small = signed_tx();
+        small.output[0].value = Amount::from_sat(10_000_000);
+        let decoded = decode_transaction(&encode::serialize_hex(&small)).unwrap();
+        let facts: Vec<InputFacts> = small
+            .input
+            .iter()
+            .map(|_| InputFacts {
+                prevout: Some(TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: p2wpkh(1),
+                }),
+                ..Default::default()
+            })
+            .collect();
+        let preview = build_preview(&decoded, Network::Signet, &facts, &[], Some(100), 0);
+        let fee = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::FeeUnknown)
+            .unwrap();
+        assert!(
+            fee.message.contains("pay more than the inputs bring"),
+            "{}",
+            fee.message
         );
     }
 
@@ -1313,6 +1391,22 @@ mod tests {
                 .iter()
                 .any(|w| w.kind == TxWarningKind::Locked)
         );
+        // One block short: the mempool still refuses it.
+        let almost = build_preview(&decoded, Network::Signet, &[], &[], Some(999), 0);
+        assert!(
+            almost
+                .warnings
+                .iter()
+                .any(|w| w.kind == TxWarningKind::Locked)
+        );
+        // Every sequence final: the lock is off, whatever it says.
+        let mut final_tx = tx.clone();
+        for input in &mut final_tx.input {
+            input.sequence = Sequence::MAX;
+        }
+        let decoded_final = decode_transaction(&encode::serialize_hex(&final_tx)).unwrap();
+        let off = build_preview(&decoded_final, Network::Signet, &[], &[], Some(900), 0);
+        assert!(!off.warnings.iter().any(|w| w.kind == TxWarningKind::Locked));
 
         tx.lock_time = absolute::LockTime::from_time(1_800_000_000).unwrap();
         let decoded = decode_transaction(&encode::serialize_hex(&tx)).unwrap();
