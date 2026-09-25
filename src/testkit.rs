@@ -165,6 +165,9 @@ pub(crate) struct ElectrumState {
     /// A method whose answer, read from the state when the request
     /// arrives, is held back until a permit is added here.
     pub gate: Option<(&'static str, Arc<tokio::sync::Semaphore>)>,
+    /// The network whose genesis block the server serves at height 0,
+    /// signet when `None`.
+    pub genesis: Option<bdk_wallet::bitcoin::Network>,
     /// Every method asked for, in order, over every connection.
     pub asked: Vec<String>,
     /// Connections the client closed.
@@ -183,8 +186,9 @@ impl ElectrumState {
         use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
         use bdk_wallet::bitcoin::hashes::Hash;
         if height == 0 {
-            let genesis =
-                bdk_wallet::bitcoin::constants::genesis_block(bdk_wallet::bitcoin::Network::Signet);
+            let genesis = bdk_wallet::bitcoin::constants::genesis_block(
+                self.genesis.unwrap_or(bdk_wallet::bitcoin::Network::Signet),
+            );
             return serialize_hex(&genesis.header);
         }
         let mut header: Header = deserialize_hex(&header_at(height)).unwrap();

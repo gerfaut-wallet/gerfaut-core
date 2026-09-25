@@ -953,7 +953,7 @@ impl WalletManager {
         &self,
         id: &str,
         reach: Reach,
-        prefer: Option<Endpoint>,
+        prefer: Option<(Network, Endpoint)>,
     ) -> CoreResult<(SyncReport, Option<Endpoint>)> {
         let arrived = Instant::now();
         let slot = match self.syncing.lock() {
@@ -987,7 +987,7 @@ impl WalletManager {
         &self,
         id: &str,
         reach: Reach,
-        prefer: Option<Endpoint>,
+        prefer: Option<(Network, Endpoint)>,
     ) -> CoreResult<(SyncReport, Reach, Endpoint)> {
         let started = Instant::now();
 
@@ -1015,8 +1015,16 @@ impl WalletManager {
             endpoints.insert(0, preferred);
         }
         // And before it, the server of the watch that asked for this
-        // sync: it told of the change, so it holds what changed.
-        if let Some(prefer) = prefer {
+        // sync: it told of the change, so it holds what changed. Only a
+        // server a watch of the wallet's own network may talk to under
+        // its backend: the watch may have moved to another network, or
+        // another backend, since the sync was asked for, and a wallet's
+        // addresses never go to a server its backend does not name.
+        if let Some((network, prefer)) = prefer
+            && network == meta.network
+            && crate::watch::servers_for(&config, meta.network, &certs)
+                .is_ok_and(|allowed| allowed.contains(&prefer))
+        {
             endpoints.retain(|endpoint| *endpoint != prefer);
             endpoints.insert(0, prefer);
         }

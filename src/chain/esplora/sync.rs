@@ -499,6 +499,7 @@ impl Meeting {
         latest: &BTreeMap<u32, BlockHash>,
         anchors: &BTreeSet<(ConfirmationBlockTime, Txid)>,
     ) -> Result<CheckPoint, String> {
+        let meeting = self.height;
         let mut tip = self
             .agreement
             .extend(self.conflicts.into_iter().rev())
@@ -512,8 +513,65 @@ impl Meeting {
             }
         }
         for (&height, &hash) in latest {
+            // Below the meeting point the two chains are one: a latest
+            // block that says otherwise is a server contradicting itself,
+            // refused, since putting it in would replace the wallet's
+            // genesis block, or blocks both agreed on.
+            if height <= meeting {
+                if tip.get(height).is_some_and(|held| held.hash() != hash) {
+                    return Err("the server's chain contradicts itself".to_owned());
+                }
+                if tip.get(height).is_some() {
+                    continue;
+                }
+            }
             tip = tip.insert(BlockId { height, hash });
         }
         Ok(tip)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bdk_wallet::bitcoin::hashes::Hash;
+
+    use super::*;
+
+    /// A server whose latest blocks contradict, below the meeting point,
+    /// the chain it agreed on: a genesis block of its own among them. The
+    /// sync fails; it neither panics nor replaces the wallet's genesis.
+    #[tokio::test]
+    async fn latest_blocks_that_contradict_the_meeting_are_refused() {
+        let hash = |byte: u8| BlockHash::from_byte_array([byte; 32]);
+        let local = CheckPoint::new(BlockId {
+            height: 0,
+            hash: hash(0),
+        })
+        .push(BlockId {
+            height: 1,
+            hash: hash(1),
+        })
+        .unwrap();
+        let meeting = || Meeting {
+            agreement: local.clone(),
+            height: 1,
+            conflicts: Vec::new(),
+        };
+        // Never asked anything: every height it needs is in the latest.
+        let client = super::super::client("http://127.0.0.1:9", None).unwrap();
+        let lying = BTreeMap::from([(0, hash(9)), (1, hash(1)), (2, hash(2))]);
+        let refused = meeting()
+            .chain(&client, &lying, &BTreeSet::new())
+            .await
+            .unwrap_err();
+        assert!(refused.contains("contradicts"), "{refused}");
+
+        let honest = BTreeMap::from([(0, hash(0)), (1, hash(1)), (2, hash(2))]);
+        let tip = meeting()
+            .chain(&client, &honest, &BTreeSet::new())
+            .await
+            .unwrap();
+        assert_eq!(tip.height(), 2);
+        assert_eq!(tip.get(0).unwrap().hash(), hash(0));
     }
 }

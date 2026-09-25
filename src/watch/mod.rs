@@ -316,7 +316,7 @@ pub struct LiveWatch {
     commands: mpsc::UnboundedSender<Command>,
     status: watch::Receiver<WatchStatus>,
     /// The server the open session talks to.
-    serving: watch::Receiver<Option<Endpoint>>,
+    serving: watch::Receiver<Option<(Network, Endpoint)>>,
     /// Set once to stop the watcher, whatever it is waiting on.
     halt: watch::Sender<bool>,
 }
@@ -425,9 +425,10 @@ impl LiveWatch {
         self.status.borrow().clone()
     }
 
-    /// The server the open session talks to, if one is open: it holds
-    /// whatever it said moved, so a sync that follows reads it there.
-    pub(crate) fn serving(&self) -> Option<Endpoint> {
+    /// The server the open session talks to, and the network it is
+    /// watched for, if one is open: it holds whatever it said moved, so
+    /// a sync of a wallet of that network that follows reads it there.
+    pub(crate) fn serving(&self) -> Option<(Network, Endpoint)> {
         if *self.halt.borrow() {
             return None;
         }
@@ -723,7 +724,7 @@ pub(crate) struct Hub {
     commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::Sender<WatchEvent>,
     status: watch::Sender<WatchStatus>,
-    serving: watch::Sender<Option<Endpoint>>,
+    serving: watch::Sender<Option<(Network, Endpoint)>>,
     debounce: Debouncer,
     tip: Option<u32>,
     /// Every wallet was reported once under this configuration, when
@@ -758,7 +759,7 @@ impl Hub {
 
     /// Notes the server a session is open with, or that none is.
     pub fn serve(&mut self, endpoint: Option<&Endpoint>) {
-        let endpoint = endpoint.cloned();
+        let endpoint = endpoint.map(|endpoint| (self.config.network, endpoint.clone()));
         self.serving.send_if_modified(|serving| {
             let changed = *serving != endpoint;
             *serving = endpoint;
@@ -1030,6 +1031,26 @@ async fn sleep_until(deadline: Option<Instant>) {
 /// operator is one the rotation already goes through, because it can
 /// push every script, and the rotation itself follows.
 fn candidates(config: &WatchConfig) -> Result<Vec<Endpoint>, String> {
+    servers_for(&config.backend, config.network, &config.electrum_certs)
+}
+
+/// The servers a watch of `network` under `backend` may talk to, in the
+/// order it tries them: the only ones a sync of a wallet of that network
+/// may be sent to because the watch talks to them.
+pub(crate) fn servers_for(
+    backend: &BackendConfig,
+    network: Network,
+    certs: &TrustedCerts,
+) -> Result<Vec<Endpoint>, String> {
+    let config = WatchConfig {
+        network,
+        backend: backend.clone(),
+        electrum_certs: certs.clone(),
+        tor: TorSettings::default(),
+        data_dir: PathBuf::new(),
+        keepalive_secs: None,
+    };
+    let config = &config;
     let mut endpoints = chain::endpoints(&config.backend, config.network, &config.electrum_certs)
         .map_err(|e| e.to_string())?;
     if config.backend == (BackendConfig::Public { server: None }) {

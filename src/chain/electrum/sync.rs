@@ -135,16 +135,36 @@ struct Chain {
 impl Chain {
     /// The tip and the latest blocks, then the wallet's chain walked down
     /// to a block the server has too. A server behind the wallet leaves
-    /// the wallet's chain as it is.
+    /// the wallet's chain as it is, once it is found on it all the same:
+    /// a server whose chain never meets the wallet's, one of another
+    /// network, is refused rather than read, or every transaction the
+    /// wallet holds would look gone from the chain.
     fn read(client: &impl ElectrumApi, local: &CheckPoint) -> Result<Self, Error> {
         let height = client.block_headers_subscribe()?.height as u32;
         if height < local.height() {
-            return Ok(Chain {
-                tip: local.clone(),
-                hashes: BTreeMap::new(),
-                headers: HashMap::new(),
-                agreement: local.height(),
-            });
+            let mut hashes = BTreeMap::new();
+            let mut headers = HashMap::new();
+            for checkpoint in local
+                .iter()
+                .filter(|checkpoint| checkpoint.height() <= height)
+            {
+                let at = checkpoint.height();
+                let header = client.block_header(at as usize)?;
+                let hash = header.block_hash();
+                hashes.insert(at, hash);
+                headers.insert(at, header);
+                if hash == checkpoint.hash() {
+                    return Ok(Chain {
+                        tip: local.clone(),
+                        hashes,
+                        headers,
+                        agreement: at,
+                    });
+                }
+            }
+            return Err(Error::Message(
+                "the server's chain never meets the wallet's".to_owned(),
+            ));
         }
         let start = height.saturating_sub(CHAIN_SUFFIX - 1);
         let latest = client.block_headers(start as usize, CHAIN_SUFFIX as usize)?;

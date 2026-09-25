@@ -752,6 +752,176 @@ async fn a_sync_that_failed_is_run_again() {
     manager.live_stop().await;
 }
 
+// --- the network a wallet belongs to ------------------------------------------------
+
+/// The live watch hands a sync the server it listens to, to try first.
+/// A wallet's sync takes it only when the watch listens for the
+/// wallet's own network, on a server its backend names: the watch may
+/// have moved to another network, or another backend, since the sync
+/// was asked for, and a wallet's addresses never go to a server of
+/// another network. A descriptor wallet and a single address alike.
+#[tokio::test]
+async fn a_sync_never_takes_a_watch_server_of_another_network() {
+    let ours = FakeElectrum::start().await;
+    let theirs = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, descriptor) = cold_wallet(dir.path(), &ours).await;
+    let address = manager
+        .add_wallet(
+            "Watched",
+            &crate::input::parse_input(ADDRESS).unwrap(),
+            Network::Signet,
+        )
+        .await
+        .unwrap()
+        .id;
+    let endpoint = |server: &FakeElectrum| {
+        crate::chain::endpoints(
+            &server.backend(),
+            Network::Signet,
+            &crate::chain::TrustedCerts::new(),
+        )
+        .unwrap()
+        .remove(0)
+    };
+    for wallet in [&descriptor, &address] {
+        for told in [
+            (Network::Mainnet, endpoint(&theirs)),
+            (Network::Signet, endpoint(&theirs)),
+            (Network::Mainnet, endpoint(&ours)),
+        ] {
+            let (_, answered) = manager
+                .sync_wallet_read(wallet, Reach::Checked, Some(told.clone()))
+                .await
+                .unwrap();
+            assert_eq!(answered, Some(endpoint(&ours)), "{told:?}");
+        }
+        let (_, answered) = manager
+            .sync_wallet_read(
+                wallet,
+                Reach::Checked,
+                Some((Network::Signet, endpoint(&ours))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answered, Some(endpoint(&ours)));
+    }
+    assert!(
+        theirs.state.lock().unwrap().asked.is_empty(),
+        "the other server heard of the wallet"
+    );
+}
+
+/// A server behind the wallet whose chain never meets the wallet's, one
+/// of another network: the sync fails, and the payment the wallet holds
+/// is not taken for gone from the chain. A server that only lags is
+/// read as before.
+#[tokio::test]
+async fn a_server_behind_on_another_chain_is_refused() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = cold_wallet(dir.path(), &server).await;
+    let pending = pay(&server, 2, &receive_script(1), 5_000, 0);
+    manager.sync_wallet(&wallet).await.unwrap();
+    let held = || async {
+        let snapshot = manager.wallet_snapshot(&wallet).await.unwrap();
+        snapshot.txs.iter().any(|tx| tx.txid == pending)
+    };
+    assert!(held().await);
+
+    {
+        let mut state = server.state.lock().unwrap();
+        state.height = 50;
+        state.genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+        state.histories.clear();
+    }
+    let refused = manager.rescan_wallet(&wallet).await.unwrap_err();
+    assert!(refused.to_string().contains("never meets"), "{refused}");
+    assert!(manager.sync_wallet(&wallet).await.is_err());
+    assert!(held().await, "the payment was taken for gone");
+
+    // The same chain, only behind: read.
+    server.state.lock().unwrap().genesis = None;
+    manager.sync_wallet(&wallet).await.unwrap();
+}
+
+/// The watch moves to another network while it owes a wallet of the old
+/// one a sync that failed. That sync is dropped with the old network:
+/// a block on the new one runs nothing for the old wallet.
+#[tokio::test]
+async fn a_new_network_drops_what_the_watch_owed_the_old_one() {
+    let old = FakeElectrum::start().await;
+    let new = FakeElectrum::start().await;
+    new.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), old.backend()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    manager
+        .set_backend(Network::Testnet4, new.backend())
+        .await
+        .unwrap();
+    manager
+        .add_wallet(
+            "Elsewhere",
+            &crate::input::parse_input(DESCRIPTOR).unwrap(),
+            Network::Testnet4,
+        )
+        .await
+        .unwrap();
+    let pace = crate::watch::Timings {
+        due: Duration::from_secs(3600),
+        ..timings()
+    };
+    let mut events = manager.live_start_with(Some(pace)).await.unwrap();
+    quiet_start(&mut events).await;
+
+    old.state
+        .lock()
+        .unwrap()
+        .refuse
+        .insert("blockchain.scripthash.get_history", "busy".to_owned());
+    let payment = transaction(&[nowhere(6, 0)], &[(ADDRESS_SCRIPT, 14_000)]);
+    old.add_tx(&payment);
+    old.set_history(ADDRESS_SCRIPT, &[(payment.compute_txid(), 0)]);
+    old.set_status(ADDRESS_SCRIPT, "in the mempool");
+    loop {
+        match tokio::time::timeout(WAIT, events.next()).await {
+            Ok(Some(LiveEvent::SyncFailed { wallet_id, .. })) if wallet_id == wallet => break,
+            Ok(Some(_)) => {}
+            other => panic!("the sync never failed: {other:?}"),
+        }
+    }
+    let asked_before = old.state.lock().unwrap().asked.len();
+    manager.set_active_network(Network::Testnet4).await.unwrap();
+    old.state.lock().unwrap().refuse.clear();
+
+    // Subscribed on the new server, then a block there.
+    let started = std::time::Instant::now();
+    while new.subscriptions().first().is_none_or(Vec::is_empty) {
+        assert!(started.elapsed() < WAIT, "never subscribed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    new.state.lock().unwrap().height = 101;
+    new.push(
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": "blockchain.headers.subscribe",
+            "params": [{ "height": 101, "hex": crate::testkit::header_at(101) }],
+        })
+        .to_string(),
+    );
+    loop {
+        match tokio::time::timeout(WAIT, events.next()).await {
+            Ok(Some(LiveEvent::NewBlock { height: 101 })) => break,
+            Ok(Some(_)) => {}
+            other => panic!("no block: {other:?}"),
+        }
+    }
+    while tokio::time::timeout(QUIET, events.next()).await.is_ok() {}
+    let asked: Vec<String> = old.state.lock().unwrap().asked[asked_before..].to_vec();
+    assert!(asked.is_empty(), "the old wallet was synced: {asked:?}");
+    manager.live_stop().await;
+}
+
 // --- how soon ---------------------------------------------------------------------
 
 /// The next transaction the watch hands out.

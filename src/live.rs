@@ -170,6 +170,8 @@ pub(crate) struct Running {
     halt: watch::Sender<bool>,
     /// The syncs someone else ran while the watch runs, for their news.
     offers: mpsc::UnboundedSender<SyncReport>,
+    /// Counts the configurations handed to the watch after its first.
+    reconfigured: watch::Sender<u64>,
 }
 
 impl Running {
@@ -365,6 +367,7 @@ impl WalletManager {
         let (halt, halted) = watch::channel(false);
         let (events, receiver) = mpsc::channel(EVENT_QUEUE);
         let (offers, offered) = mpsc::unbounded_channel();
+        let (reconfigured, configs) = watch::channel(0);
         let previous = self.live_slot().replace(Running {
             watch,
             config,
@@ -372,11 +375,15 @@ impl WalletManager {
             applied,
             halt,
             offers,
+            reconfigured,
         });
         if let Some(previous) = previous {
             previous.stop();
         }
-        tokio::spawn(self.clone().relay(changes, offered, events, halted, pace));
+        tokio::spawn(
+            self.clone()
+                .relay(changes, offered, configs, events, halted, pace),
+        );
         // Whatever changed between the reading above and now.
         self.live_refresh().await;
         Ok(LiveEvents { events: receiver })
@@ -445,6 +452,7 @@ impl WalletManager {
             running.config = config.clone();
             running.wallets = wallets.clone();
             running.watch.reconfigure(config, wallets);
+            running.reconfigured.send_modify(|count| *count += 1);
         } else if wallets != running.wallets {
             running.wallets = wallets.clone();
             running.watch.set_wallets(wallets);
@@ -588,6 +596,7 @@ impl WalletManager {
         self,
         mut changes: WatchEvents,
         mut offered: mpsc::UnboundedReceiver<SyncReport>,
+        mut configs: watch::Receiver<u64>,
         events: mpsc::Sender<LiveEvent>,
         mut halted: watch::Receiver<bool>,
         pace: Timings,
@@ -648,6 +657,17 @@ impl WalletManager {
                     if !deliver(&events, event, &mut halted).await {
                         break;
                     }
+                }
+                Ok(()) = configs.changed() => {
+                    // Another network, another backend: what was asked
+                    // under the old one is dropped, the syncs running or
+                    // waiting for a permit with it. The watch catches up
+                    // under the new one, as a start does.
+                    syncs.abort_all();
+                    wallet_of.clear();
+                    again.clear();
+                    owed.clear();
+                    tried.clear();
                 }
                 Some(report) = offered.recv() => {
                     // A sync of the watch's own under way claims it.
@@ -865,7 +885,7 @@ impl WalletManager {
     }
 
     /// The server the live watch has a session with, if any.
-    fn watch_serving(&self) -> Option<Endpoint> {
+    fn watch_serving(&self) -> Option<(Network, Endpoint)> {
         self.live_slot()
             .as_ref()
             .and_then(|running| running.watch.serving())
@@ -906,7 +926,7 @@ impl WalletManager {
             );
             let read_where_told = matches!(
                 (&outcome, &serving),
-                (Ok((_, Some(read))), Some(told)) if read == told
+                (Ok((_, Some(read))), Some((_, told))) if read == told
             );
             if asked.reason != ChangeReason::Activity
                 || !found_nothing
