@@ -24,7 +24,8 @@
 //!   background job syncing on its own never makes it twice.
 //! - Every sync, whoever runs it, records what it found in the vault,
 //!   and nothing of it goes out until someone claims it.
-//!   The watch claims after each sync it runs. A host that runs a sync
+//!   The watch claims after each sync it runs, and, while it runs,
+//!   whatever a host sync left unclaimed. A host that runs a sync
 //!   of its own claims after it with
 //!   [`WalletManager::claim_announcements`] and announces what it gets:
 //!   the contract is written there.
@@ -164,6 +165,8 @@ pub(crate) struct Running {
     applied: u64,
     /// Stops the task that turns what the watch says into events.
     halt: watch::Sender<bool>,
+    /// The syncs someone else ran while the watch runs, for their news.
+    offers: mpsc::UnboundedSender<SyncReport>,
 }
 
 impl Running {
@@ -358,17 +361,19 @@ impl WalletManager {
         let (watch, changes) = LiveWatch::start_with(config.clone(), wallets.clone(), timings);
         let (halt, halted) = watch::channel(false);
         let (events, receiver) = mpsc::channel(EVENT_QUEUE);
+        let (offers, offered) = mpsc::unbounded_channel();
         let previous = self.live_slot().replace(Running {
             watch,
             config,
             wallets,
             applied,
             halt,
+            offers,
         });
         if let Some(previous) = previous {
             previous.stop();
         }
-        tokio::spawn(self.clone().relay(changes, events, halted, pace));
+        tokio::spawn(self.clone().relay(changes, offered, events, halted, pace));
         // Whatever changed between the reading above and now.
         self.live_refresh().await;
         Ok(LiveEvents { events: receiver })
@@ -398,6 +403,16 @@ impl WalletManager {
         match self.live_slot().as_ref() {
             Some(running) => running.watch.status(),
             None => WatchStatus::default(),
+        }
+    }
+
+    /// Hands a running watch a sync someone else ran. What that sync
+    /// found and nobody claimed is announced by the watch: a watch that
+    /// starts no longer syncs a wallet whose scripts did not move, and
+    /// its news would otherwise wait for the next one that does.
+    pub(crate) fn live_offer(&self, report: &SyncReport) {
+        if let Some(running) = self.live_slot().as_ref() {
+            let _ = running.offers.send(report.clone());
         }
     }
 
@@ -502,7 +517,7 @@ impl WalletManager {
     ///   time: the core already did, and what you would leave out may
     ///   be news another sync of that wallet found meanwhile.
     /// - Claims race safely. The live watch claims after each of its
-    ///   own syncs; a host sync and a watch sync of the same wallet,
+    ///   own syncs, and after a host's when the host did not; a host sync and a watch sync of the same wallet,
     ///   at the same moment, announce each transaction exactly once
     ///   between them.
     /// - What nobody claims is kept twelve hours, then forgotten: a host
@@ -522,6 +537,40 @@ impl WalletManager {
         state.commit(|payload| Ok(news::claim(payload, wallet_id, max, now)))
     }
 
+    /// The wallets of the watched network with news nobody claimed, each
+    /// with a report of its last sync, as the vault keeps it.
+    async fn unclaimed_reports(&self) -> Vec<SyncReport> {
+        let now = crate::manager::now_secs();
+        let state = self.state.lock().await;
+        let network = state.payload.settings.active_network;
+        state
+            .payload
+            .wallets
+            .iter()
+            .filter(|record| record.meta.network == network)
+            .filter(|record| news::waiting(&state.payload, &record.meta.id, now) > 0)
+            .map(|record| SyncReport {
+                wallet_id: record.meta.id.clone(),
+                new_tx_count: 0,
+                new_txs: Vec::new(),
+                confirmed_txs: Vec::new(),
+                balance: record.meta.cached.balance,
+                tip_height: record
+                    .meta
+                    .last_sync
+                    .as_ref()
+                    .map_or(0, |stamp| stamp.tip_height),
+                took_ms: 0,
+                backend: record
+                    .meta
+                    .last_sync
+                    .as_ref()
+                    .map(|stamp| stamp.backend.clone())
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+
     /// How much news waits for a wallet.
     async fn news_waiting(&self, wallet_id: &str) -> usize {
         let now = crate::manager::now_secs();
@@ -535,6 +584,7 @@ impl WalletManager {
     async fn relay(
         self,
         mut changes: WatchEvents,
+        mut offered: mpsc::UnboundedReceiver<SyncReport>,
         events: mpsc::Sender<LiveEvent>,
         mut halted: watch::Receiver<bool>,
         pace: Timings,
@@ -546,6 +596,17 @@ impl WalletManager {
         // A wallet with a sync under way, and what was asked of it since.
         let mut again: HashMap<String, Option<Asked>> = HashMap::new();
         let mut futile = Futile::default();
+        // What a sync found before the watch started, and nobody claimed:
+        // a start no longer syncs a wallet whose scripts did not move.
+        for report in self.unclaimed_reports().await {
+            let wallet_id = report.wallet_id.clone();
+            if !self
+                .announce(&wallet_id, Ok(report), &events, &mut halted)
+                .await
+            {
+                return;
+            }
+        }
         // The loop waits on its own copy: the ones below hand theirs to
         // what they call.
         let mut stop = halted.clone();
@@ -590,6 +651,24 @@ impl WalletManager {
                         WatchEvent::Status(status) => LiveEvent::Status(status),
                     };
                     if !deliver(&events, event, &mut halted).await {
+                        break;
+                    }
+                }
+                Some(report) = offered.recv() => {
+                    // A sync of the watch's own under way claims it.
+                    if again.contains_key(&report.wallet_id)
+                        || self.news_waiting(&report.wallet_id).await == 0
+                    {
+                        continue;
+                    }
+                    let wallet_id = report.wallet_id.clone();
+                    let report = SyncReport {
+                        new_tx_count: 0,
+                        new_txs: Vec::new(),
+                        confirmed_txs: Vec::new(),
+                        ..report
+                    };
+                    if !self.announce(&wallet_id, Ok(report), &events, &mut halted).await {
                         break;
                     }
                 }

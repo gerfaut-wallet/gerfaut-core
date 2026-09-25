@@ -294,6 +294,42 @@ async fn an_opening_sync_racing_the_catch_up_announces_once() {
     }
 }
 
+/// A host sync finds a payment and claims nothing, before the watch
+/// starts and while it runs. The watch has no sync of its own to run,
+/// nothing having moved since, and announces the payment all the same,
+/// once.
+#[tokio::test]
+async fn what_a_host_sync_left_unclaimed_is_announced_by_the_watch() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), server.backend()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+
+    let before = transaction(&[nowhere(1, 0)], &[(ADDRESS_SCRIPT, 3_000)]);
+    server.add_tx(&before);
+    server.set_history(ADDRESS_SCRIPT, &[(before.compute_txid(), 0)]);
+    manager.sync_wallet(&wallet).await.unwrap();
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    assert_eq!(
+        staged(&caught_up(&mut events, &wallet).await),
+        [(before.compute_txid().to_string(), TxStage::Mempool)]
+    );
+
+    // Found by the host while the watch runs, and never pushed.
+    let during = transaction(&[nowhere(2, 0)], &[(ADDRESS_SCRIPT, 4_000)]);
+    server.add_tx(&during);
+    server.set_history(
+        ADDRESS_SCRIPT,
+        &[(before.compute_txid(), 0), (during.compute_txid(), 0)],
+    );
+    manager.sync_wallet(&wallet).await.unwrap();
+    assert_eq!(
+        staged(&caught_up(&mut events, &wallet).await),
+        [(during.compute_txid().to_string(), TxStage::Mempool)]
+    );
+    manager.live_stop().await;
+}
+
 /// One wallet of the vault pays another: each is told, the first of a
 /// payment going out and the second of one coming in, when it enters
 /// the mempool and when it confirms, once each, whichever claims first.

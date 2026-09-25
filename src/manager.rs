@@ -887,9 +887,9 @@ impl WalletManager {
     /// were.
     pub async fn sync_wallet(&self, id: &str) -> CoreResult<SyncReport> {
         let reach = self.routine_reach(id).await;
-        self.sync_wallet_read(id, reach, None)
-            .await
-            .map(|(report, _)| report)
+        let (report, _) = self.sync_wallet_read(id, reach, None).await?;
+        self.live_offer(&report);
+        Ok(report)
     }
 
     /// Scans a wallet again from its first address with the current gap
@@ -898,9 +898,9 @@ impl WalletManager {
     /// them, or a descriptor also used elsewhere, are only found by
     /// starting over. A watched address has no gap: this is a sync.
     pub async fn rescan_wallet(&self, id: &str) -> CoreResult<SyncReport> {
-        self.sync_wallet_read(id, Reach::Full, None)
-            .await
-            .map(|(report, _)| report)
+        let (report, _) = self.sync_wallet_read(id, Reach::Full, None).await?;
+        self.live_offer(&report);
+        Ok(report)
     }
 
     /// How far a sync the app asks for reads: see [`Self::sync_wallet`].
