@@ -375,17 +375,29 @@ fn lock_path(vault: &Path) -> PathBuf {
 /// system drops it when the file is closed or the process dies, so a
 /// crash never leaves a vault that cannot be opened again.
 ///
-/// A file system that cannot lock at all (some network and FUSE mounts)
-/// gets the vault unlocked, as every earlier build had it, rather than
-/// no vault: that is logged, and one copy of the app per data directory
-/// is then up to the user.
+/// A lock file that cannot be written, left read-only by a copy or a
+/// restore, is locked through a handle that only reads it. A file
+/// system that cannot lock at all (some network and FUSE mounts), or a
+/// lock file that cannot be opened at all (a read-only directory, a
+/// full disk on the first open after an upgrade), gets the vault
+/// unlocked, as every earlier build had it, rather than no vault: that
+/// is logged, and one copy of the app per data directory is then up to
+/// the user.
 fn acquire_lock(path: &Path) -> Result<Option<std::fs::File>, VaultError> {
-    let file = std::fs::OpenOptions::new()
+    let opened = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path)?;
+        .open(path)
+        .or_else(|_| std::fs::File::open(path));
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) => {
+            log::warn!("the vault lock file cannot be opened, opening the vault unlocked: {error}");
+            return Ok(None);
+        }
+    };
     match fs4::FileExt::try_lock(&file) {
         Ok(()) => Ok(Some(file)),
         Err(fs4::TryLockError::WouldBlock) => Err(VaultError::AlreadyOpen),
@@ -639,6 +651,58 @@ mod tests {
             ["gerfaut.vault", "gerfaut.vault.lock", "moved.vault"]
         );
         assert_eq!(std::fs::read(&elsewhere).unwrap(), before);
+    }
+
+    /// A lock file that cannot be written, as a copy or a restore may
+    /// leave it, neither keeps the vault shut nor lets a second open
+    /// in: it is locked through a handle that only reads it.
+    #[test]
+    fn a_read_only_lock_file_still_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let (vault, mut payload) = Vault::open_or_create(&path, key()).unwrap();
+        payload.settings.gap_limit = 42;
+        vault.save(&payload).unwrap();
+        drop(vault);
+        let lock = dir.path().join("gerfaut.vault.lock");
+        let set_read_only = |read_only: bool| {
+            let mut permissions = std::fs::metadata(&lock).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(read_only);
+            std::fs::set_permissions(&lock, permissions).unwrap();
+        };
+        set_read_only(true);
+
+        let opened = Vault::open_or_create(&path, key());
+        let second = Vault::open_or_create(&path, key());
+        set_read_only(false);
+        let (_vault, reloaded) = opened.unwrap();
+        assert_eq!(reloaded.settings.gap_limit, 42);
+        assert!(matches!(second, Err(VaultError::AlreadyOpen)));
+    }
+
+    /// A directory that takes no new file, the lock file among them,
+    /// still opens the vault an earlier build left there, unlocked, as
+    /// that build had it.
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_in_a_read_only_directory_still_opens() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let (vault, mut payload) = Vault::open_or_create(&path, key()).unwrap();
+        payload.settings.gap_limit = 42;
+        vault.save(&payload).unwrap();
+        drop(vault);
+        std::fs::remove_file(dir.path().join("gerfaut.vault.lock")).unwrap();
+        let mode = |mode: u32| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(0o555);
+
+        let opened = Vault::open_or_create(&path, key());
+        mode(0o755);
+        assert_eq!(opened.unwrap().1.settings.gap_limit, 42);
     }
 
     /// A scanner that holds the file just written, or the vault, for a
