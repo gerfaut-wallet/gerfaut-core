@@ -218,7 +218,7 @@ pub(crate) async fn get_json_through(
     url: &str,
     proxy: Option<&str>,
 ) -> CoreResult<serde_json::Value> {
-    let response = client_through(proxy)?
+    let mut response = client_through(proxy)?
         .get(url)
         .send()
         .await
@@ -226,11 +226,25 @@ pub(crate) async fn get_json_through(
     if !response.status().is_success() {
         return Err(price_error(format!("http {}", response.status())));
     }
-    response
-        .json::<serde_json::Value>()
+    // Read a chunk at a time, once decompressed: a small gzip of a huge
+    // body is cut off, not held whole.
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| price_error(e.to_string()))
+        .map_err(|e| price_error(e.to_string()))?
+    {
+        if body.len() + chunk.len() > MAX_ANSWER {
+            return Err(price_error("the answer is far too large".to_owned()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|e| price_error(e.to_string()))
 }
+
+/// Largest price answer read: the whole daily history of every currency
+/// mempool.space serves fits several times over.
+const MAX_ANSWER: usize = 32 << 20;
 
 fn price_error(detail: String) -> CoreError {
     CoreError::Sync {
