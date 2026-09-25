@@ -207,8 +207,9 @@ pub struct Vault {
     key: VaultKey,
     /// The open lock file, locked. Dropping it releases the lock, and
     /// so does the death of the process, however it dies. `None` when
-    /// the file system cannot lock at all.
-    _lock: Option<std::fs::File>,
+    /// the file system cannot lock at all, or the lock file cannot be
+    /// opened.
+    lock: Option<std::fs::File>,
     /// Makes every save fail, so a test can meet a full disk.
     #[cfg(test)]
     fail_saves: std::sync::atomic::AtomicBool,
@@ -238,13 +239,17 @@ impl Vault {
         let vault = Vault {
             path,
             key,
-            _lock: lock,
+            lock,
             #[cfg(test)]
             fail_saves: std::sync::atomic::AtomicBool::new(false),
         };
         // Nobody else writes here now: whatever temporary file is left
-        // was abandoned by a save that never finished.
-        vault.remove_stale_temporaries();
+        // was abandoned by a save that never finished. Unlocked, another
+        // copy of the app may be halfway through a save of its own, and
+        // its file is left alone.
+        if vault.lock.is_some() {
+            vault.remove_stale_temporaries();
+        }
         // Only a vault that is certainly absent is created: one that
         // cannot be looked at (a permission, a storage error) fails the
         // open rather than being replaced by an empty one.
