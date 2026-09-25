@@ -1105,10 +1105,28 @@ pub fn ntfy_subscribe_url(base: &str, topic: &str) -> String {
     format!("{}/{topic}", base.trim_end_matches('/'))
 }
 
+/// Longest start parameter Telegram passes to a bot.
+const TELEGRAM_START_MAX: usize = 64;
+
 /// A link that opens the bot with the link code filled in, so tapping
 /// Start sends `/start <code>` without typing it.
+///
+/// The code comes from the server, and Telegram takes 1 to 64 letters,
+/// digits, `_` and `-` as a start parameter. Anything else never goes
+/// into the link: a `#`, a `&` or a space would change what the link
+/// says, so the link then only opens the bot, and the code is typed
+/// there by hand.
 pub fn telegram_link_url(bot: &str, code: &str) -> String {
-    format!("https://t.me/{}?start={code}", bot.trim_start_matches('@'))
+    let bot = bot.trim_start_matches('@');
+    let valid = (1..=TELEGRAM_START_MAX).contains(&code.len())
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if valid {
+        format!("https://t.me/{bot}?start={code}")
+    } else {
+        format!("https://t.me/{bot}")
+    }
 }
 
 #[cfg(test)]
@@ -2138,6 +2156,36 @@ mod tests {
             telegram_link_url("@GerfautAlertsBot", "c"),
             "https://t.me/GerfautAlertsBot?start=c"
         );
+        assert_eq!(
+            telegram_link_url(TELEGRAM_BOT, &"a-_Z9".repeat(13)[..64]),
+            format!(
+                "https://t.me/GerfautAlertsBot?start={}",
+                &"a-_Z9".repeat(13)[..64]
+            )
+        );
+    }
+
+    /// The code is the server's word. One that is not a start parameter
+    /// Telegram takes never reaches the link, which then only opens the
+    /// bot.
+    #[test]
+    fn a_code_telegram_would_not_take_stays_out_of_the_link() {
+        for code in [
+            "",
+            "abc&start=other",
+            "abc#fragment",
+            "abc def",
+            "abc/../x",
+            "caf\u{e9}",
+            "%41",
+            &"a".repeat(65),
+        ] {
+            assert_eq!(
+                telegram_link_url(TELEGRAM_BOT, code),
+                "https://t.me/GerfautAlertsBot",
+                "{code:?}"
+            );
+        }
     }
 
     #[test]

@@ -207,3 +207,7 @@ The first release: the library both Gerfaut apps are built on.
   read as an alert. Such a signature leaves some or all of the outputs
   open, so a node that relays the transaction can send that money
   elsewhere, and the outputs the preview showed were only a suggestion.
+- The Telegram link puts the server's code in the link only when Telegram
+  would take it as a start parameter: 1 to 64 letters, digits, `_` and
+  `-`. Any other code, which could have changed what the link says, is
+  left out, and the link only opens the bot.
