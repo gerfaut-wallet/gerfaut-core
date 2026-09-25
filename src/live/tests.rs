@@ -196,6 +196,30 @@ async fn caught_up(events: &mut LiveEvents, wallet: &str) -> Vec<LiveTx> {
     txs
 }
 
+/// The transactions the watch hands out once it has read every script,
+/// up to a second in which nothing more comes: whether it syncs depends
+/// on what the host's own sync, racing it, already found.
+async fn settled(events: &mut LiveEvents) -> Vec<LiveTx> {
+    let mut txs = Vec::new();
+    let mut subscribed = false;
+    loop {
+        let wait = if subscribed {
+            Duration::from_secs(1)
+        } else {
+            WAIT
+        };
+        match tokio::time::timeout(wait, events.next()).await {
+            Ok(Some(LiveEvent::Transaction(tx))) => txs.push(tx),
+            Ok(Some(LiveEvent::Status(status))) if status.pushed_scripts > 0 => subscribed = true,
+            Ok(Some(LiveEvent::SyncFailed { message, .. })) => panic!("the sync failed: {message}"),
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the watch stopped"),
+            Err(_) if subscribed => return txs,
+            Err(_) => panic!("never subscribed within {WAIT:?}"),
+        }
+    }
+}
+
 /// Once the watch has read every script, nothing more for a while: no
 /// sync, since nothing moved, and nothing to announce.
 async fn quiet_start(events: &mut LiveEvents) {
@@ -281,7 +305,7 @@ async fn an_opening_sync_racing_the_catch_up_announces_once() {
         };
         let watch = async {
             let mut events = manager.live_start_with(Some(timings())).await.unwrap();
-            caught_up(&mut events, &wallet).await
+            settled(&mut events).await
         };
         let (by_app, by_watch) = tokio::join!(app, watch);
         let all: Vec<LiveTx> = by_app.into_iter().chain(by_watch).collect();
