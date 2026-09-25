@@ -125,7 +125,17 @@ The first release: the library both Gerfaut apps are built on.
   asked for it. Every Esplora answer is capped at 32 MiB once
   decompressed, including the requests of the live watch, single
   addresses and broadcasts, and so is every price answer: a small gzip of
-  a huge body is cut off instead of being held in memory.
+  a huge body is cut off instead of being held in memory. A page of a
+  history is capped at 8 MiB and one sync at 64 MiB in all. Pages are
+  parsed into about the memory they take on the wire, witness items
+  included, and a transaction the wallet already holds is not kept.
+- A sync that the live watch asks for goes first to the watch's server
+  only when that server serves the wallet's own network under its
+  backend. After a network or backend change, the syncs the watch owed
+  under the old one are dropped. An Electrum server whose chain never
+  meets the wallet's, even one behind it, makes the sync fail instead of
+  making the wallet's transactions look gone, and an Esplora server whose
+  latest blocks contradict the chain it agreed on is refused.
 - A payment that a reorganisation replaced with a conflicting spend to
   someone else costs nothing more once a sync has seen it go. Before,
   each Esplora sync read the whole history of its address, and each watch
