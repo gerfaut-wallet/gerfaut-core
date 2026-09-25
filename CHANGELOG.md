@@ -218,3 +218,7 @@ The first release: the library both Gerfaut apps are built on.
   answer. A redirect used to take the request on to the host it named,
   body included, and with it the device token or a new key; an answer of
   any size was held in memory whole.
+- The premium client goes through Tor as soon as a backend of any network
+  is an onion, the way the update check does. It used to look at the
+  network on screen only, so switching to one whose backend is in the
+  clear showed this device's address to the premium server.

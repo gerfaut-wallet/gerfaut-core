@@ -1889,7 +1889,11 @@ impl WalletManager {
         base_url: &str,
         key: Option<String>,
     ) -> CoreResult<PremiumClient> {
-        let proxy = if chain::is_onion(base_url) || self.backend_needs_tor().await {
+        // Tor as soon as any backend is an onion, on any network, as for
+        // the update check: the requests carry the device token, and
+        // switching to a network whose backend is in the clear must
+        // not show this device's address to the server beside it.
+        let proxy = if chain::is_onion(base_url) || self.uses_tor().await {
             let (settings, data_dir) = self.tor_setup().await;
             Some(tor::resolve(&settings, &data_dir).await?.proxy())
         } else {
@@ -4507,6 +4511,40 @@ mod tests {
             "{}",
             report.failures[0].message
         );
+    }
+
+    /// The premium client goes through Tor as soon as a backend of any
+    /// network is an onion, not only the one on screen: switching to a
+    /// network whose backend is in the clear must not show this
+    /// device's address to the premium server. Without Tor to be had,
+    /// no client is built at all.
+    #[tokio::test]
+    async fn the_premium_client_takes_tor_when_any_backend_is_an_onion() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        manager
+            .set_backend(
+                Network::Signet,
+                BackendConfig::CustomEsplora {
+                    url: "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/signet/api"
+                        .to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .set_tor_settings(TorSettings {
+                mode: TorMode::System,
+                socks_proxy: Some(closed_port().await),
+            })
+            .await
+            .unwrap();
+        manager.set_active_network(Network::Mainnet).await.unwrap();
+
+        let refused = manager
+            .premium_client_with_key("https://api.gerfaut-wallet.com", None)
+            .await;
+        assert!(matches!(refused, Err(CoreError::Tor(_))));
     }
 
     /// What the loopback Esplora below does with a question it has no
