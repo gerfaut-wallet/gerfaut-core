@@ -251,3 +251,7 @@ The first release: the library both Gerfaut apps are built on.
   answer is read.
 - `Licence::paid_until` is the end of the paid time the certificate
   signs, never the unsigned date the server sends beside it.
+- The key of a Coldcard-style JSON export is held to its SLIP-132 prefix
+  like a pasted key: a multisig cosigner key, or a prefix for another
+  script than the account's, is refused instead of imported under the
+  account's script with addresses the exporting wallet never shows.

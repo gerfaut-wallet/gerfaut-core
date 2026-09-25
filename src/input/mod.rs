@@ -973,6 +973,27 @@ fn parse_json_export(input: &str) -> CoreResult<ParsedInput> {
                 detail: format!("`{account_key}` entry has no xpub"),
             })?;
         let decoded = xpub::decode_extended_key(key)?;
+        // Held to its prefix as a pasted key is: a SLIP-132 key names
+        // its script, and a cosigner key is no single-key account.
+        if decoded.multisig_only {
+            return Err(CoreError::InvalidInput {
+                kind: "wallet export",
+                detail: format!(
+                    "`{account_key}` holds a multisig cosigner key; import the full multisig \
+                     descriptor instead"
+                ),
+            });
+        }
+        if let Some(hint) = decoded.script_hint
+            && hint != *script
+        {
+            return Err(CoreError::InvalidInput {
+                kind: "wallet export",
+                detail: format!(
+                    "`{account_key}` holds a key whose prefix is for another script type"
+                ),
+            });
+        }
 
         // Origin: master fingerprint (account-level, else top-level) plus
         // the account derivation path.
@@ -1322,6 +1343,25 @@ mod tests {
         let (external, _, script) = descriptors(&coldcard);
         assert_eq!(script, ScriptKind::Segwit);
         assert!(external.contains(XPUB));
+
+        // Its key is held to its prefix as a pasted one is: a cosigner
+        // key, or one whose prefix names another script, would derive
+        // addresses the exporting wallet never shows.
+        for key in [slip132(XPUB, ZPUB_MULTI), slip132(TPUB, UPUB)] {
+            let export = format!(
+                "{{\"xfp\": \"0F056943\", \"bip84\": {{\"xpub\": \"{key}\", \"deriv\": \"m/84'/0'/0'\"}}}}"
+            );
+            assert!(
+                matches!(
+                    parse_input(&export),
+                    Err(CoreError::InvalidInput {
+                        kind: "wallet export",
+                        ..
+                    })
+                ),
+                "{key}"
+            );
+        }
     }
 
     #[test]
