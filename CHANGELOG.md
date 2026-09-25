@@ -175,9 +175,12 @@ The first release: the library both Gerfaut apps are built on.
   from the same one, fails with the new `VaultError::AlreadyOpen` before
   anything is read. The system releases the lock when the process ends,
   a crash included. A file system that cannot lock at all opens the vault
-  unlocked, as before, and says so in the log. Each save writes to a
-  temporary file of its own, removed if the save fails, and an open clears
-  the ones a crash left behind.
+  unlocked, as before, and says so in the log. So does a lock file that
+  cannot be opened for writing, such as a read-only one restored from a
+  copy. Each save writes to a temporary file of its own, removed if the
+  save fails, and an open that holds the lock clears the ones a crash left
+  behind. On Windows, a save waits a moment when a scanner still holds the
+  new file, instead of failing at once.
 - A vault file that cannot be looked at, for a permission or a storage
   error, fails the open. It used to be taken for a first launch and
   replaced with an empty vault.
