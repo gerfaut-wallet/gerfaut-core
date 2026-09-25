@@ -500,11 +500,7 @@ impl PremiumClient {
                 "no Tor proxy to reach {host} through"
             )));
         }
-        Ok(Self::with_http(
-            base_url,
-            key,
-            crate::price::client_through(proxy)?,
-        ))
+        Ok(Self::with_http(base_url, key, http_client(proxy)?))
     }
 
     /// A client over an HTTP client built elsewhere. Signed answers are
@@ -931,18 +927,33 @@ impl PremiumClient {
     }
 
     async fn raw(&self, request: reqwest::RequestBuilder, auth: Auth) -> CoreResult<Vec<u8>> {
-        let response = request
+        let mut response = request
             .send()
             .await
             .map_err(|e| PremiumError::Unreachable(describe(&e)))?;
         let status = response.status().as_u16();
         let retry_after = retry_after(response.headers());
-        let body = response
-            .bytes()
+        let too_large =
+            || PremiumError::UnexpectedResponse(format!("an answer over {} MiB", MAX_BODY >> 20));
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_BODY as u64)
+        {
+            return Err(too_large().into());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| PremiumError::Unreachable(describe(&e)))?;
+            .map_err(|e| PremiumError::Unreachable(describe(&e)))?
+        {
+            if body.len() + chunk.len() > MAX_BODY {
+                return Err(too_large().into());
+            }
+            body.extend_from_slice(&chunk);
+        }
         if (200..300).contains(&status) {
-            return Ok(body.to_vec());
+            return Ok(body);
         }
         Err(refusal(status, retry_after, &body, auth).into())
     }
@@ -1080,6 +1091,39 @@ fn device_refusal(envelope: &ErrorBody) -> Option<PremiumError> {
 }
 
 /// What went wrong on the way to the server, as a sentence.
+/// Largest answer read from the premium server. Five hundred events
+/// fit many times over; past it, what answers is not the server, and
+/// reading on would only fill the memory of a phone.
+const MAX_BODY: usize = 2 << 20;
+
+/// The HTTP client of the premium server, through `proxy` when given.
+///
+/// It follows no redirect. The API never answers with one, and a client
+/// that follows them hands the request on: its body, which may carry
+/// the device token or a new account key, to whatever host the answer
+/// names, and its credentials too when only the scheme changes, to
+/// `http://` on the same host and port. A 3xx is then an answer like
+/// any other the route does not promise.
+fn http_client(proxy: Option<&str>) -> CoreResult<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(if proxy.is_some() {
+            60
+        } else {
+            15
+        }))
+        .user_agent("gerfaut")
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(
+            reqwest::Proxy::all(format!("socks5h://{proxy}"))
+                .map_err(|e| CoreError::Internal(format!("tor proxy: {e}")))?,
+        );
+    }
+    builder
+        .build()
+        .map_err(|e| CoreError::Internal(format!("http client: {e}")))
+}
+
 fn describe(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         return "timed out".to_owned();
@@ -1666,6 +1710,45 @@ mod tests {
         let wallets = device(&older).wallets().await.unwrap();
         assert!(wallets[0].baseline_pending, "no date means it is running");
         assert!(!wallets[1].baseline_pending, "a date means it finished");
+    }
+
+    /// A redirect is not followed: the body of the request, which may
+    /// carry the device token or a new key, never goes to the host it
+    /// names, and neither do the credentials.
+    #[tokio::test]
+    async fn a_redirect_is_not_followed() {
+        let mut elsewhere = stub(200, "{}").await;
+        let location: &'static str =
+            Box::leak(format!("Location: {}/v1/devices\r\n", elsewhere.base_url).into_boxed_str());
+        let mut origin = stub_with(307, location, "").await;
+        let error = client(&origin, Some(KEY))
+            .connect_device(DevicePlatform::Linux, TOKEN)
+            .await
+            .unwrap_err();
+        assert!(origin.request().await.starts_with("POST /v1/devices"));
+        assert!(
+            matches!(
+                premium_error(error),
+                PremiumError::Unreachable(_) | PremiumError::Rejected(_)
+            ),
+            "a 3xx is an answer the route does not promise"
+        );
+        let nothing =
+            tokio::time::timeout(std::time::Duration::from_millis(300), elsewhere.request()).await;
+        assert!(nothing.is_err(), "the other host heard from us");
+    }
+
+    /// An answer bigger than any the server gives is refused, however
+    /// it is sent.
+    #[tokio::test]
+    async fn an_oversized_answer_is_refused() {
+        let body = format!(r#"{{"events":[],"pad":"{}"}}"#, "x".repeat(MAX_BODY));
+        let stub = stub(200, &body).await;
+        let error = device(&stub).events(0, 10).await.unwrap_err();
+        assert!(
+            matches!(premium_error(error), PremiumError::UnexpectedResponse(_)),
+            "an oversized answer is not read"
+        );
     }
 
     #[tokio::test]

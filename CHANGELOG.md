@@ -214,3 +214,7 @@ The first release: the library both Gerfaut apps are built on.
 - The key derived from a password or a platform key is wiped on every way
   out of a seal or an open, a failure included, and Argon2 now wipes its
   own working hashes as well.
+- The premium client follows no redirect and reads at most 2 MiB of an
+  answer. A redirect used to take the request on to the host it named,
+  body included, and with it the device token or a new key; an answer of
+  any size was held in memory whole.
