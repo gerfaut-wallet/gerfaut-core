@@ -94,7 +94,8 @@ The first release: the library both Gerfaut apps are built on.
   about its removed wallets, with the old token, and none of those
   removals ever goes to the new account.
 - One sync of a wallet runs at a time. A caller that arrives while one runs
-  waits for it and takes its result instead of asking the backend again.
+  waits for it and takes its result instead of asking the backend again,
+  when that sync read at least as far as its own would have.
 - On a phone, the built-in Tor client uses reduced channel padding, so a
   connection held open for hours lets the radio sleep between cells. A
   desktop keeps the normal level.
@@ -104,6 +105,32 @@ The first release: the library both Gerfaut apps are built on.
 
 ### Changed
 
+- Syncs fetch only what a wallet lacks. A transaction the wallet already
+  holds is never downloaded again, and a confirmation it has already
+  proven is not proven twice. Over Electrum, a sync reads the history of
+  each script, a short list of txids, then asks only for the transactions
+  it does not have, plus the coins they spend so that their fee can be
+  shown. A confirmation is proven again only when a reorganisation moved
+  it. Over Esplora, a sync first reads the counters of each script, reads
+  its history only when they moved, and stops paging at the first
+  transaction it already holds; answers now come gzipped. On a busy
+  signet wallet of 274 transactions, a sync that finds nothing new went
+  from 5.8 MB to 131 KB over Esplora, and from 6.4 MB to 74 KB over
+  Electrum. The first sync of a wallet after the vault opens, and one a
+  day after that, also lists the unconfirmed transactions of every script
+  that has some: that is how a replacement paying the same amount gets
+  caught. `WalletMeta.complete_at` records when that last happened.
+- The live watch says which scripts moved. `WatchEvent::WalletChanged`
+  carries them in `scripts`, empty when the transport cannot tell, and the
+  sync that follows reads only those scripts, on the server the watch
+  listens to. With the automatic backend, that server is the Electrum
+  server of an operator the rotation already uses, so no new third party
+  is involved. Each `WatchedScript` also carries the Electrum `status` of
+  what the wallet holds for it. A watch that starts or reconnects compares
+  it with the server's and syncs only the scripts whose status differs,
+  instead of every wallet. On the busy wallet above, a pushed payment or
+  confirmation now costs 12 to 26 KB instead of 6.4 MB, a restart about
+  55 KB, and an hour of watching went from 38 MB to 177 KB.
 - Backup files are sealed under a heavier Argon2id profile than the vault
   (64 MiB of memory, three passes): a backup travels, and whoever holds a
   copy can guess at its password offline for as long as the file exists.
