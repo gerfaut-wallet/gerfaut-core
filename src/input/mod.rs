@@ -345,7 +345,7 @@ fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
 /// This runs before any parsing so that a private input fails with a
 /// clear, dedicated error instead of a confusing format error — and so
 /// that no other code path ever sees the material.
-fn reject_private_material(input: &str) -> CoreResult<()> {
+pub(crate) fn reject_private_material(input: &str) -> CoreResult<()> {
     for token in input.split(|c: char| !xpub::is_base58_char(c)) {
         if token.len() < 20 {
             continue;

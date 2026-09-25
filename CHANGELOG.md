@@ -181,3 +181,8 @@ The first release: the library both Gerfaut apps are built on.
 - A vault file that cannot be looked at, for a permission or a storage
   error, fails the open. It used to be taken for a first launch and
   replaced with an empty vault.
+- A descriptor with a private key is refused wherever it comes from. The
+  parser always refused one, but a backup file written by hand, or a
+  parsed input the app handed back altered, went straight to the wallet
+  engine, which took the key and stored it in the vault. Every wallet is
+  now checked again as it is created.

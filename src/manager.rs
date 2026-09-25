@@ -2297,6 +2297,13 @@ fn create_engine(
     internal: Option<&str>,
     network: Network,
 ) -> CoreResult<bdk_wallet::Wallet> {
+    // The engine takes a descriptor with private keys as readily as one
+    // without, and would sign with them. The text reaches here from the
+    // parser, but also from a backup file and from whatever the app
+    // hands back as a parsed input, so it is held to watch-only again.
+    for descriptor in std::iter::once(external).chain(internal) {
+        require_public_descriptor(descriptor)?;
+    }
     let params = match internal {
         Some(internal) => bdk_wallet::Wallet::create(external.to_owned(), internal.to_owned()),
         None => bdk_wallet::Wallet::create_single(external.to_owned()),
@@ -2304,6 +2311,17 @@ fn create_engine(
     params
         .network(network.to_bitcoin())
         .create_wallet_no_persist()
+        .map_err(|e| CoreError::Descriptor(e.to_string()))
+}
+
+/// Refuses a descriptor that carries private key material, or that does
+/// not read as a descriptor of public keys alone.
+fn require_public_descriptor(descriptor: &str) -> CoreResult<()> {
+    crate::input::reject_private_material(descriptor)?;
+    use bdk_wallet::miniscript::{Descriptor, DescriptorPublicKey};
+    descriptor
+        .parse::<Descriptor<DescriptorPublicKey>>()
+        .map(|_| ())
         .map_err(|e| CoreError::Descriptor(e.to_string()))
 }
 
@@ -2926,6 +2944,84 @@ mod tests {
             manager.wallet_snapshot(&meta.id).await,
             Err(CoreError::WalletNotFound(_))
         ));
+    }
+
+    /// A descriptor with a private key is refused however it arrives:
+    /// from a backup file written by hand, or from a parsed input the
+    /// app hands back altered. Nothing reaches the vault.
+    #[tokio::test]
+    async fn private_keys_never_reach_the_vault() {
+        const TPRV: &str = "tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L";
+        // The textbook WIF example, public for years.
+        const WIF: &str = "5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ";
+        let private = [
+            format!("wpkh({TPRV}/84'/1'/0'/0/*)"),
+            format!("wpkh({WIF})"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+
+        for descriptor in &private {
+            let mut parsed = parse_input(MULTIPATH).unwrap();
+            parsed.payload = ParsedPayload::Descriptors {
+                external: descriptor.clone(),
+                internal: None,
+                script: crate::input::ScriptKind::Segwit,
+            };
+            let error = manager
+                .add_wallet("Hot", &parsed, Network::Signet)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, CoreError::PrivateMaterialRejected),
+                "{error}"
+            );
+
+            let payload = BackupPayload {
+                version: BACKUP_VERSION,
+                created_at: 1_755_000_000,
+                wallets: vec![BackupWallet {
+                    name: "Hot".to_owned(),
+                    network: Network::Signet,
+                    kind: WalletKind::Descriptors {
+                        external: descriptor.clone(),
+                        internal: None,
+                        script: crate::input::ScriptKind::Segwit,
+                    },
+                    gap_limit: 20,
+                    labels: Default::default(),
+                    created_at: 1_755_000_000,
+                }],
+                backends: None,
+                electrum_certs: None,
+                gap_limit: None,
+            };
+            let sealed = backup::seal(&payload, BACKUP_PASSWORD).unwrap();
+            let source = data_encoding::BASE64.encode(&sealed);
+            let error = manager
+                .import_backup(
+                    &source,
+                    BACKUP_PASSWORD,
+                    &ImportChoices {
+                        indexes: None,
+                        apply_settings: false,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, CoreError::PrivateMaterialRejected),
+                "{error}"
+            );
+        }
+
+        assert!(manager.list_wallets(None).await.is_empty());
+        drop(manager);
+        let raw = crate::store::Vault::open_or_create(dir.path().join(VAULT_FILE), key())
+            .unwrap()
+            .1;
+        let json = serde_json::to_string(&raw).unwrap();
+        assert!(!json.contains("prv") && !json.contains(&private[1][5..20]));
     }
 
     #[tokio::test]
