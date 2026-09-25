@@ -54,6 +54,17 @@ pub(crate) fn script(n: u8) -> String {
     format!("0014{}", format!("{n:02x}").repeat(20))
 }
 
+/// The Electrum status of a history: SHA-256 of `txid:height:` for each
+/// transaction, in the order listed.
+pub(crate) fn status_of(history: &[(Txid, i64)]) -> String {
+    use bdk_wallet::bitcoin::hashes::{Hash, HashEngine, sha256};
+    let mut engine = sha256::Hash::engine();
+    for (txid, height) in history {
+        engine.input(format!("{txid}:{height}:").as_bytes());
+    }
+    data_encoding::HEXLOWER.encode(&sha256::Hash::from_engine(engine).to_byte_array())
+}
+
 /// The Electrum script hash of a script in hex: SHA-256, reversed.
 pub(crate) fn scripthash(script_hex: &str) -> String {
     use bdk_wallet::bitcoin::hashes::{Hash, sha256};
@@ -316,7 +327,17 @@ impl FakeElectrum {
             }),
             "blockchain.scripthash.subscribe" => {
                 state.connections[index].0.push(scripthash.clone());
-                json!(state.statuses.get(&scripthash).cloned().flatten())
+                // A status set by the test, or the one of the history,
+                // as a server hashes it.
+                let status = match state.statuses.get(&scripthash) {
+                    Some(status) => status.clone(),
+                    None => state
+                        .histories
+                        .get(&scripthash)
+                        .filter(|history| !history.is_empty())
+                        .map(|history| status_of(history)),
+                };
+                json!(status)
             }
             "blockchain.scripthash.unsubscribe" => {
                 state.unsubscribed.push(scripthash);

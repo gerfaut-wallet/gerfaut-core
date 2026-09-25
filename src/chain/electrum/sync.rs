@@ -27,7 +27,7 @@ use bdk_wallet::bitcoin::block::Header;
 use bdk_wallet::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 
-use crate::chain::{Held, Plan, Scan};
+use crate::chain::{Held, Plan, Scan, Synced};
 
 /// Requests per batch.
 const BATCH: usize = 10;
@@ -38,7 +38,7 @@ const CHAIN_SUFFIX: u32 = 8;
 type Error = electrum_client::Error;
 
 /// Runs a plan on an open connection.
-pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<bdk_wallet::Update, Error> {
+pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error> {
     let Plan {
         tip,
         start_time,
@@ -57,6 +57,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<bdk_wallet::U
         fetched: HashMap::new(),
         to_prove: Vec::new(),
         taken: HashSet::new(),
+        orders: Vec::new(),
     };
 
     for batch in scripts.chunks(BATCH) {
@@ -95,10 +96,13 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<bdk_wallet::U
     pass.prove(client, &mut chain)?;
     pass.fetch_prevouts(client)?;
     let tip = chain.update(&pass.update);
-    Ok(bdk_wallet::Update {
-        last_active_indices: last_active,
-        tx_update: pass.update,
-        chain: Some(tip),
+    Ok(Synced {
+        update: bdk_wallet::Update {
+            last_active_indices: last_active,
+            tx_update: pass.update,
+            chain: Some(tip),
+        },
+        orders: pass.orders,
     })
 }
 
@@ -220,11 +224,20 @@ struct Pass<'h> {
     to_prove: Vec<(Txid, u32)>,
     /// Transactions already taken from another script.
     taken: HashSet<Txid>,
+    /// Each history as the server listed it.
+    orders: Vec<(ScriptBuf, Vec<(Txid, i32)>)>,
 }
 
 impl Pass<'_> {
     /// Takes the history of one script.
     fn take(&mut self, script: &ScriptBuf, history: &[GetHistoryRes], chain: &Chain) {
+        self.orders.push((
+            script.clone(),
+            history
+                .iter()
+                .map(|entry| (entry.tx_hash, entry.height))
+                .collect(),
+        ));
         if let Some(facts) = self.held.scripts.get(script) {
             let listed: HashSet<Txid> = history.iter().map(|entry| entry.tx_hash).collect();
             self.update.evicted_ats.extend(

@@ -295,12 +295,13 @@ impl WalletManager {
     /// - Start it as soon as the vault is open, before or alongside the
     ///   app's own opening sync; there is nothing to wait for.
     /// - Once its connection is up and has read every script once, the
-    ///   watch syncs every wallet of the network, two at a time, and
-    ///   hands out through [`LiveEvent::Transaction`] whatever happened
-    ///   while nothing listened: a payment that arrived while the app
-    ///   was closed, the phone off, the service killed. It does the
-    ///   same after a new configuration, and after a lost connection
-    ///   whose server cannot say what it missed.
+    ///   watch syncs, two at a time, the wallets whose scripts moved
+    ///   while nothing listened, and hands out through
+    ///   [`LiveEvent::Transaction`] what happened then: a payment that
+    ///   arrived while the app was closed, the phone off, the service
+    ///   killed. An Electrum server says which scripts moved; over any
+    ///   other backend every wallet of the network is synced. The same
+    ///   after a new configuration, and after a lost connection.
     /// - The opening sync of the app may race that catch-up. Each
     ///   transaction still comes out exactly once, through the watch or
     ///   through the app, provided the app claims after its own syncs
@@ -523,6 +524,7 @@ impl WalletManager {
                             wallet_id,
                             reason,
                             rescan,
+                            ..
                         } => {
                             let asked = Asked { reason, rescan };
                             match again.get_mut(&wallet_id) {

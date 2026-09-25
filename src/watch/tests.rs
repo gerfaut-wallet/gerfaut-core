@@ -56,6 +56,7 @@ fn wallet(id: &str, scripts: &[u8], lookahead: &[u8], has_pending: bool) -> Watc
             .map(|n| WatchedScript {
                 script: script(*n),
                 lookahead: lookahead.contains(n),
+                status: None,
             })
             .collect(),
         has_pending,
@@ -101,11 +102,20 @@ async fn until(watch: &LiveWatch, what: &str, holds: impl Fn(&WatchStatus) -> bo
     }
 }
 
+/// A wallet reported whole.
 fn changed(id: &str, reason: ChangeReason, rescan: bool) -> WatchEvent {
+    moved(id, reason, rescan, &[])
+}
+
+/// A wallet reported with the scripts that moved.
+fn moved(id: &str, reason: ChangeReason, rescan: bool, scripts: &[u8]) -> WatchEvent {
+    let mut scripts: Vec<String> = scripts.iter().map(|n| script(*n)).collect();
+    scripts.sort();
     WatchEvent::WalletChanged {
         wallet_id: id.to_owned(),
         reason,
         rescan,
+        scripts,
     }
 }
 
@@ -124,6 +134,8 @@ async fn reported(events: &mut WatchEvents, ids: &[&str], reason: ChangeReason) 
 #[tokio::test]
 async fn electrum_pushes_a_change_once_per_burst() {
     let server = FakeElectrum::start().await;
+    // Something landed on "b" while nothing listened.
+    server.set_status(&script(4), "dd");
     let (watch, mut events) = LiveWatch::start_with(
         config(server.backend()),
         vec![
@@ -147,19 +159,22 @@ async fn electrum_pushes_a_change_once_per_burst() {
             scripthash(&script(3)),
         ]]
     );
-    // Once every script has its first status, every wallet is reported
-    // once: what happened before anything listened is for a sync to say.
-    reported(&mut events, &["a", "b"], ChangeReason::Started).await;
-    // From then on the statuses are a baseline: nothing to report.
+    // A script whose status differs from what its wallet holds is
+    // reported, named, once every script has its first status: what
+    // happened before anything listened, and nothing else.
+    assert_eq!(
+        next_event(&mut events).await,
+        moved("b", ChangeReason::Started, false, &[4])
+    );
     no_event(&mut events, Duration::from_millis(300)).await;
 
     // A transaction touching two scripts of one wallet: two notices,
-    // one report.
+    // one report, naming both.
     server.set_status(&script(1), "aa");
     server.set_status(&script(2), "bb");
     assert_eq!(
         next_event(&mut events).await,
-        changed("a", ChangeReason::Activity, false)
+        moved("a", ChangeReason::Activity, false, &[1, 2])
     );
     no_event(&mut events, Duration::from_millis(300)).await;
 
@@ -169,12 +184,29 @@ async fn electrum_pushes_a_change_once_per_burst() {
     }
     no_event(&mut events, Duration::from_millis(300)).await;
 
-    // Past the revealed addresses: only a full scan looks there.
+    // Past the revealed addresses.
     server.set_status(&script(3), "cc");
     assert_eq!(
         next_event(&mut events).await,
-        changed("a", ChangeReason::Activity, true)
+        moved("a", ChangeReason::Activity, true, &[3])
     );
+
+    // The wallet synced and now holds what the server lists: the same
+    // status again is nothing new.
+    watch.set_wallets(vec![
+        WatchedWallet {
+            scripts: vec![WatchedScript {
+                script: script(1),
+                lookahead: false,
+                status: Some("ab".to_owned()),
+            }],
+            ..wallet("a", &[], &[], false)
+        },
+        wallet("b", &[4], &[], false),
+    ]);
+    until(&watch, "the list shrinks", |s| s.watched_scripts == 2).await;
+    server.set_status(&script(1), "ab");
+    no_event(&mut events, Duration::from_millis(300)).await;
 
     // A block.
     server.push(
@@ -218,7 +250,8 @@ async fn electrum_reconnects_and_reports_what_moved_meanwhile() {
         Some(timings()),
     );
     until(&watch, "subscribed", |s| s.pushed_scripts == 2).await;
-    reported(&mut events, &["a", "b"], ChangeReason::Started).await;
+    // Nothing differs from what the wallets hold: nothing to report.
+    no_event(&mut events, Duration::from_millis(300)).await;
 
     // The connection drops, and a payment to "b" lands while it is down.
     server.hang_up();
@@ -232,7 +265,7 @@ async fn electrum_reconnects_and_reports_what_moved_meanwhile() {
     // reported.
     assert_eq!(
         next_event(&mut events).await,
-        changed("b", ChangeReason::Activity, false)
+        moved("b", ChangeReason::Reconnected, false, &[2])
     );
     no_event(&mut events, Duration::from_millis(300)).await;
     let subscriptions = server.subscriptions();
@@ -257,7 +290,7 @@ async fn electrum_reconnects_and_reports_what_moved_meanwhile() {
     server.set_status(&script(5), "ee");
     assert_eq!(
         next_event(&mut events).await,
-        changed("a", ChangeReason::Activity, false)
+        moved("a", ChangeReason::Activity, false, &[5])
     );
 
     // A removed wallet is heard no more.
@@ -268,8 +301,9 @@ async fn electrum_reconnects_and_reports_what_moved_meanwhile() {
     assert_eq!(server.subscriptions().len(), 2, "no reconnection for that");
 }
 
-/// A script the server refused on the first connection has no status
-/// to compare with: on the next one, its wallet is reported.
+/// A script the server refused has no status to compare with: it is
+/// reported, for a sync to say what it holds. Read on the next
+/// connection, it is compared like any other.
 #[tokio::test]
 async fn electrum_reports_what_it_never_read_after_a_reconnection() {
     let server = FakeElectrum::start().await;
@@ -283,11 +317,28 @@ async fn electrum_reports_what_it_never_read_after_a_reconnection() {
         Some(timings()),
     );
     // Refused, and answered all the same: the watch is ready.
-    reported(&mut events, &["a", "b"], ChangeReason::Started).await;
+    let mut seen = vec![next_event(&mut events).await, next_event(&mut events).await];
+    seen.sort_by_key(|event| format!("{event:?}"));
+    assert_eq!(
+        seen,
+        vec![
+            moved("a", ChangeReason::Started, false, &[1]),
+            moved("b", ChangeReason::Started, false, &[2]),
+        ]
+    );
     assert_eq!(watch.status().pushed_scripts, 0);
     server.state.lock().unwrap().refuse.clear();
+    server
+        .state
+        .lock()
+        .unwrap()
+        .statuses
+        .insert(scripthash(&script(2)), Some("bb".to_owned()));
     server.hang_up();
-    reported(&mut events, &["a", "b"], ChangeReason::Reconnected).await;
+    assert_eq!(
+        next_event(&mut events).await,
+        moved("b", ChangeReason::Reconnected, false, &[2])
+    );
     until(&watch, "subscribed", |s| s.pushed_scripts == 2).await;
     no_event(&mut events, Duration::from_millis(300)).await;
 }
@@ -412,7 +463,7 @@ async fn a_mempool_websocket_pushes_what_it_tracks_and_polls_the_rest() {
     } }));
     assert_eq!(
         next_event(&mut events).await,
-        changed("b", ChangeReason::Activity, false)
+        moved("b", ChangeReason::Activity, false, &[4])
     );
 
     // A block: the wallet waiting for a confirmation is worth a sync,
@@ -447,7 +498,7 @@ async fn a_mempool_websocket_pushes_what_it_tracks_and_polls_the_rest() {
         .insert(FakeMempool::rest_key(&script(3)), 1);
     assert_eq!(
         next_event(&mut events).await,
-        changed("a", ChangeReason::Activity, false)
+        moved("a", ChangeReason::Activity, false, &[3])
     );
     let looked_up = server.state.lock().unwrap().looked_up.clone();
     assert!(!looked_up.contains(&FakeMempool::rest_key(&script(1))));
@@ -495,7 +546,7 @@ async fn an_esplora_without_a_websocket_is_polled() {
         .insert(FakeMempool::rest_key(&script(2)), 1);
     assert_eq!(
         next_event(&mut events).await,
-        changed("a", ChangeReason::Activity, true)
+        moved("a", ChangeReason::Activity, true, &[2])
     );
 
     server.state.lock().unwrap().tip = 501;
@@ -562,7 +613,7 @@ async fn a_new_configuration_moves_the_watch() {
         Some(timings()),
     );
     until(&watch, "subscribed", |s| s.pushed_scripts == 1).await;
-    reported(&mut events, &["a"], ChangeReason::Started).await;
+    no_event(&mut events, Duration::from_millis(300)).await;
     watch.reconfigure(
         config(second.backend()),
         vec![wallet("a", &[1], &[], false)],
@@ -573,9 +624,11 @@ async fn a_new_configuration_moves_the_watch() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     until(&watch, "subscribed again", |s| s.pushed_scripts == 1).await;
-    // Another server: nothing of the first one's statuses is compared
-    // with it, and what happened before is for a sync to say again.
-    reported(&mut events, &["a"], ChangeReason::Started).await;
+    // Another server, which lists something the wallet does not hold.
+    assert_eq!(
+        next_event(&mut events).await,
+        moved("a", ChangeReason::Started, false, &[1])
+    );
     no_event(&mut events, Duration::from_millis(300)).await;
 
     // Nothing left to watch: the connection is given up.
@@ -633,10 +686,13 @@ fn a_list_is_cut_to_what_can_be_watched() {
     wallets[0].scripts.push(WatchedScript {
         script: "not hex".to_owned(),
         lookahead: false,
+        status: None,
     });
     wallets.push(wallet("b", &[1, 1, 250], &[1], false));
     let watched = Watched::new(wallets);
     assert_eq!(watched.entries.len(), MAX_SCRIPTS_PER_WALLET + 1);
+    // Cut, so a start reports it whole.
+    assert_eq!(watched.capped, vec!["a".to_owned()]);
     // Shared by two wallets, and revealed in one of them: not lookahead.
     let shared = watched.by_hex(&script(1)).unwrap();
     assert_eq!(shared.owners.len(), 2);
@@ -655,17 +711,23 @@ async fn a_burst_is_one_report_and_a_flood_is_held_to_the_gap() {
     let timings = timings();
     let mut debounce = Debouncer::default();
     let start = Instant::now();
-    debounce.mark("a", ChangeReason::NewBlock, false, start);
+    debounce.mark("a", ChangeReason::NewBlock, false, Some("x"), start);
     debounce.mark(
         "a",
         ChangeReason::Activity,
         true,
+        Some("y"),
         start + Duration::from_millis(10),
+    );
+    assert_eq!(
+        debounce.pending["a"].scripts,
+        Some(["x".to_owned(), "y".to_owned()].into())
     );
     debounce.mark(
         "a",
         ChangeReason::Reconnected,
         false,
+        None,
         start + Duration::from_millis(20),
     );
     assert!(
@@ -677,6 +739,8 @@ async fn a_burst_is_one_report_and_a_flood_is_held_to_the_gap() {
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].1.reason, ChangeReason::Activity);
     assert!(due[0].1.rescan);
+    // A mark of the whole wallet swallows the scripts named before.
+    assert_eq!(due[0].1.scripts, None);
 
     // Marked without a pause, a wallet still goes out by the end of the
     // burst window.
@@ -685,6 +749,7 @@ async fn a_burst_is_one_report_and_a_flood_is_held_to_the_gap() {
             "b",
             ChangeReason::Activity,
             false,
+            None,
             start + Duration::from_millis(step * 20),
         );
     }
@@ -699,6 +764,7 @@ async fn a_burst_is_one_report_and_a_flood_is_held_to_the_gap() {
         "c",
         ChangeReason::Activity,
         false,
+        None,
         start + Duration::from_millis(1),
     );
     assert_eq!(
@@ -774,6 +840,9 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
             scripts: vec![WatchedScript {
                 script: ADDRESS_SCRIPT.to_owned(),
                 lookahead: false,
+                // Never synced: a status no server gives, so that the
+                // watch syncs it once it starts.
+                status: Some(String::new()),
             }],
             has_pending: false,
         }]
@@ -1095,6 +1164,7 @@ async fn live_the_three_transports_see_signet_move() {
             .map(|script| WatchedScript {
                 script,
                 lookahead: false,
+                status: None,
             })
             .collect(),
         has_pending: true,

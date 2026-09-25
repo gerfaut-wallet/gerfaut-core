@@ -496,7 +496,7 @@ pub(crate) async fn sync(
     plan: super::Plan,
     proxy: Option<&str>,
     deadline: Duration,
-) -> Result<bdk_wallet::Update, String> {
+) -> Result<super::Synced, String> {
     let fail = failed(target);
     run(target, proxy, deadline, move |client| {
         sync::run(client, plan).map_err(fail)

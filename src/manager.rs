@@ -72,6 +72,9 @@ pub(crate) struct ManagerState {
     /// Where the vault lives, and where the embedded Tor client keeps
     /// its state.
     pub(crate) data_dir: PathBuf,
+    /// The order an Electrum server listed each script's history in, as
+    /// the syncs read it: what the statuses handed to the watch hash.
+    orders: views::HistoryOrders,
 }
 
 impl ManagerState {
@@ -289,6 +292,7 @@ impl WalletManager {
                     payload,
                     engines: HashMap::new(),
                     data_dir,
+                    orders: views::HistoryOrders::new(),
                 }),
                 attempts: Mutex::new(attempts),
                 live: std::sync::Mutex::new(None),
@@ -989,16 +993,19 @@ impl WalletManager {
 
             let response = chain::sync_engine(endpoint, plan, proxy)
                 .await
-                .and_then(|update| chain::check_amounts(&update).map(|()| update));
+                .and_then(|synced| chain::check_amounts(&synced.update).map(|()| synced));
             match response {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
-                Ok(update) => {
+                Ok(synced) => {
                     let mut state = self.state.lock().await;
+                    state.orders.extend(synced.orders);
                     let engine = ensure_engine(&mut state, &meta.id)?;
-                    engine.apply_update(update).map_err(|e| CoreError::Sync {
-                        backend: endpoint.label(),
-                        detail: e.to_string(),
-                    })?;
+                    engine
+                        .apply_update(synced.update)
+                        .map_err(|e| CoreError::Sync {
+                            backend: endpoint.label(),
+                            detail: e.to_string(),
+                        })?;
 
                     let balance = views::balance(engine);
                     let tip_height = views::tip_height(engine);
@@ -2391,17 +2398,44 @@ pub(crate) fn watched_wallet(
             let scripts = vec![crate::watch::WatchedScript {
                 script: script.to_hex_string(),
                 lookahead: false,
+                status: record
+                    .address_state
+                    .as_ref()
+                    .and_then(views::address_status),
             }];
             (scripts, has_pending)
         }
         WalletKind::Descriptors { .. } => {
-            let engine = ensure_engine(state, id).ok()?;
-            (
-                views::watch_scripts(engine, gap_limit),
-                views::has_pending(engine),
-            )
+            let orders = std::mem::take(&mut state.orders);
+            let listed = ensure_engine(state, id).ok().map(|engine| {
+                (
+                    views::watch_scripts(engine, gap_limit, &orders),
+                    views::has_pending(engine),
+                )
+            });
+            state.orders = orders;
+            listed?
         }
     };
+    // A wallet never synced holds nothing yet, which says nothing of
+    // what its scripts hold: an empty status matches none a server
+    // gives, and the watch syncs it once it starts.
+    let never_synced = find_record(&state.payload, id)
+        .ok()?
+        .meta
+        .last_sync
+        .is_none();
+    let scripts = scripts
+        .into_iter()
+        .map(|script| crate::watch::WatchedScript {
+            status: if never_synced {
+                Some(String::new())
+            } else {
+                script.status
+            },
+            ..script
+        })
+        .collect();
     Some(crate::watch::WatchedWallet {
         wallet_id: id.to_owned(),
         scripts,

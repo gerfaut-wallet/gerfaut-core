@@ -50,20 +50,21 @@
 //!   again after each sync ([`LiveWatch::set_wallets`]): newly revealed
 //!   scripts are subscribed on the open connection, nothing else is
 //!   sent again.
-//! - [`WatchEvent::WalletChanged`] means "sync this wallet now". With
-//!   `rescan` set, the change was seen past the addresses the wallet
-//!   has revealed: a sync reads receive addresses that far, and only a
-//!   full scan reads change addresses there.
-//! - Once the first connection is up and every script it covers has
-//!   been read once, every wallet is reported
-//!   ([`ChangeReason::Started`]): the sync that follows catches up on
-//!   whatever happened while nothing listened. The same after a new
-//!   configuration.
+//! - [`WatchEvent::WalletChanged`] means "sync this wallet now", and
+//!   names the scripts that moved when the transport can say: a sync
+//!   of those scripts is enough. With `rescan` set, the change was seen
+//!   past the addresses the wallet has revealed.
+//! - Each script is listed with the status of the history the wallet
+//!   holds for it ([`WatchedScript::status`]). An Electrum server is
+//!   asked for every status once the connection is up, and a script
+//!   whose status differs from the one listed is reported
+//!   ([`ChangeReason::Started`]): what happened while nothing listened,
+//!   and only that. The other transports cannot tell, and report every
+//!   wallet once, scripts unnamed. The same after a new configuration.
 //! - A lost connection is reopened with a capped, jittered backoff. An
-//!   Electrum server is asked for every status again and only the
-//!   scripts whose status moved meanwhile are reported, along with any
-//!   it had no status for before; the other transports cannot tell,
-//!   and report every wallet once.
+//!   Electrum server is asked for every status again and the scripts
+//!   whose status differs from what the wallet holds are reported; the
+//!   other transports report every wallet once.
 //! - Timers stop while a phone sleeps. [`LiveWatch::tick`] is the
 //!   entry point a host alarm calls: it measures the pause on the wall
 //!   clock, pings at once, and cuts a backoff short.
@@ -77,7 +78,7 @@ mod poll;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -123,10 +124,14 @@ pub struct WatchConfig {
 pub struct WatchedScript {
     /// The script pubkey, in hex.
     pub script: String,
-    /// Past the addresses the wallet has revealed: a change seen here
-    /// asks for a full scan, the only sync that reads change addresses
-    /// this far.
+    /// Past the addresses the wallet has revealed.
     pub lookahead: bool,
+    /// The Electrum status of the history the wallet holds for this
+    /// script, `None` when it holds none. An Electrum server that gives
+    /// another status has something the wallet lacks, or lists the same
+    /// transactions in another order; either way the script is synced.
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 /// One wallet to watch.
@@ -162,11 +167,16 @@ pub enum ChangeReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WatchEvent {
-    /// Sync this wallet now; a full scan when `rescan` is set.
+    /// Sync this wallet now. `scripts` are the scripts that moved, in
+    /// hex, when the transport can say which; empty, the whole wallet.
+    /// `rescan` says one of them lies past the addresses the wallet has
+    /// revealed.
     WalletChanged {
         wallet_id: String,
         reason: ChangeReason,
         rescan: bool,
+        #[serde(default)]
+        scripts: Vec<String>,
     },
     /// The chain has a new tip.
     NewBlock { height: u32 },
@@ -423,6 +433,8 @@ pub(crate) struct Entry {
     pub lookahead: bool,
     /// Indexes into [`Watched::wallets`].
     pub owners: Vec<usize>,
+    /// The status each owner holds for the script, in the same order.
+    pub statuses: Vec<Option<String>>,
 }
 
 /// The list in the order transports cover it: the first script of
@@ -431,6 +443,9 @@ pub(crate) struct Entry {
 #[derive(Debug, Default)]
 pub(crate) struct Watched {
     pub wallets: Vec<(String, bool)>,
+    /// Wallets listed with as many scripts as a watch takes of one, the
+    /// tail of their list left out.
+    pub capped: Vec<String>,
     pub entries: Vec<Entry>,
     by_hex: HashMap<String, usize>,
     by_scripthash: HashMap<String, usize>,
@@ -443,6 +458,11 @@ impl Watched {
             wallets: wallets
                 .iter()
                 .map(|wallet| (wallet.wallet_id.clone(), wallet.has_pending))
+                .collect(),
+            capped: wallets
+                .iter()
+                .filter(|wallet| wallet.scripts.len() >= MAX_SCRIPTS_PER_WALLET)
+                .map(|wallet| wallet.wallet_id.clone())
                 .collect(),
             ..Watched::default()
         };
@@ -466,10 +486,15 @@ impl Watched {
                     continue;
                 };
                 let hex = listed.script.to_ascii_lowercase();
+                let status = listed
+                    .status
+                    .as_deref()
+                    .map(|status| status.chars().take(64).collect::<String>());
                 if let Some(&index) = watched.by_hex.get(&hex) {
                     let entry = &mut watched.entries[index];
                     if !entry.owners.contains(&owner) {
                         entry.owners.push(owner);
+                        entry.statuses.push(status);
                     }
                     entry.lookahead &= listed.lookahead;
                     continue;
@@ -490,6 +515,7 @@ impl Watched {
                     scripthash,
                     lookahead: listed.lookahead,
                     owners: vec![owner],
+                    statuses: vec![status],
                 });
             }
         }
@@ -509,12 +535,14 @@ impl Watched {
 
 // --- bursts ---------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Pending {
     first: Instant,
     last: Instant,
     reason: ChangeReason,
     rescan: bool,
+    /// The scripts that moved, in hex; `None` for the whole wallet.
+    scripts: Option<BTreeSet<String>>,
 }
 
 /// One report per wallet per burst, and never two closer than the gap.
@@ -525,19 +553,35 @@ struct Debouncer {
 }
 
 impl Debouncer {
-    fn mark(&mut self, wallet_id: &str, reason: ChangeReason, rescan: bool, now: Instant) {
+    /// Marks a wallet: `script` moved, or the whole wallet with `None`.
+    fn mark(
+        &mut self,
+        wallet_id: &str,
+        reason: ChangeReason,
+        rescan: bool,
+        script: Option<&str>,
+        now: Instant,
+    ) {
+        let script = script.map(str::to_owned);
         self.pending
             .entry(wallet_id.to_owned())
             .and_modify(|pending| {
                 pending.last = now;
                 pending.reason = pending.reason.max(reason);
                 pending.rescan |= rescan;
+                match (&mut pending.scripts, &script) {
+                    (Some(scripts), Some(script)) => {
+                        scripts.insert(script.clone());
+                    }
+                    (scripts, _) => *scripts = None,
+                }
             })
             .or_insert(Pending {
                 first: now,
                 last: now,
                 reason,
                 rescan,
+                scripts: script.map(|script| BTreeSet::from([script])),
             });
     }
 
@@ -667,12 +711,14 @@ impl Hub {
         let _ = self.events.try_send(WatchEvent::Status(next));
     }
 
-    /// A script moved: its wallets are reported once the burst settles.
+    /// A script moved: its wallets are reported once the burst settles,
+    /// the script named.
     pub fn mark_entry(&mut self, entry_hex: &str, reason: ChangeReason) {
         let Some(entry) = self.watched.by_hex(entry_hex) else {
             return;
         };
         let lookahead = entry.lookahead;
+        let hex = entry.hex.clone();
         let owners: Vec<String> = entry
             .owners
             .iter()
@@ -681,14 +727,15 @@ impl Hub {
             .collect();
         let now = Instant::now();
         for id in owners {
-            self.debounce.mark(&id, reason, lookahead, now);
+            self.debounce.mark(&id, reason, lookahead, Some(&hex), now);
         }
     }
 
+    /// Every wallet, whole.
     pub fn mark_all(&mut self, reason: ChangeReason) {
         let now = Instant::now();
         for (id, _) in &self.watched.wallets {
-            self.debounce.mark(id, reason, false, now);
+            self.debounce.mark(id, reason, false, None, now);
         }
     }
 
@@ -718,21 +765,33 @@ impl Hub {
             let now = Instant::now();
             for (id, has_pending) in &self.watched.wallets {
                 if *has_pending {
-                    self.debounce.mark(id, ChangeReason::NewBlock, false, now);
+                    self.debounce
+                        .mark(id, ChangeReason::NewBlock, false, None, now);
                 }
             }
         }
     }
 
-    /// A session is up and has read every script it covers once. The
-    /// first one under a configuration reports every wallet, so the
-    /// syncs that follow catch up on what happened before anything
-    /// listened. One after a lost connection does the same when the
-    /// transport cannot say what it missed (`exact` false).
+    /// A session is up and has read every script it covers once. When
+    /// the transport cannot say what happened before it listened
+    /// (`exact` false), the first one under a configuration reports
+    /// every wallet, so the syncs that follow catch up, and one after a
+    /// lost connection does the same. An exact transport has already
+    /// reported each script whose status differs from what its wallet
+    /// holds; the first session reports whole the wallets whose list was
+    /// cut, since nothing tells what their tail did.
     pub fn ready(&mut self, exact: bool) {
         if !self.caught_up {
             self.caught_up = true;
-            self.mark_all(ChangeReason::Started);
+            if exact {
+                let now = Instant::now();
+                for id in &self.watched.capped {
+                    self.debounce
+                        .mark(id, ChangeReason::Started, false, None, now);
+                }
+            } else {
+                self.mark_all(ChangeReason::Started);
+            }
         } else if self.interrupted && !exact {
             self.mark_all(ChangeReason::Reconnected);
         }
@@ -750,6 +809,11 @@ impl Hub {
                 wallet_id: wallet_id.clone(),
                 reason: pending.reason,
                 rescan: pending.rescan,
+                scripts: pending
+                    .scripts
+                    .clone()
+                    .map(|scripts| scripts.into_iter().collect())
+                    .unwrap_or_default(),
             };
             match self.events.try_send(event) {
                 Ok(()) => {
@@ -759,8 +823,14 @@ impl Hub {
                 // out with the next flush.
                 Err(_) => {
                     let now = Instant::now();
-                    self.debounce
-                        .mark(&wallet_id, pending.reason, pending.rescan, now);
+                    self.debounce.pending.insert(
+                        wallet_id,
+                        Pending {
+                            first: now,
+                            last: now,
+                            ..pending
+                        },
+                    );
                 }
             }
         }

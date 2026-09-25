@@ -307,14 +307,22 @@ impl Session {
                     self.acknowledged += 1;
                     let acknowledged = self.acknowledged;
                     hub.set_status(|status| status.pushed_scripts = acknowledged);
-                    self.status(hub, &scripthash, &message["result"]);
+                    self.status(hub, &scripthash, &message["result"], true);
                     self.opening.remove(&scripthash);
                 }
                 // One script refused, a history too long for the server
                 // to hash in time for instance, is left to the regular
-                // syncs. Several in a row is a server at its limit: what
-                // it took is watched, and the rest is not asked for.
+                // syncs, after one of its own now: what it did while
+                // nothing listened is unknown. Several in a row is a
+                // server at its limit: what it took is watched, and the
+                // rest is not asked for.
                 Request::Subscribe(scripthash) => {
+                    if let Some(entry) = hub.watched.by_scripthash(&scripthash)
+                        && !hub.statuses.contains_key(&scripthash)
+                    {
+                        let hex = entry.hex.clone();
+                        hub.mark_entry(&hex, self.opening_reason());
+                    }
                     self.opening.remove(&scripthash);
                     self.refused += 1;
                     let refusal = words(&message["error"]);
@@ -334,7 +342,7 @@ impl Session {
             Some("blockchain.scripthash.subscribe") => {
                 if let Some(scripthash) = params[0].as_str() {
                     let scripthash = scripthash.to_owned();
-                    self.status(hub, &scripthash, &params[1]);
+                    self.status(hub, &scripthash, &params[1], false);
                 }
             }
             Some("blockchain.headers.subscribe") => {
@@ -346,11 +354,12 @@ impl Session {
         }
     }
 
-    /// A status arrived for a script, as the answer to a subscription or
-    /// as a notification. The first one ever seen is the baseline; one
-    /// that differs from the baseline is a change, whether it happened
-    /// a moment ago or while the connection was down.
-    fn status(&mut self, hub: &mut Hub, scripthash: &str, status: &Value) {
+    /// A status arrived for a script, as the answer to a subscription
+    /// (`answer`) or as a notification. It is news when it differs from
+    /// the status of what the wallet holds for the script; a
+    /// notification must also differ from the last status the server
+    /// gave, so that one sent again is not heard twice.
+    fn status(&mut self, hub: &mut Hub, scripthash: &str, status: &Value, answer: bool) {
         let Some(entry) = hub.watched.by_scripthash(scripthash) else {
             return;
         };
@@ -358,14 +367,26 @@ impl Session {
         let status = status
             .as_str()
             .map(|s| s.chars().take(64).collect::<String>());
-        match hub.statuses.insert(scripthash.to_owned(), status.clone()) {
-            Some(known) if known != status => hub.mark_entry(&hex, ChangeReason::Activity),
-            // Never read before, by a session that picks up after
-            // another: what the script did meanwhile is unknown.
-            None if self.resumed && self.opening.contains(scripthash) => {
-                hub.mark_entry(&hex, ChangeReason::Reconnected);
-            }
-            _ => {}
+        let lacking = entry.statuses.iter().any(|held| *held != status);
+        let previous = hub.statuses.insert(scripthash.to_owned(), status.clone());
+        if !lacking || (!answer && previous.as_ref() == Some(&status)) {
+            return;
+        }
+        let reason = if answer {
+            self.opening_reason()
+        } else {
+            ChangeReason::Activity
+        };
+        hub.mark_entry(&hex, reason);
+    }
+
+    /// Why a script read on subscribing is reported: the watch starts,
+    /// or picks up after a lost connection.
+    fn opening_reason(&self) -> ChangeReason {
+        if self.resumed {
+            ChangeReason::Reconnected
+        } else {
+            ChangeReason::Started
         }
     }
 }

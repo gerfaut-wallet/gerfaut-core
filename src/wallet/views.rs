@@ -154,8 +154,9 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
 /// coins (a spend shows there first), the receive addresses within the
 /// gap limit past the last revealed one, the change addresses the same
 /// way, and then the used, empty ones, newest first. A script past the
-/// revealed range is marked: a change seen there asks for a full scan,
-/// the one sync that reads change addresses past the revealed ones.
+/// revealed range is marked as such. Each comes with the Electrum
+/// status of the history the wallet holds for it, as
+/// [`electrum_statuses`] computes it.
 ///
 /// The list stops at [`crate::watch::MAX_SCRIPTS_PER_WALLET`], all a
 /// watch takes of one wallet, and nothing past it is derived: this runs
@@ -165,18 +166,16 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
 pub(crate) fn watch_scripts(
     wallet: &bdk_wallet::Wallet,
     gap_limit: u32,
+    orders: &HistoryOrders,
 ) -> Vec<crate::watch::WatchedScript> {
     let mut seen = std::collections::HashSet::new();
-    let mut scripts = Vec::new();
+    let mut listed: Vec<(bdk_wallet::bitcoin::ScriptBuf, bool)> = Vec::new();
     // True once the list is full.
     let mut push = |script: bdk_wallet::bitcoin::ScriptBuf, lookahead: bool| {
         if seen.insert(script.clone()) {
-            scripts.push(crate::watch::WatchedScript {
-                script: script.to_hex_string(),
-                lookahead,
-            });
+            listed.push((script, lookahead));
         }
-        scripts.len() >= crate::watch::MAX_SCRIPTS_PER_WALLET
+        listed.len() >= crate::watch::MAX_SCRIPTS_PER_WALLET
     };
     let keychains: Vec<KeychainKind> = wallet.keychains().map(|(keychain, _)| keychain).collect();
     let ahead = |keychain: KeychainKind| {
@@ -225,7 +224,154 @@ pub(crate) fn watch_scripts(
             }
         }
     }
+    let scripts: Vec<bdk_wallet::bitcoin::ScriptBuf> =
+        listed.iter().map(|(script, _)| script.clone()).collect();
+    let statuses = electrum_statuses(wallet, &scripts, orders);
+    listed
+        .into_iter()
+        .zip(statuses)
+        .map(
+            |((script, lookahead), status)| crate::watch::WatchedScript {
+                script: script.to_hex_string(),
+                lookahead,
+                status,
+            },
+        )
+        .collect()
+}
+
+/// The order an Electrum server listed the history of each script in,
+/// the last time a sync read it there: txids and heights, 0 or -1 for
+/// the mempool.
+pub(crate) type HistoryOrders =
+    std::collections::HashMap<bdk_wallet::bitcoin::ScriptBuf, Vec<(Txid, i32)>>;
+
+/// The Electrum status of the history a watched address holds, the
+/// same way: its transactions by height and txid, then the mempool.
+pub(crate) fn address_status(state: &AddressWatchState) -> Option<String> {
+    let mut history: Vec<(&str, i64)> = state
+        .txs
+        .iter()
+        .map(|tx| (tx.txid.as_str(), tx.height.map_or(0, i64::from)))
+        .collect();
+    if history.is_empty() {
+        return None;
+    }
+    history.sort_by_key(|(txid, height)| (*height <= 0, *height, *txid));
+    Some(electrum_status(
+        history
+            .iter()
+            .map(|(txid, height)| format!("{txid}:{height}:")),
+    ))
+}
+
+/// The SHA-256 of the parts of a status, in hex.
+fn electrum_status(parts: impl Iterator<Item = String>) -> String {
+    use bdk_wallet::bitcoin::hashes::{Hash, HashEngine, sha256};
+    let mut engine = sha256::Hash::engine();
+    for part in parts {
+        engine.input(part.as_bytes());
+    }
+    let digest = sha256::Hash::from_engine(engine).to_byte_array();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The Electrum status of the history the wallet holds for each script,
+/// `None` for one it holds nothing for: the SHA-256 of `txid:height:`
+/// for each transaction, in the order the server lists them.
+///
+/// That order is the server's: confirmed transactions by height, then
+/// by their place in the block, which the wallet does not know, then
+/// the mempool. When a sync read the script from an Electrum server and
+/// the wallet holds the same transactions it listed, its order is used;
+/// otherwise the transactions of one block are taken by txid, and a
+/// script with two in one block may get a status no server gives. That
+/// costs a sync of the script when a watch starts, and nothing else.
+pub(crate) fn electrum_statuses(
+    wallet: &bdk_wallet::Wallet,
+    scripts: &[bdk_wallet::bitcoin::ScriptBuf],
+    orders: &HistoryOrders,
+) -> Vec<Option<String>> {
+    let graph = wallet.tx_graph();
+    let position: std::collections::HashMap<&Script, usize> = scripts
+        .iter()
+        .enumerate()
+        .map(|(index, script)| (script.as_script(), index))
+        .collect();
+    let unconfirmed: std::collections::HashSet<Txid> = wallet
+        .transactions()
+        .filter(|wtx| !wtx.chain_position.is_confirmed())
+        .map(|wtx| wtx.tx_node.txid)
+        .collect();
+    let mut histories: Vec<Vec<(Txid, i32)>> = vec![Vec::new(); scripts.len()];
+    for wtx in wallet.transactions() {
+        let tx = &wtx.tx_node.tx;
+        let height = match wtx.chain_position {
+            ChainPosition::Confirmed { anchor, .. } => {
+                i32::try_from(anchor.block_id.height).unwrap_or(i32::MAX)
+            }
+            ChainPosition::Unconfirmed { .. } => {
+                // -1 when it spends an output still in the mempool.
+                if tx
+                    .input
+                    .iter()
+                    .any(|input| unconfirmed.contains(&input.previous_output.txid))
+                {
+                    -1
+                } else {
+                    0
+                }
+            }
+        };
+        let mut touched = std::collections::BTreeSet::new();
+        for output in &tx.output {
+            if let Some(&index) = position.get(output.script_pubkey.as_script()) {
+                touched.insert(index);
+            }
+        }
+        for input in &tx.input {
+            if let Some(previous) = graph.get_txout(input.previous_output)
+                && let Some(&index) = position.get(previous.script_pubkey.as_script())
+            {
+                touched.insert(index);
+            }
+        }
+        for index in touched {
+            histories[index].push((wtx.tx_node.txid, height));
+        }
+    }
+    // What a history holds, the order and the mempool heights aside.
+    let content = |history: &[(Txid, i32)]| {
+        let mut content: Vec<(Txid, i32)> = history
+            .iter()
+            .map(|(txid, height)| (*txid, (*height).max(0)))
+            .collect();
+        content.sort_unstable();
+        content
+    };
     scripts
+        .iter()
+        .zip(histories)
+        .map(|(script, mut history)| {
+            if history.is_empty() {
+                return None;
+            }
+            let history = match orders.get(script) {
+                Some(order) if content(order) == content(&history) => order.clone(),
+                _ => {
+                    history.sort_by_key(|(txid, height)| {
+                        (*height <= 0, (*height).max(0), txid.to_string())
+                    });
+                    history
+                }
+            };
+            Some(electrum_status(
+                history
+                    .iter()
+                    .map(|(txid, height)| format!("{txid}:{height}:")),
+            ))
+        })
+        .collect()
 }
 
 /// What the wallet already holds, handed to a sync so that it asks the
@@ -964,7 +1110,7 @@ mod tests {
         let _ = wallet
             .reveal_addresses_to(KeychainKind::External, 1_000)
             .count();
-        let scripts = watch_scripts(&wallet, 20);
+        let scripts = watch_scripts(&wallet, 20, &HistoryOrders::new());
         assert_eq!(scripts.len(), crate::watch::MAX_SCRIPTS_PER_WALLET);
         assert_eq!(
             scripts[0].script,

@@ -366,6 +366,14 @@ pub(crate) struct ScriptFacts {
     pub counts: esplora::Counts,
 }
 
+/// What one sync attempt brought back.
+pub(crate) struct Synced {
+    pub update: bdk_wallet::Update,
+    /// The histories an Electrum server listed, in its order, by script:
+    /// the order its statuses hash them in.
+    pub orders: Vec<(ScriptBuf, Vec<(Txid, i32)>)>,
+}
+
 /// Refuses an update that holds an amount no transaction can carry: an
 /// output, or the outputs of one transaction together, above the 21
 /// million bitcoin there will ever be. Nothing in a block can, but an
@@ -403,12 +411,17 @@ pub(crate) async fn sync_engine(
     endpoint: &Endpoint,
     plan: Plan,
     proxy: Option<&str>,
-) -> Result<bdk_wallet::Update, String> {
+) -> Result<Synced, String> {
     let deadline = scan_deadline(endpoint);
     match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client(url, proxy)?;
-            within(deadline, esplora::sync::run(&client, plan)).await
+            within(deadline, esplora::sync::run(&client, plan))
+                .await
+                .map(|update| Synced {
+                    update,
+                    orders: Vec::new(),
+                })
         }
         Endpoint::Electrum(target) => electrum::sync(target, plan, proxy, deadline).await,
     }

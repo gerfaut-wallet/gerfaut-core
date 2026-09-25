@@ -196,10 +196,30 @@ async fn caught_up(events: &mut LiveEvents, wallet: &str) -> Vec<LiveTx> {
     txs
 }
 
+/// Once the watch has read every script, nothing more for a while: no
+/// sync, since nothing moved, and nothing to announce.
+async fn quiet_start(events: &mut LiveEvents) {
+    loop {
+        match tokio::time::timeout(WAIT, events.next()).await {
+            Ok(Some(LiveEvent::Status(status))) if status.pushed_scripts > 0 => break,
+            Ok(Some(LiveEvent::Status(_) | LiveEvent::NewBlock { .. })) => {}
+            Ok(Some(other)) => panic!("expected a quiet start, got {other:?}"),
+            Ok(None) => panic!("the watch stopped"),
+            Err(_) => panic!("never subscribed within {WAIT:?}"),
+        }
+    }
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET, events.next()).await {
+        assert!(
+            matches!(event, LiveEvent::Status(_) | LiveEvent::NewBlock { .. }),
+            "expected a quiet start, got {event:?}"
+        );
+    }
+}
+
 /// A payment that arrived while nothing ran, the app closed or killed,
 /// is announced when the watch starts, once; its confirmation, come
 /// while nothing ran either, at the next start, once; and a start with
-/// nothing new says nothing.
+/// nothing new says nothing, and syncs nothing.
 #[tokio::test]
 async fn what_arrived_while_nothing_ran_is_announced_when_the_watch_starts() {
     let server = FakeElectrum::start().await;
@@ -226,7 +246,7 @@ async fn what_arrived_while_nothing_ran_is_announced_when_the_watch_starts() {
     manager.live_stop().await;
 
     let mut events = manager.live_start_with(Some(timings())).await.unwrap();
-    assert!(caught_up(&mut events, &wallet).await.is_empty());
+    quiet_start(&mut events).await;
     manager.live_stop().await;
 }
 
@@ -489,7 +509,7 @@ async fn an_arrival_and_its_confirmation_are_announced_within_a_second() {
     manager.sync_wallet(&wallet).await.unwrap();
     let pace = crate::watch::Timings::of(&manager.watch_config().await);
     let mut events = manager.live_start_with(Some(pace)).await.unwrap();
-    assert!(caught_up(&mut events, &wallet).await.is_empty());
+    quiet_start(&mut events).await;
 
     let payment = transaction(&[nowhere(4, 0)], &[(ADDRESS_SCRIPT, 12_000)]);
     let paid = payment.compute_txid();
@@ -607,7 +627,7 @@ async fn a_server_that_forges_changes_is_heard_less_and_less() {
         ..timings()
     };
     let mut events = manager.live_start_with(Some(pace)).await.unwrap();
-    assert!(caught_up(&mut events, &wallet).await.is_empty());
+    quiet_start(&mut events).await;
 
     let mut forged = 0u32;
     let mut forge = || {
