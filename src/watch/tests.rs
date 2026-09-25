@@ -706,6 +706,23 @@ fn a_list_is_cut_to_what_can_be_watched() {
     );
 }
 
+/// A block marked in the burst of a reconnection that cannot say what
+/// it missed: the wallet goes out whole, for a reconnection, not for a
+/// block, which only asks for what waits for one.
+#[test]
+fn a_block_in_a_catch_up_burst_leaves_it_a_catch_up() {
+    let timings = timings();
+    let start = Instant::now();
+    for whole in [ChangeReason::Started, ChangeReason::Reconnected] {
+        let mut debounce = Debouncer::default();
+        debounce.mark("a", whole, false, None, start);
+        debounce.mark("a", ChangeReason::NewBlock, false, None, start);
+        let due = debounce.take_due(start + timings.burst, &timings);
+        assert_eq!(due[0].1.reason, whole);
+        assert_eq!(due[0].1.scripts, None);
+    }
+}
+
 #[tokio::test]
 async fn a_burst_is_one_report_and_a_flood_is_held_to_the_gap() {
     let timings = timings();

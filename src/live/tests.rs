@@ -913,3 +913,20 @@ fn a_descriptor_wallet_tells_replacements_and_vanished_payments() {
     assert_eq!(claimed[0].net_sats, 20_000);
     assert!(sync(&mut engine, &|_| {}).is_empty());
 }
+
+/// A block heard in the same burst as a start or a reconnection, which
+/// ask for the whole wallet, or while their sync runs: the sync that
+/// follows still reads the whole wallet, not only what waits for a
+/// block, or a payment that landed elsewhere meanwhile is missed.
+#[test]
+fn a_block_does_not_narrow_a_catch_up() {
+    let block = || Asked::of(ChangeReason::NewBlock, Vec::new());
+    for whole in [ChangeReason::Started, ChangeReason::Reconnected] {
+        let asked = Asked::of(whole, Vec::new());
+        assert_eq!(asked.clone().and(block()).reach(), Reach::Complete);
+        assert_eq!(block().and(asked).reach(), Reach::Complete);
+    }
+    assert_eq!(block().reach(), Reach::Pending);
+    let pushed = Asked::of(ChangeReason::Activity, Vec::new());
+    assert_eq!(pushed.and(block()).reach(), Reach::Checked);
+}
