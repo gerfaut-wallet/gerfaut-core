@@ -524,7 +524,19 @@ pub(crate) fn address_list(wallet: &mut bdk_wallet::Wallet) -> AddressList {
     }
 }
 
-/// The next unused receive address plus `lookahead` upcoming ones.
+/// Most upcoming addresses handed out at once, past the next unused
+/// one: the count comes from the app, and derivation is not free.
+const MAX_LOOKAHEAD: u32 = 200;
+
+/// Highest index a non-hardened derivation step can take.
+const MAX_INDEX: u32 = (1 << 31) - 1;
+
+/// The next unused receive address plus up to `lookahead` upcoming
+/// unused ones, 200 at most.
+///
+/// An upcoming address that already received a payment, one a sync
+/// found past addresses nobody paid, is skipped rather than offered
+/// again. A descriptor with no wildcard has one address, given once.
 ///
 /// Reveals the next unused address if needed: the caller must persist
 /// the staged change set afterwards.
@@ -539,8 +551,26 @@ pub(crate) fn receive_addresses(
         used: false,
         derivation: derivation_path(wallet, next.index),
     }];
-    for offset in 1..=lookahead {
-        let peeked = wallet.peek_address(KeychainKind::External, next.index + offset);
+    if !wallet
+        .public_descriptor(KeychainKind::External)
+        .has_wildcard()
+    {
+        return entries;
+    }
+    let wanted = lookahead.min(MAX_LOOKAHEAD) as usize + 1;
+    let mut index = next.index;
+    while entries.len() < wanted && index < MAX_INDEX {
+        index += 1;
+        // Only a script the index holds can have been paid; one past it
+        // reads as "used" to the index, and is not.
+        let index_holds = wallet
+            .spk_index()
+            .spk_at_index(KeychainKind::External, index)
+            .is_some();
+        if index_holds && wallet.spk_index().is_used(KeychainKind::External, index) {
+            continue;
+        }
+        let peeked = wallet.peek_address(KeychainKind::External, index);
         entries.push(AddressEntry {
             index: peeked.index,
             address: peeked.address.to_string(),
@@ -723,6 +753,56 @@ mod tests {
     /// across the tests of this crate.
     const EXTERNAL: &str = "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)";
     const INTERNAL: &str = "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)";
+
+    /// Upcoming addresses skip one a payment already reached, stop at
+    /// the cap whatever the app asks, and a descriptor without a
+    /// wildcard hands out its one address once.
+    #[test]
+    fn upcoming_receive_addresses_are_unused_bounded_and_distinct() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::{
+            Amount, OutPoint, Transaction, TxIn, TxOut, absolute, transaction,
+        };
+
+        let mut wallet = bdk_wallet::Wallet::create(EXTERNAL, INTERNAL)
+            .network(bdk_wallet::bitcoin::Network::Signet)
+            .create_wallet_no_persist()
+            .unwrap();
+        // Index 2 is paid while 0 and 1 stay empty: another app handed
+        // it out.
+        let paid = wallet.peek_address(KeychainKind::External, 2).address;
+        let payment = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+                ..TxIn::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: paid.script_pubkey(),
+            }],
+        };
+        wallet.apply_unconfirmed_txs([(payment, 1_700_000_000)]);
+
+        let entries = receive_addresses(&mut wallet, 3);
+        let indexes: Vec<u32> = entries.iter().map(|e| e.index).collect();
+        assert_eq!(indexes, [0, 1, 3, 4]);
+        assert!(entries.iter().all(|e| e.address != paid.to_string()));
+
+        assert_eq!(
+            receive_addresses(&mut wallet, u32::MAX).len(),
+            MAX_LOOKAHEAD as usize + 1
+        );
+
+        let mut single = bdk_wallet::Wallet::create_single(
+            "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/0)",
+        )
+        .network(bdk_wallet::bitcoin::Network::Signet)
+        .create_wallet_no_persist()
+        .unwrap();
+        assert_eq!(receive_addresses(&mut single, 5).len(), 1);
+    }
 
     /// A payment is worth two words: when it shows up, and when a block
     /// takes it. The first sync lists it as new and pending, the one

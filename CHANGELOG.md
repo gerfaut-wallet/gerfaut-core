@@ -236,3 +236,8 @@ The first release: the library both Gerfaut apps are built on.
   sequence turns it on, and until the right block: a transaction locked
   to height 1,000 was shown free at a tip of 999, one block before the
   network takes it.
+- Upcoming receive addresses skip one that a payment already reached, so
+  an address another app handed out and a sync found paid is not offered
+  again as unused. At most 200 are derived at once, whatever the app
+  asks, and a descriptor without a wildcard gives its one address once
+  instead of the same address over and over.
