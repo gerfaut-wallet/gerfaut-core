@@ -39,6 +39,10 @@ use crate::chain::{Held, Plan, Reading, Scan, ScriptFacts};
 
 /// Confirmed transactions an Esplora server lists per page.
 const PAGE: usize = 25;
+/// Pages read of one script at most: 10,000 confirmed transactions. A
+/// server that keeps listing new ones past that is refused rather than
+/// read on until the deadline, holding every page in memory.
+const MAX_PAGES: usize = 400;
 
 /// The part of a block summary that is read.
 #[derive(serde::Deserialize)]
@@ -207,7 +211,13 @@ async fn read_pages_down_to(
     let mut after: Option<Txid> = None;
     let mut listed_mempool = 0usize;
     let mut whole = false;
-    loop {
+    for pages in 1.. {
+        if pages > MAX_PAGES {
+            return Err(format!(
+                "the server lists more than {} transactions for one address",
+                MAX_PAGES * PAGE
+            ));
+        }
         let path = match after {
             Some(txid) => format!("{base}/chain/{txid}"),
             None => base.clone(),
