@@ -79,6 +79,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<bdk_wallet::Updat
     let meeting = Meeting::find(client, &latest, &tip).await?;
     let mut found = Found::new(&held, start_time);
 
+    let mut covered: HashSet<ScriptBuf> = scripts.iter().cloned().collect();
     for batch in scripts.chunks(PARALLEL_REQUESTS) {
         let mut reads = Vec::with_capacity(batch.len());
         for script in batch {
@@ -100,6 +101,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<bdk_wallet::Updat
             let mut reads = Vec::with_capacity(batch.len());
             for (_, script) in &batch {
                 reads.push(read_scanned(client, script, &held, meeting.height));
+                covered.insert(script.clone());
             }
             for ((index, _), read) in batch.iter().zip(try_join_all(reads).await?) {
                 if !read.used {
@@ -113,6 +115,25 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<bdk_wallet::Updat
             if unused >= (stop_gap as usize).max(1) {
                 break;
             }
+        }
+    }
+
+    // The scripts of the confirmations a reorganisation moved, read
+    // whatever the plan: see [`Held::reorganised`].
+    let moved = held.reorganised(meeting.height, &covered);
+    for batch in moved.chunks(PARALLEL_REQUESTS) {
+        let mut reads = Vec::with_capacity(batch.len());
+        for script in batch {
+            reads.push(read_script(
+                client,
+                script,
+                &held,
+                Reading::Complete,
+                meeting.height,
+            ));
+        }
+        for read in try_join_all(reads).await? {
+            found.take(read)?;
         }
     }
 

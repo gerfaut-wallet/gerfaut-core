@@ -65,7 +65,13 @@ struct Chain {
 
 impl Chain {
     fn start() -> Self {
-        let tag = format!("gerfaut-rt-{}", std::process::id());
+        // One set of containers per test, the tests of a run side by side.
+        static STARTED: AtomicU64 = AtomicU64::new(0);
+        let tag = format!(
+            "gerfaut-rt-{}-{}",
+            std::process::id(),
+            STARTED.fetch_add(1, Ordering::SeqCst)
+        );
         let network = tag.clone();
         let node = format!("{tag}-node");
         let electrs = format!("{tag}-electrs");
@@ -718,4 +724,330 @@ async fn a_sync_reads_only_what_the_wallet_lacks() {
             tx.txid
         );
     }
+}
+
+// --- the wallet against the node, while the watch runs ------------------------------
+
+impl Chain {
+    fn cli_in(&self, wallet: &str, args: &[&str]) -> String {
+        docker(
+            &[
+                &["exec", &self.node, "bitcoin-cli", "-regtest", "-rpcuser=rt"][..],
+                &["-rpcpassword=rt", &format!("-rpcwallet={wallet}")],
+                args,
+            ]
+            .concat(),
+        )
+    }
+
+    /// A watch-only wallet of the node on the same descriptor: what the
+    /// node says the watched wallet holds.
+    fn watch_on_node(&self) {
+        self.cli(&["createwallet", "watch", "true", "true"]);
+        let mut requests = Vec::new();
+        for (keychain, internal) in [("0", false), ("1", true)] {
+            let descriptor = WALLET.replace("<0;1>", keychain);
+            let info: serde_json::Value =
+                serde_json::from_str(&self.cli(&["getdescriptorinfo", &descriptor])).unwrap();
+            requests.push(serde_json::json!({
+                "desc": format!("{descriptor}#{}", info["checksum"].as_str().unwrap()),
+                "timestamp": 0,
+                "active": true,
+                "internal": internal,
+                "range": [0, 200],
+            }));
+        }
+        let imported = self.cli_in(
+            "watch",
+            &[
+                "importdescriptors",
+                &serde_json::Value::Array(requests).to_string(),
+            ],
+        );
+        assert!(!imported.contains("\"success\": false"), "{imported}");
+    }
+
+    /// The node's balance of the watched wallet, in satoshis: confirmed,
+    /// and not yet.
+    fn node_balance(&self) -> (u64, u64) {
+        let balances: serde_json::Value =
+            serde_json::from_str(&self.cli_in("watch", &["getbalances"])).unwrap();
+        let sats = |value: &serde_json::Value| (value.as_f64().unwrap() * 1e8).round() as u64;
+        let mine = &balances["mine"];
+        (sats(&mine["trusted"]), sats(&mine["untrusted_pending"]))
+    }
+
+    /// Spends the coins `txid` spends again, `sats` to `address` and the
+    /// rest, less a higher fee, back to the node: a replacement.
+    fn replace(&self, txid: &str, address: &str, sats: u64) -> String {
+        let raw = self.decoded(txid);
+        let mut inputs = Vec::new();
+        let mut total = 0u64;
+        for vin in raw["vin"].as_array().unwrap() {
+            let previous = self.decoded(vin["txid"].as_str().unwrap());
+            let vout = vin["vout"].as_u64().unwrap() as usize;
+            total += (previous["vout"][vout]["value"].as_f64().unwrap() * 1e8).round() as u64;
+            inputs.push(serde_json::json!({ "txid": vin["txid"], "vout": vin["vout"] }));
+        }
+        let btc = |sats: u64| format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000);
+        let mut outputs = serde_json::Map::new();
+        outputs.insert(address.to_owned(), btc(sats).into());
+        let back = self.cli(&["getrawchangeaddress"]);
+        outputs.insert(back, btc(total - sats - 100_000).into());
+        let unsigned = self.cli(&[
+            "createrawtransaction",
+            &serde_json::Value::Array(inputs).to_string(),
+            &serde_json::Value::Object(outputs).to_string(),
+        ]);
+        let signed: serde_json::Value =
+            serde_json::from_str(&self.cli(&["signrawtransactionwithwallet", &unsigned])).unwrap();
+        self.cli(&["sendrawtransaction", signed["hex"].as_str().unwrap()])
+    }
+
+    /// A transaction of the node's wallet, decoded.
+    fn decoded(&self, txid: &str) -> serde_json::Value {
+        let tx: serde_json::Value =
+            serde_json::from_str(&self.cli(&["gettransaction", txid])).unwrap();
+        serde_json::from_str(&self.cli(&["decoderawtransaction", tx["hex"].as_str().unwrap()]))
+            .unwrap()
+    }
+
+    /// How deep the node's watch-only wallet has a transaction.
+    fn confirmations(&self, txid: &str) -> i64 {
+        let seen: serde_json::Value =
+            serde_json::from_str(&self.cli_in("watch", &["gettransaction", txid, "true"])).unwrap();
+        seen["confirmations"].as_i64().unwrap_or(0).max(0)
+    }
+}
+
+/// The change address at `index` of the watched wallet.
+fn change_address(index: u32) -> String {
+    let descriptor = WALLET.replace("<0;1>", "1");
+    bdk_wallet::Wallet::create_single(descriptor)
+        .network(BitcoinNetwork::Regtest)
+        .create_wallet_no_persist()
+        .unwrap()
+        .peek_address(bdk_wallet::KeychainKind::External, index)
+        .address
+        .to_string()
+}
+
+/// Waits, while the watch runs, until the wallet agrees with the node:
+/// the same balance, confirmed and not, and each transaction the wallet
+/// shows as deep in the chain as the node has it.
+async fn agrees(
+    chain: &Chain,
+    manager: &WalletManager,
+    wallet: &str,
+    events: &mut LiveEvents,
+    what: &str,
+) {
+    let started = std::time::Instant::now();
+    loop {
+        let (confirmed, pending) = chain.node_balance();
+        let snapshot = manager.wallet_snapshot(wallet).await.unwrap();
+        let balance = &snapshot.balance;
+        let ours = (
+            balance.confirmed,
+            balance.trusted_pending + balance.untrusted_pending,
+        );
+        let depths: Vec<(String, i64, i64)> = snapshot
+            .txs
+            .iter()
+            .map(|tx| {
+                (
+                    tx.txid.clone(),
+                    i64::from(tx.confirmations),
+                    chain.confirmations(&tx.txid),
+                )
+            })
+            .filter(|(_, ours, node)| ours != node)
+            .collect();
+        if ours == (confirmed, pending) && depths.is_empty() {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{what}: the wallet shows {ours:?}, the node {:?}; depths apart: {depths:?}",
+            (confirmed, pending)
+        );
+        // Whatever the watch says meanwhile, drained.
+        let _ = tokio::time::timeout(Duration::from_millis(500), events.next()).await;
+    }
+}
+
+/// Waits, while the watch runs, until the txids the wallet shows pass
+/// `test`.
+async fn holds(
+    manager: &WalletManager,
+    wallet: &str,
+    events: &mut LiveEvents,
+    what: &str,
+    test: impl Fn(&[String]) -> bool,
+) {
+    let started = std::time::Instant::now();
+    loop {
+        let snapshot = manager.wallet_snapshot(wallet).await.unwrap();
+        let txids: Vec<String> = snapshot.txs.into_iter().map(|tx| tx.txid).collect();
+        if test(&txids) {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{what}: the wallet shows {txids:?}"
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(500), events.next()).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker: runs a regtest node and electrs"]
+async fn a_live_wallet_stays_true_to_the_chain() {
+    let chain = Chain::start();
+    chain.watch_on_node();
+    let first = receive_address(0);
+    let paid_first = chain.pay(&first, "0.5");
+    chain.mine();
+    chain.indexed().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let electrum = chain.electrum;
+    let (manager, wallet) = watching(
+        dir.path(),
+        BackendConfig::CustomElectrum {
+            url: format!("tcp://{electrum}"),
+        },
+    )
+    .await;
+    manager.sync_wallet(&wallet).await.unwrap();
+
+    // A block the wallet holds a confirmation in is replaced, while the
+    // watch is off, by another at the same height that confirms the same
+    // payment: the status of its address does not move. A sync of
+    // another address then carries the new block: the payment must stay
+    // confirmed.
+    chain.drop_tip();
+    let other = chain.cli(&["getnewaddress"]);
+    chain.cli(&["generatetoaddress", "1", &other]);
+    chain.indexed().await;
+    assert_eq!(chain.confirmations(&paid_first), 1);
+    let mut events = manager.live_start().await.unwrap();
+    settled(&mut events).await;
+    let second = receive_address(1);
+    let paid_second = chain.pay(&second, "0.25");
+    announced(&mut events, &paid_second, TxStage::Mempool).await;
+    agrees(
+        &chain,
+        &manager,
+        &wallet,
+        &mut events,
+        "a block replaced at the same height",
+    )
+    .await;
+
+    // A payment five addresses past the last one revealed, then one far
+    // past that, found from the first: each on a script the watch
+    // follows ahead of the wallet.
+    let ahead = receive_address(6);
+    let paid_ahead = chain.pay(&ahead, "0.01");
+    announced(&mut events, &paid_ahead, TxStage::Mempool).await;
+    let further = receive_address(6 + 18);
+    let paid_further = chain.pay(&further, "0.01");
+    announced(&mut events, &paid_further, TxStage::Mempool).await;
+    // And a change address the wallet never handed out.
+    let change = change_address(4);
+    let paid_change = chain.pay(&change, "0.01");
+    announced(&mut events, &paid_change, TxStage::Mempool).await;
+    agrees(&chain, &manager, &wallet, &mut events, "payments ahead").await;
+
+    // A payment replaced by one that pays another address of the wallet.
+    let third = receive_address(2);
+    let replaced = chain.pay(&third, "0.1");
+    announced(&mut events, &replaced, TxStage::Mempool).await;
+    let fourth = receive_address(3);
+    let replacement = chain.replace(&replaced, &fourth, 10_000_000);
+    agrees(
+        &chain,
+        &manager,
+        &wallet,
+        &mut events,
+        "a replacement to another address",
+    )
+    .await;
+    holds(
+        &manager,
+        &wallet,
+        &mut events,
+        "the replacement in place",
+        |txs| txs.contains(&replacement) && !txs.contains(&replaced),
+    )
+    .await;
+
+    // Two payments to one address in a row: the second may land while
+    // the sync of the first runs.
+    let fifth = receive_address(4);
+    let twice = [chain.pay(&fifth, "0.02"), chain.pay(&fifth, "0.03")];
+    holds(
+        &manager,
+        &wallet,
+        &mut events,
+        "two payments in a row",
+        |txs| twice.iter().all(|txid| txs.contains(txid)),
+    )
+    .await;
+    agrees(
+        &chain,
+        &manager,
+        &wallet,
+        &mut events,
+        "two payments in a row",
+    )
+    .await;
+
+    // Everything confirmed.
+    chain.mine();
+    chain.indexed().await;
+    agrees(&chain, &manager, &wallet, &mut events, "a block").await;
+
+    // A reorganisation takes a confirmed payment back to the mempool,
+    // the chain that replaces its block two blocks longer; then a block
+    // at another height confirms it again.
+    let sixth = receive_address(5);
+    let moved = chain.pay(&sixth, "0.04");
+    chain.mine();
+    chain.indexed().await;
+    agrees(
+        &chain,
+        &manager,
+        &wallet,
+        &mut events,
+        "a payment confirmed",
+    )
+    .await;
+    let tx: serde_json::Value =
+        serde_json::from_str(&chain.cli(&["gettransaction", &moved])).unwrap();
+    let block = tx["blockhash"].as_str().unwrap().to_owned();
+    chain.cli(&["invalidateblock", &block]);
+    chain.mine_empty();
+    chain.mine_empty();
+    chain.indexed().await;
+    agrees(
+        &chain,
+        &manager,
+        &wallet,
+        &mut events,
+        "a confirmation reorganised away",
+    )
+    .await;
+    chain.mine();
+    chain.indexed().await;
+    agrees(
+        &chain,
+        &manager,
+        &wallet,
+        &mut events,
+        "confirmed again, higher",
+    )
+    .await;
+    manager.live_stop().await;
 }

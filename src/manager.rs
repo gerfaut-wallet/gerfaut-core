@@ -262,12 +262,20 @@ fn plan_for(engine: &bdk_wallet::Wallet, reach: &Reach, gap_limit: u32) -> (chai
             (revealed(), vec![tail], reading)
         }
     };
-    // A rescan holds what the wallet revealed: its scans read those
-    // scripts the way a sync does, down to what the wallet holds.
-    let held = if reach == Reach::Full {
-        views::held(engine, &revealed())
-    } else {
-        views::held(engine, &scripts)
+    // What the wallet holds for every script it revealed, and for those
+    // of the plan: a rescan reads the revealed ones the way a sync does,
+    // down to what the wallet holds, and any sync reads a script outside
+    // its plan whose confirmation a reorganisation moved.
+    let held = {
+        let mut all = revealed();
+        let known: HashSet<&bdk_wallet::bitcoin::ScriptBuf> = all.iter().collect();
+        let extra: Vec<bdk_wallet::bitcoin::ScriptBuf> = scripts
+            .iter()
+            .filter(|script| !known.contains(script))
+            .cloned()
+            .collect();
+        all.extend(extra);
+        views::held(engine, &all)
     };
     let plan = chain::Plan {
         tip: engine.latest_checkpoint(),

@@ -60,6 +60,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
         orders: Vec::new(),
     };
 
+    let mut covered: HashSet<ScriptBuf> = scripts.iter().cloned().collect();
     for batch in scripts.chunks(BATCH) {
         let histories = client.batch_script_get_history(batch.iter().map(|s| s.as_script()))?;
         for (script, history) in batch.iter().zip(histories) {
@@ -88,7 +89,18 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
                     last_active.insert(keychain, *index);
                 }
                 pass.take(script, &history, &chain);
+                covered.insert(script.clone());
             }
+        }
+    }
+
+    // The scripts of the confirmations a reorganisation moved, read
+    // whatever the plan: see [`Held::reorganised`].
+    let moved = held.reorganised(chain.agreement, &covered);
+    for batch in moved.chunks(BATCH) {
+        let histories = client.batch_script_get_history(batch.iter().map(|s| s.as_script()))?;
+        for (script, history) in batch.iter().zip(histories) {
+            pass.take(script, &history, &chain);
         }
     }
 

@@ -350,8 +350,39 @@ pub(crate) struct Held {
     /// Outputs the graph holds without their transaction: the coins the
     /// wallet's transactions spend from others, fetched once for the fee.
     pub txouts: HashSet<OutPoint>,
-    /// What the wallet holds for each script of the plan.
+    /// What the wallet holds for each script it revealed, and each
+    /// script of the plan.
     pub scripts: HashMap<ScriptBuf, ScriptFacts>,
+}
+
+impl Held {
+    /// The scripts not in `read` holding a confirmation above
+    /// `agreed_up_to`, in a block the server no longer has: a
+    /// reorganisation moved it, and its script may not have moved with
+    /// it, a transaction mined again at the same height leaving the
+    /// history as it was. A sync reads them whatever its plan, or the
+    /// block it carries would leave that confirmation out of the chain.
+    pub(crate) fn reorganised(
+        &self,
+        agreed_up_to: u32,
+        read: &HashSet<ScriptBuf>,
+    ) -> Vec<ScriptBuf> {
+        let mut moved: Vec<ScriptBuf> = self
+            .scripts
+            .iter()
+            .filter(|(script, _)| !read.contains(*script))
+            .filter(|(_, facts)| {
+                facts.confirmed.iter().any(|txid| {
+                    self.anchors
+                        .get(txid)
+                        .is_some_and(|anchor| anchor.block_id.height > agreed_up_to)
+                })
+            })
+            .map(|(script, _)| script.clone())
+            .collect();
+        moved.sort();
+        moved
+    }
 }
 
 /// What the wallet holds for one script.
