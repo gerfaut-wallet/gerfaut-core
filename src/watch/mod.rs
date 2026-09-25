@@ -624,6 +624,10 @@ pub(crate) enum Wake {
 }
 
 /// The state every transport shares and that outlives a connection.
+/// How far below the height kept a tip may read and still be a server
+/// that lags: past a day of blocks, the height kept was the wrong one.
+const TIP_LAG_MAX: u32 = 144;
+
 pub(crate) struct Hub {
     pub config: WatchConfig,
     pub timings: Timings,
@@ -692,11 +696,19 @@ impl Hub {
     /// that is a block, and `sync_pending` says whether wallets waiting
     /// for a confirmation are worth a sync on this transport. A lower
     /// one is a server that lags, or one of several behind an address.
+    /// One far lower says the height kept was never real, a server's
+    /// invention or a slip: it becomes the baseline again, silently, so
+    /// that one height of four billion does not hide every block after
+    /// it.
     pub fn new_tip(&mut self, height: u32, sync_pending: bool) {
         let Some(previous) = self.tip else {
             self.tip = Some(height);
             return;
         };
+        if height.saturating_add(TIP_LAG_MAX) < previous {
+            self.tip = Some(height);
+            return;
+        }
         if height <= previous {
             return;
         }

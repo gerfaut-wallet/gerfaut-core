@@ -509,6 +509,41 @@ async fn an_esplora_without_a_websocket_is_polled() {
     );
 }
 
+/// One impossible height, from a lying server or a slip, does not hide
+/// the blocks that follow it: the honest height after it becomes the
+/// baseline again, and the next block is a block.
+#[tokio::test]
+async fn one_impossible_height_does_not_hide_later_blocks() {
+    let server = FakeMempool::start(false, 0).await;
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &[1, 2], &[2], true)],
+        Some(timings()),
+    );
+    until(&watch, "polling", |s| s.state == WatchState::Polling).await;
+    reported(&mut events, &["a"], ChangeReason::Started).await;
+
+    server.state.lock().unwrap().tip = 4_000_000_000;
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock {
+            height: 4_000_000_000
+        }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        changed("a", ChangeReason::NewBlock, false)
+    );
+
+    server.state.lock().unwrap().tip = 501;
+    no_event(&mut events, Duration::from_millis(300)).await;
+    server.state.lock().unwrap().tip = 502;
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock { height: 502 }
+    );
+}
+
 /// Another backend: the old connection is closed, the new one opened,
 /// and nothing of the old baseline is compared with the new server.
 #[tokio::test]

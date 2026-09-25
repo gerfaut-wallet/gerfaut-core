@@ -241,3 +241,6 @@ The first release: the library both Gerfaut apps are built on.
   again as unused. At most 200 are derived at once, whatever the app
   asks, and a descriptor without a wildcard gives its one address once
   instead of the same address over and over.
+- A live watch that read an impossible tip height, from a lying server or
+  a slip, no longer ignores every block after it: a height more than a
+  day of blocks below the one kept becomes the baseline again.
