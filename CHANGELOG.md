@@ -94,8 +94,9 @@ The first release: the library both Gerfaut apps are built on.
   about its removed wallets, with the old token, and none of those
   removals ever goes to the new account.
 - One sync of a wallet runs at a time. A caller that arrives while one runs
-  waits for it and takes its result instead of asking the backend again,
-  when that sync read at least as far as its own would have.
+  waits for it, then runs its own, since that sync may have read the
+  wallet before the payment the caller came for arrived. Callers that
+  wait together share that next sync instead of asking the backend each.
 - On a phone, the built-in Tor client uses reduced channel padding, so a
   connection held open for hours lets the radio sleep between cells. A
   desktop keeps the normal level.

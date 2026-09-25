@@ -162,6 +162,9 @@ pub(crate) struct ElectrumState {
     pub stall: Option<&'static str>,
     /// A method answered with this many bytes and no line end.
     pub flood: Option<(&'static str, usize)>,
+    /// A method whose answer, read from the state when the request
+    /// arrives, is held back until a permit is added here.
+    pub gate: Option<(&'static str, Arc<tokio::sync::Semaphore>)>,
     /// Every method asked for, in order, over every connection.
     pub asked: Vec<String>,
     /// Connections the client closed.
@@ -253,14 +256,24 @@ impl FakeElectrum {
                         return;
                     };
                     spoke = true;
-                    let answer = {
+                    let (answer, gate) = {
                         let mut state = state.lock().unwrap();
                         state.asked.push(method.clone());
                         if state.silent || stalled {
                             continue;
                         }
-                        Self::answer(&mut state, index, &request, &method)
+                        let gate = state
+                            .gate
+                            .as_ref()
+                            .filter(|(gated, _)| *gated == method)
+                            .map(|(_, gate)| gate.clone());
+                        (Self::answer(&mut state, index, &request, &method), gate)
                     };
+                    if let Some(gate) = gate
+                        && let Ok(permit) = gate.acquire().await
+                    {
+                        permit.forget();
+                    }
                     let bytes = match answer {
                         Answer::Line(answer) => format!("{answer}\n").into_bytes(),
                         Answer::Stall => {

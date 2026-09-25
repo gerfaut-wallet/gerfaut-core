@@ -133,6 +133,55 @@ async fn two_syncs_at_once_announce_a_payment_once() {
     }
 }
 
+/// A caller arrives while a sync of the wallet runs, one that read the
+/// address before the payment the caller came for arrived: the watch
+/// heard of it a moment ago. The caller does not take that sync's
+/// result, which lacks the payment, but runs one of its own after it.
+#[tokio::test]
+async fn a_caller_does_not_take_a_sync_that_read_before_it_came() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), server.backend()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+
+    let histories = || {
+        server
+            .state
+            .lock()
+            .unwrap()
+            .asked
+            .iter()
+            .filter(|method| *method == "blockchain.scripthash.get_history")
+            .count()
+    };
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    server.state.lock().unwrap().gate = Some(("blockchain.scripthash.get_history", gate.clone()));
+    let read_before = histories();
+    let first = tokio::spawn({
+        let (manager, wallet) = (manager.clone(), wallet.clone());
+        async move { manager.sync_wallet(&wallet).await }
+    });
+    while histories() == read_before {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Read, and held back on its way: the payment lands after.
+    let payment = transaction(&[nowhere(1, 0)], &[(ADDRESS_SCRIPT, 7_000)]);
+    let paid = payment.compute_txid().to_string();
+    server.add_tx(&payment);
+    server.set_history(ADDRESS_SCRIPT, &[(payment.compute_txid(), 0)]);
+    let second = tokio::spawn({
+        let (manager, wallet) = (manager.clone(), wallet.clone());
+        async move { manager.sync_wallet(&wallet).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.add_permits(1_000);
+    let first = first.await.unwrap().unwrap();
+    assert!(first.new_txs.is_empty(), "it read before the payment");
+    let second = second.await.unwrap().unwrap();
+    let found: Vec<&str> = second.new_txs.iter().map(|tx| tx.txid.as_str()).collect();
+    assert_eq!(found, [paid.as_str()]);
+}
+
 /// A wallet removed takes its unclaimed news with it.
 #[tokio::test]
 async fn a_removed_wallet_leaves_no_news_behind() {

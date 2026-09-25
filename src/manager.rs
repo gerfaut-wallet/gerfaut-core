@@ -147,8 +147,8 @@ pub struct Shared {
     premium_public_key: std::sync::Mutex<Option<String>>,
 }
 
-/// The last sync of a wallet to finish and how far it read, behind the
-/// lock a sync of that wallet holds while it runs.
+/// The last sync of a wallet to finish, when it started and how far it
+/// read, behind the lock a sync of that wallet holds while it runs.
 type SyncSlot = std::sync::Arc<Mutex<Option<(Instant, SyncReport, Reach)>>>;
 
 /// How long routine syncs may go on reading only the counters of the
@@ -932,12 +932,15 @@ impl WalletManager {
 
     /// One sync of a wallet at a time, whoever asks: the app, a
     /// background job, the live watch. A caller that arrives while one
-    /// runs waits for it, and takes its result instead of asking the
-    /// backend the same question again when that sync read at least as
-    /// much as it would have, with nothing listed as new: the lists went
-    /// to the caller that ran it. What that sync found worth announcing
-    /// is in the vault for whoever claims it
-    /// ([`Self::claim_announcements`]), so neither caller can lose it.
+    /// runs waits for it, then runs its own: that sync may have read the
+    /// wallet before what the caller came for happened, a payment the
+    /// watch just heard of. Callers that wait together share the one
+    /// sync that follows: each takes the result of a sync that started
+    /// after it arrived and read at least as much as it would have, with
+    /// nothing listed as new, the lists having gone to the caller that
+    /// ran it. What that sync found worth announcing is in the vault for
+    /// whoever claims it ([`Self::claim_announcements`]), so no caller
+    /// can lose it.
     ///
     /// `prefer` is a server to try first: the one the live watch listens
     /// to, for a sync it asked for. Returns the report and the server
@@ -954,8 +957,8 @@ impl WalletManager {
             Err(_) => SyncSlot::default(),
         };
         let mut last = slot.lock().await;
-        if let Some((finished, report, read)) = last.as_ref()
-            && *finished > arrived
+        if let Some((started, report, read)) = last.as_ref()
+            && *started > arrived
             && read.covers(&reach)
         {
             let report = SyncReport {
@@ -966,8 +969,9 @@ impl WalletManager {
             };
             return Ok((report, None));
         }
+        let started = Instant::now();
         let (report, read, answered) = self.sync_wallet_alone(id, reach, prefer).await?;
-        *last = Some((Instant::now(), report.clone(), read));
+        *last = Some((started, report.clone(), read));
         drop(last);
         // The scripts this sync revealed, and whether something is
         // still waiting for a block.
