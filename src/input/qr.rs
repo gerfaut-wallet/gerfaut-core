@@ -122,8 +122,26 @@ fn ur_header(frame: &str) -> CoreResult<(String, Option<u32>)> {
     Ok((ur_type.to_owned(), total))
 }
 
+/// Most parts a multi-part UR may announce: a 4 MB message in the
+/// smallest fragments any encoder uses, far past anything a wallet
+/// shows as a QR code. The decoder sizes its tables by the announced
+/// count before a single fragment is checked, and a count near four
+/// billion, in one frame anyone can print, asks for tens of gigabytes:
+/// the process dies there, beyond the reach of any error.
+const MAX_UR_PARTS: u32 = 100_000;
+
+/// True when a multi-part frame announces a count the decoder can take.
+fn ur_part_count_is_sane(frame: &str) -> bool {
+    matches!(ur_header(frame), Ok((_, Some(total))) if (1..=MAX_UR_PARTS).contains(&total))
+}
+
 fn assemble_ur(frames: &[&str]) -> CoreResult<QrProgress> {
     let (ur_type, total) = ur_header(frames[0])?;
+    if total.is_some() && !ur_part_count_is_sane(frames[0]) {
+        return Err(qr_error(
+            "this QR code announces an impossible number of parts",
+        ));
+    }
     let progress =
         |received: u32, total: u32, message: Option<Vec<u8>>| -> CoreResult<QrProgress> {
             let text = message
@@ -147,7 +165,11 @@ fn assemble_ur(frames: &[&str]) -> CoreResult<QrProgress> {
     let mut decoder = ur::ur::Decoder::default();
     for frame in frames {
         // Frames of another type or a damaged one do not abort the scan:
-        // the camera will see them again.
+        // the camera will see them again. One announcing an impossible
+        // count never reaches the decoder.
+        if !ur_part_count_is_sane(frame) {
+            continue;
+        }
         let _ = decoder.receive(frame);
         if decoder.complete() {
             break;
@@ -758,6 +780,47 @@ mod tests {
             let progress = assemble(&frames).unwrap();
             if progress.complete {
                 assert!(progress.text.unwrap().starts_with("wpkh([9a6a2580"));
+                return;
+            }
+        }
+        panic!("the fountain never completed");
+    }
+
+    /// One multi-part frame announcing about four billion parts, as its
+    /// header and its fountain part both say.
+    fn frame_announcing_billions(ur_type: &str) -> String {
+        let part = Value::Array(vec![
+            Value::Integer(4_294_967_295u32.into()),
+            Value::Integer(4_294_967_294u32.into()),
+            Value::Integer(1.into()),
+            Value::Integer(0.into()),
+            Value::Bytes(vec![0]),
+        ]);
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&part, &mut cbor).unwrap();
+        let words = ur::bytewords::encode(&cbor, ur::bytewords::Style::Minimal);
+        format!("ur:{ur_type}/4294967295-4294967294/{words}")
+    }
+
+    /// Such a frame is refused before the decoder sizes anything by it,
+    /// alone or among the frames of an honest scan.
+    #[test]
+    fn a_ur_announcing_billions_of_parts_is_refused() {
+        let hostile = frame_announcing_billions("bytes");
+        assert!(matches!(
+            assemble(std::slice::from_ref(&hostile)),
+            Err(CoreError::InvalidInput { kind: "qr", .. })
+        ));
+        assert!(crate::input::parse_input(&hostile).is_err());
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&tag(TAG_WPKH, hdkey(None)), &mut bytes).unwrap();
+        let mut encoder = ur::ur::Encoder::new(&bytes, 40, "crypto-output").unwrap();
+        let hostile = frame_announcing_billions("crypto-output");
+        let mut frames = vec![encoder.next_part().unwrap(), hostile];
+        for _ in 0..40 {
+            frames.push(encoder.next_part().unwrap());
+            if assemble(&frames).unwrap().complete {
                 return;
             }
         }

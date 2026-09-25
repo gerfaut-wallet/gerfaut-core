@@ -186,3 +186,6 @@ The first release: the library both Gerfaut apps are built on.
   parsed input the app handed back altered, went straight to the wallet
   engine, which took the key and stored it in the vault. Every wallet is
   now checked again as it is created.
+- A multi-part UR that announces more than 100,000 parts is refused. One
+  frame announcing about four billion, pasted or scanned, made the decoder
+  ask for tens of gigabytes and ended the app on the spot.
