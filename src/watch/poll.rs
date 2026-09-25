@@ -31,16 +31,8 @@ const FAILED_ROUNDS: u32 = 3;
 const ROUND_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// The counters of a script: transactions in the chain and in the
-/// mempool, and the sums they moved. Any difference is a change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Fingerprint {
-    chain_txs: u64,
-    chain_funded: u64,
-    chain_spent: u64,
-    mempool_txs: u64,
-    mempool_funded: u64,
-    mempool_spent: u64,
-}
+/// mempool, and the coins they moved. Any difference is a change.
+pub(crate) type Fingerprint = crate::chain::esplora::Counts;
 
 /// Picks the scripts of each round and looks them up.
 pub(super) struct Poller {
@@ -98,17 +90,7 @@ impl Plan {
                     .get_scripthash_stats(script)
                     .await
                     .map_err(|e| self.client.describe(&e))?;
-                found.push((
-                    hex.clone(),
-                    Fingerprint {
-                        chain_txs: u64::from(stats.chain_stats.tx_count),
-                        chain_funded: stats.chain_stats.funded_txo_sum,
-                        chain_spent: stats.chain_stats.spent_txo_sum,
-                        mempool_txs: u64::from(stats.mempool_stats.tx_count),
-                        mempool_funded: stats.mempool_stats.funded_txo_sum,
-                        mempool_spent: stats.mempool_stats.spent_txo_sum,
-                    },
-                ));
+                found.push((hex.clone(), Fingerprint::of(&stats)));
             }
             Ok(found)
         };

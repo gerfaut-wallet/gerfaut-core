@@ -8,12 +8,13 @@ pub(crate) mod tls;
 pub mod tor;
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
-use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
+use bdk_wallet::chain::{CheckPoint, ConfirmationBlockTime};
 use serde::{Deserialize, Serialize};
 use url::{Host, ParseError, Url};
 
@@ -297,58 +298,98 @@ async fn within<T>(
         .unwrap_or_else(|_| Err(format!("no answer within {} s", deadline.as_secs())))
 }
 
-/// A prepared sync request for a descriptor wallet.
-pub(crate) enum EngineRequest {
-    Full(FullScanRequest<KeychainKind>),
-    /// The scripts the wallet revealed, and a full scan of its receive
-    /// addresses from the first one it has not: where a payment to an
-    /// address it never showed lands, one another app or the signing
-    /// device handed out. That scan stops, as a full scan does, once
-    /// the gap limit of addresses in a row shows nothing.
-    Incremental(
-        SyncRequest<(KeychainKind, u32)>,
-        FullScanRequest<KeychainKind>,
-    ),
+/// What a sync of a descriptor wallet reads, and what the wallet
+/// already holds: built under the lock of the vault, consumed by one
+/// attempt against one endpoint.
+pub(crate) struct Plan {
+    /// The wallet's chain, which the answer extends.
+    pub tip: CheckPoint,
+    /// The time a transaction seen in the mempool is stamped with.
+    pub start_time: u64,
+    /// Scripts whose history is read.
+    pub scripts: Vec<ScriptBuf>,
+    /// Keychains walked past what the wallet knows, each until
+    /// `stop_gap` scripts in a row show nothing.
+    pub scans: Vec<Scan>,
+    pub stop_gap: u32,
+    /// How an Esplora server is read. Electrum is always read the same
+    /// way: a history is a list of txids, cheaper than any check.
+    pub reading: Reading,
+    pub held: Held,
 }
 
-/// The matching response, to apply back onto the wallet.
-pub(crate) enum EngineResponse {
-    Full(FullScanResponse<KeychainKind>),
-    Incremental(SyncResponse, FullScanResponse<KeychainKind>),
+/// The scripts of one keychain, from the first one to read on.
+pub(crate) struct Scan {
+    pub keychain: KeychainKind,
+    pub spks: Box<dyn Iterator<Item = (u32, ScriptBuf)> + Send>,
 }
 
-impl EngineResponse {
-    /// Refuses a response that holds an amount no transaction can
-    /// carry: an output, or the outputs of one transaction together,
-    /// above the 21 million bitcoin there will ever be. Nothing in a
-    /// block can, but an unconfirmed transaction is only the server's
-    /// word, and the wallet engine adds amounts up with a panic on
-    /// overflow: once stored, such a transaction brought down every
-    /// later look at the wallet.
-    pub(crate) fn check_amounts(&self) -> Result<(), String> {
-        let updates = match self {
-            EngineResponse::Full(full) => vec![&full.tx_update],
-            EngineResponse::Incremental(sync, tail) => vec![&sync.tx_update, &tail.tx_update],
-        };
-        let refused = || "the server sent a transaction worth more than every bitcoin".to_owned();
-        for update in updates {
-            for tx in &update.txs {
-                tx.output
-                    .iter()
-                    .try_fold(0u64, |sum, out| sum.checked_add(out.value.to_sat()))
-                    .filter(|&total| total <= bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat())
-                    .ok_or_else(refused)?;
-            }
-            if update
-                .txouts
-                .values()
-                .any(|out| out.value > bdk_wallet::bitcoin::Amount::MAX_MONEY)
-            {
-                return Err(refused());
-            }
-        }
-        Ok(())
+/// How much of each script an Esplora server is asked for. Either way
+/// its counters come first, and its history is read, down to what the
+/// wallet holds, only when they differ from what the wallet holds or a
+/// reorganisation moved one of its confirmations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reading {
+    /// And the unconfirmed transactions of a script that has some are
+    /// listed whatever its counters say: a replacement that pays the
+    /// same amount to the same script leaves them as they were.
+    Complete,
+    /// The counters alone.
+    Checked,
+}
+
+/// What the wallet already holds, so that a sync asks the server only
+/// for what it lacks: no transaction twice, no proof of a confirmation
+/// already proven.
+#[derive(Debug, Default)]
+pub(crate) struct Held {
+    /// Every transaction of the wallet's graph.
+    pub txs: HashMap<Txid, Arc<Transaction>>,
+    /// Where each transaction confirmed in the wallet's best chain sits.
+    pub anchors: HashMap<Txid, ConfirmationBlockTime>,
+    /// Outputs the graph holds without their transaction: the coins the
+    /// wallet's transactions spend from others, fetched once for the fee.
+    pub txouts: HashSet<OutPoint>,
+    /// What the wallet holds for each script of the plan.
+    pub scripts: HashMap<ScriptBuf, ScriptFacts>,
+}
+
+/// What the wallet holds for one script.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ScriptFacts {
+    /// Every transaction of the wallet's view that touches it: a server
+    /// that no longer lists one of them saw it leave the mempool.
+    pub expected: HashSet<Txid>,
+    /// Those among them confirmed in the wallet's best chain.
+    pub confirmed: HashSet<Txid>,
+    /// Its counters, as an Esplora server keeps them.
+    pub counts: esplora::Counts,
+}
+
+/// Refuses an update that holds an amount no transaction can carry: an
+/// output, or the outputs of one transaction together, above the 21
+/// million bitcoin there will ever be. Nothing in a block can, but an
+/// unconfirmed transaction is only the server's word, and the wallet
+/// engine adds amounts up with a panic on overflow: once stored, such a
+/// transaction brought down every later look at the wallet.
+pub(crate) fn check_amounts(update: &bdk_wallet::Update) -> Result<(), String> {
+    let refused = || "the server sent a transaction worth more than every bitcoin".to_owned();
+    for tx in &update.tx_update.txs {
+        tx.output
+            .iter()
+            .try_fold(0u64, |sum, out| sum.checked_add(out.value.to_sat()))
+            .filter(|&total| total <= bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat())
+            .ok_or_else(refused)?;
     }
+    if update
+        .tx_update
+        .txouts
+        .values()
+        .any(|out| out.value > bdk_wallet::bitcoin::Amount::MAX_MONEY)
+    {
+        return Err(refused());
+    }
+    Ok(())
 }
 
 /// Runs one sync attempt against one endpoint, within the deadline of
@@ -360,37 +401,16 @@ impl EngineResponse {
 /// for this operation; `None` when no endpoint of the list is an onion.
 pub(crate) async fn sync_engine(
     endpoint: &Endpoint,
-    request: EngineRequest,
-    stop_gap: u32,
+    plan: Plan,
     proxy: Option<&str>,
-) -> Result<EngineResponse, String> {
+) -> Result<bdk_wallet::Update, String> {
     let deadline = scan_deadline(endpoint);
-    match (endpoint, request) {
-        (Endpoint::Esplora(url), EngineRequest::Full(request)) => {
+    match endpoint {
+        Endpoint::Esplora(url) => {
             let client = esplora::client(url, proxy)?;
-            within(deadline, esplora::full_scan(&client, request, stop_gap))
-                .await
-                .map(EngineResponse::Full)
+            within(deadline, esplora::sync::run(&client, plan)).await
         }
-        (Endpoint::Esplora(url), EngineRequest::Incremental(request, tail)) => {
-            let client = esplora::client(url, proxy)?;
-            within(deadline, async {
-                let synced = esplora::sync(&client, request).await?;
-                let tail = esplora::full_scan(&client, tail, stop_gap).await?;
-                Ok(EngineResponse::Incremental(synced, tail))
-            })
-            .await
-        }
-        (Endpoint::Electrum(target), EngineRequest::Full(request)) => {
-            electrum::full_scan(target, request, stop_gap, proxy, deadline)
-                .await
-                .map(EngineResponse::Full)
-        }
-        (Endpoint::Electrum(target), EngineRequest::Incremental(request, tail)) => {
-            electrum::sync(target, request, tail, stop_gap, proxy, deadline)
-                .await
-                .map(|(synced, tail)| EngineResponse::Incremental(synced, tail))
-        }
+        Endpoint::Electrum(target) => electrum::sync(target, plan, proxy, deadline).await,
     }
 }
 
@@ -924,9 +944,9 @@ mod tests {
             })
         };
         let full = |txs: Vec<Arc<Transaction>>, txouts: Vec<u64>| {
-            let mut response = FullScanResponse::<KeychainKind>::default();
-            response.tx_update.txs = txs;
-            response.tx_update.txouts = txouts
+            let mut update = bdk_wallet::Update::default();
+            update.tx_update.txs = txs;
+            update.tx_update.txouts = txouts
                 .into_iter()
                 .enumerate()
                 .map(|(vout, value)| {
@@ -939,28 +959,18 @@ mod tests {
                     )
                 })
                 .collect();
-            response
+            update
         };
         let max = Amount::MAX_MONEY.to_sat();
         use bdk_wallet::bitcoin::hashes::Hash;
 
-        assert!(
-            EngineResponse::Full(full(vec![tx(&[max])], vec![max]))
-                .check_amounts()
-                .is_ok()
-        );
-        for response in [
+        assert!(check_amounts(&full(vec![tx(&[max])], vec![max])).is_ok());
+        for update in [
             full(vec![tx(&[1 << 63, 1 << 63])], Vec::new()),
             full(vec![tx(&[max, 1])], Vec::new()),
             full(Vec::new(), vec![max + 1]),
         ] {
-            assert!(EngineResponse::Full(response).check_amounts().is_err());
-            let tail = full(vec![tx(&[max, max])], Vec::new());
-            assert!(
-                EngineResponse::Incremental(SyncResponse::default(), tail)
-                    .check_amounts()
-                    .is_err()
-            );
+            assert!(check_amounts(&update).is_err());
         }
     }
 

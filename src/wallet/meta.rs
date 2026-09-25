@@ -106,6 +106,12 @@ pub struct WalletMeta {
     pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub last_sync: Option<SyncStamp>,
+    /// When a sync last read every script of the wallet, Unix seconds:
+    /// a full scan, or a sync that read each revealed script down to
+    /// what the wallet holds. The syncs in between may read only the
+    /// scripts whose counters moved; one a day reads them all again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete_at: Option<u64>,
     #[serde(default)]
     pub cached: CachedTotals,
 }

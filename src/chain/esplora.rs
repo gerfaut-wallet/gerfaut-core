@@ -3,20 +3,26 @@
 use std::ops::Deref;
 use std::time::Duration;
 
-use bdk_esplora::EsploraAsyncExt;
 use bdk_esplora::esplora_client::{self, AsyncClient};
-use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::address::Address;
-use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
 
 use bdk_wallet::bitcoin::{Amount, OutPoint, Transaction, TxOut, Txid};
+
+pub(crate) mod sync;
 
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
 use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
 
 /// Concurrent requests during scans.
-const PARALLEL_REQUESTS: usize = 4;
+pub(crate) const PARALLEL_REQUESTS: usize = 4;
+/// The largest answer read, once decompressed: a page of the biggest
+/// transactions there are, with room to spare. A server that sends more
+/// is not answering the question, and is cut off rather than buffered.
+const MAX_BODY: usize = 32 << 20;
+/// Tries of a request a server turned away for being busy: a public
+/// instance answers a burst with 429, and a moment later with the data.
+const TRIES: u32 = 4;
 /// Address history pages fetched per request round (25 confirmed txs
 /// each). A sync stays fast; anything older is fetched on demand by
 /// [`fetch_address_history`], so nothing stays out of reach.
@@ -69,6 +75,95 @@ impl Client {
     pub(crate) fn describe(&self, error: &esplora_client::Error) -> String {
         describe(error, self.budget)
     }
+
+    /// The body of `path` under the instance's address, decompressed and
+    /// held to [`MAX_BODY`]. A busy server is asked again a few times,
+    /// a little later each time.
+    pub(crate) async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        let url = format!("{}{path}", self.inner.url());
+        let mut wait = Duration::from_millis(250);
+        let mut tries = 1;
+        let mut response = loop {
+            let response = self
+                .inner
+                .client()
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| describe_request(&e, self.budget))?;
+            let status = response.status().as_u16();
+            if tries < TRIES && matches!(status, 429 | 500 | 502 | 503 | 504) {
+                tokio::time::sleep(wait).await;
+                wait *= 2;
+                tries += 1;
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(describe_status(status));
+            }
+            break response;
+        };
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| describe_request(&e, self.budget))?
+        {
+            if body.len() + chunk.len() > MAX_BODY {
+                return Err(format!(
+                    "the server sent an answer longer than {} MiB",
+                    MAX_BODY >> 20
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    /// The same, read as JSON.
+    pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, String> {
+        let body = self.get_bytes(path).await?;
+        serde_json::from_slice(&body).map_err(|_| "unexpected response".to_owned())
+    }
+}
+
+/// The counters an Esplora server keeps for a script, confirmed and
+/// unconfirmed apart: how many transactions touch it, and the coins they
+/// paid to it and spent from it. A transaction that arrives, leaves the
+/// mempool or confirms moves them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Counts {
+    pub chain: Tally,
+    pub mempool: Tally,
+}
+
+/// One side of [`Counts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Tally {
+    pub txs: u64,
+    pub funded: u64,
+    pub funded_sats: u64,
+    pub spent: u64,
+    pub spent_sats: u64,
+}
+
+impl Counts {
+    pub(crate) fn of(stats: &esplora_client::api::ScriptHashStats) -> Self {
+        let tally = |side: &esplora_client::api::ScriptHashTxsSummary| Tally {
+            txs: u64::from(side.tx_count),
+            funded: u64::from(side.funded_txo_count),
+            funded_sats: side.funded_txo_sum,
+            spent: u64::from(side.spent_txo_count),
+            spent_sats: side.spent_txo_sum,
+        };
+        Counts {
+            chain: tally(&stats.chain_stats),
+            mempool: tally(&stats.mempool_stats),
+        }
+    }
 }
 
 /// A client for one instance. `proxy` is the Tor SOCKS proxy the caller
@@ -111,29 +206,6 @@ fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, Strin
         inner: AsyncClient::from_client(url.to_owned(), http),
         budget,
     })
-}
-
-pub(crate) async fn full_scan(
-    client: &Client,
-    request: FullScanRequest<KeychainKind>,
-    stop_gap: u32,
-) -> Result<FullScanResponse<KeychainKind>, String> {
-    client
-        .inner
-        .full_scan(request, stop_gap as usize, PARALLEL_REQUESTS)
-        .await
-        .map_err(|e| client.describe(&e))
-}
-
-pub(crate) async fn sync(
-    client: &Client,
-    request: SyncRequest<(KeychainKind, u32)>,
-) -> Result<SyncResponse, String> {
-    client
-        .inner
-        .sync(request, PARALLEL_REQUESTS)
-        .await
-        .map_err(|e| client.describe(&e))
 }
 
 // --- errors ---------------------------------------------------------------

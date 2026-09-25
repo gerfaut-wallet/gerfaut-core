@@ -487,6 +487,7 @@ mod tests {
             scan_gap: DEFAULT_GAP_LIMIT,
             labels: Default::default(),
             last_sync: None,
+            complete_at: None,
             cached: CachedTotals::default(),
         }
     }

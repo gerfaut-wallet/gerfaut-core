@@ -5,7 +5,6 @@ use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::address::Address;
 use bdk_wallet::bitcoin::{Script, Txid};
 use bdk_wallet::chain::ChainPosition;
-use bdk_wallet::chain::spk_client::FullScanRequest;
 
 use crate::error::{CoreError, CoreResult};
 use crate::live::news::{Moves, Seen};
@@ -229,28 +228,84 @@ pub(crate) fn watch_scripts(
     scripts
 }
 
-/// The full scan of the receive addresses the wallet has not revealed,
-/// from the next one on: what an incremental sync adds to its revealed
-/// scripts, so that a payment to an address the wallet never showed,
-/// one another app or the signing device handed out, is found by any
-/// sync and not only by a rescan. Run with the gap limit as its stop
-/// gap, it reads that many addresses when they are empty, and goes on
-/// past any that is not, the way a full scan does; what it finds is
-/// revealed when the response is applied. Change addresses are left
-/// out: the wallet makes those itself, and a spend that pays one is
-/// found through the coins it spends.
-pub(crate) fn receive_tail(wallet: &bdk_wallet::Wallet) -> FullScanRequest<KeychainKind> {
-    let next = wallet
-        .derivation_index(KeychainKind::External)
-        .map_or(0, |last| last.saturating_add(1));
-    let descriptor = wallet.public_descriptor(KeychainKind::External).clone();
-    FullScanRequest::builder()
-        .chain_tip(wallet.latest_checkpoint())
-        .spks_for_keychain(
-            KeychainKind::External,
-            bdk_wallet::chain::SpkIterator::new_with_range(descriptor, next..),
-        )
-        .build()
+/// What the wallet already holds, handed to a sync so that it asks the
+/// server only for what is missing, and what it holds for each of
+/// `scripts`: the transactions touching it, which of them confirmed, and
+/// the counters an Esplora server keeps for it.
+pub(crate) fn held(
+    wallet: &bdk_wallet::Wallet,
+    scripts: &[bdk_wallet::bitcoin::ScriptBuf],
+) -> crate::chain::Held {
+    use crate::chain::{Held, ScriptFacts};
+    let graph = wallet.tx_graph();
+    let mut held = Held {
+        txs: graph
+            .full_txs()
+            .map(|node| (node.txid, node.tx.clone()))
+            .collect(),
+        txouts: graph
+            .floating_txouts()
+            .map(|(outpoint, _)| outpoint)
+            .collect(),
+        ..Held::default()
+    };
+    let position: std::collections::HashMap<&Script, usize> = scripts
+        .iter()
+        .enumerate()
+        .map(|(index, script)| (script.as_script(), index))
+        .collect();
+    let mut facts = vec![ScriptFacts::default(); scripts.len()];
+    for wtx in wallet.transactions() {
+        let txid = wtx.tx_node.txid;
+        let confirmed = match wtx.chain_position {
+            ChainPosition::Confirmed {
+                anchor,
+                transitively: None,
+            } => {
+                held.anchors.insert(txid, anchor);
+                true
+            }
+            ChainPosition::Confirmed { .. } => true,
+            ChainPosition::Unconfirmed { .. } => false,
+        };
+        // What the transaction does to each script it touches: coins
+        // paid to it, and coins of it spent.
+        let mut touched: std::collections::BTreeMap<usize, crate::chain::esplora::Tally> =
+            Default::default();
+        for output in &wtx.tx_node.tx.output {
+            if let Some(&index) = position.get(output.script_pubkey.as_script()) {
+                let tally = touched.entry(index).or_default();
+                tally.funded += 1;
+                tally.funded_sats = tally.funded_sats.saturating_add(output.value.to_sat());
+            }
+        }
+        for input in &wtx.tx_node.tx.input {
+            if let Some(previous) = graph.get_txout(input.previous_output)
+                && let Some(&index) = position.get(previous.script_pubkey.as_script())
+            {
+                let tally = touched.entry(index).or_default();
+                tally.spent += 1;
+                tally.spent_sats = tally.spent_sats.saturating_add(previous.value.to_sat());
+            }
+        }
+        for (index, tally) in touched {
+            let facts = &mut facts[index];
+            facts.expected.insert(txid);
+            let side = if confirmed {
+                facts.confirmed.insert(txid);
+                &mut facts.counts.chain
+            } else {
+                &mut facts.counts.mempool
+            };
+            side.txs += 1;
+            side.funded += tally.funded;
+            side.funded_sats = side.funded_sats.saturating_add(tally.funded_sats);
+            side.spent += tally.spent;
+            side.spent_sats = side.spent_sats.saturating_add(tally.spent_sats);
+        }
+    }
+    held.scripts = scripts.iter().cloned().zip(facts).collect();
+    held
 }
 
 /// Whether the wallet holds a transaction still waiting for a block.

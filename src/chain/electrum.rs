@@ -24,21 +24,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bdk_electrum::BdkElectrumClient;
 use bdk_electrum::electrum_client::raw_client::RawClient;
 use bdk_electrum::electrum_client::socks::Socks5Stream;
 use bdk_electrum::electrum_client::{self, ElectrumApi, Param};
-use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
-use bdk_wallet::chain::spk_client::{FullScanRequest, FullScanResponse, SyncRequest, SyncResponse};
 
 use super::tls::{self, ConnectError, Verdict};
 
 pub(crate) mod address;
 pub(crate) mod rpc;
+pub(crate) mod sync;
 
-/// Requests per Electrum batch call.
-const BATCH_SIZE: usize = 10;
 /// Socket timeout, each read and each write. Without it a stalled
 /// server holds a call until its deadline.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(20);
@@ -420,9 +416,6 @@ fn negotiate(raw: &Connection, timeout: Duration) -> Result<(), ConnectError> {
     .map_err(|e| ConnectError::Io(describe(&e, timeout)))
 }
 
-/// A connected client, as BDK drives it.
-type Client = BdkElectrumClient<Connection>;
-
 /// Runs `operation` against `target` on a thread of its own, and waits
 /// for it at most `deadline`. Past it, or as soon as the future is
 /// dropped, the connection is shut down: the thread's next read fails
@@ -431,7 +424,7 @@ async fn run<T: Send + 'static>(
     target: &Target,
     proxy: Option<&str>,
     deadline: Duration,
-    operation: impl FnOnce(&Client) -> Result<T, String> + Send + 'static,
+    operation: impl FnOnce(&Connection) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     let cancel = Arc::new(Cancel::default());
     let _abort = AbortOnDrop(cancel.clone());
@@ -443,7 +436,7 @@ async fn run<T: Send + 'static>(
         .spawn(move || {
             let result = connect(&target, proxy.as_deref(), &cancel)
                 .map_err(|e| e.to_string())
-                .and_then(|raw| operation(&BdkElectrumClient::new(raw)));
+                .and_then(|raw| operation(&raw));
             let _ = done.send(result);
         })
         .map_err(|e| format!("could not start the connection: {e}"))?;
@@ -496,43 +489,17 @@ pub(crate) async fn inspect(target: &Target) -> Result<Inspection, String> {
     }
 }
 
-/// A full scan, within `deadline`.
-pub(crate) async fn full_scan(
-    target: &Target,
-    request: FullScanRequest<KeychainKind>,
-    stop_gap: u32,
-    proxy: Option<&str>,
-    deadline: Duration,
-) -> Result<FullScanResponse<KeychainKind>, String> {
-    let fail = failed(target);
-    run(target, proxy, deadline, move |client| {
-        client
-            .full_scan(request, stop_gap as usize, BATCH_SIZE, true)
-            .map_err(fail)
-    })
-    .await
-}
-
-/// A sync of the revealed scripts, then the full scan of `tail`, the
-/// receive addresses past them, with `stop_gap`: both on one
-/// connection, within `deadline`. The scan asks for the histories of
-/// its addresses [`BATCH_SIZE`] at a time, two round trips for a gap
-/// limit of 20 when they are empty, plus the tip and the latest headers.
+/// Runs a sync plan on one connection, within `deadline`. What is
+/// asked for, and what is not, is written in the `sync` module.
 pub(crate) async fn sync(
     target: &Target,
-    request: SyncRequest<(KeychainKind, u32)>,
-    tail: FullScanRequest<KeychainKind>,
-    stop_gap: u32,
+    plan: super::Plan,
     proxy: Option<&str>,
     deadline: Duration,
-) -> Result<(SyncResponse, FullScanResponse<KeychainKind>), String> {
+) -> Result<bdk_wallet::Update, String> {
     let fail = failed(target);
     run(target, proxy, deadline, move |client| {
-        let synced = client.sync(request, BATCH_SIZE, true).map_err(&fail)?;
-        let tail = client
-            .full_scan(tail, stop_gap as usize, BATCH_SIZE, true)
-            .map_err(&fail)?;
-        Ok((synced, tail))
+        sync::run(client, plan).map_err(fail)
     })
     .await
 }
@@ -638,7 +605,6 @@ pub(crate) async fn broadcast(
     let timeout = timeout_for(target);
     run(target, proxy, call_deadline(target), move |client| {
         client
-            .inner
             .transaction_broadcast(&tx)
             .map_err(|e| broadcast_error(timeout, &e))
     })
@@ -676,7 +642,7 @@ pub(crate) async fn fetch_prevout(
         target,
         proxy,
         call_deadline(target),
-        move |client| match client.inner.transaction_get(&outpoint.txid) {
+        move |client| match client.transaction_get(&outpoint.txid) {
             Ok(tx) => crate::chain::output_at(&tx, outpoint),
             Err(electrum_client::Error::Protocol(_)) => Ok(None),
             Err(error) => Err(fail(error)),
@@ -696,12 +662,8 @@ pub(crate) async fn tx_standing(
 ) -> Result<(bool, Option<u32>, u32), String> {
     let fail = failed(target);
     run(target, proxy, call_deadline(target), move |client| {
-        let tip = client
-            .inner
-            .block_headers_subscribe()
-            .map_err(&fail)?
-            .height as u32;
-        let history = client.inner.script_get_history(&script).map_err(&fail)?;
+        let tip = client.block_headers_subscribe().map_err(&fail)?.height as u32;
+        let history = client.script_get_history(&script).map_err(&fail)?;
         let entry = history.iter().find(|entry| entry.tx_hash == txid);
         Ok(match entry {
             None => (false, None, tip),
@@ -783,10 +745,7 @@ mod tests {
         let deadline = Duration::from_secs(2);
         let started = Instant::now();
         let outcome = run(&Target::new(url, None), None, deadline, |client| {
-            client
-                .inner
-                .block_headers_subscribe()
-                .map_err(|e| e.to_string())
+            client.block_headers_subscribe().map_err(|e| e.to_string())
         })
         .await;
         assert_eq!(outcome.err().as_deref(), Some("no answer within 2 s"));
@@ -861,12 +820,7 @@ mod tests {
                 &Target::new(url, None),
                 None,
                 Duration::from_secs(3600),
-                |client| {
-                    client
-                        .inner
-                        .block_headers_subscribe()
-                        .map_err(|e| e.to_string())
-                },
+                |client| client.block_headers_subscribe().map_err(|e| e.to_string()),
             )
             .await;
         });
@@ -887,7 +841,7 @@ mod tests {
         let server = crate::testkit::FakeElectrum::start().await;
         let target = Target::new(format!("tcp://{}", server.address), None);
         run(&target, None, Duration::from_secs(10), |client| {
-            client.inner.ping().map_err(|e| e.to_string())
+            client.ping().map_err(|e| e.to_string())
         })
         .await
         .unwrap();
@@ -915,7 +869,7 @@ mod tests {
         let target = Target::new(format!("tcp://{ONION}:50001"), None);
         let proxy = format!("user:pass@{address}");
         run(&target, Some(&proxy), Duration::from_secs(10), |client| {
-            client.inner.ping().map_err(|e| e.to_string())
+            client.ping().map_err(|e| e.to_string())
         })
         .await
         .unwrap();

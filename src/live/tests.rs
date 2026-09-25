@@ -451,6 +451,14 @@ async fn a_payment_to_an_address_the_wallet_never_showed_is_announced() {
         .count();
     println!("a sync with nothing new asked {asked:?}");
     assert_eq!(histories, 13 + 20);
+    // And nothing the wallet holds: no transaction, no proof of a
+    // confirmation it has proven already.
+    assert!(
+        !asked
+            .iter()
+            .any(|method| method.starts_with("blockchain.transaction.")),
+        "{asked:?}"
+    );
 }
 
 // --- how soon ---------------------------------------------------------------------
