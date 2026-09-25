@@ -454,6 +454,32 @@ pub(crate) fn held(
     held
 }
 
+/// The scripts of the transactions still waiting for a block: those
+/// they pay the wallet on, and those of the wallet's coins they spend.
+/// A block that confirms them moves these and no other.
+pub(crate) fn pending_scripts(wallet: &bdk_wallet::Wallet) -> Vec<bdk_wallet::bitcoin::ScriptBuf> {
+    let graph = wallet.tx_graph();
+    let mut scripts = std::collections::BTreeSet::new();
+    for wtx in wallet
+        .transactions()
+        .filter(|wtx| !wtx.chain_position.is_confirmed())
+    {
+        for output in &wtx.tx_node.tx.output {
+            if wallet.is_mine(output.script_pubkey.clone()) {
+                scripts.insert(output.script_pubkey.clone());
+            }
+        }
+        for input in &wtx.tx_node.tx.input {
+            if let Some(previous) = graph.get_txout(input.previous_output)
+                && wallet.is_mine(previous.script_pubkey.clone())
+            {
+                scripts.insert(previous.script_pubkey.clone());
+            }
+        }
+    }
+    scripts.into_iter().collect()
+}
+
 /// Whether the wallet holds a transaction still waiting for a block.
 pub(crate) fn has_pending(wallet: &bdk_wallet::Wallet) -> bool {
     wallet

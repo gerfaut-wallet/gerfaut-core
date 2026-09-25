@@ -440,12 +440,19 @@ async fn a_payment_to_an_address_the_wallet_never_showed_is_announced() {
     );
 
     let unseen = pay(&server, 2, &receive_script(6), 20_000, 0);
+    let asked_before = server.state.lock().unwrap().asked.len();
     let mut events = manager.live_start_with(Some(timings())).await.unwrap();
     assert_eq!(
         staged(&caught_up(&mut events, &wallet).await),
         [(unseen.clone(), TxStage::Mempool)]
     );
     manager.live_stop().await;
+    // The watch saw that one script move, and the sync it ran read that
+    // one: its history, the payment, and the coin it spends, for the fee.
+    let asked: Vec<String> = server.state.lock().unwrap().asked[asked_before..].to_vec();
+    let count = |method: &str| asked.iter().filter(|asked| *asked == method).count();
+    assert_eq!(count("blockchain.scripthash.get_history"), 1, "{asked:?}");
+    assert_eq!(count("blockchain.transaction.get"), 2, "{asked:?}");
 
     // A new block takes it.
     server.state.lock().unwrap().height = 101;
@@ -580,14 +587,8 @@ fn a_change_no_sync_finds_is_heard_less_and_less_often() {
         hold_cap: second * 5,
         ..timings()
     };
-    let pushed = Asked {
-        reason: ChangeReason::Activity,
-        rescan: false,
-    };
-    let block = Asked {
-        reason: ChangeReason::NewBlock,
-        rescan: false,
-    };
+    let pushed = &Asked::of(ChangeReason::Activity, Vec::new());
+    let block = &Asked::of(ChangeReason::NewBlock, Vec::new());
     let mut futile = Futile::default();
     for _ in 0..FREE_FUTILE {
         assert_eq!(futile.hold("w", pushed, &pace), Duration::ZERO);

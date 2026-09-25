@@ -160,6 +160,10 @@ const COMPLETE_EVERY_SECS: u64 = 24 * 60 * 60;
 /// How much of a descriptor wallet a sync reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Reach {
+    /// These scripts only: the ones the live watch saw move.
+    Scripts(Vec<bdk_wallet::bitcoin::ScriptBuf>),
+    /// The scripts of the transactions waiting for a block.
+    Pending,
     /// Every revealed script, and the receive addresses past them; an
     /// Esplora server is asked for the history only of the scripts
     /// whose counters moved.
@@ -175,6 +179,7 @@ pub(crate) enum Reach {
 impl Reach {
     fn rank(&self) -> u8 {
         match self {
+            Reach::Scripts(_) | Reach::Pending => 0,
             Reach::Checked => 1,
             Reach::Complete => 2,
             Reach::Full => 3,
@@ -184,15 +189,38 @@ impl Reach {
     /// Whether a sync that read this far read everything `asked` would
     /// have.
     fn covers(&self, asked: &Reach) -> bool {
-        self.rank() >= asked.rank()
+        match (self, asked) {
+            (Reach::Scripts(read), Reach::Scripts(wanted)) => {
+                wanted.iter().all(|script| read.contains(script))
+            }
+            (Reach::Scripts(_) | Reach::Pending, _) => false,
+            (_, Reach::Scripts(_) | Reach::Pending) => true,
+            _ => self.rank() >= asked.rank(),
+        }
     }
 }
 
-/// The plan of a sync that reads `reach` of a wallet.
-fn plan_for(engine: &bdk_wallet::Wallet, reach: &Reach, gap_limit: u32) -> chain::Plan {
+/// The plan of a sync that reads `reach` of a wallet, and the reach it
+/// comes to: scripts the wallet does not know, past what its index looks
+/// ahead, are only found by a full scan, and a wallet waiting on no
+/// block has nothing pending to read.
+fn plan_for(engine: &bdk_wallet::Wallet, reach: &Reach, gap_limit: u32) -> (chain::Plan, Reach) {
     use bdk_wallet::KeychainKind;
     use bdk_wallet::chain::SpkIterator;
-    let reach = reach.clone();
+    let reach = match reach {
+        Reach::Scripts(scripts)
+            if scripts
+                .iter()
+                .any(|script| engine.spk_index().index_of_spk(script.clone()).is_none()) =>
+        {
+            Reach::Full
+        }
+        Reach::Pending => match views::pending_scripts(engine) {
+            scripts if scripts.is_empty() => Reach::Checked,
+            scripts => Reach::Scripts(scripts),
+        },
+        other => other.clone(),
+    };
     let revealed = || -> Vec<bdk_wallet::bitcoin::ScriptBuf> {
         engine
             .spk_index()
@@ -211,7 +239,8 @@ fn plan_for(engine: &bdk_wallet::Wallet, reach: &Reach, gap_limit: u32) -> chain
                 .collect();
             (Vec::new(), scans, chain::Reading::Complete)
         }
-        Reach::Checked | Reach::Complete => {
+        Reach::Scripts(scripts) => (scripts.clone(), Vec::new(), chain::Reading::Complete),
+        Reach::Checked | Reach::Complete | Reach::Pending => {
             // The receive addresses past the last revealed one: where a
             // payment to an address the wallet never showed lands, one
             // another app or the signing device handed out.
@@ -240,7 +269,7 @@ fn plan_for(engine: &bdk_wallet::Wallet, reach: &Reach, gap_limit: u32) -> chain
     } else {
         views::held(engine, &scripts)
     };
-    chain::Plan {
+    let plan = chain::Plan {
         tip: engine.latest_checkpoint(),
         start_time: now_secs(),
         scripts,
@@ -248,7 +277,8 @@ fn plan_for(engine: &bdk_wallet::Wallet, reach: &Reach, gap_limit: u32) -> chain
         stop_gap: gap_limit,
         reading,
         held,
-    }
+    };
+    (plan, reach)
 }
 
 impl std::ops::Deref for WalletManager {
@@ -857,7 +887,9 @@ impl WalletManager {
     /// were.
     pub async fn sync_wallet(&self, id: &str) -> CoreResult<SyncReport> {
         let reach = self.routine_reach(id).await;
-        self.sync_wallet_with(id, reach).await
+        self.sync_wallet_read(id, reach, None)
+            .await
+            .map(|(report, _)| report)
     }
 
     /// Scans a wallet again from its first address with the current gap
@@ -866,7 +898,9 @@ impl WalletManager {
     /// them, or a descriptor also used elsewhere, are only found by
     /// starting over. A watched address has no gap: this is a sync.
     pub async fn rescan_wallet(&self, id: &str) -> CoreResult<SyncReport> {
-        self.sync_wallet_with(id, Reach::Full).await
+        self.sync_wallet_read(id, Reach::Full, None)
+            .await
+            .map(|(report, _)| report)
     }
 
     /// How far a sync the app asks for reads: see [`Self::sync_wallet`].
@@ -896,7 +930,16 @@ impl WalletManager {
     /// to the caller that ran it. What that sync found worth announcing
     /// is in the vault for whoever claims it
     /// ([`Self::claim_announcements`]), so neither caller can lose it.
-    async fn sync_wallet_with(&self, id: &str, reach: Reach) -> CoreResult<SyncReport> {
+    ///
+    /// `prefer` is a server to try first: the one the live watch listens
+    /// to, for a sync it asked for. Returns the report and the server
+    /// that answered; none when the report is another caller's.
+    pub(crate) async fn sync_wallet_read(
+        &self,
+        id: &str,
+        reach: Reach,
+        prefer: Option<Endpoint>,
+    ) -> CoreResult<(SyncReport, Option<Endpoint>)> {
         let arrived = Instant::now();
         let slot = match self.syncing.lock() {
             Ok(mut slots) => slots.entry(id.to_owned()).or_default().clone(),
@@ -907,23 +950,29 @@ impl WalletManager {
             && *finished > arrived
             && read.covers(&reach)
         {
-            return Ok(SyncReport {
+            let report = SyncReport {
                 new_tx_count: 0,
                 new_txs: Vec::new(),
                 confirmed_txs: Vec::new(),
                 ..report.clone()
-            });
+            };
+            return Ok((report, None));
         }
-        let (report, read) = self.sync_wallet_alone(id, reach).await?;
+        let (report, read, answered) = self.sync_wallet_alone(id, reach, prefer).await?;
         *last = Some((Instant::now(), report.clone(), read));
         drop(last);
         // The scripts this sync revealed, and whether something is
         // still waiting for a block.
         self.live_refresh().await;
-        Ok(report)
+        Ok((report, Some(answered)))
     }
 
-    async fn sync_wallet_alone(&self, id: &str, reach: Reach) -> CoreResult<(SyncReport, Reach)> {
+    async fn sync_wallet_alone(
+        &self,
+        id: &str,
+        reach: Reach,
+        prefer: Option<Endpoint>,
+    ) -> CoreResult<(SyncReport, Reach, Endpoint)> {
         let started = Instant::now();
 
         // Snapshot what the sync needs; do not hold the lock during I/O.
@@ -949,6 +998,12 @@ impl WalletManager {
             let preferred = endpoints.remove(position);
             endpoints.insert(0, preferred);
         }
+        // And before it, the server of the watch that asked for this
+        // sync: it told of the change, so it holds what changed.
+        if let Some(prefer) = prefer {
+            endpoints.retain(|endpoint| *endpoint != prefer);
+            endpoints.insert(0, prefer);
+        }
         let proxy = self.tor_proxy_for(&endpoints).await?;
 
         match &meta.kind {
@@ -959,7 +1014,7 @@ impl WalletManager {
             WalletKind::SingleAddress { address } => self
                 .sync_address_wallet(&meta, address, &endpoints, proxy.as_deref(), started)
                 .await
-                .map(|report| (report, Reach::Full)),
+                .map(|(report, answered)| (report, Reach::Full, answered)),
         }
     }
 
@@ -970,7 +1025,7 @@ impl WalletManager {
         proxy: Option<&str>,
         started: Instant,
         reach: Reach,
-    ) -> CoreResult<(SyncReport, Reach)> {
+    ) -> CoreResult<(SyncReport, Reach, Endpoint)> {
         // First sync, a gap limit raised since the last full scan, or a
         // rescan asked for: only a full scan looks past the addresses
         // already revealed.
@@ -984,11 +1039,11 @@ impl WalletManager {
         for endpoint in endpoints {
             // Build a fresh plan under the lock (a plan is consumed by
             // each attempt).
-            let (plan, known) = {
+            let (plan, known, reach) = {
                 let mut state = self.state.lock().await;
                 let engine = ensure_engine(&mut state, &meta.id)?;
-                let plan = plan_for(engine, &reach, meta.gap_limit);
-                (plan, views::known(engine))
+                let (plan, reach) = plan_for(engine, &reach, meta.gap_limit);
+                (plan, views::known(engine), reach)
             };
 
             let response = chain::sync_engine(endpoint, plan, proxy)
@@ -1048,7 +1103,7 @@ impl WalletManager {
                     if complete && let Ok(mut done) = self.complete_here.lock() {
                         done.insert(meta.id.clone());
                     }
-                    return Ok((report, reach));
+                    return Ok((report, reach, endpoint.clone()));
                 }
             }
         }
@@ -1063,7 +1118,7 @@ impl WalletManager {
         endpoints: &[Endpoint],
         proxy: Option<&str>,
         started: Instant,
-    ) -> CoreResult<SyncReport> {
+    ) -> CoreResult<(SyncReport, Endpoint)> {
         let mut attempts: Vec<String> = Vec::new();
         for endpoint in endpoints {
             match chain::fetch_address_state(endpoint, address, meta.network, proxy).await {
@@ -1108,7 +1163,7 @@ impl WalletManager {
                     };
                     find_record_mut(&mut state.payload, &meta.id)?.address_state = Some(watch);
                     finish_sync(&mut state, &meta.id, &report, tx_count_after, None, true)?;
-                    return Ok(report);
+                    return Ok((report, endpoint.clone()));
                 }
             }
         }

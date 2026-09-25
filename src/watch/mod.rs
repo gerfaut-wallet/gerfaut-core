@@ -299,6 +299,8 @@ enum Command {
 pub struct LiveWatch {
     commands: mpsc::UnboundedSender<Command>,
     status: watch::Receiver<WatchStatus>,
+    /// The server the open session talks to.
+    serving: watch::Receiver<Option<Endpoint>>,
     /// Set once to stop the watcher, whatever it is waiting on.
     halt: watch::Sender<bool>,
 }
@@ -344,7 +346,9 @@ impl LiveWatch {
         let (commands, command_rx) = mpsc::unbounded_channel();
         let (event_tx, events) = mpsc::channel(EVENT_QUEUE);
         let (status_tx, status) = watch::channel(WatchStatus::default());
+        let (serving_tx, serving) = watch::channel(None);
         let mut hub = Hub {
+            serving: serving_tx,
             config,
             timings,
             watched: Watched::default(),
@@ -368,6 +372,7 @@ impl LiveWatch {
             LiveWatch {
                 commands,
                 status,
+                serving,
                 halt,
             },
             WatchEvents { events },
@@ -402,6 +407,15 @@ impl LiveWatch {
             return WatchStatus::default();
         }
         self.status.borrow().clone()
+    }
+
+    /// The server the open session talks to, if one is open: it holds
+    /// whatever it said moved, so a sync that follows reads it there.
+    pub(crate) fn serving(&self) -> Option<Endpoint> {
+        if *self.halt.borrow() {
+            return None;
+        }
+        self.serving.borrow().clone()
     }
 
     /// Stops the watcher and closes its connection, at once: the task
@@ -679,6 +693,7 @@ pub(crate) struct Hub {
     commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::Sender<WatchEvent>,
     status: watch::Sender<WatchStatus>,
+    serving: watch::Sender<Option<Endpoint>>,
     debounce: Debouncer,
     tip: Option<u32>,
     /// Every wallet was reported once under this configuration, when
@@ -709,6 +724,16 @@ impl Hub {
         }
         let _ = self.status.send(next.clone());
         let _ = self.events.try_send(WatchEvent::Status(next));
+    }
+
+    /// Notes the server a session is open with, or that none is.
+    pub fn serve(&mut self, endpoint: Option<&Endpoint>) {
+        let endpoint = endpoint.cloned();
+        self.serving.send_if_modified(|serving| {
+            let changed = *serving != endpoint;
+            *serving = endpoint;
+            changed
+        });
     }
 
     /// A script moved: its wallets are reported once the burst settles,
@@ -1014,6 +1039,7 @@ async fn watcher(mut hub: Hub, mut halted: watch::Receiver<bool>) {
         _ = halted.wait_for(|halt| *halt) => {}
     }
     hub.watched = Watched::default();
+    hub.serve(None);
     hub.set_status(|status| *status = WatchStatus::default());
 }
 
@@ -1025,6 +1051,7 @@ async fn supervise(hub: &mut Hub) {
     let mut no_push: Option<Instant> = None;
     loop {
         if hub.watched.entries.is_empty() {
+            hub.serve(None);
             hub.set_status(|status| *status = WatchStatus::default());
             match hub.idle(None).await {
                 Some(Exit::Stop) => break,
@@ -1056,6 +1083,7 @@ async fn supervise(hub: &mut Hub) {
                 else {
                     continue;
                 };
+                hub.serve(None);
                 hub.set_status(|status| {
                     if !established {
                         status.transport = None;

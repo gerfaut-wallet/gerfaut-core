@@ -133,6 +133,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
     };
 
     hub.alive();
+    hub.serve(Some(endpoint));
     hub.set_status(|status| {
         status.state = WatchState::Connected;
         status.transport = Some(WatchTransport::MempoolWebsocket);

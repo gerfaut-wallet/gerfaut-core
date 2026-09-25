@@ -142,6 +142,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         ready_told: false,
     };
     hub.alive();
+    hub.serve(Some(endpoint));
     hub.set_status(|status| {
         status.state = WatchState::Connected;
         status.transport = Some(WatchTransport::Electrum);

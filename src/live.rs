@@ -50,7 +50,7 @@
 //! server. A sync the host started itself is abandoned the same way
 //! when its future is dropped.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -59,8 +59,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
+use bdk_wallet::bitcoin::ScriptBuf;
+
+use crate::chain::Endpoint;
 use crate::error::CoreResult;
-use crate::manager::{ManagerState, WalletManager};
+use crate::manager::{ManagerState, Reach, WalletManager};
 use crate::network::Network;
 use crate::store::TxStage;
 use crate::wallet::snapshot::SyncReport;
@@ -170,19 +173,53 @@ impl Running {
     }
 }
 
-/// What the watch asked of a wallet: the strongest reason, and a full
-/// scan when any change asked for one.
-#[derive(Debug, Clone, Copy)]
+/// What the watch asked of a wallet: the strongest reason, and the
+/// scripts that moved, `None` for the whole wallet.
+#[derive(Debug, Clone)]
 struct Asked {
     reason: ChangeReason,
-    rescan: bool,
+    scripts: Option<BTreeSet<String>>,
 }
 
 impl Asked {
+    fn of(reason: ChangeReason, scripts: Vec<String>) -> Asked {
+        Asked {
+            reason,
+            scripts: (!scripts.is_empty()).then(|| scripts.into_iter().collect()),
+        }
+    }
+
     fn and(self, other: Asked) -> Asked {
         Asked {
             reason: self.reason.max(other.reason),
-            rescan: self.rescan || other.rescan,
+            scripts: match (self.scripts, other.scripts) {
+                (Some(mut these), Some(those)) => {
+                    these.extend(those);
+                    Some(these)
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// How much of the wallet the sync reads: the scripts that moved; the
+    /// ones waiting for a block, for a block; every script, counters
+    /// first, when the transport cannot say which moved. A script past
+    /// what the wallet's index looks ahead turns it into a full scan
+    /// (see [`crate::manager::Reach`]).
+    fn reach(&self) -> Reach {
+        match &self.scripts {
+            Some(scripts) => Reach::Scripts(
+                scripts
+                    .iter()
+                    .filter_map(|hex| ScriptBuf::from_hex(hex).ok())
+                    .collect(),
+            ),
+            None => match self.reason {
+                ChangeReason::NewBlock => Reach::Pending,
+                ChangeReason::Started | ChangeReason::Reconnected => Reach::Complete,
+                ChangeReason::Activity => Reach::Checked,
+            },
         }
     }
 }
@@ -206,7 +243,7 @@ struct Futile(HashMap<String, u32>);
 
 impl Futile {
     /// How long the sync `asked` for this wallet waits before it runs.
-    fn hold(&self, wallet_id: &str, asked: Asked, timings: &Timings) -> Duration {
+    fn hold(&self, wallet_id: &str, asked: &Asked, timings: &Timings) -> Duration {
         if asked.reason != ChangeReason::Activity {
             return Duration::ZERO;
         }
@@ -222,7 +259,7 @@ impl Futile {
 
     /// Takes what a sync `asked` for this wallet came to: whether it
     /// found anything, a failure counting as nothing found.
-    fn settle(&mut self, wallet_id: &str, asked: Asked, found: bool) {
+    fn settle(&mut self, wallet_id: &str, asked: &Asked, found: bool) {
         if found {
             self.0.remove(wallet_id);
         } else if asked.reason == ChangeReason::Activity {
@@ -523,18 +560,23 @@ impl WalletManager {
                         WatchEvent::WalletChanged {
                             wallet_id,
                             reason,
-                            rescan,
+                            scripts,
                             ..
                         } => {
-                            let asked = Asked { reason, rescan };
+                            let asked = Asked::of(reason, scripts);
                             match again.get_mut(&wallet_id) {
-                                Some(next) => *next = Some(next.map_or(asked, |n| n.and(asked))),
+                                Some(next) => {
+                                    *next = Some(match next.take() {
+                                        Some(earlier) => earlier.and(asked),
+                                        None => asked,
+                                    });
+                                }
                                 None => {
                                     again.insert(wallet_id.clone(), None);
-                                    let hold = futile.hold(&wallet_id, asked, &pace);
+                                    let hold = futile.hold(&wallet_id, &asked, &pace);
                                     let task = syncs.spawn(self.clone().live_sync(
                                         wallet_id.clone(),
-                                        asked,
+                                        asked.clone(),
                                         permits.clone(),
                                         hold,
                                         pace.retries,
@@ -568,16 +610,16 @@ impl WalletManager {
                         }
                         Err(_) => false,
                     };
-                    futile.settle(&wallet_id, asked, found);
+                    futile.settle(&wallet_id, &asked, found);
                     if !self.announce(&wallet_id, outcome, &events, &mut halted).await {
                         break;
                     }
                     if let Some(Some(next)) = again.remove(&wallet_id) {
                         again.insert(wallet_id.clone(), None);
-                        let hold = futile.hold(&wallet_id, next, &pace);
+                        let hold = futile.hold(&wallet_id, &next, &pace);
                         let task = syncs.spawn(self.clone().live_sync(
                             wallet_id.clone(),
-                            next,
+                            next.clone(),
                             permits.clone(),
                             hold,
                             pace.retries,
@@ -647,11 +689,20 @@ impl WalletManager {
         }
     }
 
+    /// The server the live watch has a session with, if any.
+    fn watch_serving(&self) -> Option<Endpoint> {
+        self.live_slot()
+            .as_ref()
+            .and_then(|running| running.watch.serving())
+    }
+
     /// The sync a change asked for, run under one of the permits once
-    /// `hold` has passed. When a pushed change found nothing, it is run
-    /// again after each of `retries`: with the automatic backend the
-    /// push comes from one server and the sync reads another, which may
-    /// hear of the transaction a moment later.
+    /// `hold` has passed: of the scripts that moved when the watch named
+    /// them, on the server the watch listens to first, which holds what
+    /// it said moved. A sync that found nothing behind a pushed change,
+    /// read from another server, is run again after each of `retries`:
+    /// that server may hear of the transaction a moment later. Read from
+    /// the watch's own server, it found all there was.
     async fn live_sync(
         self,
         wallet_id: String,
@@ -663,29 +714,37 @@ impl WalletManager {
         if !hold.is_zero() {
             tokio::time::sleep(hold).await;
         }
+        let reach = asked.reach();
         let sync = async || {
             let _permit = permits.acquire().await;
-            if asked.rescan {
-                self.rescan_wallet(&wallet_id).await
-            } else {
-                self.sync_wallet(&wallet_id).await
-            }
+            let serving = self.watch_serving();
+            let outcome = self
+                .sync_wallet_read(&wallet_id, reach.clone(), serving.clone())
+                .await;
+            (outcome, serving)
         };
-        let mut outcome = sync().await;
+        let (mut outcome, mut serving) = sync().await;
         for delay in retries {
             let found_nothing = matches!(
                 &outcome,
-                Ok(report) if report.new_txs.is_empty() && report.confirmed_txs.is_empty()
+                Ok((report, _)) if report.new_txs.is_empty() && report.confirmed_txs.is_empty()
+            );
+            let read_where_told = matches!(
+                (&outcome, &serving),
+                (Ok((_, Some(read))), Some(told)) if read == told
             );
             if asked.reason != ChangeReason::Activity
                 || !found_nothing
+                || read_where_told
                 || self.news_waiting(&wallet_id).await > 0
             {
                 break;
             }
             tokio::time::sleep(delay).await;
-            outcome = sync().await;
+            (outcome, serving) = sync().await;
         }
-        outcome.map_err(|error| error.to_string())
+        outcome
+            .map(|(report, _)| report)
+            .map_err(|error| error.to_string())
     }
 }

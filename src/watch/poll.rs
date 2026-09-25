@@ -166,6 +166,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
                 if first_round {
                     hub.ready(false);
                 }
+                hub.serve(Some(endpoint));
                 hub.set_status(|status| {
                     status.state = WatchState::Polling;
                     status.transport = Some(WatchTransport::EsploraPolling);
