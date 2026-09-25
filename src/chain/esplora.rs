@@ -7,7 +7,10 @@ use bdk_wallet::bitcoin::address::Address;
 
 use bdk_wallet::bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 
+pub(crate) mod page;
 pub(crate) mod sync;
+
+use page::PageTx;
 
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
@@ -19,6 +22,15 @@ pub(crate) const PARALLEL_REQUESTS: usize = 4;
 /// transactions there are, with room to spare. A server that sends more
 /// is not answering the question, and is cut off rather than buffered.
 const MAX_BODY: usize = 32 << 20;
+/// The largest page of a history read, once decompressed: 25 confirmed
+/// transactions and the unconfirmed ones, each a few kilobytes, the
+/// largest a node relays a few hundred.
+const PAGE_MAX: usize = 8 << 20;
+/// What one sync, or one reading of an address, may read in all, once
+/// decompressed: the first sync of a wallet with some twenty thousand
+/// transactions. A server that sends more is refused rather than read
+/// until memory runs out, a page at a time.
+const RUN_MAX: usize = 64 << 20;
 /// Tries of a request a server turned away for being busy: a public
 /// instance answers a burst with 429, and a moment later with the data.
 const TRIES: u32 = 4;
@@ -66,6 +78,9 @@ pub(crate) struct Client {
     /// The instance's address, without a trailing slash.
     base: String,
     budget: Budget,
+    /// What was read so far, decompressed, and how much may be.
+    spent: std::sync::atomic::AtomicUsize,
+    run_max: usize,
 }
 
 impl Client {
@@ -73,7 +88,7 @@ impl Client {
     /// held to [`MAX_BODY`]; `None` when the server has nothing there
     /// (404). A busy server is asked again a few times, a little later
     /// each time.
-    async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+    async fn fetch(&self, path: &str, max: usize) -> Result<Option<Vec<u8>>, String> {
         let url = format!("{}{path}", self.base);
         let mut wait = Duration::from_millis(250);
         let mut tries = 1;
@@ -99,7 +114,7 @@ impl Client {
             }
             break response;
         };
-        self.body(response, MAX_BODY).await.map(Some)
+        self.body(response, max).await.map(Some)
     }
 
     /// The body of an answer, read a chunk at a time, decompressed, and
@@ -118,6 +133,16 @@ impl Client {
                     format!("the server sent an answer longer than {} KiB", max >> 10)
                 });
             }
+            let spent = self
+                .spent
+                .fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(chunk.len());
+            if spent > self.run_max {
+                return Err(format!(
+                    "the server sent more than {} MiB for one sync",
+                    self.run_max >> 20
+                ));
+            }
             body.extend_from_slice(&chunk);
         }
         Ok(body)
@@ -125,7 +150,19 @@ impl Client {
 
     /// The body of `path`, which must be there.
     pub(crate) async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
-        self.fetch(path).await?.ok_or_else(|| describe_status(404))
+        self.fetch(path, MAX_BODY)
+            .await?
+            .ok_or_else(|| describe_status(404))
+    }
+
+    /// A page of a history, read as it is listed, held to a few
+    /// megabytes.
+    pub(crate) async fn get_page(&self, path: &str) -> Result<Vec<PageTx>, String> {
+        let body = self
+            .fetch(path, PAGE_MAX)
+            .await?
+            .ok_or_else(|| describe_status(404))?;
+        serde_json::from_slice(&body).map_err(|_| "unexpected response".to_owned())
     }
 
     /// The same, read as JSON.
@@ -142,7 +179,7 @@ impl Client {
         &self,
         path: &str,
     ) -> Result<Option<T>, String> {
-        match self.fetch(path).await? {
+        match self.fetch(path, MAX_BODY).await? {
             Some(body) => serde_json::from_slice(&body)
                 .map(Some)
                 .map_err(|_| "unexpected response".to_owned()),
@@ -187,13 +224,13 @@ impl Client {
         &self,
         address: &Address,
         after: Option<Txid>,
-    ) -> Result<Vec<api::Tx>, String> {
+    ) -> Result<Vec<PageTx>, String> {
         match after {
             Some(txid) => {
-                self.get_json(&format!("/address/{address}/txs/chain/{txid}"))
+                self.get_page(&format!("/address/{address}/txs/chain/{txid}"))
                     .await
             }
-            None => self.get_json(&format!("/address/{address}/txs")).await,
+            None => self.get_page(&format!("/address/{address}/txs")).await,
         }
     }
 
@@ -203,7 +240,7 @@ impl Client {
 
     /// A transaction, `None` when the server does not know it.
     pub(crate) async fn tx(&self, txid: &Txid) -> Result<Option<Transaction>, String> {
-        match self.fetch(&format!("/tx/{txid}/raw")).await? {
+        match self.fetch(&format!("/tx/{txid}/raw"), MAX_BODY).await? {
             Some(bytes) => bdk_wallet::bitcoin::consensus::deserialize(&bytes)
                 .map(Some)
                 .map_err(|_| "unexpected response".to_owned()),
@@ -211,10 +248,12 @@ impl Client {
         }
     }
 
-    /// A transaction as the server describes it, `None` when it does not
-    /// know it.
-    async fn tx_info(&self, txid: &Txid) -> Result<Option<api::Tx>, String> {
-        self.get_json_opt(&format!("/tx/{txid}")).await
+    /// Whether the server knows a transaction. What it says of it is
+    /// skipped as it is parsed.
+    async fn knows_tx(&self, txid: &Txid) -> Result<bool, String> {
+        self.get_json_opt::<serde::de::IgnoredAny>(&format!("/tx/{txid}"))
+            .await
+            .map(|found| found.is_some())
     }
 
     async fn tx_status(&self, txid: &Txid) -> Result<api::TxStatus, String> {
@@ -326,7 +365,17 @@ fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, Strin
         http,
         base: url.trim_end_matches('/').to_owned(),
         budget,
+        spent: std::sync::atomic::AtomicUsize::new(0),
+        run_max: usize::MAX,
     })
+}
+
+/// A client for one sync, or one reading of an address: the same, and
+/// what it reads in all held to [`RUN_MAX`].
+pub(crate) fn client_for_run(url: &str, proxy: Option<&str>) -> Result<Client, String> {
+    let mut client = client(url, proxy)?;
+    client.run_max = RUN_MAX;
+    Ok(client)
 }
 
 // --- errors ---------------------------------------------------------------
@@ -507,23 +556,33 @@ async fn history_round(
     from: Option<Txid>,
     confirmed_total: Option<usize>,
 ) -> Result<HistoryRound, String> {
-    let mut raw_txs = client.address_txs(address, from).await?;
+    // Each page is read into what the app shows as soon as it arrives,
+    // and dropped: forty pages are never held as the server spelled them.
+    let mut txs: Vec<AddressTx> = Vec::new();
+    let mut confirmed = 0usize;
+    let mut last_seen: Option<Txid> = None;
+    let mut read = |page: Vec<PageTx>, txs: &mut Vec<AddressTx>| {
+        for tx in page {
+            if tx.status.confirmed {
+                confirmed += 1;
+                last_seen = Some(tx.txid);
+            }
+            txs.push(to_address_tx(tx, our_script, network));
+        }
+        (confirmed, last_seen)
+    };
+    let (mut confirmed_so_far, mut last) = read(client.address_txs(address, from).await?, &mut txs);
     let mut cursor: Option<String> = None;
     let mut pages = 1usize;
     loop {
         // The whole history is in hand: `confirmed_total` counts it from
         // the address stats, so no probing request is needed.
         if let Some(total) = confirmed_total
-            && raw_txs.iter().filter(|t| t.status.confirmed).count() >= total
+            && confirmed_so_far >= total
         {
             break;
         }
-        let Some(last_seen) = raw_txs
-            .iter()
-            .rev()
-            .find(|t| t.status.confirmed)
-            .map(|t| t.txid)
-        else {
+        let Some(last_seen) = last else {
             break;
         };
         if pages >= HISTORY_PAGES_PER_ROUND {
@@ -535,19 +594,14 @@ async fn history_round(
         if page.is_empty() {
             break;
         }
-        raw_txs.extend(page);
+        (confirmed_so_far, last) = read(page, &mut txs);
     }
-
-    let txs = raw_txs
-        .into_iter()
-        .map(|tx| to_address_tx(tx, our_script, network))
-        .collect();
     Ok(HistoryRound { txs, cursor })
 }
 
 /// One esplora transaction as seen from the watched address.
 fn to_address_tx(
-    tx: esplora_client::api::Tx,
+    tx: PageTx,
     our_script: &bdk_wallet::bitcoin::ScriptBuf,
     network: Network,
 ) -> AddressTx {
@@ -728,7 +782,7 @@ pub(crate) struct TxStanding {
 
 pub(crate) async fn tx_standing(client: &Client, txid: &Txid) -> Result<TxStanding, String> {
     let tip_height = client.height().await?;
-    let found = client.tx_info(txid).await?.is_some();
+    let found = client.knows_tx(txid).await?;
     if !found {
         return Ok(TxStanding {
             found: false,
@@ -943,6 +997,36 @@ mod error_tests {
         let address = gzipping("200 OK", b"812345\n".to_vec()).await;
         let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
         assert_eq!(client.height().await.unwrap(), 812_345);
+    }
+
+    /// A page of a history is held to a few megabytes, and one sync to a
+    /// few dozen in all, however the server spreads them over its
+    /// answers: past that the sync fails, rather than read on.
+    #[tokio::test]
+    async fn a_sync_reads_so_much_and_no_more() {
+        let address = gzipping("200 OK", vec![b' '; PAGE_MAX + 1]).await;
+        let url = format!("http://{address}");
+        let paged = client_for_run(&url, None).unwrap();
+        assert_eq!(
+            paged.get_page("/scripthash/00/txs").await.unwrap_err(),
+            "the server sent an answer longer than 8 MiB"
+        );
+
+        let address = gzipping("200 OK", vec![b' '; 20 << 20]).await;
+        let url = format!("http://{address}");
+        let one_sync = client_for_run(&url, None).unwrap();
+        for _ in 0..3 {
+            one_sync.get_bytes("/blocks").await.unwrap();
+        }
+        assert_eq!(
+            one_sync.get_bytes("/blocks").await.unwrap_err(),
+            "the server sent more than 64 MiB for one sync"
+        );
+        // A client that serves a watch, not one sync, has no such cap.
+        let watching = super::client(&url, None).unwrap();
+        for _ in 0..4 {
+            watching.get_bytes("/blocks").await.unwrap();
+        }
     }
 
     #[test]

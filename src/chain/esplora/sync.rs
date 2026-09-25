@@ -28,12 +28,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
-use bdk_esplora::esplora_client::api::{ScriptHashStats, Tx};
+use bdk_esplora::esplora_client::api::{ScriptHashStats, TxStatus};
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
-use bdk_wallet::bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, TxOut, Txid};
+use bdk_wallet::bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use futures_util::future::try_join_all;
 
+use super::page::PageTx;
 use super::{Client, Counts, PARALLEL_REQUESTS};
 use crate::chain::{Held, Plan, Reading, Scan, ScriptFacts};
 
@@ -51,10 +52,46 @@ struct Block {
     height: u32,
 }
 
+/// A transaction a history lists: where it stands, and, when the wallet
+/// lacks it, the transaction and the coins it spends. What the wallet
+/// holds already is not kept.
+struct Listed {
+    txid: Txid,
+    status: TxStatus,
+    whole: Option<(Transaction, Vec<(OutPoint, TxOut)>)>,
+}
+
+/// A page as the engine keeps it: see [`Listed`].
+fn listed(page: Vec<PageTx>, held: &Held) -> Result<Vec<Listed>, String> {
+    page.into_iter()
+        .map(|tx| {
+            let whole = if held.txs.contains_key(&tx.txid) {
+                None
+            } else {
+                let whole = tx.to_tx();
+                // The txid commits to the transaction: one that does not
+                // hash to it is not the one listed.
+                if whole.compute_txid() != tx.txid {
+                    return Err(
+                        "the server answered with another transaction than the one it listed"
+                            .to_owned(),
+                    );
+                }
+                Some((whole, tx.prevouts().collect()))
+            };
+            Ok(Listed {
+                txid: tx.txid,
+                status: tx.status,
+                whole,
+            })
+        })
+        .collect()
+}
+
 /// What was read of one script.
 #[derive(Default)]
 struct Read {
-    txs: Vec<Tx>,
+    txs: Vec<Listed>,
     /// Transactions the wallet expected there that the server no longer
     /// lists.
     evicted: Vec<Txid>,
@@ -77,7 +114,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<bdk_wallet::Updat
     // is what the wallet counts itself synced up to.
     let latest = latest_blocks(client).await?;
     let meeting = Meeting::find(client, &latest, &tip).await?;
-    let mut found = Found::new(&held, start_time);
+    let mut found = Found::new(start_time);
 
     let mut covered: HashSet<ScriptBuf> = scripts.iter().cloned().collect();
     for batch in scripts.chunks(PARALLEL_REQUESTS) {
@@ -184,7 +221,7 @@ async fn read_script(
             });
         }
         let path = format!("{}/txs/mempool", script_path(script));
-        let txs: Vec<Tx> = client.get_json(&path).await?;
+        let txs = listed(client.get_page(&path).await?, held)?;
         let listed_mempool = txs.len();
         let mut read = Read {
             txs,
@@ -195,7 +232,7 @@ async fn read_script(
         return Ok(read);
     }
     let (mut read, listed_mempool, whole) =
-        read_pages_down_to(client, script, Some((&facts, held, &stats))).await?;
+        read_pages_down_to(client, script, held, Some((&facts, &stats))).await?;
     read.evicted = evicted(&read, &facts, &stats, listed_mempool, whole);
     read.used |= used;
     Ok(read)
@@ -213,7 +250,7 @@ async fn read_scanned(
     if held.scripts.contains_key(script) {
         return read_script(client, script, held, Reading::Complete, agreed_up_to).await;
     }
-    read_pages_down_to(client, script, None)
+    read_pages_down_to(client, script, held, None)
         .await
         .map(|(read, _, _)| read)
 }
@@ -225,10 +262,11 @@ async fn read_scanned(
 async fn read_pages_down_to(
     client: &Client,
     script: &ScriptBuf,
-    known: Option<(&ScriptFacts, &Held, &ScriptHashStats)>,
+    held: &Held,
+    known: Option<(&ScriptFacts, &ScriptHashStats)>,
 ) -> Result<(Read, usize, bool), String> {
     let base = format!("{}/txs", script_path(script));
-    let mut txs: Vec<Tx> = Vec::new();
+    let mut txs: Vec<Listed> = Vec::new();
     let mut after: Option<Txid> = None;
     let mut listed_mempool = 0usize;
     let mut whole = false;
@@ -243,7 +281,7 @@ async fn read_pages_down_to(
             Some(txid) => format!("{base}/chain/{txid}"),
             None => base.clone(),
         };
-        let page: Vec<Tx> = client.get_json(&path).await?;
+        let page = listed(client.get_page(&path).await?, held)?;
         let confirmed = page.iter().filter(|tx| tx.status.confirmed).count();
         if after.is_none() {
             listed_mempool = page.len() - confirmed;
@@ -258,7 +296,7 @@ async fn read_pages_down_to(
             whole = true;
             break;
         }
-        if let Some((facts, held, stats)) = known
+        if let Some((facts, stats)) = known
             && enough(&txs, facts, held, stats)
         {
             break;
@@ -308,7 +346,7 @@ fn evicted(
 /// the wallet holds unconfirmed on the script is listed, the reading has
 /// reached one it holds confirmed in the same block, and what it holds
 /// and what was read together make up the server's count.
-fn enough(txs: &[Tx], facts: &ScriptFacts, held: &Held, stats: &ScriptHashStats) -> bool {
+fn enough(txs: &[Listed], facts: &ScriptFacts, held: &Held, stats: &ScriptHashStats) -> bool {
     let listed: HashSet<Txid> = txs.iter().map(|tx| tx.txid).collect();
     let pending = facts
         .expected
@@ -338,17 +376,15 @@ fn enough(txs: &[Tx], facts: &ScriptFacts, held: &Held, stats: &ScriptHashStats)
 }
 
 /// The update being put together.
-struct Found<'h> {
-    held: &'h Held,
+struct Found {
     start_time: u64,
     update: TxUpdate<ConfirmationBlockTime>,
     taken: HashSet<Txid>,
 }
 
-impl<'h> Found<'h> {
-    fn new(held: &'h Held, start_time: u64) -> Self {
+impl Found {
+    fn new(start_time: u64) -> Self {
         Found {
-            held,
             start_time,
             update: TxUpdate::default(),
             taken: HashSet::new(),
@@ -382,29 +418,10 @@ impl<'h> Found<'h> {
                     self.update.seen_ats.insert((txid, self.start_time));
                 }
             }
-            if self.held.txs.contains_key(&txid) {
+            let Some((whole, prevouts)) = tx.whole else {
                 continue;
-            }
-            let whole = tx.to_tx();
-            // The txid commits to the transaction: one that does not
-            // hash to it is not the one listed.
-            if whole.compute_txid() != txid {
-                return Err(
-                    "the server answered with another transaction than the one it listed"
-                        .to_owned(),
-                );
-            }
-            for vin in &tx.vin {
-                if let Some(prevout) = &vin.prevout {
-                    self.update.txouts.insert(
-                        OutPoint::new(vin.txid, vin.vout),
-                        TxOut {
-                            value: Amount::from_sat(prevout.value),
-                            script_pubkey: prevout.scriptpubkey.clone(),
-                        },
-                    );
-                }
-            }
+            };
+            self.update.txouts.extend(prevouts);
             self.update.txs.push(Arc::new(whole));
         }
         self.update

@@ -446,7 +446,7 @@ pub(crate) async fn sync_engine(
     let deadline = scan_deadline(endpoint);
     match endpoint {
         Endpoint::Esplora(url) => {
-            let client = esplora::client(url, proxy)?;
+            let client = esplora::client_for_run(url, proxy)?;
             within(deadline, esplora::sync::run(&client, plan))
                 .await
                 .map(|update| Synced {
@@ -469,7 +469,7 @@ pub(crate) async fn fetch_address_state(
 ) -> Result<AddressWatchState, String> {
     match endpoint {
         Endpoint::Esplora(url) => {
-            let client = esplora::client(url, proxy)?;
+            let client = esplora::client_for_run(url, proxy)?;
             within(
                 scan_deadline(endpoint),
                 esplora::fetch_address_state(&client, address, network),
@@ -641,7 +641,7 @@ pub(crate) async fn fetch_address_history(
 ) -> Result<esplora::HistoryRound, String> {
     match endpoint {
         Endpoint::Esplora(url) => {
-            let client = esplora::client(url, proxy)?;
+            let client = esplora::client_for_run(url, proxy)?;
             within(
                 scan_deadline(endpoint),
                 esplora::fetch_address_history(&client, address, network, from),
