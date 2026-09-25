@@ -57,6 +57,7 @@ fn wallet(id: &str, scripts: &[u8], lookahead: &[u8], has_pending: bool) -> Watc
                 script: script(*n),
                 lookahead: lookahead.contains(n),
                 status: None,
+                counts: None,
             })
             .collect(),
         has_pending,
@@ -199,6 +200,7 @@ async fn electrum_pushes_a_change_once_per_burst() {
                 script: script(1),
                 lookahead: false,
                 status: Some("ab".to_owned()),
+                counts: None,
             }],
             ..wallet("a", &[], &[], false)
         },
@@ -602,6 +604,48 @@ async fn an_esplora_without_a_websocket_is_polled() {
     );
 }
 
+/// Polling reads a few scripts a round, the rest in turn: a script may
+/// be read for the first time well after the watch started, and what
+/// arrived there meanwhile, after the catch-up sync read it, must not
+/// be taken for where it stands. Its first reading is compared with
+/// what the wallet holds for it.
+#[tokio::test]
+async fn a_first_poll_is_compared_with_what_the_wallet_holds() {
+    let server = FakeMempool::start(false, 0).await;
+    let mut listed = wallet("a", &[1, 2, 3, 4, 5, 6], &[], false);
+    let one_payment = poll::Fingerprint {
+        mempool: crate::chain::esplora::Tally {
+            txs: 1,
+            funded: 1,
+            funded_sats: 1_000,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for (index, script) in listed.scripts.iter_mut().enumerate() {
+        script.counts = Some(if index == 4 {
+            one_payment
+        } else {
+            poll::Fingerprint::default()
+        });
+    }
+    {
+        let mut state = server.state.lock().unwrap();
+        // Held by the wallet already: nothing to say.
+        state.counts.insert(FakeMempool::rest_key(&script(5)), 1);
+        // Arrived after the catch-up, before the first reading.
+        state.counts.insert(FakeMempool::rest_key(&script(6)), 1);
+    }
+    let (_watch, mut events) =
+        LiveWatch::start_with(config(server.backend()), vec![listed], Some(timings()));
+    reported(&mut events, &["a"], ChangeReason::Started).await;
+    assert_eq!(
+        next_event(&mut events).await,
+        moved("a", ChangeReason::Activity, false, &[6])
+    );
+    no_event(&mut events, Duration::from_millis(500)).await;
+}
+
 /// One impossible height, from a lying server or a slip, does not hide
 /// the blocks that follow it: the honest height after it becomes the
 /// baseline again, and the next block is a block.
@@ -735,6 +779,7 @@ fn wallets_the_whole_list_cut_short_are_caught_up_whole() {
                     script: format!("0014{:040x}", w * 1_000 + n),
                     lookahead: false,
                     status: None,
+                    counts: None,
                 })
                 .collect(),
             has_pending: false,
@@ -755,6 +800,7 @@ fn a_list_is_cut_to_what_can_be_watched() {
         script: "not hex".to_owned(),
         lookahead: false,
         status: None,
+        counts: None,
     });
     wallets.push(wallet("b", &[1, 1, 250], &[1], false));
     let watched = Watched::new(wallets);
@@ -931,6 +977,7 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
                 // Never synced: a status no server gives, so that the
                 // watch syncs it once it starts.
                 status: Some(String::new()),
+                counts: None,
             }],
             has_pending: false,
         }]
@@ -1253,6 +1300,7 @@ async fn live_the_three_transports_see_signet_move() {
                 script,
                 lookahead: false,
                 status: None,
+                counts: None,
             })
             .collect(),
         has_pending: true,

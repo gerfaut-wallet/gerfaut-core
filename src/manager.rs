@@ -2469,6 +2469,9 @@ pub(crate) fn watched_wallet(
                     .address_state
                     .as_ref()
                     .and_then(views::address_status),
+                // Its history may be cut short: nothing to compare
+                // counters with.
+                counts: None,
             }];
             (scripts, has_pending)
         }

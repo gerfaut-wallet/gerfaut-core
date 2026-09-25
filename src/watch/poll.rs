@@ -100,15 +100,23 @@ impl Plan {
     }
 }
 
-/// Compares what a round found with what was known: the first reading
-/// of a script is its baseline, a different one after that is a change.
+/// Compares what a round found with what was known: a reading that
+/// differs from the one before is a change. The first reading of a
+/// script is compared with what its wallets hold instead: the list
+/// takes turns, a script may be read for the first time an hour into a
+/// watch, and what arrived meanwhile must not become its baseline.
 pub(super) fn apply(hub: &mut Hub, found: Vec<(String, Fingerprint)>) {
     for (hex, fingerprint) in found {
-        if hub.watched.by_hex(&hex).is_none() {
+        let Some(entry) = hub.watched.by_hex(&hex) else {
             continue;
-        }
+        };
+        let lacking = entry
+            .counts
+            .iter()
+            .any(|held| held.is_some_and(|held| held != fingerprint));
         match hub.fingerprints.insert(hex.clone(), fingerprint) {
             Some(known) if known != fingerprint => hub.mark_entry(&hex, ChangeReason::Activity),
+            None if lacking => hub.mark_entry(&hex, ChangeReason::Activity),
             _ => {}
         }
     }

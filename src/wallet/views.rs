@@ -156,7 +156,8 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
 /// way, and then the used, empty ones, newest first. A script past the
 /// revealed range is marked as such. Each comes with the Electrum
 /// status of the history the wallet holds for it, as
-/// [`electrum_statuses`] computes it.
+/// [`electrum_statuses`] computes it, and the counters an Esplora server
+/// would keep for that history.
 ///
 /// The list stops at [`crate::watch::MAX_SCRIPTS_PER_WALLET`], all a
 /// watch takes of one wallet, and nothing past it is derived: this runs
@@ -227,14 +228,17 @@ pub(crate) fn watch_scripts(
     let scripts: Vec<bdk_wallet::bitcoin::ScriptBuf> =
         listed.iter().map(|(script, _)| script.clone()).collect();
     let statuses = electrum_statuses(wallet, &scripts, orders);
+    let facts = script_facts(wallet, &scripts);
     listed
         .into_iter()
         .zip(statuses)
+        .zip(facts)
         .map(
-            |((script, lookahead), status)| crate::watch::WatchedScript {
+            |(((script, lookahead), status), facts)| crate::watch::WatchedScript {
                 script: script.to_hex_string(),
                 lookahead,
                 status,
+                counts: Some(facts.counts),
             },
         )
         .collect()
@@ -382,7 +386,7 @@ pub(crate) fn held(
     wallet: &bdk_wallet::Wallet,
     scripts: &[bdk_wallet::bitcoin::ScriptBuf],
 ) -> crate::chain::Held {
-    use crate::chain::{Held, ScriptFacts};
+    use crate::chain::Held;
     let graph = wallet.tx_graph();
     let mut held = Held {
         txs: graph
@@ -395,25 +399,40 @@ pub(crate) fn held(
             .collect(),
         ..Held::default()
     };
+    for wtx in wallet.transactions() {
+        if let ChainPosition::Confirmed {
+            anchor,
+            transitively: None,
+        } = wtx.chain_position
+        {
+            held.anchors.insert(wtx.tx_node.txid, anchor);
+        }
+    }
+    held.scripts = scripts
+        .iter()
+        .cloned()
+        .zip(script_facts(wallet, scripts))
+        .collect();
+    held
+}
+
+/// What the wallet holds for each of `scripts`: the transactions
+/// touching it, which of them confirmed, and the counters an Esplora
+/// server keeps for it.
+pub(crate) fn script_facts(
+    wallet: &bdk_wallet::Wallet,
+    scripts: &[bdk_wallet::bitcoin::ScriptBuf],
+) -> Vec<crate::chain::ScriptFacts> {
+    let graph = wallet.tx_graph();
     let position: std::collections::HashMap<&Script, usize> = scripts
         .iter()
         .enumerate()
         .map(|(index, script)| (script.as_script(), index))
         .collect();
-    let mut facts = vec![ScriptFacts::default(); scripts.len()];
+    let mut facts = vec![crate::chain::ScriptFacts::default(); scripts.len()];
     for wtx in wallet.transactions() {
         let txid = wtx.tx_node.txid;
-        let confirmed = match wtx.chain_position {
-            ChainPosition::Confirmed {
-                anchor,
-                transitively: None,
-            } => {
-                held.anchors.insert(txid, anchor);
-                true
-            }
-            ChainPosition::Confirmed { .. } => true,
-            ChainPosition::Unconfirmed { .. } => false,
-        };
+        let confirmed = wtx.chain_position.is_confirmed();
         // What the transaction does to each script it touches: coins
         // paid to it, and coins of it spent.
         let mut touched: std::collections::BTreeMap<usize, crate::chain::esplora::Tally> =
@@ -450,8 +469,7 @@ pub(crate) fn held(
             side.spent_sats = side.spent_sats.saturating_add(tally.spent_sats);
         }
     }
-    held.scripts = scripts.iter().cloned().zip(facts).collect();
-    held
+    facts
 }
 
 /// The scripts of the transactions still waiting for a block: those

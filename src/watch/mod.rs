@@ -132,6 +132,13 @@ pub struct WatchedScript {
     /// transactions in another order; either way the script is synced.
     #[serde(default)]
     pub status: Option<String>,
+    /// The counters an Esplora server keeps for this script, as the
+    /// wallet's history makes them, `None` when unknown. The first
+    /// counters polling reads of a script are compared with them: what
+    /// arrived before the watch first read the script is not taken for
+    /// where it stands.
+    #[serde(skip)]
+    pub(crate) counts: Option<poll::Fingerprint>,
 }
 
 /// One wallet to watch.
@@ -453,6 +460,8 @@ pub(crate) struct Entry {
     pub owners: Vec<usize>,
     /// The status each owner holds for the script, in the same order.
     pub statuses: Vec<Option<String>>,
+    /// The counters each owner holds for it, in the same order.
+    pub counts: Vec<Option<poll::Fingerprint>>,
 }
 
 /// The list in the order transports cover it: the first script of
@@ -510,6 +519,7 @@ impl Watched {
                     if !entry.owners.contains(&owner) {
                         entry.owners.push(owner);
                         entry.statuses.push(status);
+                        entry.counts.push(listed.counts);
                     }
                     entry.lookahead &= listed.lookahead;
                     kept[owner] += 1;
@@ -533,6 +543,7 @@ impl Watched {
                     lookahead: listed.lookahead,
                     owners: vec![owner],
                     statuses: vec![status],
+                    counts: vec![listed.counts],
                 });
             }
         }
