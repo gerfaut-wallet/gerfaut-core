@@ -461,8 +461,8 @@ pub(crate) struct Entry {
 #[derive(Debug, Default)]
 pub(crate) struct Watched {
     pub wallets: Vec<(String, bool)>,
-    /// Wallets listed with as many scripts as a watch takes of one, the
-    /// tail of their list left out.
+    /// Wallets with scripts left out of the list: past what a watch
+    /// takes of one wallet, or of all of them.
     pub capped: Vec<String>,
     pub entries: Vec<Entry>,
     by_hex: HashMap<String, usize>,
@@ -477,13 +477,10 @@ impl Watched {
                 .iter()
                 .map(|wallet| (wallet.wallet_id.clone(), wallet.has_pending))
                 .collect(),
-            capped: wallets
-                .iter()
-                .filter(|wallet| wallet.scripts.len() >= MAX_SCRIPTS_PER_WALLET)
-                .map(|wallet| wallet.wallet_id.clone())
-                .collect(),
             ..Watched::default()
         };
+        // How many scripts of each wallet made it into the list.
+        let mut kept = vec![0usize; wallets.len()];
         let longest = wallets
             .iter()
             .map(|wallet| wallet.scripts.len().min(MAX_SCRIPTS_PER_WALLET))
@@ -515,11 +512,13 @@ impl Watched {
                         entry.statuses.push(status);
                     }
                     entry.lookahead &= listed.lookahead;
+                    kept[owner] += 1;
                     continue;
                 }
                 if watched.entries.len() >= MAX_SCRIPTS {
                     break 'ranks;
                 }
+                kept[owner] += 1;
                 let mut digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
                 digest.reverse();
                 let scripthash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
@@ -537,6 +536,17 @@ impl Watched {
                 });
             }
         }
+        // A wallet listed with as many scripts as a watch takes of one,
+        // or whose tail the cap on the whole list cut off: what the
+        // scripts left out do is never heard.
+        watched.capped = wallets
+            .iter()
+            .zip(kept)
+            .filter(|(wallet, kept)| {
+                wallet.scripts.len() >= MAX_SCRIPTS_PER_WALLET || *kept < wallet.scripts.len()
+            })
+            .map(|(wallet, _)| wallet.wallet_id.clone())
+            .collect();
         watched
     }
 

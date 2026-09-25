@@ -721,6 +721,32 @@ fn the_automatic_backend_prefers_a_server_that_pushes() {
     );
 }
 
+/// Wallets each below what a watch takes of one, together past what it
+/// takes of all: the tail of each is cut, and each is reported whole at
+/// the start, since nothing will say what those scripts did. A wallet
+/// the cut spared is not.
+#[test]
+fn wallets_the_whole_list_cut_short_are_caught_up_whole() {
+    let mut wallets: Vec<WatchedWallet> = (0..15u32)
+        .map(|w| WatchedWallet {
+            wallet_id: format!("w{w}"),
+            scripts: (0..150u32)
+                .map(|n| WatchedScript {
+                    script: format!("0014{:040x}", w * 1_000 + n),
+                    lookahead: false,
+                    status: None,
+                })
+                .collect(),
+            has_pending: false,
+        })
+        .collect();
+    wallets.insert(0, wallet("small", &[1, 2, 3], &[], false));
+    let watched = Watched::new(wallets);
+    assert_eq!(watched.entries.len(), MAX_SCRIPTS);
+    let expected: Vec<String> = (0..15).map(|w| format!("w{w}")).collect();
+    assert_eq!(watched.capped, expected);
+}
+
 #[test]
 fn a_list_is_cut_to_what_can_be_watched() {
     let long: Vec<u8> = (0..=255).collect();
