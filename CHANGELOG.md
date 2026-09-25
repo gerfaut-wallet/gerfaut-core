@@ -195,3 +195,9 @@ The first release: the library both Gerfaut apps are built on.
   runs before an address is saved, asked the system resolver for that
   name. The host of every Electrum address is now read the way the Tor
   check reads it, and no clear connection is ever opened to an onion.
+- A sync that brings a transaction worth more than 21 million bitcoin,
+  which only a lying server can send for one still out of a block, is
+  refused like a failed server, and the next one is tried. Stored, such a
+  transaction made every later look at the wallet crash the app. The
+  balance of a watched address saturates instead of wrapping around when
+  a server lists coins no one can hold.

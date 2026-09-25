@@ -864,7 +864,10 @@ impl WalletManager {
                 (request, views::known(engine))
             };
 
-            match chain::sync_engine(endpoint, request, meta.gap_limit, proxy).await {
+            let response = chain::sync_engine(endpoint, request, meta.gap_limit, proxy)
+                .await
+                .and_then(|response| response.check_amounts().map(|()| response));
+            match response {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(response) => {
                     let mut state = self.state.lock().await;

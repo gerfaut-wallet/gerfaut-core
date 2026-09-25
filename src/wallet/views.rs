@@ -58,7 +58,7 @@ fn net_of(wallet: &bdk_wallet::Wallet, tx: &bdk_wallet::bitcoin::Transaction) ->
 /// nothing is. The figure and the fact travel as one value: a spend
 /// that happens to net to zero is still pending, and still shows.
 fn pending_net(nets: impl Iterator<Item = i64>) -> Option<i64> {
-    nets.fold(None, |sum, net| Some(sum.unwrap_or(0) + net))
+    nets.fold(None, |sum, net| Some(sum.unwrap_or(0).saturating_add(net)))
 }
 
 pub(crate) fn tip_height(wallet: &bdk_wallet::Wallet) -> u32 {
@@ -578,24 +578,24 @@ fn derivation_path(wallet: &bdk_wallet::Wallet, index: u32) -> Option<String> {
 // --- single-address wallets --------------------------------------------
 
 pub(crate) fn address_balance(state: &AddressWatchState) -> BalanceSnapshot {
-    let confirmed_funded: u64 = state
-        .utxos
-        .iter()
-        .filter(|u| u.height.is_some())
-        .map(|u| u.value_sats)
-        .sum();
-    let pending_funded: u64 = state
-        .utxos
-        .iter()
-        .filter(|u| u.height.is_none())
-        .map(|u| u.value_sats)
-        .sum();
+    // The coins are the server's word. Summed with a plain `+`, values
+    // no coin can hold panicked a debug build and wrapped around to a
+    // small balance in a release one.
+    let funded = |confirmed: bool| {
+        state
+            .utxos
+            .iter()
+            .filter(|u| u.height.is_some() == confirmed)
+            .fold(0u64, |sum, u| sum.saturating_add(u.value_sats))
+    };
+    let confirmed_funded = funded(true);
+    let pending_funded = funded(false);
     BalanceSnapshot {
         confirmed: confirmed_funded,
         trusted_pending: 0,
         untrusted_pending: pending_funded,
         immature: 0,
-        total: confirmed_funded + pending_funded,
+        total: confirmed_funded.saturating_add(pending_funded),
         pending_net_sats: pending_net(
             state
                 .txs
@@ -958,6 +958,32 @@ mod tests {
         assert_eq!(balance.untrusted_pending, 500);
         assert_eq!(balance.total, 1500);
         assert_eq!(balance.pending_net_sats, None, "no transaction listed");
+    }
+
+    /// Coins no one can hold, as a hostile server may list them, stop
+    /// at the largest balance there is instead of panicking or wrapping
+    /// around to a small one.
+    #[test]
+    fn address_balance_never_overflows() {
+        let coin = |txid: &str, height: Option<u32>| crate::wallet::AddressUtxo {
+            txid: txid.into(),
+            vout: 0,
+            value_sats: u64::MAX,
+            height,
+            timestamp: None,
+        };
+        let state = AddressWatchState {
+            utxos: vec![coin("aa", Some(1)), coin("bb", Some(2)), coin("cc", None)],
+            txs: vec![
+                address_tx("dd", i64::MAX, None),
+                address_tx("ee", i64::MAX, None),
+            ],
+            ..Default::default()
+        };
+        let balance = address_balance(&state);
+        assert_eq!(balance.confirmed, u64::MAX);
+        assert_eq!(balance.total, u64::MAX);
+        assert_eq!(balance.pending_net_sats, Some(i64::MAX));
     }
 
     fn address_tx(txid: &str, net_sats: i64, height: Option<u32>) -> AddressTx {

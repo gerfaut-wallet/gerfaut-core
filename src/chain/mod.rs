@@ -317,6 +317,40 @@ pub(crate) enum EngineResponse {
     Incremental(SyncResponse, FullScanResponse<KeychainKind>),
 }
 
+impl EngineResponse {
+    /// Refuses a response that holds an amount no transaction can
+    /// carry: an output, or the outputs of one transaction together,
+    /// above the 21 million bitcoin there will ever be. Nothing in a
+    /// block can, but an unconfirmed transaction is only the server's
+    /// word, and the wallet engine adds amounts up with a panic on
+    /// overflow: once stored, such a transaction brought down every
+    /// later look at the wallet.
+    pub(crate) fn check_amounts(&self) -> Result<(), String> {
+        let updates = match self {
+            EngineResponse::Full(full) => vec![&full.tx_update],
+            EngineResponse::Incremental(sync, tail) => vec![&sync.tx_update, &tail.tx_update],
+        };
+        let refused = || "the server sent a transaction worth more than every bitcoin".to_owned();
+        for update in updates {
+            for tx in &update.txs {
+                tx.output
+                    .iter()
+                    .try_fold(0u64, |sum, out| sum.checked_add(out.value.to_sat()))
+                    .filter(|&total| total <= bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat())
+                    .ok_or_else(refused)?;
+            }
+            if update
+                .txouts
+                .values()
+                .any(|out| out.value > bdk_wallet::bitcoin::Amount::MAX_MONEY)
+            {
+                return Err(refused());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Runs one sync attempt against one endpoint, within the deadline of
 /// a scan. The error is a plain string: the caller owns retry logic and
 /// error wrapping. Dropping the future abandons the attempt, an
@@ -853,5 +887,67 @@ mod tests {
         );
         // A network without a public instance still says so.
         assert!(endpoints(&BackendConfig::default(), Network::Regtest, &none).is_err());
+    }
+
+    /// A server may say anything about a transaction still out of a
+    /// block. One that sums past every bitcoin is refused before the
+    /// wallet engine, which would panic adding it up at every look.
+    #[test]
+    fn a_response_worth_more_than_every_bitcoin_is_refused() {
+        use bdk_wallet::bitcoin::{Amount, absolute, transaction};
+        use std::sync::Arc;
+        let tx = |values: &[u64]| {
+            Arc::new(Transaction {
+                version: transaction::Version::TWO,
+                lock_time: absolute::LockTime::ZERO,
+                input: Vec::new(),
+                output: values
+                    .iter()
+                    .map(|&value| TxOut {
+                        value: Amount::from_sat(value),
+                        script_pubkey: ScriptBuf::new(),
+                    })
+                    .collect(),
+            })
+        };
+        let full = |txs: Vec<Arc<Transaction>>, txouts: Vec<u64>| {
+            let mut response = FullScanResponse::<KeychainKind>::default();
+            response.tx_update.txs = txs;
+            response.tx_update.txouts = txouts
+                .into_iter()
+                .enumerate()
+                .map(|(vout, value)| {
+                    (
+                        OutPoint::new(Txid::from_byte_array([7; 32]), vout as u32),
+                        TxOut {
+                            value: Amount::from_sat(value),
+                            script_pubkey: ScriptBuf::new(),
+                        },
+                    )
+                })
+                .collect();
+            response
+        };
+        let max = Amount::MAX_MONEY.to_sat();
+        use bdk_wallet::bitcoin::hashes::Hash;
+
+        assert!(
+            EngineResponse::Full(full(vec![tx(&[max])], vec![max]))
+                .check_amounts()
+                .is_ok()
+        );
+        for response in [
+            full(vec![tx(&[1 << 63, 1 << 63])], Vec::new()),
+            full(vec![tx(&[max, 1])], Vec::new()),
+            full(Vec::new(), vec![max + 1]),
+        ] {
+            assert!(EngineResponse::Full(response).check_amounts().is_err());
+            let tail = full(vec![tx(&[max, max])], Vec::new());
+            assert!(
+                EngineResponse::Incremental(SyncResponse::default(), tail)
+                    .check_amounts()
+                    .is_err()
+            );
+        }
     }
 }
