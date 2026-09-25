@@ -875,6 +875,9 @@ impl Hub {
                     self.config = *config;
                     self.watched = Watched::new(wallets);
                     self.forget_baselines();
+                    // The server of the old configuration, its certificate
+                    // and its route with it, is no longer one to sync on.
+                    self.serve(None);
                     Wake::Reconfigured
                 }
                 Some(Command::Wallets(wallets)) => {
