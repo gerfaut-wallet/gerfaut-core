@@ -189,3 +189,9 @@ The first release: the library both Gerfaut apps are built on.
 - A multi-part UR that announces more than 100,000 parts is refused. One
   frame announcing about four billion, pasted or scanned, made the decoder
   ask for tens of gigabytes and ended the app on the spot.
+- An Electrum address whose host still holds a port, such as
+  `ssl://[x.onion:50001]:50002` or `x.onion:50001:50002`, is refused. The
+  Tor check did not see the onion in it, and the certificate check, which
+  runs before an address is saved, asked the system resolver for that
+  name. The host of every Electrum address is now read the way the Tor
+  check reads it, and no clear connection is ever opened to an onion.

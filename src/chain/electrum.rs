@@ -133,7 +133,14 @@ pub(crate) fn parse(url: &str) -> Result<(bool, String, u16), String> {
     if host.is_empty() {
         return Err("the address has no host".to_owned());
     }
-    Ok((tls, host.to_owned(), port))
+    // Read the way the URL standard reads a host, as the Tor check
+    // reads it. A name it cannot read, such as one with a port still in
+    // it (`[x.onion:50001]`, or `x.onion:50001:50002`), is refused here:
+    // passed on, it looked like no onion at all, and the system
+    // resolver was asked for it in the clear.
+    let host =
+        crate::chain::canonical_host(host).map_err(|_| format!("{host} is not a server name"))?;
+    Ok((tls, host, port))
 }
 
 /// The key a trusted fingerprint is stored under: the host and port
@@ -1000,6 +1007,31 @@ mod tests {
         );
         assert!(parse("http://host:50002").is_err());
         assert!(parse("ssl://host:not-a-port").is_err());
+    }
+
+    /// A port typed into the host field leaves a name no resolver should
+    /// see. Once it hid an onion from the Tor check, and the certificate
+    /// check, which runs before the address is saved, handed that name to
+    /// the system resolver.
+    #[test]
+    fn a_host_with_a_port_still_in_it_is_refused() {
+        let onion = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion";
+        for url in [
+            format!("ssl://[{onion}:50001]:50002"),
+            format!("ssl://{onion}:50001:50002"),
+            format!("{onion}:50001:50002"),
+            format!("tcp://[{onion}:50001]"),
+        ] {
+            assert!(parse(&url).is_err(), "{url}");
+            assert!(inspect_blocking(&Target::new(url.clone(), None)).is_err());
+        }
+        // Spelled any way the standard allows, an onion is read as one.
+        let (_, host, _) = parse(&format!("ssl://{}%2E:50002", onion.to_uppercase())).unwrap();
+        assert_eq!(host, onion);
+        assert!(matches!(
+            inspect_blocking(&Target::new(format!("ssl://{onion}%2e:50002"), None)),
+            Ok(Inspection::Tor)
+        ));
     }
 
     /// Live. The whole trust-on-first-use path against real servers:
