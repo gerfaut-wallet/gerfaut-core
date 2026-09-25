@@ -623,11 +623,11 @@ pub(crate) enum Wake {
     Flushed,
 }
 
-/// The state every transport shares and that outlives a connection.
 /// How far below the height kept a tip may read and still be a server
 /// that lags: past a day of blocks, the height kept was the wrong one.
 const TIP_LAG_MAX: u32 = 144;
 
+/// The state every transport shares and that outlives a connection.
 pub(crate) struct Hub {
     pub config: WatchConfig,
     pub timings: Timings,

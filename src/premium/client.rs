@@ -1092,7 +1092,6 @@ fn device_refusal(envelope: &ErrorBody) -> Option<PremiumError> {
     })
 }
 
-/// What went wrong on the way to the server, as a sentence.
 /// Largest answer read from the premium server. Five hundred events
 /// fit many times over; past it, what answers is not the server, and
 /// reading on would only fill the memory of a phone.
@@ -1126,6 +1125,7 @@ fn http_client(proxy: Option<&str>) -> CoreResult<reqwest::Client> {
         .map_err(|e| CoreError::Internal(format!("http client: {e}")))
 }
 
+/// What went wrong on the way to the server, as a sentence.
 fn describe(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         return "timed out".to_owned();
