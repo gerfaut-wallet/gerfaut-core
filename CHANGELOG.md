@@ -226,3 +226,6 @@ The first release: the library both Gerfaut apps are built on.
   against its txid, on Electrum as on Esplora. A server could answer with
   another transaction and set the value of the coin, and so the fee, the
   preview showed.
+- A node's refusal of a broadcast is shown in at most 200 characters,
+  control characters dropped, as other sentences from a server already
+  were. A server could fill the screen with a page of text of its own.

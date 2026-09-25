@@ -500,9 +500,26 @@ fn broadcast_error(client: &Client, error: &esplora_client::Error) -> String {
     }
 }
 
+/// Longest refusal shown, in characters, as for any other sentence a
+/// server writes.
+const NODE_MESSAGE_MAX: usize = 200;
+
 /// The reason inside a `sendrawtransaction` refusal, whichever way the
-/// server spelled it; the whole text when it is not one.
+/// server spelled it; the whole text when it is not one. Shown as the
+/// node's words, so kept to one short line: a server that answers a
+/// page of text, or instructions of its own, gets its first 200
+/// characters on screen, control characters dropped.
 pub(crate) fn node_message(text: &str) -> String {
+    let words = node_words(text);
+    let mut kept = words.chars().filter(|c| !c.is_control());
+    let mut short: String = kept.by_ref().take(NODE_MESSAGE_MAX).collect();
+    if kept.next().is_some() {
+        short.push('\u{2026}');
+    }
+    short
+}
+
+fn node_words(text: &str) -> String {
     // A body quoted inside another error arrives with its quotes
     // escaped: read it as if it were not.
     let text = text.replace("\\\"", "\"");
@@ -793,5 +810,10 @@ mod broadcast_tests {
         let escaped = r#"{\"code\":-26,\"message\":\"bad-txns-inputs-missingorspent\"}"#;
         assert_eq!(node_message(escaped), "bad-txns-inputs-missingorspent");
         assert_eq!(node_message("connection refused"), "connection refused");
+        // A page of text, or a sentence of the server's own, is cut to
+        // one short line.
+        let long = node_message(&format!("send it again to\n{}", "x".repeat(1 << 20)));
+        assert_eq!(long.chars().count(), 201);
+        assert!(long.starts_with("send it again tox") && long.ends_with('\u{2026}'));
     }
 }
