@@ -178,3 +178,6 @@ The first release: the library both Gerfaut apps are built on.
   unlocked, as before, and says so in the log. Each save writes to a
   temporary file of its own, removed if the save fails, and an open clears
   the ones a crash left behind.
+- A vault file that cannot be looked at, for a permission or a storage
+  error, fails the open. It used to be taken for a first launch and
+  replaced with an empty vault.

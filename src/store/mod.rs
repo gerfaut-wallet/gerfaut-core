@@ -245,7 +245,10 @@ impl Vault {
         // Nobody else writes here now: whatever temporary file is left
         // was abandoned by a save that never finished.
         vault.remove_stale_temporaries();
-        if vault.path.exists() {
+        // Only a vault that is certainly absent is created: one that
+        // cannot be looked at (a permission, a storage error) fails the
+        // open rather than being replaced by an empty one.
+        if vault.path.try_exists()? {
             let payload = vault.load()?;
             Ok((vault, payload))
         } else {
@@ -586,6 +589,21 @@ mod tests {
                 "notes.tmp",
             ]
         );
+    }
+
+    /// A vault whose presence cannot be checked is not taken for a
+    /// first launch and replaced with an empty one. A link that loops
+    /// stands for any such error here, a permission or a storage fault.
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_that_cannot_be_checked_is_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+
+        let opened = Vault::open_or_create(&path, key());
+        assert!(matches!(opened, Err(VaultError::Io(_))));
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
     }
 
     /// A save that fails removes what it wrote, and the vault on disk is
