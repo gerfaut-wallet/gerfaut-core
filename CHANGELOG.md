@@ -211,3 +211,6 @@ The first release: the library both Gerfaut apps are built on.
   would take it as a start parameter: 1 to 64 letters, digits, `_` and
   `-`. Any other code, which could have changed what the link says, is
   left out, and the link only opens the bot.
+- The key derived from a password or a platform key is wiped on every way
+  out of a seal or an open, a failure included, and Argon2 now wipes its
+  own working hashes as well.

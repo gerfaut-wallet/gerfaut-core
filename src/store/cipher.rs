@@ -19,7 +19,7 @@ use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use rand::RngCore;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::VaultError;
 
@@ -70,9 +70,10 @@ impl VaultKey {
 
     /// Derives the 32-byte encryption key for a given salt, under the
     /// profile the file's KDF byte names.
-    fn derive(&self, kdf: u8, salt: &[u8]) -> Result<[u8; 32], VaultError> {
+    /// Wiped when dropped, on every path out, an error included.
+    fn derive(&self, kdf: u8, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, VaultError> {
         match self {
-            VaultKey::Raw(key) => Ok(*key),
+            VaultKey::Raw(key) => Ok(Zeroizing::new(*key)),
             VaultKey::Password(password) => {
                 let (m_cost, t_cost) = match kdf {
                     KDF_ARGON2ID_64M => (65_536, 3),
@@ -82,9 +83,9 @@ impl VaultKey {
                     .map_err(|e| VaultError::Kdf(e.to_string()))?;
                 let argon =
                     Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-                let mut out = [0u8; 32];
+                let mut out = Zeroizing::new([0u8; 32]);
                 argon
-                    .hash_password_into(password.as_bytes(), salt, &mut out)
+                    .hash_password_into(password.as_bytes(), salt, &mut out[..])
                     .map_err(|e| VaultError::Kdf(e.to_string()))?;
                 Ok(out)
             }
@@ -116,8 +117,8 @@ pub fn seal_with(magic: &[u8; 8], plaintext: &[u8], key: &VaultKey) -> Result<Ve
     header.extend_from_slice(&salt);
     header.extend_from_slice(&nonce);
 
-    let mut derived = key.derive(kdf, &salt)?;
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
+    let derived = key.derive(kdf, &salt)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived[..]));
     let ciphertext = cipher
         .encrypt(
             XNonce::from_slice(&nonce),
@@ -127,7 +128,6 @@ pub fn seal_with(magic: &[u8; 8], plaintext: &[u8], key: &VaultKey) -> Result<Ve
             },
         )
         .map_err(|_| VaultError::Kdf("encryption failure".to_owned()))?;
-    derived.zeroize();
 
     let mut out = header;
     out.extend_from_slice(&ciphertext);
@@ -169,8 +169,8 @@ pub fn unseal_with(magic: &[u8; 8], file: &[u8], key: &VaultKey) -> Result<Vec<u
     let nonce = &file[10 + SALT_LEN..HEADER_LEN];
     let ciphertext = &file[HEADER_LEN..];
 
-    let mut derived = key.derive(kdf, salt)?;
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
+    let derived = key.derive(kdf, salt)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived[..]));
     let payload = Payload {
         msg: ciphertext,
         // Version 1 sealed without associated data.
@@ -180,11 +180,9 @@ pub fn unseal_with(magic: &[u8; 8], file: &[u8], key: &VaultKey) -> Result<Vec<u
             &file[..HEADER_LEN]
         },
     };
-    let plaintext = cipher
+    cipher
         .decrypt(XNonce::from_slice(nonce), payload)
-        .map_err(|_| VaultError::WrongKeyOrCorrupted);
-    derived.zeroize();
-    plaintext
+        .map_err(|_| VaultError::WrongKeyOrCorrupted)
 }
 
 /// Reads the KDF kind of a vault file, so the app knows whether to ask
@@ -272,12 +270,11 @@ mod tests {
         let mut nonce = [0u8; NONCE_LEN];
         rand::rng().fill_bytes(&mut salt);
         rand::rng().fill_bytes(&mut nonce);
-        let mut derived = key.derive(KDF_RAW, &salt).unwrap();
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
+        let derived = key.derive(KDF_RAW, &salt).unwrap();
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived[..]));
         let ciphertext = cipher
             .encrypt(XNonce::from_slice(&nonce), b"legacy payload".as_slice())
             .unwrap();
-        derived.zeroize();
         let mut file = Vec::new();
         file.extend_from_slice(MAGIC);
         file.push(1);
@@ -302,8 +299,8 @@ mod tests {
         header.push(kdf);
         header.extend_from_slice(&salt);
         header.extend_from_slice(&nonce);
-        let mut derived = key.derive(kdf, &salt).unwrap();
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
+        let derived = key.derive(kdf, &salt).unwrap();
+        let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived[..]));
         let ciphertext = cipher
             .encrypt(
                 XNonce::from_slice(&nonce),
@@ -313,7 +310,6 @@ mod tests {
                 },
             )
             .unwrap();
-        derived.zeroize();
         header.extend_from_slice(&ciphertext);
         header
     }
