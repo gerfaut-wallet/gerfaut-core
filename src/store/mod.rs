@@ -411,17 +411,18 @@ fn write_then_swap(tmp: &Path, bytes: &[u8], target: &Path) -> std::io::Result<(
     rename_over(tmp, target)
 }
 
-/// Renames `from` over `to`. On Windows a rename onto a file something
-/// else holds open without delete sharing (a virus scanner, a backup or
-/// indexing tool reading the vault) fails for as long as it holds it, so
-/// it is tried again a few times, 310 ms in all, before giving up.
+/// Renames `from` over `to`. On Windows a rename fails for as long as
+/// something else holds either file open without delete sharing: a
+/// virus scanner or an indexer reading the temporary file just written,
+/// a backup tool reading the vault. It is tried again a few times,
+/// 310 ms in all, before giving up.
 fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         let mut delay = std::time::Duration::from_millis(10);
         for _ in 0..5 {
             match std::fs::rename(from, to) {
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                Err(e) if held_by_another(&e) => {
                     std::thread::sleep(delay);
                     delay *= 2;
                 }
@@ -430,6 +431,16 @@ fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
         }
     }
     std::fs::rename(from, to)
+}
+
+/// Whether a rename failed only because another program holds one of
+/// the files: access denied when it is the target, a sharing or lock
+/// violation (32, 33) when it is the source, which the standard library
+/// leaves uncategorized.
+#[cfg(windows)]
+fn held_by_another(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(error.raw_os_error(), Some(32 | 33))
 }
 
 #[cfg(test)]
@@ -628,6 +639,34 @@ mod tests {
             ["gerfaut.vault", "gerfaut.vault.lock", "moved.vault"]
         );
         assert_eq!(std::fs::read(&elsewhere).unwrap(), before);
+    }
+
+    /// A scanner that holds the file just written, or the vault, for a
+    /// moment does not fail the save: the rename waits it out.
+    #[cfg(windows)]
+    #[test]
+    fn a_rename_waits_for_a_brief_holder_of_either_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("gerfaut.vault");
+        std::fs::write(&target, b"old").unwrap();
+        for held in ["source", "target"] {
+            let source = dir.path().join("gerfaut.vault.1.tmp");
+            std::fs::write(&source, held).unwrap();
+            let handle = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(if held == "source" { &source } else { &target })
+                .unwrap();
+            let release = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                drop(handle);
+            });
+            rename_over(&source, &target).unwrap();
+            release.join().unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), held.as_bytes());
+        }
     }
 
     #[test]
