@@ -23,7 +23,10 @@ embedded-tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:tor-config"]
 bdk_wallet = "3.1"
 bdk_esplora = { version = "0.22", default-features = false, features = ["async-https-rustls", "tokio"] }
 bdk_electrum = { version = "0.24", default-features = false, features = ["use-rustls-ring"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# `gzip`: Esplora answers are JSON, and compressed they are about a
+# quarter of the size. The client asks for it and decompresses on its
+# own; what reads a body whole still caps it where it did.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
 # Reads a server address the way the HTTP client will, so the Tor check
 # and the connection never mean two different hosts; the version
 # reqwest already pulls in, so nothing new is compiled.
