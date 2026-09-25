@@ -168,3 +168,13 @@ The first release: the library both Gerfaut apps are built on.
   descriptor written for another key derives addresses the exporting wallet
   never shows. A prefix that agrees with the function is read as before,
   with the notice that the key was rewritten.
+- A vault opens once at a time. Two copies of the app on the same data
+  directory used to save over each other's changes; now opening the vault
+  takes an exclusive lock on `gerfaut.vault.lock` beside it, held until the
+  wallet manager is dropped, and a second open, from another process or
+  from the same one, fails with the new `VaultError::AlreadyOpen` before
+  anything is read. The system releases the lock when the process ends,
+  a crash included. A file system that cannot lock at all opens the vault
+  unlocked, as before, and says so in the log. Each save writes to a
+  temporary file of its own, removed if the save fails, and an open clears
+  the ones a crash left behind.

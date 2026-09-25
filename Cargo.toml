@@ -65,6 +65,11 @@ chacha20poly1305 = "0.10"
 argon2 = "0.5"
 rand = "0.9"
 zeroize = { version = "1", features = ["derive"] }
+# The exclusive lock on the vault: flock on Unix and Android, LockFileEx
+# on Windows. The standard library's own `File::try_lock` answers
+# "unsupported" on Android. Built on rustix and windows-sys, both
+# already in the tree.
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 # Constant-time comparison of the app lock hash.
 subtle = "2"
 uuid = { version = "1", features = ["v4", "serde"] }

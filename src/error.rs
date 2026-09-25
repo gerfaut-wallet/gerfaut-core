@@ -80,6 +80,13 @@ pub enum VaultError {
     #[error("vault i/o error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Another open holds this vault: a second copy of the app running
+    /// on the same data directory, or a second manager opened in the
+    /// same process. Nothing was read or written. The holder keeps the
+    /// vault until it closes it or exits, and a crash releases it too.
+    #[error("the vault is already open in another Gerfaut process")]
+    AlreadyOpen,
+
     /// The file does not start with the expected magic bytes.
     #[error("not a vault file")]
     NotAVault,

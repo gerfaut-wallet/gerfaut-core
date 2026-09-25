@@ -200,14 +200,27 @@ impl Default for VaultPayload {
     }
 }
 
-/// Handle on the vault file. Owns the key material.
+/// Handle on the vault file. Owns the key material, and the exclusive
+/// lock that keeps every other opener out while it lives.
 pub struct Vault {
     path: PathBuf,
     key: VaultKey,
+    /// The open lock file, locked. Dropping it releases the lock, and
+    /// so does the death of the process, however it dies. `None` when
+    /// the file system cannot lock at all.
+    _lock: Option<std::fs::File>,
+    /// Makes every save fail, so a test can meet a full disk.
+    #[cfg(test)]
+    fail_saves: std::sync::atomic::AtomicBool,
 }
 
 impl Vault {
     /// Opens an existing vault or creates an empty one at `path`.
+    ///
+    /// The vault is locked first, so no other process, and no other
+    /// open in this one, can read or write it until this handle is
+    /// dropped. A vault already open elsewhere is refused with
+    /// [`VaultError::AlreadyOpen`] before anything is read.
     ///
     /// Creation writes the file immediately so that a wrong permission
     /// or path fails now, not at the first save.
@@ -215,19 +228,27 @@ impl Vault {
         path: impl Into<PathBuf>,
         key: VaultKey,
     ) -> Result<(Self, VaultPayload), VaultError> {
+        let path = path.into();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let lock = acquire_lock(&lock_path(&path))?;
         let vault = Vault {
-            path: path.into(),
+            path,
             key,
+            _lock: lock,
+            #[cfg(test)]
+            fail_saves: std::sync::atomic::AtomicBool::new(false),
         };
+        // Nobody else writes here now: whatever temporary file is left
+        // was abandoned by a save that never finished.
+        vault.remove_stale_temporaries();
         if vault.path.exists() {
             let payload = vault.load()?;
             Ok((vault, payload))
         } else {
-            if let Some(parent) = vault.path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)?;
-            }
             let payload = VaultPayload::default();
             vault.save(&payload)?;
             Ok((vault, payload))
@@ -251,19 +272,22 @@ impl Vault {
     /// Encrypts and writes the whole payload, atomically: the new file
     /// is written and flushed to disk next to the old one, then swapped
     /// in with a rename, so neither a crash mid-write nor a power loss
-    /// right after the rename can leave a truncated vault.
+    /// right after the rename can leave a truncated vault. Each save
+    /// writes to a temporary file of its own, removed if the save fails.
     pub fn save(&self, payload: &VaultPayload) -> Result<(), VaultError> {
+        #[cfg(test)]
+        if self.fail_saves.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(VaultError::Io(std::io::Error::other("saves fail")));
+        }
         let plaintext =
             serde_json::to_vec(payload).map_err(|e| VaultError::CorruptedPayload(e.to_string()))?;
         let sealed = cipher::seal(&plaintext, &self.key)?;
-        let tmp = self.path.with_extension("tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(&sealed)?;
-            file.sync_all()?;
+        let tmp = self.temporary_path();
+        let written = write_then_swap(&tmp, &sealed, &self.path);
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        std::fs::rename(&tmp, &self.path)?;
+        written?;
         // Persist the rename itself where the platform allows it.
         #[cfg(unix)]
         if let Some(parent) = self.path.parent()
@@ -278,6 +302,131 @@ impl Vault {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Makes every later save fail, or succeed again.
+    #[cfg(test)]
+    pub(crate) fn fail_saves(&self, fail: bool) {
+        self.fail_saves
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `gerfaut.vault.<random>.tmp` beside `gerfaut.vault`: a name no
+    /// other save picks.
+    fn temporary_path(&self) -> PathBuf {
+        let mut name = self.file_name();
+        name.push(format!(".{:016x}{TEMP_SUFFIX}", rand::random::<u64>()));
+        self.path.with_file_name(name)
+    }
+
+    fn file_name(&self) -> std::ffi::OsString {
+        self.path.file_name().unwrap_or_default().to_owned()
+    }
+
+    /// Removes the temporary files of saves that never finished: those
+    /// named after this vault, and the one fixed name older builds used.
+    /// Only files, and never the vault or its lock.
+    fn remove_stale_temporaries(&self) {
+        let prefix = {
+            let mut prefix = self.file_name();
+            prefix.push(".");
+            prefix.to_string_lossy().into_owned()
+        };
+        let legacy = self.path.with_extension("tmp");
+        let dir = match self.path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let ours = name.starts_with(&prefix) && name.ends_with(TEMP_SUFFIX);
+            let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+            if is_file && (ours || entry.path() == legacy) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// What ends the name of a vault's temporary file.
+const TEMP_SUFFIX: &str = ".tmp";
+
+/// `gerfaut.vault.lock` beside `gerfaut.vault`. It stays on disk after
+/// the vault is closed: the lock lives in the open file, not in the
+/// file's existence, and removing it would only let two openers lock
+/// two different files.
+fn lock_path(vault: &Path) -> PathBuf {
+    let mut name = vault.file_name().unwrap_or_default().to_owned();
+    name.push(".lock");
+    vault.with_file_name(name)
+}
+
+/// Takes the exclusive lock on the lock file, without waiting.
+///
+/// The lock is advisory and belongs to the open file: flock on Unix and
+/// Android, where a second open of the same file conflicts even within
+/// one process, and LockFileEx on Windows, which behaves the same. The
+/// system drops it when the file is closed or the process dies, so a
+/// crash never leaves a vault that cannot be opened again.
+///
+/// A file system that cannot lock at all (some network and FUSE mounts)
+/// gets the vault unlocked, as every earlier build had it, rather than
+/// no vault: that is logged, and one copy of the app per data directory
+/// is then up to the user.
+fn acquire_lock(path: &Path) -> Result<Option<std::fs::File>, VaultError> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match fs4::FileExt::try_lock(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(fs4::TryLockError::WouldBlock) => Err(VaultError::AlreadyOpen),
+        Err(fs4::TryLockError::Error(error)) => {
+            log::warn!("the vault cannot be locked here, opening it unlocked: {error}");
+            Ok(None)
+        }
+    }
+}
+
+/// Writes `bytes` to the new file `tmp`, flushes them to disk, and
+/// renames `tmp` over `target`.
+fn write_then_swap(tmp: &Path, bytes: &[u8], target: &Path) -> std::io::Result<()> {
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    rename_over(tmp, target)
+}
+
+/// Renames `from` over `to`. On Windows a rename onto a file something
+/// else holds open without delete sharing (a virus scanner, a backup or
+/// indexing tool reading the vault) fails for as long as it holds it, so
+/// it is tried again a few times, 310 ms in all, before giving up.
+fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut delay = std::time::Duration::from_millis(10);
+        for _ in 0..5 {
+            match std::fs::rename(from, to) {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    std::thread::sleep(delay);
+                    delay *= 2;
+                }
+                other => return other,
+            }
+        }
+    }
+    std::fs::rename(from, to)
 }
 
 #[cfg(test)]
@@ -327,6 +476,7 @@ mod tests {
         });
         payload.settings.active_network = Network::Signet;
         vault.save(&payload).unwrap();
+        drop(vault);
 
         let (_, reloaded) = Vault::open_or_create(&path, key()).unwrap();
         assert_eq!(reloaded.wallets.len(), 1);
@@ -350,7 +500,116 @@ mod tests {
         let path = dir.path().join("gerfaut.vault");
         let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
         vault.save(&payload).unwrap();
-        assert!(!path.with_extension("tmp").exists());
+        vault.save(&payload).unwrap();
+        assert_eq!(
+            names_in(dir.path()),
+            ["gerfaut.vault", "gerfaut.vault.lock"]
+        );
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Two opens of one vault would each save their own copy over the
+    /// other's. The second is refused before it reads anything, in this
+    /// process as in another, and the vault opens again once the first
+    /// handle is gone.
+    #[test]
+    fn a_vault_opens_once_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let (vault, mut payload) = Vault::open_or_create(&path, key()).unwrap();
+
+        let second = Vault::open_or_create(&path, key());
+        assert!(matches!(second, Err(VaultError::AlreadyOpen)));
+        // Even with the wrong key: nothing was read to find out.
+        let wrong = Vault::open_or_create(&path, VaultKey::Raw([1u8; 32]));
+        assert!(matches!(wrong, Err(VaultError::AlreadyOpen)));
+
+        payload.settings.gap_limit = 42;
+        vault.save(&payload).unwrap();
+        drop(vault);
+
+        let (_, reloaded) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(reloaded.settings.gap_limit, 42);
+        // The lock file stays: the lock is in the open file, not in its
+        // existence.
+        assert!(dir.path().join("gerfaut.vault.lock").exists());
+    }
+
+    /// An open that fails, on a wrong key here, lets go of the lock:
+    /// the app can set that vault aside and try again.
+    #[test]
+    fn a_failed_open_releases_the_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        drop(Vault::open_or_create(&path, key()).unwrap());
+
+        let wrong = Vault::open_or_create(&path, VaultKey::Raw([1u8; 32]));
+        assert!(matches!(wrong, Err(VaultError::WrongKeyOrCorrupted)));
+        assert!(Vault::open_or_create(&path, key()).is_ok());
+    }
+
+    /// A save cut short by a crash leaves its temporary file behind; the
+    /// next open clears it, and the name older builds used, and nothing
+    /// else.
+    #[test]
+    fn an_open_clears_abandoned_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        drop(Vault::open_or_create(&path, key()).unwrap());
+        for name in [
+            "gerfaut.vault.00000000deadbeef.tmp",
+            "gerfaut.tmp",
+            "gerfaut.attempts.tmp",
+            "notes.tmp",
+        ] {
+            std::fs::write(dir.path().join(name), b"half a vault").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("gerfaut.vault.dir.tmp")).unwrap();
+
+        let (_, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert!(payload.wallets.is_empty());
+        assert_eq!(
+            names_in(dir.path()),
+            [
+                "gerfaut.attempts.tmp",
+                "gerfaut.vault",
+                "gerfaut.vault.dir.tmp",
+                "gerfaut.vault.lock",
+                "notes.tmp",
+            ]
+        );
+    }
+
+    /// A save that fails removes what it wrote, and the vault on disk is
+    /// the one before it.
+    #[test]
+    fn a_failed_save_leaves_the_previous_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let (vault, mut payload) = Vault::open_or_create(&path, key()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        // A directory where the vault should be: the rename fails after
+        // the temporary file was written.
+        let elsewhere = dir.path().join("moved.vault");
+        std::fs::rename(&path, &elsewhere).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep"), b"x").unwrap();
+        payload.settings.gap_limit = 42;
+        assert!(vault.save(&payload).is_err());
+        assert_eq!(
+            names_in(dir.path()),
+            ["gerfaut.vault", "gerfaut.vault.lock", "moved.vault"]
+        );
+        assert_eq!(std::fs::read(&elsewhere).unwrap(), before);
     }
 
     #[test]

@@ -2939,6 +2939,7 @@ mod tests {
             .unwrap();
         manager.rename_wallet(&meta.id, "New name").await.unwrap();
 
+        drop(manager);
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         let wallets = manager.list_wallets(None).await;
         assert_eq!(wallets[0].name, "New name");
@@ -2963,6 +2964,7 @@ mod tests {
             Err(CoreError::WalletNotFound(_))
         ));
 
+        drop(manager);
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         assert_eq!(
             manager.list_wallets(None).await[0].icon,
@@ -3015,6 +3017,7 @@ mod tests {
             Err(CoreError::WalletNotFound(_))
         ));
 
+        drop(manager);
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         assert_eq!(names(manager.list_wallets(None).await), ["C", "B", "A"]);
     }
@@ -3038,6 +3041,7 @@ mod tests {
             .await
             .unwrap();
 
+        drop(manager);
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         let settings = manager.settings().await;
         assert_eq!(settings.active_network, Network::Signet);
@@ -3161,6 +3165,7 @@ mod tests {
         assert!(!premium.is_consented(&meta.id));
 
         // It survives a reopen: the message waits in the vault.
+        drop(manager);
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         assert_eq!(manager.premium_state().await.pending_unwatch, vec![meta.id]);
     }
@@ -3528,6 +3533,7 @@ mod tests {
         premium.consent("w1", 100);
         store_premium(&manager, premium.clone()).await;
 
+        drop(manager);
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         assert_eq!(manager.premium_state().await, premium);
         // The client built from it carries the stored key, and a
@@ -4224,11 +4230,13 @@ mod tests {
 
         let target_dir = tempfile::tempdir().unwrap();
         let target = manager(target_dir.path()).await;
-        // The vault is written to a temporary file first and renamed
-        // into place; a directory under that name makes every save fail
-        // before the vault itself is touched.
-        let blocker = target_dir.path().join("gerfaut.tmp");
-        std::fs::create_dir(&blocker).unwrap();
+        // Every save fails from here, before the vault itself is
+        // touched, as it would on a full disk.
+        let fail_saves = |fail: bool| {
+            let target = target.clone();
+            async move { target.state.lock().await.vault.fail_saves(fail) }
+        };
+        fail_saves(true).await;
 
         let error = target
             .import_backup(&bundle.data, BACKUP_PASSWORD, &everything)
@@ -4261,7 +4269,7 @@ mod tests {
 
         // The disk back: the same import goes through whole, and a
         // fresh open finds exactly what the report said.
-        std::fs::remove_dir(&blocker).unwrap();
+        fail_saves(false).await;
         let report = target
             .import_backup(&bundle.data, BACKUP_PASSWORD, &everything)
             .await
@@ -4271,14 +4279,14 @@ mod tests {
         let cold = report.added[0].id.clone();
 
         // Renaming and removing are held to the same rule.
-        std::fs::create_dir(&blocker).unwrap();
+        fail_saves(true).await;
         assert!(target.rename_wallet(&cold, "Renamed").await.is_err());
         assert!(target.remove_wallet(&cold).await.is_err());
         let wallets = target.list_wallets(None).await;
         assert_eq!(wallets.len(), 2);
         assert_eq!(wallets[0].name, "Cold");
         assert!(target.wallet_snapshot(&cold).await.is_ok());
-        std::fs::remove_dir(&blocker).unwrap();
+        fail_saves(false).await;
 
         drop(target);
         let reopened = WalletManager::open(target_dir.path(), key()).unwrap();
@@ -4331,6 +4339,7 @@ mod tests {
             }
         ));
 
+        drop(manager);
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         assert_eq!(
             manager.settings().await.tor,
