@@ -244,3 +244,8 @@ The first release: the library both Gerfaut apps are built on.
 - A live watch that read an impossible tip height, from a lying server or
   a slip, no longer ignores every block after it: a height more than a
   day of blocks below the one kept becomes the baseline again.
+- The update check keeps the page it links to only when it is one of the
+  repository's release pages on GitHub, and falls back to the latest
+  release page otherwise. A tag longer than 32 characters, or with
+  spaces in it, is not taken for a version, and at most 1 MiB of the
+  answer is read.

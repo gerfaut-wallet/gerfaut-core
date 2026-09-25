@@ -79,7 +79,7 @@ pub(crate) async fn check_update(
     let client = builder
         .build()
         .map_err(|e| CoreError::Internal(format!("http client: {e}")))?;
-    let response = client
+    let mut response = client
         .get(format!("{api}/repos/{repo}/releases/latest"))
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -88,18 +88,56 @@ pub(crate) async fn check_update(
     if !response.status().is_success() {
         return Err(check_error(format!("http {}", response.status())));
     }
-    let value: serde_json::Value = response
-        .json()
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|e| check_error(e.to_string()))?;
+        .map_err(|e| check_error(crate::chain::esplora::describe_failure(&e)))?
+    {
+        if body.len() + chunk.len() > MAX_ANSWER {
+            return Err(check_error("the answer is far too large".to_owned()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| check_error(e.to_string()))?;
+    read_release(&value, repo, current_version)
+}
+
+/// Largest answer read from the releases API: one release, its notes
+/// and its assets fit many times over.
+const MAX_ANSWER: usize = 1 << 20;
+
+/// Longest version tag taken: `v1.2.3` and any suffix a release could
+/// carry fit well within it.
+const TAG_MAX: usize = 32;
+
+/// What the answer says, held to what a release of `repo` looks like.
+/// The page it links to is shown and opened by the apps, so it is kept
+/// only when it is one of that repository's release pages on GitHub,
+/// and replaced by the latest release page otherwise. A tag longer than
+/// any version is not one.
+fn read_release(
+    value: &serde_json::Value,
+    repo: &str,
+    current_version: &str,
+) -> CoreResult<UpdateCheck> {
     let latest = value["tag_name"]
         .as_str()
-        .ok_or_else(|| check_error("no tag in response".to_owned()))?
+        .filter(|tag| {
+            !tag.is_empty() && tag.len() <= TAG_MAX && tag.chars().all(|c| c.is_ascii_graphic())
+        })
+        .ok_or_else(|| check_error("no version tag in response".to_owned()))?
         .to_owned();
+    let releases = format!("https://github.com/{repo}/releases/");
     let url = value["html_url"]
         .as_str()
-        .unwrap_or(&format!("https://github.com/{repo}/releases/latest"))
-        .to_owned();
+        .filter(|url| {
+            url.starts_with(&releases)
+                && url.len() <= releases.len() + 64
+                && url.chars().all(|c| c.is_ascii_graphic())
+        })
+        .map_or_else(|| format!("{releases}latest"), str::to_owned);
     Ok(UpdateCheck {
         update_available: is_newer(&latest, current_version),
         latest,
@@ -286,6 +324,47 @@ mod tests {
             .unwrap_err();
         assert!(matches!(refused, CoreError::Tor(_)), "{refused}");
         assert_eq!(*visits.lock().unwrap(), 0, "nothing left in the clear");
+    }
+
+    /// The page an update notice opens is one of the repository's
+    /// release pages, whatever the answer names; and a tag no version
+    /// could be is refused.
+    #[test]
+    fn a_release_answer_is_held_to_what_a_release_looks_like() {
+        let repo = "gerfaut-wallet/gerfaut-desktop";
+        let read = |tag: &str, url: &str| {
+            read_release(
+                &serde_json::json!({ "tag_name": tag, "html_url": url }),
+                repo,
+                "0.1.0",
+            )
+        };
+        let good = read(
+            "v0.2.0",
+            "https://github.com/gerfaut-wallet/gerfaut-desktop/releases/tag/v0.2.0",
+        )
+        .unwrap();
+        assert!(good.update_available);
+        assert_eq!(
+            good.url,
+            "https://github.com/gerfaut-wallet/gerfaut-desktop/releases/tag/v0.2.0"
+        );
+        for url in [
+            "javascript:alert(1)",
+            "https://evil.example/gerfaut-wallet/gerfaut-desktop/releases/",
+            "https://github.com/someone-else/gerfaut-desktop/releases/tag/v0.2.0",
+            "https://github.com.evil.example/gerfaut-wallet/gerfaut-desktop/releases/",
+            "https://github.com/gerfaut-wallet/gerfaut-desktop/releases/tag/v0.2.0 click here",
+        ] {
+            assert_eq!(
+                read("v0.2.0", url).unwrap().url,
+                "https://github.com/gerfaut-wallet/gerfaut-desktop/releases/latest",
+                "{url}"
+            );
+        }
+        assert!(read(&"9".repeat(33), "").is_err());
+        assert!(read("", "").is_err());
+        assert!(read("v1.0.0 <b>", "").is_err());
     }
 
     #[test]
