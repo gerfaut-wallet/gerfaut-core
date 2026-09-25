@@ -94,9 +94,9 @@ The first release: the library both Gerfaut apps are built on.
   about its removed wallets, with the old token, and none of those
   removals ever goes to the new account.
 - One sync of a wallet runs at a time. A caller that arrives while one runs
-  waits for it, then runs its own, since that sync may have read the
-  wallet before the payment the caller came for arrived. Callers that
-  wait together share that next sync instead of asking the backend each.
+  waits for it, then runs its own, since the running sync may have read
+  the wallet before the payment the caller came for arrived. Callers that
+  wait together share that next sync instead of each asking the backend.
 - On a phone, the built-in Tor client uses reduced channel padding, so a
   connection held open for hours lets the radio sleep between cells. A
   desktop keeps the normal level.
@@ -120,7 +120,17 @@ The first release: the library both Gerfaut apps are built on.
   Electrum. The first sync of a wallet after the vault opens, and one a
   day after that, also lists the unconfirmed transactions of every script
   that has some: that is how a replacement paying the same amount gets
-  caught. `WalletMeta.complete_at` records when that last happened.
+  caught. `WalletMeta.complete_at` records when that last happened, and
+  any sync that comes a day or more after it reads every script, whoever
+  asked for it. Every Esplora answer is capped at 32 MiB once
+  decompressed, including the requests of the live watch, single
+  addresses and broadcasts, and so is every price answer: a small gzip of
+  a huge body is cut off instead of being held in memory.
+- A payment that a reorganisation replaced with a conflicting spend to
+  someone else costs nothing more once a sync has seen it go. Before,
+  each Esplora sync read the whole history of its address, and each watch
+  start synced it again. The wallet still lists it as pending, as it did
+  before.
 - The live watch says which scripts moved. `WatchEvent::WalletChanged`
   carries them in `scripts`, empty when the transport cannot tell, and the
   sync that follows reads only those scripts, on the server the watch
@@ -131,7 +141,21 @@ The first release: the library both Gerfaut apps are built on.
   it with the server's and syncs only the scripts whose status differs,
   instead of every wallet. On the busy wallet above, a pushed payment or
   confirmation now costs 12 to 26 KB instead of 6.4 MB, a restart about
-  55 KB, and an hour of watching went from 38 MB to 177 KB.
+  55 KB, and an hour of watching went from 38 MB to 177 KB. When the
+  server refuses to watch a script, or gives up on the rest after
+  refusing several in a row, those scripts are synced when the watch
+  starts, and so is every script of a wallet that the 2,000-script cap of
+  a watch cut short. Polling compares the first counters it reads for a
+  script with what the wallet holds, so a payment that arrives after the
+  watch starts, but before polling reaches its address, is still
+  announced. A change heard on one script at the same time as a
+  reconnection no longer narrows the whole-wallet sync the reconnection
+  asks for.
+- The live watch keeps each wallet complete on its own. At each block,
+  and every ten minutes, it reruns any sync that failed, and reads every
+  script of any wallet that has gone a day without a complete sync. A
+  phone can keep a watch running for days with no other sync, and the
+  watch cannot hear every script.
 - Backup files are sealed under a heavier Argon2id profile than the vault
   (64 MiB of memory, three passes): a backup travels, and whoever holds a
   copy can guess at its password offline for as long as the file exists.
