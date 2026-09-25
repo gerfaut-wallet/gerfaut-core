@@ -255,3 +255,7 @@ The first release: the library both Gerfaut apps are built on.
   like a pasted key: a multisig cosigner key, or a prefix for another
   script than the account's, is refused instead of imported under the
   account's script with addresses the exporting wallet never shows.
+- A watched address whose sync comes back with a full page of 50
+  unconfirmed transactions no longer announces a payment as dropped for
+  missing from that page. Anyone could push it off by sending the
+  address enough dust.

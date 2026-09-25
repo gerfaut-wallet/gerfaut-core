@@ -323,6 +323,12 @@ pub(crate) fn address_moves(
         .flat_map(|state| &state.txs)
         .filter(|tx| tx.height.is_none())
         .collect();
+    // A sync reads at most a page of unconfirmed transactions. When it
+    // came back full, one missing from it may only have been pushed
+    // off the page, by anyone who sends the address enough dust: that
+    // is no sign it left the mempool, and nothing is said gone.
+    let page_full = watch.txs.iter().filter(|tx| tx.height.is_none()).count()
+        >= crate::chain::electrum::address::MEMPOOL_PER_ROUND;
     Moves {
         new: watch
             .txs
@@ -338,7 +344,7 @@ pub(crate) fn address_moves(
             .collect(),
         gone: pending_before
             .iter()
-            .filter(|tx| !now.contains(tx.txid.as_str()))
+            .filter(|tx| !page_full && !now.contains(tx.txid.as_str()))
             .map(|tx| address_seen(tx))
             .collect(),
         pending_before: pending_before.into_iter().map(address_seen).collect(),
@@ -1078,6 +1084,28 @@ mod tests {
             outputs: Vec::new(),
             extras: None,
         }
+    }
+
+    /// A payment pushed off a full page of unconfirmed transactions,
+    /// by dust anyone can send, is not said gone: only one missing from
+    /// a page with room left is.
+    #[test]
+    fn a_full_page_of_pending_transactions_says_nothing_gone() {
+        let first = AddressWatchState {
+            txs: vec![address_tx("paid", 50_000, None)],
+            ..Default::default()
+        };
+        let dust = |count: usize| AddressWatchState {
+            txs: (0..count)
+                .map(|n| address_tx(&format!("dust{n}"), 546, None))
+                .collect(),
+            ..Default::default()
+        };
+        let full = crate::chain::electrum::address::MEMPOOL_PER_ROUND;
+        assert!(address_moves(Some(&first), &dust(full)).gone.is_empty());
+        let room = address_moves(Some(&first), &dust(full - 1));
+        assert_eq!(room.gone.len(), 1);
+        assert_eq!(room.gone[0].txid, "paid");
     }
 
     /// The pending line under a balance reads the transactions, not the

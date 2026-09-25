@@ -31,7 +31,7 @@ use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
 
 /// Unconfirmed transactions in a round: what the first page of an
 /// Esplora history holds.
-const MEMPOOL_PER_ROUND: usize = 50;
+pub(crate) const MEMPOOL_PER_ROUND: usize = 50;
 /// Confirmed transactions in a round: as many as Esplora pages hold in
 /// one, 25 a page.
 pub(crate) const CONFIRMED_PER_ROUND: usize = HISTORY_PAGES_PER_ROUND * 25;
