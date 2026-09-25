@@ -17,8 +17,12 @@
 use std::collections::HashMap;
 
 use bdk_wallet::bitcoin::consensus::encode;
+use bdk_wallet::bitcoin::script::Instruction;
 use bdk_wallet::bitcoin::secp256k1::Secp256k1;
-use bdk_wallet::bitcoin::{Address, Amount, OutPoint, Psbt, ScriptBuf, Transaction, TxIn, TxOut};
+use bdk_wallet::bitcoin::sighash::{EcdsaSighashType, TapSighashType};
+use bdk_wallet::bitcoin::{
+    Address, Amount, OutPoint, Psbt, Script, ScriptBuf, Transaction, TxIn, TxOut, Witness,
+};
 use bdk_wallet::miniscript::psbt::PsbtExt;
 use serde::{Deserialize, Serialize};
 
@@ -127,6 +131,10 @@ pub enum TxWarningKind {
     DustOutput,
     /// The transaction spends coins of a watched wallet.
     SpendsWatched,
+    /// An input is signed with `SIGHASH_NONE` or `SIGHASH_SINGLE`: its
+    /// signature leaves some or all of the outputs open, and whoever
+    /// relays or mines the transaction can send that money elsewhere.
+    UncommittedOutputs,
 }
 
 /// How loudly a caution should be read.
@@ -159,6 +167,10 @@ impl TxWarningKind {
             // shows is whatever its author chose, and the signature is
             // valid over the real one.
             TxWarningKind::InputMismatch => TxSeverity::Alert,
+            // A signature that leaves outputs open hands them to the
+            // first node that relays it: the outputs shown are a
+            // suggestion, not what will be paid.
+            TxWarningKind::UncommittedOutputs => TxSeverity::Alert,
             // Nothing here costs anything: an input the backend has not
             // indexed, a time lock, a fee that could not be computed, an
             // output under the dust threshold, a coin of a watched
@@ -280,6 +292,11 @@ pub struct DecodedInput {
     /// shown: what the PSBT's author declared, for the caution that
     /// names it.
     pub disputed_witness_utxo: Option<TxOut>,
+    /// The signature hash type of a signature on this input that does
+    /// not cover every output, `SIGHASH_NONE` or `SIGHASH_SINGLE` with
+    /// or without `ANYONECANPAY`, spelled that way. `None` when every
+    /// signature found covers every output.
+    pub loose_sighash: Option<String>,
 }
 
 /// Decodes a transaction from text: base64 PSBT, hex PSBT, hex raw
@@ -334,6 +351,7 @@ pub fn decode_bytes_as_transaction(bytes: &[u8]) -> CoreResult<DecodedTx> {
             signed: !input.script_sig.is_empty() || !input.witness.is_empty(),
             prevout: None,
             disputed_witness_utxo: None,
+            loose_sighash: loose_sighash_in(&input.script_sig, &input.witness),
         })
         .collect::<Vec<_>>();
     let ready = inputs.iter().all(|input| input.signed);
@@ -399,6 +417,25 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
             )));
         }
     }
+    // The finalizer folds the partial signatures into the final script
+    // or witness, where they are read again below; an input it cannot
+    // finish keeps them only here.
+    let partial_loose: Vec<Option<String>> = psbt
+        .inputs
+        .iter()
+        .map(|input| {
+            let ecdsa = input.partial_sigs.values().map(|sig| sig.sighash_type);
+            let schnorr = input
+                .tap_key_sig
+                .iter()
+                .chain(input.tap_script_sigs.values())
+                .map(|sig| sig.sighash_type);
+            ecdsa
+                .filter_map(loose_ecdsa)
+                .chain(schnorr.filter_map(loose_schnorr))
+                .next()
+        })
+        .collect();
     let secp = Secp256k1::verification_only();
     // Inputs the finalizer could not complete are the unsigned ones;
     // the error list names them by index.
@@ -433,10 +470,17 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
             _ => None,
         };
         let prevout = from_previous.or_else(|| input.witness_utxo.clone());
+        let no_witness = Witness::new();
+        let loose_sighash = loose_sighash_in(
+            input.final_script_sig.as_deref().unwrap_or(Script::new()),
+            input.final_script_witness.as_ref().unwrap_or(&no_witness),
+        )
+        .or_else(|| partial_loose[index].clone());
         inputs.push(DecodedInput {
             signed: final_present && !unfinished.contains(&index),
             prevout,
             disputed_witness_utxo,
+            loose_sighash,
         });
     }
     let ready = inputs.iter().all(|input| input.signed);
@@ -451,6 +495,76 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
         inputs,
         ready,
     })
+}
+
+/// The first signature hash type found on an input's signatures that
+/// leaves outputs open, spelled the way the protocol names it.
+///
+/// Signatures are recognised by their shape, without the coin they
+/// spend: a strict DER signature followed by its type byte, anywhere;
+/// and in a witness, a 65-byte Schnorr signature, whose last byte is
+/// its type. The script and the control block that end a taproot
+/// script-path witness, and its annex, are set aside first, since a
+/// control block can be 65 bytes long too; a 65-byte push in a legacy
+/// script is an uncompressed public key, and is never read as one.
+fn loose_sighash_in(script_sig: &Script, witness: &Witness) -> Option<String> {
+    let mut elements: Vec<&[u8]> = witness.iter().collect();
+    if elements.len() >= 2 && elements.last().is_some_and(|e| e.first() == Some(&0x50)) {
+        elements.pop();
+    }
+    if elements.len() >= 2 && elements.last().is_some_and(|e| is_control_block(e)) {
+        elements.truncate(elements.len() - 2);
+    }
+    let in_witness = elements.into_iter().find_map(|element| {
+        match bdk_wallet::bitcoin::ecdsa::Signature::from_slice(element) {
+            Ok(sig) => loose_ecdsa(sig.sighash_type),
+            Err(_) if element.len() == 65 => {
+                bdk_wallet::bitcoin::taproot::Signature::from_slice(element)
+                    .ok()
+                    .and_then(|sig| loose_schnorr(sig.sighash_type))
+            }
+            Err(_) => None,
+        }
+    });
+    in_witness.or_else(|| {
+        script_sig
+            .instructions()
+            .find_map(|instruction| match instruction {
+                Ok(Instruction::PushBytes(bytes)) => {
+                    bdk_wallet::bitcoin::ecdsa::Signature::from_slice(bytes.as_bytes())
+                        .ok()
+                        .and_then(|sig| loose_ecdsa(sig.sighash_type))
+                }
+                _ => None,
+            })
+    })
+}
+
+/// A taproot control block: a leaf version byte, the internal key, and
+/// up to 128 hashes of the path.
+fn is_control_block(element: &[u8]) -> bool {
+    element.len() >= 33
+        && (element.len() - 33).is_multiple_of(32)
+        && element.len() <= 33 + 32 * 128
+        && element[0] & 0xfe == 0xc0
+}
+
+fn loose_ecdsa(kind: EcdsaSighashType) -> Option<String> {
+    use EcdsaSighashType as T;
+    matches!(
+        kind,
+        T::None | T::Single | T::NonePlusAnyoneCanPay | T::SinglePlusAnyoneCanPay
+    )
+    .then(|| kind.to_string())
+}
+
+fn loose_schnorr(kind: TapSighashType) -> Option<String> {
+    use TapSighashType as T;
+    matches!(
+        kind,
+        T::None | T::Single | T::NonePlusAnyoneCanPay | T::SinglePlusAnyoneCanPay
+    )
+    .then(|| kind.to_string())
 }
 
 /// The first input that spends a coin an earlier one already spends,
@@ -580,6 +694,16 @@ pub fn build_preview(
             .unwrap_or_else(|| format!("script {:x}", prevout.script_pubkey))
     };
     for (i, input) in decoded.inputs.iter().enumerate() {
+        if let Some(kind) = &input.loose_sighash {
+            warnings.push(TxWarning::new(
+                TxWarningKind::UncommittedOutputs,
+                format!(
+                    "Input {i} is signed with {kind}, which leaves some or all of the outputs \
+                     open: whoever relays or mines this transaction can send that money \
+                     elsewhere. Have it signed again over every output (SIGHASH_ALL)."
+                ),
+            ));
+        }
         // The PSBT disagrees with itself on the coin: the previous
         // transaction it carries, which the outpoint pins, pays one
         // thing, and its witness entry declares another. The amount
@@ -775,6 +899,7 @@ mod tests {
             (HighFeeRate, TxSeverity::Alert),
             (HighFeeShare, TxSeverity::Alert),
             (InputMismatch, TxSeverity::Alert),
+            (UncommittedOutputs, TxSeverity::Alert),
             (InputUnknown, TxSeverity::Info),
             (Locked, TxSeverity::Info),
             (FeeUnknown, TxSeverity::Info),
@@ -788,7 +913,7 @@ mod tests {
             .iter()
             .filter(|(_, s)| *s == TxSeverity::Alert)
             .count();
-        assert_eq!(red, 5, "red widened without a decision");
+        assert_eq!(red, 6, "red widened without a decision");
     }
 
     /// The tone travels with the caution: a screen reads it, never
@@ -804,6 +929,146 @@ mod tests {
     }
     use bdk_wallet::bitcoin::hashes::Hash;
     use bdk_wallet::bitcoin::{Sequence, TxIn, Txid, WPubkeyHash, Witness, absolute, transaction};
+
+    /// A well-formed DER signature with r = s = 1, then its type byte.
+    /// Only its shape matters here: nothing checks it against a key.
+    fn der_signature(sighash: u8) -> Vec<u8> {
+        vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, sighash]
+    }
+
+    fn spending(script_sig: ScriptBuf, witness: Vec<Vec<u8>>) -> Transaction {
+        Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([3; 32]), 0),
+                script_sig,
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&witness),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: p2wpkh(9),
+            }],
+        }
+    }
+
+    fn loose_of(tx: &Transaction) -> Option<String> {
+        let decoded = decode_bytes_as_transaction(&encode::serialize(tx)).unwrap();
+        decoded.inputs[0].loose_sighash.clone()
+    }
+
+    /// A signature over only some outputs, or none, leaves the rest to
+    /// whoever relays the transaction. The preview says so, in red,
+    /// whatever the kind of input carries it.
+    #[test]
+    fn a_signature_that_leaves_outputs_open_is_called_out() {
+        let key = vec![0x02; 33];
+        // P2WPKH, SIGHASH_NONE.
+        let none = spending(ScriptBuf::new(), vec![der_signature(0x02), key.clone()]);
+        assert_eq!(loose_of(&none).as_deref(), Some("SIGHASH_NONE"));
+        let decoded = decode_bytes_as_transaction(&encode::serialize(&none)).unwrap();
+        let preview = build_preview(&decoded, Network::Mainnet, &[], &[], Some(100), 0);
+        let warning = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::UncommittedOutputs)
+            .expect("the caution");
+        assert_eq!(warning.severity, TxSeverity::Alert);
+        assert!(warning.message.contains("SIGHASH_NONE"));
+
+        // Legacy, SIGHASH_SINGLE|ANYONECANPAY, in the script.
+        let legacy = ScriptBuf::builder()
+            .push_slice(
+                <&bdk_wallet::bitcoin::script::PushBytes>::try_from(&der_signature(0x83)[..])
+                    .unwrap(),
+            )
+            .push_slice([0x02; 33])
+            .into_script();
+        assert_eq!(
+            loose_of(&spending(legacy, Vec::new())).as_deref(),
+            Some("SIGHASH_SINGLE|SIGHASH_ANYONECANPAY")
+        );
+
+        // Taproot key path: a 65-byte signature ends with its type.
+        let mut schnorr = vec![0x11; 64];
+        schnorr.push(0x03);
+        assert_eq!(
+            loose_of(&spending(ScriptBuf::new(), vec![schnorr])).as_deref(),
+            Some("SIGHASH_SINGLE")
+        );
+    }
+
+    /// Signatures over every output, and what only looks like a typed
+    /// signature, raise nothing.
+    #[test]
+    fn signatures_over_every_output_raise_nothing() {
+        let key = vec![0x02; 33];
+        for sighash in [0x01, 0x81] {
+            let tx = spending(ScriptBuf::new(), vec![der_signature(sighash), key.clone()]);
+            assert_eq!(loose_of(&tx), None);
+            let decoded = decode_bytes_as_transaction(&encode::serialize(&tx)).unwrap();
+            let preview = build_preview(&decoded, Network::Mainnet, &[], &[], Some(100), 0);
+            assert!(
+                preview
+                    .warnings
+                    .iter()
+                    .all(|w| w.kind != TxWarningKind::UncommittedOutputs)
+            );
+        }
+        // Taproot key path, SIGHASH_DEFAULT: 64 bytes.
+        assert_eq!(
+            loose_of(&spending(ScriptBuf::new(), vec![vec![0x11; 64]])),
+            None
+        );
+        // A script-path spend whose 65-byte control block happens to end
+        // in 0x02: the control block is no signature.
+        let mut control = vec![0xc0];
+        control.extend([0x22; 63]);
+        control.push(0x02);
+        let script = vec![0x51];
+        let path = spending(ScriptBuf::new(), vec![vec![0x11; 64], script, control]);
+        assert_eq!(loose_of(&path), None);
+        // A legacy spend with an uncompressed key that ends in 0x02.
+        let mut uncompressed = [0x04; 65];
+        uncompressed[64] = 0x02;
+        let legacy = ScriptBuf::builder()
+            .push_slice(
+                <&bdk_wallet::bitcoin::script::PushBytes>::try_from(&der_signature(0x01)[..])
+                    .unwrap(),
+            )
+            .push_slice(uncompressed)
+            .into_script();
+        assert_eq!(loose_of(&spending(legacy, Vec::new())), None);
+    }
+
+    /// A PSBT not finished yet carries its signatures apart, each with
+    /// its type: those are read too.
+    #[test]
+    fn a_partial_signature_that_leaves_outputs_open_is_called_out() {
+        use bdk_wallet::bitcoin::{PublicKey, ecdsa, secp256k1};
+        let mut unsigned = spending(ScriptBuf::new(), Vec::new());
+        unsigned.input[0].witness = Witness::new();
+        let mut psbt = Psbt::from_unsigned_tx(unsigned).unwrap();
+        // The public key of the BIP-32 test vector 1 master.
+        let key: PublicKey = "0339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2"
+            .parse()
+            .unwrap();
+        psbt.inputs[0].partial_sigs.insert(
+            key,
+            ecdsa::Signature {
+                signature: secp256k1::ecdsa::Signature::from_der(&der_signature(0x02)[..8])
+                    .unwrap(),
+                sighash_type: EcdsaSighashType::None,
+            },
+        );
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        assert!(!decoded.ready);
+        assert_eq!(
+            decoded.inputs[0].loose_sighash.as_deref(),
+            Some("SIGHASH_NONE")
+        );
+    }
 
     fn p2wpkh(byte: u8) -> ScriptBuf {
         ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([byte; 20]))

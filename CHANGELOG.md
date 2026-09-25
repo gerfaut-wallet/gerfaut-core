@@ -201,3 +201,9 @@ The first release: the library both Gerfaut apps are built on.
   transaction made every later look at the wallet crash the app. The
   balance of a watched address saturates instead of wrapping around when
   a server lists coins no one can hold.
+- The transaction preview reads the signature hash type of every
+  signature it finds, and a signature made with `SIGHASH_NONE` or
+  `SIGHASH_SINGLE` gets a warning of its own, `uncommitted_outputs`,
+  read as an alert. Such a signature leaves some or all of the outputs
+  open, so a node that relays the transaction can send that money
+  elsewhere, and the outputs the preview showed were only a suggestion.
