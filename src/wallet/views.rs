@@ -302,13 +302,12 @@ pub(crate) fn electrum_statuses(
         .enumerate()
         .map(|(index, script)| (script.as_script(), index))
         .collect();
-    let unconfirmed: std::collections::HashSet<Txid> = wallet
-        .transactions()
+    let unconfirmed: std::collections::HashSet<Txid> = standing(wallet)
         .filter(|wtx| !wtx.chain_position.is_confirmed())
         .map(|wtx| wtx.tx_node.txid)
         .collect();
     let mut histories: Vec<Vec<(Txid, i32)>> = vec![Vec::new(); scripts.len()];
-    for wtx in wallet.transactions() {
+    for wtx in standing(wallet) {
         let tx = &wtx.tx_node.tx;
         let height = match wtx.chain_position {
             ChainPosition::Confirmed { anchor, .. } => {
@@ -430,7 +429,7 @@ pub(crate) fn script_facts(
         .map(|(index, script)| (script.as_script(), index))
         .collect();
     let mut facts = vec![crate::chain::ScriptFacts::default(); scripts.len()];
-    for wtx in wallet.transactions() {
+    for wtx in standing(wallet) {
         let txid = wtx.tx_node.txid;
         let confirmed = wtx.chain_position.is_confirmed();
         // What the transaction does to each script it touches: coins
@@ -478,10 +477,7 @@ pub(crate) fn script_facts(
 pub(crate) fn pending_scripts(wallet: &bdk_wallet::Wallet) -> Vec<bdk_wallet::bitcoin::ScriptBuf> {
     let graph = wallet.tx_graph();
     let mut scripts = std::collections::BTreeSet::new();
-    for wtx in wallet
-        .transactions()
-        .filter(|wtx| !wtx.chain_position.is_confirmed())
-    {
+    for wtx in standing(wallet).filter(|wtx| !wtx.chain_position.is_confirmed()) {
         for output in &wtx.tx_node.tx.output {
             if wallet.is_mine(output.script_pubkey.clone()) {
                 scripts.insert(output.script_pubkey.clone());
@@ -498,11 +494,41 @@ pub(crate) fn pending_scripts(wallet: &bdk_wallet::Wallet) -> Vec<bdk_wallet::bi
     scripts.into_iter().collect()
 }
 
-/// Whether the wallet holds a transaction still waiting for a block.
+/// Whether the wallet holds a transaction still waiting for a block, one
+/// a server still has.
 pub(crate) fn has_pending(wallet: &bdk_wallet::Wallet) -> bool {
-    wallet
-        .transactions()
-        .any(|wtx| !wtx.chain_position.is_confirmed())
+    standing(wallet).any(|wtx| !wtx.chain_position.is_confirmed())
+}
+
+/// The transactions of the wallet a server may still list: all of them
+/// but the ones [`vanished`].
+pub(crate) fn standing(
+    wallet: &bdk_wallet::Wallet,
+) -> impl Iterator<Item = bdk_wallet::WalletTx<'_>> {
+    wallet.transactions().filter(|wtx| !vanished(wallet, wtx))
+}
+
+/// A payment the wallet still shows as waiting for a block only because
+/// a block once confirmed it: a reorganisation took that block out, a
+/// conflicting spend took its place, and a sync has seen it gone from
+/// the server since it was last seen there. The wallet engine keeps
+/// such a transaction, whatever a server says, as long as nothing it
+/// holds conflicts with it; the spend that replaced it pays none of the
+/// wallet's scripts.
+///
+/// The syncs and the watch leave it out of what they expect a server to
+/// list, the way it left the server: a sync does not read a whole
+/// history again looking for it, and a watch that starts does not sync
+/// its script again because the server's status leaves it out. Should a
+/// server list it again, a reorganisation undoing the first one, it is
+/// news on its script like any transaction the wallet lacks.
+fn vanished(wallet: &bdk_wallet::Wallet, wtx: &bdk_wallet::WalletTx<'_>) -> bool {
+    !wtx.chain_position.is_confirmed()
+        && !wtx.tx_node.anchors.is_empty()
+        && wallet
+            .tx_graph()
+            .get_last_evicted(wtx.tx_node.txid)
+            .is_some_and(|evicted| wtx.tx_node.last_seen.is_none_or(|seen| evicted >= seen))
 }
 
 /// What a sync of a descriptor wallet moved, against what the engine
@@ -1413,5 +1439,85 @@ mod tests {
         let balance: BalanceSnapshot = serde_json::from_str(old).expect("old balance");
         assert_eq!(balance.pending_net_sats, None);
         assert_eq!(balance.total, 1500);
+    }
+
+    /// A payment confirmed, then taken out of the chain by a
+    /// reorganisation that mines a conflicting spend in its place: the
+    /// wallet engine keeps showing it as waiting for a block, whatever a
+    /// server says. Once a sync has seen it gone from the server, the
+    /// syncs and the watch stop expecting it there; listed again, it is
+    /// expected again.
+    #[test]
+    fn a_payment_a_reorganisation_took_is_not_expected_of_a_server() {
+        use bdk_wallet::bitcoin::BlockHash;
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+
+        const EXTERNAL: &str = "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)";
+        let mut engine = bdk_wallet::Wallet::create_single(EXTERNAL)
+            .network(bdk_wallet::bitcoin::Network::Signet)
+            .create_wallet_no_persist()
+            .unwrap();
+        let ours = engine
+            .reveal_next_address(KeychainKind::External)
+            .script_pubkey();
+        let payment = crate::testkit::transaction(
+            &[crate::testkit::nowhere(1, 0)],
+            &[(ours.to_hex_string().as_str(), 50_000)],
+        );
+        let txid = payment.compute_txid();
+        let genesis = engine.latest_checkpoint();
+        let block = |byte: u8| BlockId {
+            height: 10,
+            hash: BlockHash::from_byte_array([byte; 32]),
+        };
+        let mut update = bdk_wallet::Update {
+            chain: Some(genesis.clone().push(block(1)).unwrap()),
+            ..Default::default()
+        };
+        update.tx_update.txs.push(std::sync::Arc::new(payment));
+        update.tx_update.anchors.insert((
+            ConfirmationBlockTime {
+                block_id: block(1),
+                confirmation_time: 1_700_000_000,
+            },
+            txid,
+        ));
+        engine.apply_update(update).unwrap();
+        let facts = script_facts(&engine, std::slice::from_ref(&ours));
+        assert_eq!(facts[0].confirmed.len(), 1);
+
+        // Another block at that height, without it, and a sync that no
+        // longer finds it on its script.
+        engine
+            .apply_update(bdk_wallet::Update {
+                chain: Some(genesis.push(block(2)).unwrap()),
+                ..Default::default()
+            })
+            .unwrap();
+        engine.apply_evicted_txs([(txid, 1_800_000_000)]);
+        // The engine still shows it, waiting for a block.
+        let shown: Vec<_> = engine.transactions().collect();
+        assert_eq!(shown.len(), 1);
+        assert!(!shown[0].chain_position.is_confirmed());
+        // Nothing expects it of a server any more.
+        let facts = script_facts(&engine, std::slice::from_ref(&ours));
+        assert!(facts[0].expected.is_empty());
+        assert_eq!(facts[0].counts, crate::chain::esplora::Counts::default());
+        assert!(!has_pending(&engine));
+        assert!(pending_scripts(&engine).is_empty());
+        assert_eq!(
+            electrum_statuses(&engine, std::slice::from_ref(&ours), &HistoryOrders::new()),
+            vec![None]
+        );
+
+        // Listed by a server again, it is expected again.
+        engine.apply_unconfirmed_txs([(
+            engine.get_tx(txid).unwrap().tx_node.tx.as_ref().clone(),
+            1_800_000_100,
+        )]);
+        let facts = script_facts(&engine, std::slice::from_ref(&ours));
+        assert!(facts[0].expected.contains(&txid));
+        assert!(has_pending(&engine));
     }
 }

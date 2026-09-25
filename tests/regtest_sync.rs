@@ -1051,3 +1051,90 @@ async fn a_live_wallet_stays_true_to_the_chain() {
     .await;
     manager.live_stop().await;
 }
+
+/// A confirmed payment that a reorganisation replaces with a conflicting
+/// spend paying someone else. The wallet engine keeps showing it as
+/// waiting for a block: nothing the wallet holds conflicts with it. That
+/// costs nothing more after the sync that saw it go: an Esplora sync
+/// reads the counters of its address and no history, and a watch that
+/// starts over Electrum finds every status as the wallet holds it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker: runs a regtest node and electrs"]
+async fn a_payment_a_reorganisation_replaced_costs_nothing_after() {
+    let chain = Chain::start();
+    let first = receive_address(0);
+    let paid = chain.pay(&first, "0.5");
+    chain.mine();
+    chain.indexed().await;
+
+    let (esplora, esplora_wire) = tap_to(chain.esplora).await;
+    let esplora_dir = tempfile::tempdir().unwrap();
+    let (esplora_manager, esplora_wallet) = watching(
+        esplora_dir.path(),
+        BackendConfig::CustomEsplora {
+            url: format!("http://{esplora}"),
+        },
+    )
+    .await;
+    esplora_manager.sync_wallet(&esplora_wallet).await.unwrap();
+    let electrum = chain.electrum;
+    let electrum_dir = tempfile::tempdir().unwrap();
+    let (electrum_manager, electrum_wallet) = watching(
+        electrum_dir.path(),
+        BackendConfig::CustomElectrum {
+            url: format!("tcp://{electrum}"),
+        },
+    )
+    .await;
+    electrum_manager
+        .sync_wallet(&electrum_wallet)
+        .await
+        .unwrap();
+
+    // The block is taken out, the payment goes back to the mempool, a
+    // spend of the same coins to the node replaces it, and a block
+    // confirms that spend.
+    chain.drop_tip();
+    let elsewhere = chain.cli(&["getnewaddress"]);
+    let replacement = chain.replace(&paid, &elsewhere, 10_000_000);
+    chain.mine();
+    chain.indexed().await;
+    let seen: serde_json::Value =
+        serde_json::from_str(&chain.cli(&["gettransaction", &replacement])).unwrap();
+    assert_eq!(seen["confirmations"].as_i64(), Some(1));
+
+    // Each wallet sees it go, and still shows it waiting for a block.
+    for (manager, wallet) in [
+        (&esplora_manager, &esplora_wallet),
+        (&electrum_manager, &electrum_wallet),
+    ] {
+        manager.sync_wallet(wallet).await.unwrap();
+        let snapshot = manager.wallet_snapshot(wallet).await.unwrap();
+        let shown = snapshot.txs.iter().find(|tx| tx.txid == paid);
+        println!(
+            "after the reorganisation, the wallet shows {:?}",
+            shown.map(|tx| tx.confirmations)
+        );
+    }
+
+    // Over Esplora, the next syncs read the counters of the address, and
+    // no page of its history.
+    for _ in 0..2 {
+        let mark = esplora_wire.mark();
+        esplora_manager.sync_wallet(&esplora_wallet).await.unwrap();
+        let paths = esplora_wire.since(mark).paths();
+        let counters = format!("/scripthash/{}", esplora_hash(&first));
+        assert!(paths.contains(&counters), "{paths:?}");
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.starts_with(&format!("{counters}/"))),
+            "{paths:?}"
+        );
+    }
+
+    // Over Electrum, a watch that starts syncs nothing.
+    let mut events = electrum_manager.live_start().await.unwrap();
+    settled(&mut events).await;
+    electrum_manager.live_stop().await;
+}
