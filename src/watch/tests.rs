@@ -343,6 +343,48 @@ async fn electrum_reports_what_it_never_read_after_a_reconnection() {
     no_event(&mut events, Duration::from_millis(300)).await;
 }
 
+/// A server that refuses subscription after subscription is at its
+/// limit, and the scripts still waiting their turn are not asked for.
+/// Nothing watches them from then on, and nothing says what they did
+/// while nothing listened: each is reported, as a refused one is, for a
+/// sync to catch up on it.
+#[tokio::test]
+async fn electrum_reports_the_scripts_it_gave_up_on() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().refuse.insert(
+        "blockchain.scripthash.subscribe",
+        "too many subscriptions".to_owned(),
+    );
+    let all: Vec<u8> = (1..=40).collect();
+    let (_watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(timings()),
+    );
+    let mut reported = BTreeSet::new();
+    while reported.len() < all.len() {
+        match next_event(&mut events).await {
+            WatchEvent::WalletChanged {
+                wallet_id,
+                reason,
+                scripts,
+                ..
+            } => {
+                assert_eq!((wallet_id.as_str(), reason), ("a", ChangeReason::Started));
+                assert!(!scripts.is_empty(), "named, not the whole wallet");
+                reported.extend(scripts);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let expected: BTreeSet<String> = all.iter().map(|n| script(*n)).collect();
+    assert_eq!(reported, expected);
+    assert!(
+        server.subscriptions()[0].len() < all.len(),
+        "the queue was given up"
+    );
+}
+
 #[tokio::test]
 async fn electrum_unsubscribes_where_the_server_can() {
     let server = FakeElectrum::start().await;

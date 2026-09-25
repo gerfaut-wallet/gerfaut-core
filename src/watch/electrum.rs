@@ -314,13 +314,12 @@ impl Session {
                 // One script refused, a history too long for the server
                 // to hash in time for instance, is left to the regular
                 // syncs, after one of its own now: what it did while
-                // nothing listened is unknown. Several in a row is a
-                // server at its limit: what it took is watched, and the
-                // rest is not asked for.
+                // nothing listened is unknown, whatever a session before
+                // this one heard of it. Several in a row is a server at
+                // its limit: what it took is watched, and the rest is
+                // not asked for.
                 Request::Subscribe(scripthash) => {
-                    if let Some(entry) = hub.watched.by_scripthash(&scripthash)
-                        && !hub.statuses.contains_key(&scripthash)
-                    {
+                    if let Some(entry) = hub.watched.by_scripthash(&scripthash) {
                         let hex = entry.hex.clone();
                         hub.mark_entry(&hex, self.opening_reason());
                     }
@@ -329,8 +328,16 @@ impl Session {
                     let refusal = words(&message["error"]);
                     hub.set_status(|status| status.detail = Some(refusal));
                     if self.refused >= REFUSALS {
+                        // Not watched from now on, and what they did
+                        // while nothing listened is as unknown as for
+                        // the one refused: a sync of their own each.
+                        let reason = self.opening_reason();
                         for given_up in self.queue.drain(..) {
                             self.opening.remove(&given_up);
+                            if let Some(entry) = hub.watched.by_scripthash(&given_up) {
+                                let hex = entry.hex.clone();
+                                hub.mark_entry(&hex, reason);
+                            }
                         }
                     }
                 }
