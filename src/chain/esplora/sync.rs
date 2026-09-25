@@ -61,8 +61,9 @@ struct Listed {
     whole: Option<(Transaction, Vec<(OutPoint, TxOut)>)>,
 }
 
-/// A page as the engine keeps it: see [`Listed`].
-fn listed(page: Vec<PageTx>, held: &Held) -> Result<Vec<Listed>, String> {
+/// A page as the engine keeps it: see [`Listed`]. What it keeps counts
+/// against what the sync may keep.
+fn listed(client: &Client, page: Vec<PageTx>, held: &Held) -> Result<Vec<Listed>, String> {
     page.into_iter()
         .map(|tx| {
             let whole = if held.txs.contains_key(&tx.txid) {
@@ -77,7 +78,13 @@ fn listed(page: Vec<PageTx>, held: &Held) -> Result<Vec<Listed>, String> {
                             .to_owned(),
                     );
                 }
-                Some((whole, tx.prevouts().collect()))
+                let prevouts: Vec<(OutPoint, TxOut)> = tx.prevouts().collect();
+                let spent: usize = prevouts
+                    .iter()
+                    .map(|(_, out)| 44 + out.script_pubkey.len())
+                    .sum();
+                client.keep(whole.total_size().saturating_add(spent))?;
+                Some((whole, prevouts))
             };
             Ok(Listed {
                 txid: tx.txid,
@@ -221,7 +228,7 @@ async fn read_script(
             });
         }
         let path = format!("{}/txs/mempool", script_path(script));
-        let txs = listed(client.get_page(&path).await?, held)?;
+        let txs = listed(client, client.get_page(&path).await?, held)?;
         let listed_mempool = txs.len();
         let mut read = Read {
             txs,
@@ -281,7 +288,7 @@ async fn read_pages_down_to(
             Some(txid) => format!("{base}/chain/{txid}"),
             None => base.clone(),
         };
-        let page = listed(client.get_page(&path).await?, held)?;
+        let page = listed(client, client.get_page(&path).await?, held)?;
         let confirmed = page.iter().filter(|tx| tx.status.confirmed).count();
         if after.is_none() {
             listed_mempool = page.len() - confirmed;

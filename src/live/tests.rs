@@ -182,6 +182,25 @@ async fn a_caller_does_not_take_a_sync_that_read_before_it_came() {
     assert_eq!(found, [paid.as_str()]);
 }
 
+/// An address paid by an inscription of the largest kind: its history
+/// page carries some 16 MB of JSON, the 4 MB witness spelled as hex and
+/// again as assembly. The sync reads it, whatever the page weighs.
+#[tokio::test]
+async fn an_address_paid_by_a_large_inscription_syncs() {
+    let server = FakeMempool::start(false, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), server.backend()).await;
+    let mut payment = esplora_payment(0x12, 0x22, 546, true);
+    let item = "ab".repeat(4_000_000);
+    payment["vin"][0]["witness"] = serde_json::json!([item]);
+    payment["vin"][0]["inner_witnessscript_asm"] =
+        serde_json::json!(format!("OP_PUSHBYTES_4000000 {item}"));
+    assert!(payment.to_string().len() > 16_000_000);
+    server.state.lock().unwrap().address_txs = vec![payment];
+    let report = manager.sync_wallet(&wallet).await.unwrap();
+    assert_eq!(report.new_txs.len(), 1);
+}
+
 /// A wallet removed takes its unclaimed news with it.
 #[tokio::test]
 async fn a_removed_wallet_leaves_no_news_behind() {

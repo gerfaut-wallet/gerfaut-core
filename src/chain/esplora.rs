@@ -22,15 +22,18 @@ pub(crate) const PARALLEL_REQUESTS: usize = 4;
 /// transactions there are, with room to spare. A server that sends more
 /// is not answering the question, and is cut off rather than buffered.
 const MAX_BODY: usize = 32 << 20;
-/// The largest page of a history read, once decompressed: 25 confirmed
-/// transactions and the unconfirmed ones, each a few kilobytes, the
-/// largest a node relays a few hundred.
-const PAGE_MAX: usize = 8 << 20;
-/// What one sync, or one reading of an address, may read in all, once
-/// decompressed: the first sync of a wallet with some twenty thousand
-/// transactions. A server that sends more is refused rather than read
-/// until memory runs out, a page at a time.
-const RUN_MAX: usize = 64 << 20;
+/// The largest JSON answer read, once decompressed. It is parsed as it
+/// arrives, and what is not kept, the assembly of each script and each
+/// witness, costs nothing: this only stops a server that never ends.
+/// Four of the largest inscriptions there are fit in one page.
+const JSON_MAX: usize = 64 << 20;
+/// What one sync may keep of the transactions it reads, those the
+/// wallet lacks: what it stores then. A wallet paid dozens of the
+/// largest inscriptions there are fits; a server that invents
+/// transactions to fill memory does not.
+const KEEP_MAX: usize = 256 << 20;
+/// Chunks of an answer read ahead of its parsing.
+const CHUNKS_AHEAD: usize = 8;
 /// Tries of a request a server turned away for being busy: a public
 /// instance answers a burst with 429, and a moment later with the data.
 const TRIES: u32 = 4;
@@ -78,17 +81,17 @@ pub(crate) struct Client {
     /// The instance's address, without a trailing slash.
     base: String,
     budget: Budget,
-    /// What was read so far, decompressed, and how much may be.
-    spent: std::sync::atomic::AtomicUsize,
-    run_max: usize,
+    /// What a sync kept so far of the transactions it read, and how
+    /// much it may.
+    kept: std::sync::atomic::AtomicUsize,
+    keep_max: usize,
 }
 
 impl Client {
-    /// The body of `path` under the instance's address, decompressed and
-    /// held to [`MAX_BODY`]; `None` when the server has nothing there
-    /// (404). A busy server is asked again a few times, a little later
-    /// each time.
-    async fn fetch(&self, path: &str, max: usize) -> Result<Option<Vec<u8>>, String> {
+    /// The answer to `path` under the instance's address, its body not
+    /// read yet; `None` when the server has nothing there (404). A busy
+    /// server is asked again a few times, a little later each time.
+    async fn open(&self, path: &str) -> Result<Option<reqwest::Response>, String> {
         let url = format!("{}{path}", self.base);
         let mut wait = Duration::from_millis(250);
         let mut tries = 1;
@@ -114,7 +117,82 @@ impl Client {
             }
             break response;
         };
-        self.body(response, max).await.map(Some)
+        Ok(Some(response))
+    }
+
+    /// The body of `path`, decompressed and held to `max`; `None` when
+    /// the server has nothing there.
+    async fn fetch(&self, path: &str, max: usize) -> Result<Option<Vec<u8>>, String> {
+        match self.open(path).await? {
+            Some(response) => self.body(response, max).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The JSON answer to `path`, parsed as it arrives and decompresses,
+    /// never held whole: what the reading skips, it never keeps. `None`
+    /// when the server has nothing there.
+    async fn stream_json<T>(&self, path: &str) -> Result<Option<T>, String>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let Some(mut response) = self.open(path).await? else {
+            return Ok(None);
+        };
+        let (chunks, arriving) = tokio::sync::mpsc::channel(CHUNKS_AHEAD);
+        let parsing = tokio::task::spawn_blocking(move || {
+            let reader = std::io::BufReader::with_capacity(
+                64 << 10,
+                ChunkReader {
+                    arriving,
+                    chunk: None,
+                    at: 0,
+                },
+            );
+            serde_json::from_reader::<_, T>(reader)
+        });
+        let mut read = 0usize;
+        let pumped: Result<(), String> = async {
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|e| describe_request(&e, self.budget))?
+            {
+                read = read.saturating_add(chunk.len());
+                if read > JSON_MAX {
+                    return Err(too_long(JSON_MAX));
+                }
+                // The parsing ended early: it says why below.
+                if chunks.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        drop(chunks);
+        let parsed = parsing
+            .await
+            .map_err(|_| "unexpected response".to_owned())?;
+        pumped?;
+        parsed
+            .map(Some)
+            .map_err(|_| "unexpected response".to_owned())
+    }
+
+    /// Counts `bytes` of transactions against what one sync may keep.
+    pub(crate) fn keep(&self, bytes: usize) -> Result<(), String> {
+        let kept = self
+            .kept
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(bytes);
+        if kept > self.keep_max {
+            return Err(format!(
+                "the server sent more than {} MiB of transactions for one sync",
+                self.keep_max >> 20
+            ));
+        }
+        Ok(())
     }
 
     /// The body of an answer, read a chunk at a time, decompressed, and
@@ -127,21 +205,7 @@ impl Client {
             .map_err(|e| describe_request(&e, self.budget))?
         {
             if body.len() + chunk.len() > max {
-                return Err(if max >= 1 << 20 {
-                    format!("the server sent an answer longer than {} MiB", max >> 20)
-                } else {
-                    format!("the server sent an answer longer than {} KiB", max >> 10)
-                });
-            }
-            let spent = self
-                .spent
-                .fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed)
-                .saturating_add(chunk.len());
-            if spent > self.run_max {
-                return Err(format!(
-                    "the server sent more than {} MiB for one sync",
-                    self.run_max >> 20
-                ));
+                return Err(too_long(max));
             }
             body.extend_from_slice(&chunk);
         }
@@ -155,36 +219,28 @@ impl Client {
             .ok_or_else(|| describe_status(404))
     }
 
-    /// A page of a history, read as it is listed, held to a few
-    /// megabytes.
+    /// A page of a history, read as it is listed: see [`PageTx`].
     pub(crate) async fn get_page(&self, path: &str) -> Result<Vec<PageTx>, String> {
-        let body = self
-            .fetch(path, PAGE_MAX)
-            .await?
-            .ok_or_else(|| describe_status(404))?;
-        serde_json::from_slice(&body).map_err(|_| "unexpected response".to_owned())
+        self.get_json(path).await
     }
 
-    /// The same, read as JSON.
-    pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
-        &self,
-        path: &str,
-    ) -> Result<T, String> {
-        let body = self.get_bytes(path).await?;
-        serde_json::from_slice(&body).map_err(|_| "unexpected response".to_owned())
+    /// The JSON answer to `path`, which must be there: see
+    /// [`Self::stream_json`].
+    pub(crate) async fn get_json<T>(&self, path: &str) -> Result<T, String>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        self.stream_json(path)
+            .await?
+            .ok_or_else(|| describe_status(404))
     }
 
     /// The same, `None` when the server has nothing there.
-    async fn get_json_opt<T: serde::de::DeserializeOwned>(
-        &self,
-        path: &str,
-    ) -> Result<Option<T>, String> {
-        match self.fetch(path, MAX_BODY).await? {
-            Some(body) => serde_json::from_slice(&body)
-                .map(Some)
-                .map_err(|_| "unexpected response".to_owned()),
-            None => Ok(None),
-        }
+    async fn get_json_opt<T>(&self, path: &str) -> Result<Option<T>, String>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        self.stream_json(path).await
     }
 
     /// The body of `path` as one line of text, parsed.
@@ -365,17 +421,57 @@ fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, Strin
         http,
         base: url.trim_end_matches('/').to_owned(),
         budget,
-        spent: std::sync::atomic::AtomicUsize::new(0),
-        run_max: usize::MAX,
+        kept: std::sync::atomic::AtomicUsize::new(0),
+        keep_max: usize::MAX,
     })
 }
 
-/// A client for one sync, or one reading of an address: the same, and
-/// what it reads in all held to [`RUN_MAX`].
+/// A client for one sync: the same, and what it keeps of the
+/// transactions it reads held to [`KEEP_MAX`].
 pub(crate) fn client_for_run(url: &str, proxy: Option<&str>) -> Result<Client, String> {
     let mut client = client(url, proxy)?;
-    client.run_max = RUN_MAX;
+    client.keep_max = KEEP_MAX;
     Ok(client)
+}
+
+/// The error of an answer longer than `max`.
+fn too_long(max: usize) -> String {
+    if max >= 1 << 20 {
+        format!("the server sent an answer longer than {} MiB", max >> 20)
+    } else {
+        format!("the server sent an answer longer than {} KiB", max >> 10)
+    }
+}
+
+/// The chunks of an answer as they arrive, read by a parser on a thread
+/// of its own; the end of the answer when they stop.
+struct ChunkReader<B> {
+    arriving: tokio::sync::mpsc::Receiver<B>,
+    chunk: Option<B>,
+    at: usize,
+}
+
+impl<B: AsRef<[u8]>> std::io::Read for ChunkReader<B> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some(chunk) = &self.chunk {
+                let left = &chunk.as_ref()[self.at..];
+                if !left.is_empty() {
+                    let n = left.len().min(buf.len());
+                    buf[..n].copy_from_slice(&left[..n]);
+                    self.at += n;
+                    return Ok(n);
+                }
+            }
+            match self.arriving.blocking_recv() {
+                Some(chunk) => {
+                    self.chunk = Some(chunk);
+                    self.at = 0;
+                }
+                None => return Ok(0),
+            }
+        }
+    }
 }
 
 // --- errors ---------------------------------------------------------------
@@ -966,16 +1062,17 @@ mod error_tests {
         let cut = "the server sent an answer longer than 32 MiB";
         assert_eq!(client.height().await.unwrap_err(), cut);
         assert_eq!(client.tip_hash().await.unwrap_err(), cut);
-        let script = ScriptBuf::from_bytes(vec![0x51]);
-        assert_eq!(client.scripthash_stats(&script).await.unwrap_err(), cut);
         let txid: Txid = "01".repeat(32).parse().unwrap();
         assert_eq!(client.tx(&txid).await.unwrap_err(), cut);
+        // JSON is parsed as it arrives: refused at its first bytes.
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        assert!(client.scripthash_stats(&script).await.is_err());
         let address = parse_address(
             "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
             Network::Signet,
         )
         .unwrap();
-        assert_eq!(client.address_utxos(&address).await.unwrap_err(), cut);
+        assert!(client.address_utxos(&address).await.is_err());
         // And a broadcast, whose refusal is read to a few kilobytes.
         let address = gzipping("400 Bad Request", bomb).await;
         let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
@@ -999,34 +1096,60 @@ mod error_tests {
         assert_eq!(client.height().await.unwrap(), 812_345);
     }
 
-    /// A page of a history is held to a few megabytes, and one sync to a
-    /// few dozen in all, however the server spreads them over its
-    /// answers: past that the sync fails, rather than read on.
+    /// A JSON answer is parsed as it arrives, and one that never ends,
+    /// valid all along, is cut off past its cap.
     #[tokio::test]
-    async fn a_sync_reads_so_much_and_no_more() {
-        let address = gzipping("200 OK", vec![b' '; PAGE_MAX + 1]).await;
-        let url = format!("http://{address}");
-        let paged = client_for_run(&url, None).unwrap();
+    async fn an_answer_that_never_ends_is_cut_off() {
+        let mut endless = b"[".to_vec();
+        endless.resize(JSON_MAX + (1 << 20), b' ');
+        let address = gzipping("200 OK", endless).await;
+        let client = client_for_run(&format!("http://{address}"), None).unwrap();
         assert_eq!(
-            paged.get_page("/scripthash/00/txs").await.unwrap_err(),
-            "the server sent an answer longer than 8 MiB"
+            client.get_page("/scripthash/00/txs").await.unwrap_err(),
+            "the server sent an answer longer than 64 MiB"
         );
+    }
 
-        let address = gzipping("200 OK", vec![b' '; 20 << 20]).await;
-        let url = format!("http://{address}");
-        let one_sync = client_for_run(&url, None).unwrap();
-        for _ in 0..3 {
-            one_sync.get_bytes("/blocks").await.unwrap();
-        }
+    /// What one sync keeps of the transactions it reads is counted, and
+    /// past its cap the sync fails; a client that serves a watch keeps
+    /// none and has no such cap.
+    #[test]
+    fn a_sync_keeps_so_much_and_no_more() {
+        let one_sync = client_for_run("http://127.0.0.1:9", None).unwrap();
+        one_sync.keep(KEEP_MAX - 1).unwrap();
         assert_eq!(
-            one_sync.get_bytes("/blocks").await.unwrap_err(),
-            "the server sent more than 64 MiB for one sync"
+            one_sync.keep(2).unwrap_err(),
+            "the server sent more than 256 MiB of transactions for one sync"
         );
-        // A client that serves a watch, not one sync, has no such cap.
-        let watching = super::client(&url, None).unwrap();
-        for _ in 0..4 {
-            watching.get_bytes("/blocks").await.unwrap();
-        }
+        let watching = client("http://127.0.0.1:9", None).unwrap();
+        watching.keep(KEEP_MAX).unwrap();
+        watching.keep(KEEP_MAX).unwrap();
+    }
+
+    /// A history page listing an inscription of the largest kind: a
+    /// witness item of 4 MB, spelled twice in the answer, as hex and as
+    /// assembly, some 16 MB of JSON. It is read, and what the page keeps
+    /// of it is the witness, once, in bytes.
+    #[tokio::test]
+    async fn a_page_with_the_largest_inscription_is_read() {
+        let item = "ab".repeat(4_000_000);
+        let entry = format!(
+            r#"[{{"txid": "{txid}", "version": 2, "locktime": 0, "size": 4000200, "weight": 4000800, "fee": 1000,
+                "vin": [{{"txid": "{txid}", "vout": 0,
+                    "prevout": {{"scriptpubkey": "5120aa", "scriptpubkey_type": "v1_p2tr", "value": 10000}},
+                    "scriptsig": "", "scriptsig_asm": "",
+                    "witness": ["{item}"], "inner_witnessscript_asm": "OP_PUSHBYTES {item}",
+                    "is_coinbase": false, "sequence": 4294967293}}],
+                "vout": [{{"scriptpubkey": "5120bb", "scriptpubkey_type": "v1_p2tr", "value": 546}}],
+                "status": {{"confirmed": false}}}}]"#,
+            txid = "01".repeat(32),
+        );
+        assert!(entry.len() > 16_000_000);
+        let address = gzipping("200 OK", entry.into_bytes()).await;
+        let client = client_for_run(&format!("http://{address}"), None).unwrap();
+        let page = client.get_page("/scripthash/00/txs").await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].vin[0].witness.nth(0).unwrap().len(), 4_000_000);
     }
 
     #[test]
