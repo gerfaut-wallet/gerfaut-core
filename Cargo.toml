@@ -94,6 +94,8 @@ tor-config = { version = "0.45", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Gzips the answers of a test server; already built for reqwest.
+flate2 = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # So `tests/tls_provider.rs` can name the backend it expects. Already a
 # dependency above; this only makes it visible to the test crates.

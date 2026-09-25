@@ -148,7 +148,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<bdk_wallet::Updat
 
 /// The path of a script on the server: SHA-256 of the script, in the
 /// order it was computed (Electrum reverses it, Esplora does not).
-fn script_path(script: &ScriptBuf) -> String {
+pub(crate) fn script_path(script: &ScriptBuf) -> String {
     format!("/scripthash/{:x}", sha256::Hash::hash(script.as_bytes()))
 }
 

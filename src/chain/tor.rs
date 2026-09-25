@@ -740,7 +740,7 @@ mod tests {
 
         let client = crate::chain::esplora::client(MEMPOOL_ONION, Some(&route.proxy())).unwrap();
         let height = client
-            .get_height()
+            .height()
             .await
             .expect("the onion Esplora answers over Tor");
         assert!(height > 900_000, "{height}");

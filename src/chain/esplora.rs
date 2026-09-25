@@ -1,12 +1,11 @@
 //! Esplora backend: descriptor wallet sync and single-address tracking.
 
-use std::ops::Deref;
 use std::time::Duration;
 
-use bdk_esplora::esplora_client::{self, AsyncClient};
+use bdk_esplora::esplora_client::{self, api};
 use bdk_wallet::bitcoin::address::Address;
 
-use bdk_wallet::bitcoin::{Amount, OutPoint, Transaction, TxOut, Txid};
+use bdk_wallet::bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 
 pub(crate) mod sync;
 
@@ -23,6 +22,9 @@ const MAX_BODY: usize = 32 << 20;
 /// Tries of a request a server turned away for being busy: a public
 /// instance answers a burst with 429, and a moment later with the data.
 const TRIES: u32 = 4;
+/// The longest refusal read from a broadcast: the node's reason is one
+/// line, and a page of text is cut to its first 200 characters anyway.
+const REFUSAL_MAX: usize = 64 << 10;
 /// Address history pages fetched per request round (25 confirmed txs
 /// each). A sync stays fast; anything older is fetched on demand by
 /// [`fetch_address_history`], so nothing stays out of reach.
@@ -53,40 +55,31 @@ struct Budget {
     total: Duration,
 }
 
-/// A client for one instance, with its budgets kept beside it. It
-/// dereferences to the underlying client for every request, and turns
-/// the errors those return into sentences.
+/// A client for one instance, with its budgets kept beside it. Every
+/// request goes through [`Client::fetch`], which holds the answer to
+/// [`MAX_BODY`] once decompressed, and turns what fails into sentences:
+/// a server that sends a small gzip of a huge body is cut off, not
+/// buffered.
 #[derive(Debug)]
 pub(crate) struct Client {
-    inner: AsyncClient,
+    http: reqwest::Client,
+    /// The instance's address, without a trailing slash.
+    base: String,
     budget: Budget,
 }
 
-impl Deref for Client {
-    type Target = AsyncClient;
-
-    fn deref(&self) -> &AsyncClient {
-        &self.inner
-    }
-}
-
 impl Client {
-    /// The error as a sentence the sync report can show.
-    pub(crate) fn describe(&self, error: &esplora_client::Error) -> String {
-        describe(error, self.budget)
-    }
-
     /// The body of `path` under the instance's address, decompressed and
-    /// held to [`MAX_BODY`]. A busy server is asked again a few times,
-    /// a little later each time.
-    pub(crate) async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
-        let url = format!("{}{path}", self.inner.url());
+    /// held to [`MAX_BODY`]; `None` when the server has nothing there
+    /// (404). A busy server is asked again a few times, a little later
+    /// each time.
+    async fn fetch(&self, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let url = format!("{}{path}", self.base);
         let mut wait = Duration::from_millis(250);
         let mut tries = 1;
-        let mut response = loop {
+        let response = loop {
             let response = self
-                .inner
-                .client()
+                .http
                 .get(&url)
                 .send()
                 .await
@@ -98,26 +91,41 @@ impl Client {
                 tries += 1;
                 continue;
             }
+            if status == 404 {
+                return Ok(None);
+            }
             if !response.status().is_success() {
                 return Err(describe_status(status));
             }
             break response;
         };
+        self.body(response, MAX_BODY).await.map(Some)
+    }
+
+    /// The body of an answer, read a chunk at a time, decompressed, and
+    /// refused past `max` bytes.
+    async fn body(&self, mut response: reqwest::Response, max: usize) -> Result<Vec<u8>, String> {
         let mut body = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|e| describe_request(&e, self.budget))?
         {
-            if body.len() + chunk.len() > MAX_BODY {
-                return Err(format!(
-                    "the server sent an answer longer than {} MiB",
-                    MAX_BODY >> 20
-                ));
+            if body.len() + chunk.len() > max {
+                return Err(if max >= 1 << 20 {
+                    format!("the server sent an answer longer than {} MiB", max >> 20)
+                } else {
+                    format!("the server sent an answer longer than {} KiB", max >> 10)
+                });
             }
             body.extend_from_slice(&chunk);
         }
         Ok(body)
+    }
+
+    /// The body of `path`, which must be there.
+    pub(crate) async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.fetch(path).await?.ok_or_else(|| describe_status(404))
     }
 
     /// The same, read as JSON.
@@ -127,6 +135,118 @@ impl Client {
     ) -> Result<T, String> {
         let body = self.get_bytes(path).await?;
         serde_json::from_slice(&body).map_err(|_| "unexpected response".to_owned())
+    }
+
+    /// The same, `None` when the server has nothing there.
+    async fn get_json_opt<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<Option<T>, String> {
+        match self.fetch(path).await? {
+            Some(body) => serde_json::from_slice(&body)
+                .map(Some)
+                .map_err(|_| "unexpected response".to_owned()),
+            None => Ok(None),
+        }
+    }
+
+    /// The body of `path` as one line of text, parsed.
+    async fn get_parsed<T: std::str::FromStr>(&self, path: &str) -> Result<T, String> {
+        let body = self.get_bytes(path).await?;
+        std::str::from_utf8(&body)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .ok_or_else(|| "unexpected response".to_owned())
+    }
+
+    /// The height of the server's tip.
+    pub(crate) async fn height(&self) -> Result<u32, String> {
+        self.get_parsed("/blocks/tip/height").await
+    }
+
+    /// The hash of the server's tip.
+    pub(crate) async fn tip_hash(&self) -> Result<BlockHash, String> {
+        self.get_parsed("/blocks/tip/hash").await
+    }
+
+    /// The counters of a script.
+    pub(crate) async fn scripthash_stats(
+        &self,
+        script: &ScriptBuf,
+    ) -> Result<api::ScriptHashStats, String> {
+        self.get_json(&sync::script_path(script)).await
+    }
+
+    async fn address_stats(&self, address: &Address) -> Result<api::AddressStats, String> {
+        self.get_json(&format!("/address/{address}")).await
+    }
+
+    /// A page of an address's history: the unconfirmed transactions and
+    /// the latest confirmed ones, or the confirmed ones after `after`.
+    async fn address_txs(
+        &self,
+        address: &Address,
+        after: Option<Txid>,
+    ) -> Result<Vec<api::Tx>, String> {
+        match after {
+            Some(txid) => {
+                self.get_json(&format!("/address/{address}/txs/chain/{txid}"))
+                    .await
+            }
+            None => self.get_json(&format!("/address/{address}/txs")).await,
+        }
+    }
+
+    async fn address_utxos(&self, address: &Address) -> Result<Vec<api::Utxo>, String> {
+        self.get_json(&format!("/address/{address}/utxo")).await
+    }
+
+    /// A transaction, `None` when the server does not know it.
+    pub(crate) async fn tx(&self, txid: &Txid) -> Result<Option<Transaction>, String> {
+        match self.fetch(&format!("/tx/{txid}/raw")).await? {
+            Some(bytes) => bdk_wallet::bitcoin::consensus::deserialize(&bytes)
+                .map(Some)
+                .map_err(|_| "unexpected response".to_owned()),
+            None => Ok(None),
+        }
+    }
+
+    /// A transaction as the server describes it, `None` when it does not
+    /// know it.
+    async fn tx_info(&self, txid: &Txid) -> Result<Option<api::Tx>, String> {
+        self.get_json_opt(&format!("/tx/{txid}")).await
+    }
+
+    async fn tx_status(&self, txid: &Txid) -> Result<api::TxStatus, String> {
+        self.get_json(&format!("/tx/{txid}/status")).await
+    }
+
+    /// Whether an output is spent, `None` when the server cannot say.
+    async fn output_status(
+        &self,
+        txid: &Txid,
+        vout: u32,
+    ) -> Result<Option<api::OutputStatus>, String> {
+        self.get_json_opt(&format!("/tx/{txid}/outspend/{vout}"))
+            .await
+    }
+
+    /// Hands a transaction to the server. The node's refusal comes back
+    /// as the error, from a body held to a few kilobytes.
+    async fn post_tx(&self, tx: &Transaction) -> Result<(), String> {
+        let response = self
+            .http
+            .post(format!("{}/tx", self.base))
+            .body(bdk_wallet::bitcoin::consensus::encode::serialize_hex(tx))
+            .send()
+            .await
+            .map_err(|e| describe_request(&e, self.budget))?;
+        // Accepted: whatever else the server says is not read.
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let body = self.body(response, REFUSAL_MAX).await?;
+        Err(node_message(&String::from_utf8_lossy(&body)))
     }
 }
 
@@ -203,34 +323,13 @@ fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, Strin
         .build()
         .map_err(|e| format!("could not set up the HTTP client: {e}"))?;
     Ok(Client {
-        inner: AsyncClient::from_client(url.to_owned(), http),
+        http,
+        base: url.trim_end_matches('/').to_owned(),
         budget,
     })
 }
 
 // --- errors ---------------------------------------------------------------
-
-/// The error as a sentence a person can act on. The crate's own
-/// `Display` is its `Debug`: `Reqwest(reqwest::Error { kind: Request,
-/// source: TimedOut })` is what reached the sync report until now.
-fn describe(error: &esplora_client::Error, budget: Budget) -> String {
-    use esplora_client::Error;
-    match error {
-        Error::Reqwest(error) => describe_request(error, budget),
-        Error::HttpResponse { status, message: _ } => describe_status(*status),
-        Error::TransactionNotFound(_) => "transaction not found".to_owned(),
-        Error::HeaderHeightNotFound(_) | Error::HeaderHashNotFound(_) => {
-            "block not found".to_owned()
-        }
-        Error::InvalidHttpHeaderName(_) | Error::InvalidHttpHeaderValue(_) => {
-            "invalid request header".to_owned()
-        }
-        // A number, a status code, hex or consensus bytes that do not
-        // parse, a body that is not what the endpoint promised: the
-        // server answered, with something else.
-        _ => "unexpected response".to_owned(),
-    }
-}
 
 fn describe_status(status: u16) -> String {
     let reason = match status {
@@ -336,11 +435,8 @@ pub(crate) async fn fetch_address_state(
     let address = parse_address(address, network)?;
     let our_script = address.script_pubkey();
 
-    let tip_height = client.get_height().await.map_err(|e| client.describe(&e))?;
-    let stats = client
-        .get_address_stats(&address)
-        .await
-        .map_err(|e| client.describe(&e))?;
+    let tip_height = client.height().await?;
+    let stats = client.address_stats(&address).await?;
 
     let round = history_round(
         client,
@@ -353,9 +449,8 @@ pub(crate) async fn fetch_address_state(
     .await?;
 
     let utxos = client
-        .get_address_utxos(&address)
-        .await
-        .map_err(|e| client.describe(&e))?
+        .address_utxos(&address)
+        .await?
         .into_iter()
         .map(|utxo| AddressUtxo {
             txid: utxo.txid.to_string(),
@@ -412,10 +507,7 @@ async fn history_round(
     from: Option<Txid>,
     confirmed_total: Option<usize>,
 ) -> Result<HistoryRound, String> {
-    let mut raw_txs = client
-        .get_address_txs(address, from)
-        .await
-        .map_err(|e| client.describe(&e))?;
+    let mut raw_txs = client.address_txs(address, from).await?;
     let mut cursor: Option<String> = None;
     let mut pages = 1usize;
     loop {
@@ -438,10 +530,7 @@ async fn history_round(
             cursor = Some(last_seen.to_string());
             break;
         }
-        let page = client
-            .get_address_txs(address, Some(last_seen))
-            .await
-            .map_err(|e| client.describe(&e))?;
+        let page = client.address_txs(address, Some(last_seen)).await?;
         pages += 1;
         if page.is_empty() {
             break;
@@ -551,25 +640,15 @@ pub(crate) fn script_address(
 /// Hands a signed transaction to the network through this instance.
 /// The instance's own node validates it; its refusal comes back as the
 /// message, verbatim, which is the most useful thing to show.
-pub(crate) async fn broadcast(client: &Client, tx: &Transaction) -> Result<(), String> {
-    client
-        .inner
-        .broadcast(tx)
-        .await
-        .map_err(|e| broadcast_error(client, &e))
-}
-
+///
 /// Esplora wraps the node's refusal in an HTTP error whose body is the
 /// reason, in one of two spellings:
 /// `sendrawtransaction RPC error: {"code":-26,"message":"..."}` (the
 /// mempool instances) or `sendrawtransaction RPC error -26: ...`
-/// (blockstream.info). Keep the message, drop the wrapping. Anything
-/// else is a failure to reach the node, described as such.
-fn broadcast_error(client: &Client, error: &esplora_client::Error) -> String {
-    match error {
-        esplora_client::Error::HttpResponse { message, .. } => node_message(message),
-        other => client.describe(other),
-    }
+/// (blockstream.info). The message is kept, the wrapping dropped.
+/// Anything else is a failure to reach the node, described as such.
+pub(crate) async fn broadcast(client: &Client, tx: &Transaction) -> Result<(), String> {
+    client.post_tx(tx).await
 }
 
 /// Longest refusal shown, in characters, as for any other sentence a
@@ -622,10 +701,7 @@ pub(crate) async fn fetch_prevout(
     client: &Client,
     outpoint: OutPoint,
 ) -> Result<PrevoutFacts, String> {
-    let tx = client
-        .get_tx(&outpoint.txid)
-        .await
-        .map_err(|e| client.describe(&e))?;
+    let tx = client.tx(&outpoint.txid).await?;
     let Some(tx) = tx else {
         return Ok(PrevoutFacts {
             txout: None,
@@ -634,7 +710,7 @@ pub(crate) async fn fetch_prevout(
     };
     let txout = crate::chain::output_at(&tx, outpoint)?;
     let spent = client
-        .get_output_status(&outpoint.txid, outpoint.vout as u64)
+        .output_status(&outpoint.txid, outpoint.vout)
         .await
         .ok()
         .flatten()
@@ -651,12 +727,8 @@ pub(crate) struct TxStanding {
 }
 
 pub(crate) async fn tx_standing(client: &Client, txid: &Txid) -> Result<TxStanding, String> {
-    let tip_height = client.get_height().await.map_err(|e| client.describe(&e))?;
-    let found = client
-        .get_tx_info(txid)
-        .await
-        .map_err(|e| client.describe(&e))?
-        .is_some();
+    let tip_height = client.height().await?;
+    let found = client.tx_info(txid).await?.is_some();
     if !found {
         return Ok(TxStanding {
             found: false,
@@ -665,10 +737,7 @@ pub(crate) async fn tx_standing(client: &Client, txid: &Txid) -> Result<TxStandi
             tip_height,
         });
     }
-    let status = client
-        .get_tx_status(txid)
-        .await
-        .map_err(|e| client.describe(&e))?;
+    let status = client.tx_status(txid).await?;
     Ok(TxStanding {
         found: true,
         confirmed: status.confirmed,
@@ -681,7 +750,6 @@ pub(crate) async fn tx_standing(client: &Client, txid: &Txid) -> Result<TxStandi
 mod error_tests {
     use std::net::Ipv4Addr;
 
-    use bdk_wallet::bitcoin::hashes::Hash;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -703,45 +771,13 @@ mod error_tests {
 
     #[test]
     fn a_status_is_a_code_and_a_reason() {
-        let status = |status| {
-            describe(
-                &esplora_client::Error::HttpResponse {
-                    status,
-                    message: "<html><body>a page nobody should see</body></html>".to_owned(),
-                },
-                BUDGET,
-            )
-        };
-        assert_eq!(status(429), "HTTP 429: rate limited");
-        assert_eq!(status(503), "HTTP 503: server error");
-        assert_eq!(status(500), "HTTP 500: server error");
-        assert_eq!(status(404), "HTTP 404: not found");
-        assert_eq!(status(400), "HTTP 400: bad request");
-        assert_eq!(status(403), "HTTP 403: access refused");
-        assert_eq!(status(418), "HTTP 418: unexpected status");
-    }
-
-    #[test]
-    fn the_other_variants_read_as_sentences() {
-        use esplora_client::Error;
-        assert_eq!(
-            describe(&Error::TransactionNotFound(Txid::all_zeros()), BUDGET),
-            "transaction not found"
-        );
-        assert_eq!(
-            describe(&Error::HeaderHeightNotFound(7), BUDGET),
-            "block not found"
-        );
-        assert_eq!(
-            describe(&Error::InvalidResponse, BUDGET),
-            "unexpected response"
-        );
-        assert_eq!(
-            describe(&Error::Parsing("x".parse::<u32>().unwrap_err()), BUDGET),
-            "unexpected response"
-        );
-        // And none of them is the debug form the crate displays.
-        assert!(!describe(&Error::InvalidResponse, BUDGET).contains("InvalidResponse"));
+        assert_eq!(describe_status(429), "HTTP 429: rate limited");
+        assert_eq!(describe_status(503), "HTTP 503: server error");
+        assert_eq!(describe_status(500), "HTTP 500: server error");
+        assert_eq!(describe_status(404), "HTTP 404: not found");
+        assert_eq!(describe_status(400), "HTTP 400: bad request");
+        assert_eq!(describe_status(403), "HTTP 403: access refused");
+        assert_eq!(describe_status(418), "HTTP 418: unexpected status");
     }
 
     /// A server that accepts the connection and never answers: the
@@ -758,12 +794,8 @@ mod error_tests {
             }
         });
         let client = build(&format!("http://{address}"), None, BUDGET).unwrap();
-        let error = client.get_height().await.unwrap_err();
-        assert!(
-            matches!(error, esplora_client::Error::Reqwest(_)),
-            "{error:?}"
-        );
-        assert_eq!(client.describe(&error), "timed out after 1 s");
+        let error = client.height().await.unwrap_err();
+        assert_eq!(error, "timed out after 1 s");
     }
 
     #[tokio::test]
@@ -772,16 +804,16 @@ mod error_tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
-        let error = client.get_height().await.unwrap_err();
-        assert_eq!(client.describe(&error), "could not connect");
+        let error = client.height().await.unwrap_err();
+        assert_eq!(error, "could not connect");
     }
 
     #[tokio::test]
     async fn an_unknown_host_is_said_to_be_one() {
         // `.invalid` is reserved never to resolve, whatever the resolver.
         let client = build("http://esplora.invalid", None, PATIENT).unwrap();
-        let error = client.get_height().await.unwrap_err();
-        assert_eq!(client.describe(&error), "host not found");
+        let error = client.height().await.unwrap_err();
+        assert_eq!(error, "host not found");
     }
 
     /// A server that answers the handshake with something that is not
@@ -809,8 +841,7 @@ mod error_tests {
             }
         });
         let client = build(&format!("https://{address}"), None, PATIENT).unwrap();
-        let error = client.get_height().await.unwrap_err();
-        let described = client.describe(&error);
+        let described = client.height().await.unwrap_err();
         assert!(
             described.starts_with("TLS handshake failed: received corrupt message"),
             "{described}"
@@ -835,11 +866,83 @@ mod error_tests {
         });
         let onion = "http://gerfautexample000000000000000000000000000000000000000.onion/api";
         let client = build(onion, Some(&proxy.to_string()), PATIENT).unwrap();
-        let error = client.get_height().await.unwrap_err();
+        let error = client.height().await.unwrap_err();
         assert_eq!(
-            client.describe(&error),
+            error,
             "could not connect through Tor: server does not support user/pass authentication"
         );
+    }
+
+    /// A server that answers with `status` and `body` gzipped, whatever
+    /// is asked.
+    async fn gzipping(status: &'static str, body: Vec<u8>) -> std::net::SocketAddr {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&body).unwrap();
+        let gzipped = encoder.finish().unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let gzipped = gzipped.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\ncontent-encoding: gzip\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        gzipped.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&gzipped).await;
+                });
+            }
+        });
+        address
+    }
+
+    /// A small gzip of a huge body, from any request a client makes:
+    /// the tip polling reads, the counters of a script, the page of an
+    /// address. The answer is cut off past its cap, never held whole.
+    #[tokio::test]
+    async fn a_gzip_bomb_is_cut_off_whatever_is_asked() {
+        let bomb = vec![b'0'; MAX_BODY + (1 << 20)];
+        let address = gzipping("200 OK", bomb.clone()).await;
+        let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
+        let cut = "the server sent an answer longer than 32 MiB";
+        assert_eq!(client.height().await.unwrap_err(), cut);
+        assert_eq!(client.tip_hash().await.unwrap_err(), cut);
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        assert_eq!(client.scripthash_stats(&script).await.unwrap_err(), cut);
+        let txid: Txid = "01".repeat(32).parse().unwrap();
+        assert_eq!(client.tx(&txid).await.unwrap_err(), cut);
+        let address = parse_address(
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+            Network::Signet,
+        )
+        .unwrap();
+        assert_eq!(client.address_utxos(&address).await.unwrap_err(), cut);
+        // And a broadcast, whose refusal is read to a few kilobytes.
+        let address = gzipping("400 Bad Request", bomb).await;
+        let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
+        let tx = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        assert_eq!(
+            broadcast(&client, &tx).await.unwrap_err(),
+            "the server sent an answer longer than 64 KiB"
+        );
+    }
+
+    /// A gzipped answer of a sensible size reads as it always did.
+    #[tokio::test]
+    async fn a_gzipped_answer_is_read() {
+        let address = gzipping("200 OK", b"812345\n".to_vec()).await;
+        let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
+        assert_eq!(client.height().await.unwrap(), 812_345);
     }
 
     #[test]

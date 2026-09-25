@@ -1257,12 +1257,16 @@ const SIGNET_ESPLORA: &str = "https://mempool.emzy.de/signet/api";
 async fn scripts_waiting_for_a_block() -> Vec<String> {
     let client = crate::chain::esplora::client(SIGNET_ESPLORA, None).unwrap();
     let mut scripts = Vec::new();
-    for recent in client.get_mempool_recent_txs().await.unwrap() {
-        let Ok(Some(tx)) = client.get_tx(&recent.txid).await else {
+    let recent: Vec<serde_json::Value> = client.get_json("/mempool/recent").await.unwrap();
+    for recent in recent {
+        let Some(txid) = recent["txid"].as_str().and_then(|txid| txid.parse().ok()) else {
+            continue;
+        };
+        let Ok(Some(tx)) = client.tx(&txid).await else {
             continue;
         };
         for output in tx.output {
-            let Ok(stats) = client.get_scripthash_stats(&output.script_pubkey).await else {
+            let Ok(stats) = client.scripthash_stats(&output.script_pubkey).await else {
                 continue;
             };
             let hex = output.script_pubkey.to_hex_string();

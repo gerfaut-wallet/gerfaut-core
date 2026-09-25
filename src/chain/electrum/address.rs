@@ -782,18 +782,25 @@ mod tests {
     async fn live_an_address_reads_the_same_over_electrum_and_esplora() {
         let esplora = crate::chain::esplora::client(SIGNET_ESPLORA, None).unwrap();
         let addresses = crate::chain::esplora::client(SIGNET_ADDRESSES, None).unwrap();
-        let tip = esplora.get_height().await.unwrap();
-        let block = esplora.get_block_hash(tip - 3).await.unwrap();
-        let txids = esplora.get_block_txids(&block).await.unwrap();
+        let tip = esplora.height().await.unwrap();
+        let block = esplora
+            .get_bytes(&format!("/block-height/{}", tip - 3))
+            .await
+            .unwrap();
+        let block = String::from_utf8(block).unwrap();
+        let txids: Vec<bdk_wallet::bitcoin::Txid> = esplora
+            .get_json(&format!("/block/{}/txids", block.trim()))
+            .await
+            .unwrap();
         let mut address = None;
         // The address an input of a recent transaction spent from: one
         // that was paid, then spent, so both sides are read.
         for txid in txids.iter().skip(1).take(12) {
-            let Ok(Some(tx)) = esplora.get_tx(txid).await else {
+            let Ok(Some(tx)) = esplora.tx(txid).await else {
                 continue;
             };
             let spent = tx.input[0].previous_output;
-            let Ok(Some(parent)) = esplora.get_tx(&spent.txid).await else {
+            let Ok(Some(parent)) = esplora.tx(&spent.txid).await else {
                 continue;
             };
             let Some(candidate) = parent.output.get(spent.vout as usize).and_then(|output| {
@@ -805,7 +812,12 @@ mod tests {
             }) else {
                 continue;
             };
-            let Ok(stats) = addresses.get_address_stats(&candidate).await else {
+            let Ok(stats) = addresses
+                .get_json::<bdk_esplora::esplora_client::api::AddressStats>(&format!(
+                    "/address/{candidate}"
+                ))
+                .await
+            else {
                 continue;
             };
             if (1..=40).contains(&(stats.chain_stats.tx_count + stats.mempool_stats.tx_count)) {

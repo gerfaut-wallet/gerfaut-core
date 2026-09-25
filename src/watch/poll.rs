@@ -85,11 +85,7 @@ impl Plan {
         let lookups = async {
             let mut found = Vec::with_capacity(self.scripts.len());
             for (hex, script) in &self.scripts {
-                let stats = self
-                    .client
-                    .get_scripthash_stats(script)
-                    .await
-                    .map_err(|e| self.client.describe(&e))?;
+                let stats = self.client.scripthash_stats(script).await?;
                 found.push((hex.clone(), Fingerprint::of(&stats)));
             }
             Ok(found)
@@ -145,15 +141,11 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         let plan = poller.plan(&hub.watched, 0, HOT);
         let known_tip = tip.clone();
         let round = async move {
-            let hash = client
-                .get_tip_hash()
-                .await
-                .map_err(|e| client.describe(&e))?
-                .to_string();
+            let hash = client.tip_hash().await?.to_string();
             let height = if known_tip.as_deref() == Some(hash.as_str()) {
                 None
             } else {
-                Some(client.get_height().await.map_err(|e| client.describe(&e))?)
+                Some(client.height().await?)
             };
             Ok::<_, String>((hash, height, plan.check().await?))
         };

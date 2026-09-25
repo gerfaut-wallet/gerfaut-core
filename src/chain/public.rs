@@ -345,7 +345,7 @@ mod tests {
                     continue;
                 }
                 let client = crate::chain::esplora::client(&server.url, None).unwrap();
-                match client.get_height().await {
+                match client.height().await {
                     Ok(height) => {
                         reached += 1;
                         assert!(height > 100_000, "{} on {network}: {height}", server.label);
