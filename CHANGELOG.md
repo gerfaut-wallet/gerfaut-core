@@ -222,3 +222,7 @@ The first release: the library both Gerfaut apps are built on.
   is an onion, the way the update check does. It used to look at the
   network on screen only, so switching to one whose backend is in the
   clear showed this device's address to the premium server.
+- A previous transaction fetched for the transaction preview is checked
+  against its txid, on Electrum as on Esplora. A server could answer with
+  another transaction and set the value of the coin, and so the fee, the
+  preview showed.

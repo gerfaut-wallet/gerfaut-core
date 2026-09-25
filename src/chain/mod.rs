@@ -487,6 +487,19 @@ pub(crate) async fn inspect_certificate(
     electrum::inspect(&electrum::Target::new(url, pin)).await
 }
 
+/// The output an outpoint names, in the transaction a server returned
+/// for its txid. The txid commits to every output, so a transaction
+/// that does not hash to it is the server's invention, refused rather
+/// than read for the value and the fee the preview shows.
+pub(crate) fn output_at(tx: &Transaction, outpoint: OutPoint) -> Result<Option<TxOut>, String> {
+    if tx.compute_txid() != outpoint.txid {
+        return Err(
+            "the server answered with another transaction than the one asked for".to_owned(),
+        );
+    }
+    Ok(tx.output.get(outpoint.vout as usize).cloned())
+}
+
 /// What one endpoint knows about a coin about to be spent.
 pub(crate) struct PrevoutFacts {
     pub txout: Option<TxOut>,
@@ -949,5 +962,33 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    /// A previous transaction is read only if it is the one asked for:
+    /// its txid is what vouches for the value of the coin.
+    #[test]
+    fn a_previous_transaction_must_hash_to_its_txid() {
+        use bdk_wallet::bitcoin::{Amount, absolute, transaction};
+        let tx = |value: u64| Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let real = tx(1_000);
+        let forged = tx(900_000);
+        let outpoint = OutPoint::new(real.compute_txid(), 0);
+        assert_eq!(
+            output_at(&real, outpoint).unwrap().unwrap().value,
+            Amount::from_sat(1_000)
+        );
+        assert_eq!(
+            output_at(&real, OutPoint::new(real.compute_txid(), 1)).unwrap(),
+            None
+        );
+        assert!(output_at(&forged, outpoint).is_err());
     }
 }

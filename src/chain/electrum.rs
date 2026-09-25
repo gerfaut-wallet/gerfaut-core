@@ -677,7 +677,7 @@ pub(crate) async fn fetch_prevout(
         proxy,
         call_deadline(target),
         move |client| match client.inner.transaction_get(&outpoint.txid) {
-            Ok(tx) => Ok(tx.output.get(outpoint.vout as usize).cloned()),
+            Ok(tx) => crate::chain::output_at(&tx, outpoint),
             Err(electrum_client::Error::Protocol(_)) => Ok(None),
             Err(error) => Err(fail(error)),
         },

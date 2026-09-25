@@ -543,7 +543,7 @@ pub(crate) async fn fetch_prevout(
             spent: None,
         });
     };
-    let txout = tx.output.get(outpoint.vout as usize).cloned();
+    let txout = crate::chain::output_at(&tx, outpoint)?;
     let spent = client
         .get_output_status(&outpoint.txid, outpoint.vout as u64)
         .await
