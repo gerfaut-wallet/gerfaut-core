@@ -160,6 +160,8 @@ pub struct Licence {
     /// The key the server says it signs with. Informative: the
     /// certificate was checked against the embedded key.
     pub public_key: String,
+    /// Unix seconds: when the paid time ends. The signed `claims.exp`,
+    /// never the unsigned field beside it in the answer.
     pub paid_until: i64,
     pub claims: Claims,
 }
@@ -368,11 +370,11 @@ struct HeartbeatBody<'a> {
     public_key: String,
 }
 
+/// The answer also carries `paid_until`, unsigned: it is not read.
 #[derive(Deserialize)]
 struct LicenceBody {
     certificate: String,
     public_key: String,
-    paid_until: i64,
 }
 
 #[derive(Deserialize)]
@@ -726,7 +728,7 @@ impl PremiumClient {
         Ok(Licence {
             certificate: parsed.certificate,
             public_key: parsed.public_key,
-            paid_until: parsed.paid_until,
+            paid_until: claims.exp,
             claims,
         })
     }
@@ -2191,10 +2193,12 @@ mod tests {
             iat: NOW,
         };
         let certificate = fixtures::ACCOUNT_CERTIFICATE;
+        // The unsigned date beside the certificate says a year more:
+        // only the signed one counts.
         let body = format!(
             r#"{{"certificate":"{certificate}","public_key":"{}","paid_until":{}}}"#,
             fixtures::SERVER_PUBLIC_KEY_HEX,
-            claims.exp
+            claims.exp + 365 * 86_400
         );
         let stub = stub(200, &body).await;
         let licence = device(&stub)

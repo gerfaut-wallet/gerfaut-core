@@ -249,3 +249,5 @@ The first release: the library both Gerfaut apps are built on.
   release page otherwise. A tag longer than 32 characters, or with
   spaces in it, is not taken for a version, and at most 1 MiB of the
   answer is read.
+- `Licence::paid_until` is the end of the paid time the certificate
+  signs, never the unsigned date the server sends beside it.
