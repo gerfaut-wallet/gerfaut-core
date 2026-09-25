@@ -219,6 +219,7 @@ fn timings() -> crate::watch::Timings {
         retries: [Duration::from_millis(20), Duration::from_millis(50)],
         hold: Duration::from_millis(100),
         hold_cap: Duration::from_millis(400),
+        due: Duration::from_millis(100),
     }
 }
 
@@ -595,6 +596,160 @@ async fn a_payment_to_an_address_the_wallet_never_showed_is_announced() {
             .any(|method| method.starts_with("blockchain.transaction.")),
         "{asked:?}"
     );
+}
+
+// --- once a day, whatever the watch hears ------------------------------------------
+
+/// A descriptor wallet of [`DESCRIPTOR`] on `server`, imported with one
+/// confirmed payment at its first address.
+async fn cold_wallet(dir: &std::path::Path, server: &FakeElectrum) -> (WalletManager, String) {
+    let manager = WalletManager::open(dir, key()).unwrap();
+    manager.set_active_network(Network::Signet).await.unwrap();
+    manager
+        .set_backend(Network::Signet, server.backend())
+        .await
+        .unwrap();
+    let wallet = manager
+        .add_wallet(
+            "Cold",
+            &crate::input::parse_input(DESCRIPTOR).unwrap(),
+            Network::Signet,
+        )
+        .await
+        .unwrap()
+        .id;
+    pay(server, 1, &receive_script(0), 10_000, 90);
+    manager.sync_wallet(&wallet).await.unwrap();
+    (manager, wallet)
+}
+
+/// Makes the last complete sync of a wallet a day and an hour old.
+async fn age(manager: &WalletManager, wallet: &str) -> u64 {
+    let old = crate::manager::now_secs() - 25 * 60 * 60;
+    let mut state = manager.state.lock().await;
+    let record = state
+        .payload
+        .wallets
+        .iter_mut()
+        .find(|record| record.meta.id == wallet)
+        .unwrap();
+    record.meta.complete_at = Some(old);
+    old
+}
+
+async fn complete_at(manager: &WalletManager, wallet: &str) -> Option<u64> {
+    let state = manager.state.lock().await;
+    state
+        .payload
+        .wallets
+        .iter()
+        .find(|record| record.meta.id == wallet)
+        .and_then(|record| record.meta.complete_at)
+}
+
+fn histories_since(server: &FakeElectrum, from: usize) -> usize {
+    server.state.lock().unwrap().asked[from..]
+        .iter()
+        .filter(|method| *method == "blockchain.scripthash.get_history")
+        .count()
+}
+
+/// A sync of the scripts that moved, a day after the last one that read
+/// every script, reads every script: the syncs the watch asks for are
+/// the only ones a phone may run for days.
+#[tokio::test]
+async fn a_narrow_sync_a_day_after_a_complete_one_reads_it_all() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = cold_wallet(dir.path(), &server).await;
+    let moved = Reach::Scripts(vec![ScriptBuf::from_hex(&receive_script(0)).unwrap()]);
+
+    let before = server.state.lock().unwrap().asked.len();
+    manager
+        .sync_wallet_read(&wallet, moved.clone(), None)
+        .await
+        .unwrap();
+    assert_eq!(histories_since(&server, before), 1, "recent: that script");
+
+    let old = age(&manager, &wallet).await;
+    let before = server.state.lock().unwrap().asked.len();
+    manager
+        .sync_wallet_read(&wallet, moved, None)
+        .await
+        .unwrap();
+    // The one address shown, and the 20 past it.
+    assert_eq!(histories_since(&server, before), 1 + 20);
+    assert!(complete_at(&manager, &wallet).await.unwrap() > old);
+}
+
+/// A watch that hears nothing for a day still reads every wallet whole
+/// once that day, on its own: a phone may keep a watch for days with no
+/// other sync, and some scripts it never hears of. Not again after.
+#[tokio::test]
+async fn a_quiet_watch_reads_each_wallet_whole_once_a_day() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = cold_wallet(dir.path(), &server).await;
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+
+    let old = age(&manager, &wallet).await;
+    let before = server.state.lock().unwrap().asked.len();
+    let (report, _) = next_sync(&mut events, &wallet).await;
+    assert!(report.new_txs.is_empty());
+    assert_eq!(histories_since(&server, before), 1 + 20);
+    assert!(complete_at(&manager, &wallet).await.unwrap() > old);
+    quiet_start_after(&mut events).await;
+    manager.live_stop().await;
+}
+
+/// Nothing but statuses and blocks for a while.
+async fn quiet_start_after(events: &mut LiveEvents) {
+    while let Ok(Some(event)) = tokio::time::timeout(QUIET, events.next()).await {
+        assert!(
+            matches!(event, LiveEvent::Status(_) | LiveEvent::NewBlock { .. }),
+            "expected nothing more, got {event:?}"
+        );
+    }
+}
+
+/// The sync a pushed change asked for fails, the server refusing it for
+/// a moment. The watch runs it again on its own, at its next look, and
+/// the payment is announced without waiting for another change.
+#[tokio::test]
+async fn a_sync_that_failed_is_run_again() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), server.backend()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+
+    server
+        .state
+        .lock()
+        .unwrap()
+        .refuse
+        .insert("blockchain.scripthash.get_history", "busy".to_owned());
+    let payment = transaction(&[nowhere(5, 0)], &[(ADDRESS_SCRIPT, 13_000)]);
+    let paid = payment.compute_txid();
+    server.add_tx(&payment);
+    server.set_history(ADDRESS_SCRIPT, &[(paid, 0)]);
+    server.set_status(ADDRESS_SCRIPT, "in the mempool");
+    loop {
+        match tokio::time::timeout(WAIT, events.next()).await {
+            Ok(Some(LiveEvent::SyncFailed { wallet_id, .. })) if wallet_id == wallet => break,
+            Ok(Some(LiveEvent::Transaction(tx))) => panic!("announced while refused: {tx:?}"),
+            Ok(Some(_)) => {}
+            other => panic!("the sync never failed: {other:?}"),
+        }
+    }
+    server.state.lock().unwrap().refuse.clear();
+    assert_eq!(
+        staged(&[next_announcement(&mut events).await]),
+        [(paid.to_string(), TxStage::Mempool)]
+    );
+    manager.live_stop().await;
 }
 
 // --- how soon ---------------------------------------------------------------------

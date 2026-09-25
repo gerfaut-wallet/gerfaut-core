@@ -157,6 +157,12 @@ type SyncSlot = std::sync::Arc<Mutex<Option<(Instant, SyncReport, Reach)>>>;
 /// replacement paying the same amount to the same address.
 const COMPLETE_EVERY_SECS: u64 = 24 * 60 * 60;
 
+/// Whether a sync read every script of the wallet less than a day ago.
+pub(crate) fn complete_lately(meta: &WalletMeta, now: u64) -> bool {
+    meta.complete_at
+        .is_some_and(|at| now.saturating_sub(at) < COMPLETE_EVERY_SECS)
+}
+
 /// How much of a descriptor wallet a sync reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Reach {
@@ -920,9 +926,7 @@ impl WalletManager {
             .unwrap_or(false);
         let state = self.state.lock().await;
         let recent = find_record(&state.payload, id)
-            .ok()
-            .and_then(|record| record.meta.complete_at)
-            .is_some_and(|at| now_secs().saturating_sub(at) < COMPLETE_EVERY_SECS);
+            .is_ok_and(|record| complete_lately(&record.meta, now_secs()));
         if done_here && recent {
             Reach::Checked
         } else {
@@ -1041,8 +1045,12 @@ impl WalletManager {
         // First sync, a gap limit raised since the last full scan, or a
         // rescan asked for: only a full scan looks past the addresses
         // already revealed.
+        // And a day at most since a sync read every script: the syncs
+        // the live watch asks for read only what moved, whoever asks.
         let reach = if meta.last_sync.is_none() || meta.scan_gap < meta.gap_limit {
             Reach::Full
+        } else if reach.rank() < Reach::Complete.rank() && !complete_lately(meta, now_secs()) {
+            Reach::Complete
         } else {
             reach
         };

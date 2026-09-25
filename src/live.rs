@@ -92,6 +92,9 @@ const CLAIM_BATCH: usize = 32;
 /// one of them and never the others; a backend, often a public one, is
 /// never asked for every wallet at the same moment.
 const SYNCS_AT_ONCE: usize = 2;
+/// How long a wallet whose complete sync the watch ran, and failed, is
+/// left before the watch tries again.
+const DUE_RETRY: Duration = Duration::from_secs(60 * 60);
 
 /// One transaction to announce.
 ///
@@ -596,6 +599,14 @@ impl WalletManager {
         // A wallet with a sync under way, and what was asked of it since.
         let mut again: HashMap<String, Option<Asked>> = HashMap::new();
         let mut futile = Futile::default();
+        // What a sync that failed was asked, run again at the next look.
+        let mut owed: HashMap<String, Asked> = HashMap::new();
+        // When the watch last ran the complete sync of a wallet it found
+        // due: one that failed is not tried again at every look.
+        let mut tried: HashMap<String, tokio::time::Instant> = HashMap::new();
+        // How often the watch looks for both, besides at each block.
+        let mut looks = tokio::time::interval_at(tokio::time::Instant::now() + pace.due, pace.due);
+        looks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // What a sync found before the watch started, and nobody claimed:
         // a start no longer syncs a wallet whose scripts did not move.
         for report in self.unclaimed_reports().await {
@@ -625,29 +636,13 @@ impl WalletManager {
                             ..
                         } => {
                             let asked = Asked::of(reason, scripts);
-                            match again.get_mut(&wallet_id) {
-                                Some(next) => {
-                                    *next = Some(match next.take() {
-                                        Some(earlier) => earlier.and(asked),
-                                        None => asked,
-                                    });
-                                }
-                                None => {
-                                    again.insert(wallet_id.clone(), None);
-                                    let hold = futile.hold(&wallet_id, &asked, &pace);
-                                    let task = syncs.spawn(self.clone().live_sync(
-                                        wallet_id.clone(),
-                                        asked.clone(),
-                                        permits.clone(),
-                                        hold,
-                                        pace.retries,
-                                    ));
-                                    wallet_of.insert(task.id(), (wallet_id, asked));
-                                }
-                            }
+                            self.ask(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, wallet_id, asked);
                             continue;
                         }
-                        WatchEvent::NewBlock { height } => LiveEvent::NewBlock { height },
+                        WatchEvent::NewBlock { height } => {
+                            self.look(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, &mut owed, &mut tried).await;
+                            LiveEvent::NewBlock { height }
+                        }
                         WatchEvent::Status(status) => LiveEvent::Status(status),
                     };
                     if !deliver(&events, event, &mut halted).await {
@@ -672,6 +667,9 @@ impl WalletManager {
                         break;
                     }
                 }
+                _ = looks.tick() => {
+                    self.look(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, &mut owed, &mut tried).await;
+                }
                 Some(done) = syncs.join_next_with_id() => {
                     let (task, outcome) = match done {
                         Ok((task, outcome)) => (task, outcome),
@@ -690,6 +688,13 @@ impl WalletManager {
                         Err(_) => false,
                     };
                     futile.settle(&wallet_id, &asked, found);
+                    if outcome.is_err() {
+                        let asked = match owed.remove(&wallet_id) {
+                            Some(earlier) => earlier.and(asked),
+                            None => asked,
+                        };
+                        owed.insert(wallet_id.clone(), asked);
+                    }
                     if !self.announce(&wallet_id, outcome, &events, &mut halted).await {
                         break;
                     }
@@ -766,6 +771,97 @@ impl WalletManager {
                 .await
             }
         }
+    }
+
+    /// Runs the sync `asked` of a wallet, or, with one under way, keeps
+    /// it for when that one ends.
+    #[allow(clippy::too_many_arguments)]
+    fn ask(
+        &self,
+        syncs: &mut JoinSet<Synced>,
+        wallet_of: &mut HashMap<tokio::task::Id, (String, Asked)>,
+        again: &mut HashMap<String, Option<Asked>>,
+        futile: &Futile,
+        permits: &Arc<Semaphore>,
+        pace: &Timings,
+        wallet_id: String,
+        asked: Asked,
+    ) {
+        match again.get_mut(&wallet_id) {
+            Some(next) => {
+                *next = Some(match next.take() {
+                    Some(earlier) => earlier.and(asked),
+                    None => asked,
+                });
+            }
+            None => {
+                again.insert(wallet_id.clone(), None);
+                let hold = futile.hold(&wallet_id, &asked, pace);
+                let task = syncs.spawn(self.clone().live_sync(
+                    wallet_id.clone(),
+                    asked.clone(),
+                    permits.clone(),
+                    hold,
+                    pace.retries,
+                ));
+                wallet_of.insert(task.id(), (wallet_id, asked));
+            }
+        }
+    }
+
+    /// What the watch runs of its own accord, at each block and every
+    /// [`Timings::due`], while it has a session: the syncs that failed,
+    /// again, and a complete sync of each wallet that has had none for a
+    /// day. The syncs the watch asks for read only what moved, and a
+    /// phone can keep a watch for days with no other sync: this is what
+    /// reads, once a day, whatever the watch cannot hear, such as a
+    /// script past what it follows of a wallet.
+    #[allow(clippy::too_many_arguments)]
+    async fn look(
+        &self,
+        syncs: &mut JoinSet<Synced>,
+        wallet_of: &mut HashMap<tokio::task::Id, (String, Asked)>,
+        again: &mut HashMap<String, Option<Asked>>,
+        futile: &Futile,
+        permits: &Arc<Semaphore>,
+        pace: &Timings,
+        owed: &mut HashMap<String, Asked>,
+        tried: &mut HashMap<String, tokio::time::Instant>,
+    ) {
+        if self.watch_serving().is_none() {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        tried.retain(|_, at| now.duration_since(*at) < DUE_RETRY);
+        let mut asks: Vec<(String, Asked)> = owed.drain().collect();
+        for wallet_id in self.due_complete().await {
+            if tried.contains_key(&wallet_id) {
+                continue;
+            }
+            tried.insert(wallet_id.clone(), now);
+            asks.push((wallet_id, Asked::of(ChangeReason::Started, Vec::new())));
+        }
+        for (wallet_id, asked) in asks {
+            self.ask(
+                syncs, wallet_of, again, futile, permits, pace, wallet_id, asked,
+            );
+        }
+    }
+
+    /// The wallets of the watched network whose last complete sync is a
+    /// day old, or that never had one.
+    async fn due_complete(&self) -> Vec<String> {
+        let now = crate::manager::now_secs();
+        let state = self.state.lock().await;
+        let network = state.payload.settings.active_network;
+        state
+            .payload
+            .wallets
+            .iter()
+            .filter(|record| record.meta.network == network)
+            .filter(|record| !crate::manager::complete_lately(&record.meta, now))
+            .map(|record| record.meta.id.clone())
+            .collect()
     }
 
     /// The server the live watch has a session with, if any.

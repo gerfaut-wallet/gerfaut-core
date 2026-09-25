@@ -273,6 +273,10 @@ pub(crate) struct Timings {
     /// behind, doubled each time after, up to `hold_cap`.
     pub hold: Duration,
     pub hold_cap: Duration,
+    /// For the live alerts too: how often the watch runs again the syncs
+    /// that failed, and looks for a wallet whose last complete sync is a
+    /// day old. It also does at each block.
+    pub due: Duration,
 }
 
 impl Timings {
@@ -294,6 +298,7 @@ impl Timings {
             retries: [Duration::from_secs(3), Duration::from_secs(10)],
             hold: Duration::from_secs(30),
             hold_cap: Duration::from_secs(10 * 60),
+            due: Duration::from_secs(10 * 60),
         }
     }
 }

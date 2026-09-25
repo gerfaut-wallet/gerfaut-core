@@ -34,6 +34,7 @@ fn timings() -> Timings {
         retries: [Duration::from_millis(20), Duration::from_millis(50)],
         hold: Duration::from_millis(100),
         hold_cap: Duration::from_millis(400),
+        due: Duration::from_secs(3600),
     }
 }
 
