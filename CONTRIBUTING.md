@@ -65,7 +65,7 @@ Every app goes through `WalletManager`. The rest of `src/` answers one question 
 | `wallet/` | What does a wallet hold, and who can spend it? Metadata, snapshots, the views the screens read, the policy page (`policy`). |
 | `chain/` | How does a sync reach a server? Esplora and Electrum, certificates, the public servers, Tor, and the sockets (`net`) that the live watch opens too. |
 | `watch/` | Did a watched wallet just move? The live connection. |
-| `live.rs` | What is worth announcing, and was it announced already? |
+| `live/news.rs` | What is worth announcing, and was it announced already? |
 | `store/` | How is it all kept on disk? The vault and its encryption (`cipher`). |
 | `backup.rs` | How do wallets leave the device? The encrypted backup file and its animated QR. |
 | `lock.rs` | Who may open the app? The PIN or password, and the delay after wrong guesses. |
