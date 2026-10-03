@@ -64,7 +64,7 @@ const TCP_PORT: u16 = 50001;
 
 /// One Electrum server, with the certificate fingerprint the user
 /// accepted for it, if any.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Target {
     pub url: String,
     pub pin: Option<String>,

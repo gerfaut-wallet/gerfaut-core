@@ -77,6 +77,13 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         Err(Exit::Lost(detail)) => return Exit::Unreachable(detail),
         Err(exit) => return exit,
     };
+    let mut poller = match Poller::new(base, proxy.as_deref()) {
+        Ok(poller) => poller,
+        Err(detail) => return Exit::Unreachable(detail),
+    };
+    if let Err(exit) = poll::same_network(hub, &poller).await {
+        return exit;
+    }
     // Credentials in the address travel as a header, the way the HTTP
     // client of a sync sends them, and not in the request line.
     let authorization = (!url.username().is_empty()).then(|| {
@@ -152,10 +159,6 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
     // This transport keeps no record of what it missed: at the start,
     // and after a loss, every wallet is worth one sync.
     hub.ready(false);
-    let mut poller = match Poller::new(base, proxy.as_deref()) {
-        Ok(poller) => poller,
-        Err(detail) => return Exit::Lost(detail),
-    };
 
     let mut keepalive = tokio::time::interval_at(
         Instant::now() + hub.timings.keepalive,

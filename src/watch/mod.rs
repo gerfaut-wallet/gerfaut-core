@@ -65,6 +65,10 @@
 //!   Electrum server is asked for every status again and the scripts
 //!   whose status differs from what the wallet holds are reported; the
 //!   other transports report every wallet once.
+//! - A server is asked for its genesis block before it hears of any
+//!   script. One of another network is refused, and left alone for a
+//!   quarter of an hour ([`Exit::Refused`]) while the next one is
+//!   tried.
 //! - Timers stop while a phone sleeps. [`LiveWatch::tick`] is the
 //!   entry point a host alarm calls: it measures the pause on the wall
 //!   clock, pings at once, and cuts a backoff short.
@@ -399,6 +403,9 @@ pub(crate) struct Timings {
     /// that failed, and looks for a wallet whose last complete sync is a
     /// day old. It also does at each block.
     pub due: Duration,
+    /// How long a server that refused the watch is left alone: see
+    /// [`Exit::Refused`].
+    pub refused: Duration,
 }
 
 impl Timings {
@@ -421,6 +428,7 @@ impl Timings {
             hold: Duration::from_secs(30),
             hold_cap: Duration::from_secs(10 * 60),
             due: Duration::from_secs(10 * 60),
+            refused: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -500,6 +508,7 @@ impl LiveWatch {
             statuses: HashMap::new(),
             fingerprints: HashMap::new(),
             track_limit: None,
+            shunned: HashMap::new(),
             last_alive: SystemTime::now(),
             fixed_timings,
         };
@@ -840,6 +849,10 @@ pub(crate) enum Exit {
     /// The server is there and offers no push (a WebSocket upgrade
     /// answered with an HTTP refusal).
     NoPush(String),
+    /// The server will not do: one of another network. It is left alone
+    /// for [`Timings::refused`], whatever else is tried meanwhile, so that
+    /// coming back does not cost it, or the watch, what it just did.
+    Refused(String),
 }
 
 /// What a session is woken for, besides its socket.
@@ -882,6 +895,9 @@ pub(crate) struct Hub {
     pub fingerprints: HashMap<String, poll::Fingerprint>,
     /// Scripts a mempool instance said it tracks per connection.
     pub track_limit: Option<usize>,
+    /// The servers that refused the watch, and until when each is left
+    /// alone: see [`Exit::Refused`].
+    shunned: HashMap<Endpoint, Instant>,
     /// Wall clock of the last sign of life, to measure a suspension.
     last_alive: SystemTime,
     /// Timings given by a test, which a new configuration leaves alone.
@@ -1092,7 +1108,27 @@ impl Hub {
         self.statuses.clear();
         self.fingerprints.clear();
         self.track_limit = None;
+        self.shunned.clear();
         self.debounce = Debouncer::default();
+    }
+
+    /// Leaves a server alone for a while, a little more or less than
+    /// [`Timings::refused`] so that a fleet of clients does not come back
+    /// at once.
+    fn shun(&mut self, endpoint: &Endpoint) {
+        let wait = self
+            .timings
+            .refused
+            .mul_f64(0.8 + 0.4 * rand::random::<f64>());
+        self.shunned.insert(endpoint.clone(), Instant::now() + wait);
+    }
+
+    /// Whether a server is being left alone, and until when.
+    fn shunned_until(&self, endpoint: &Endpoint) -> Option<Instant> {
+        self.shunned
+            .get(endpoint)
+            .copied()
+            .filter(|until| *until > Instant::now())
     }
 
     /// Waits out a delay, or for ever without one, while commands and
@@ -1276,16 +1312,30 @@ async fn supervise(hub: &mut Hub) {
                 no_push = None;
             }
             Exit::Reprobe => no_push = None,
-            exit @ (Exit::Lost(_) | Exit::Unreachable(_) | Exit::NoPush(_)) => {
+            exit @ (Exit::Lost(_) | Exit::Unreachable(_) | Exit::NoPush(_) | Exit::Refused(_)) => {
                 if started.elapsed() >= hub.timings.stable {
                     backoff.reset();
                 }
-                let delay = backoff.delay(&hub.timings);
+                let mut delay = backoff.delay(&hub.timings);
+                // Every server refused the watch: none is asked again
+                // before the first of them may be.
+                if let Some(until) = candidates(&hub.config)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|endpoint| hub.shunned_until(endpoint))
+                    .collect::<Option<Vec<Instant>>>()
+                    .and_then(|untils| untils.into_iter().min())
+                {
+                    delay = delay.max(until.saturating_duration_since(Instant::now()));
+                }
                 // Without a session, the transport last tried is not one
                 // in use.
                 let established = matches!(exit, Exit::Lost(_));
                 hub.interrupted |= established;
-                let (Exit::Lost(detail) | Exit::Unreachable(detail) | Exit::NoPush(detail)) = exit
+                let (Exit::Lost(detail)
+                | Exit::Unreachable(detail)
+                | Exit::NoPush(detail)
+                | Exit::Refused(detail)) = exit
                 else {
                     continue;
                 };
@@ -1317,12 +1367,20 @@ async fn run_once(hub: &mut Hub, endpoints: &[Endpoint], no_push: &mut Option<In
     let mut last = Exit::Lost("no backend to watch".to_owned());
     let mut esplora: Vec<&Endpoint> = Vec::new();
     for endpoint in endpoints {
+        if hub.shunned_until(endpoint).is_some() {
+            last = Exit::Refused("the server refused the watch a moment ago".to_owned());
+            continue;
+        }
         match endpoint {
             Endpoint::Electrum(target) => {
                 let target = target.clone();
                 match electrum::run(hub, endpoint, &target).await {
                     // The next candidate may do.
                     Exit::Unreachable(detail) => last = Exit::Unreachable(detail),
+                    Exit::Refused(detail) => {
+                        hub.shun(endpoint);
+                        last = Exit::Refused(detail);
+                    }
                     exit => return exit,
                 }
             }
@@ -1337,6 +1395,10 @@ async fn run_once(hub: &mut Hub, endpoints: &[Endpoint], no_push: &mut Option<In
             };
             match mempool::run(hub, endpoint, url).await {
                 exit @ (Exit::NoPush(_) | Exit::Unreachable(_)) => last = exit,
+                exit @ Exit::Refused(_) => {
+                    hub.shun(endpoint);
+                    last = exit;
+                }
                 exit => return exit,
             }
         }
@@ -1346,8 +1408,15 @@ async fn run_once(hub: &mut Hub, endpoints: &[Endpoint], no_push: &mut Option<In
         let Endpoint::Esplora(url) = endpoint else {
             continue;
         };
+        if hub.shunned_until(endpoint).is_some() {
+            continue;
+        }
         match poll::run(hub, endpoint, url).await {
             exit @ Exit::Unreachable(_) => last = exit,
+            exit @ Exit::Refused(_) => {
+                hub.shun(endpoint);
+                last = exit;
+            }
             exit => return exit,
         }
     }

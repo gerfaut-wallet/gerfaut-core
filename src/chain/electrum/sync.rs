@@ -28,7 +28,8 @@ use bdk_wallet::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 
 use crate::chain::{
-    Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX, has_proof_of_work, height_limit,
+    ANOTHER_NETWORK, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX, has_proof_of_work,
+    height_limit,
 };
 use crate::network::Network;
 
@@ -177,6 +178,7 @@ impl Chain {
             } else {
                 (local.clone(), None)
             };
+        let mut network_checked = false;
         if height < local.height() {
             let mut hashes = BTreeMap::new();
             let mut headers = HashMap::new();
@@ -198,6 +200,7 @@ impl Chain {
                         dropped,
                     });
                 }
+                same_network(client, &local, &mut network_checked)?;
             }
             return Err(Error::Message(
                 "the server's chain never meets the wallet's".to_owned(),
@@ -229,6 +232,7 @@ impl Chain {
                 agreement = Some(checkpoint);
                 break;
             }
+            same_network(client, &local, &mut network_checked)?;
         }
         let agreement = agreement.ok_or_else(|| {
             Error::Message("the server's chain never meets the wallet's".to_owned())
@@ -315,6 +319,25 @@ fn checked_suffix(
     Err(Error::Message(
         "the server's latest blocks do not chain".to_owned(),
     ))
+}
+
+/// Refuses a server of another network, once its chain and the
+/// wallet's have disagreed on a block: their genesis blocks differ, and
+/// walking down to it would take a request for every block the wallet
+/// holds. Asked once a walk.
+fn same_network(
+    client: &impl ElectrumApi,
+    local: &CheckPoint,
+    checked: &mut bool,
+) -> Result<(), Error> {
+    if std::mem::replace(checked, true) {
+        return Ok(());
+    }
+    let ours = local.iter().last().map(|genesis| genesis.hash());
+    if Some(client.block_header(0)?.block_hash()) != ours {
+        return Err(Error::Message(ANOTHER_NETWORK.to_owned()));
+    }
+    Ok(())
 }
 
 /// The update being put together.

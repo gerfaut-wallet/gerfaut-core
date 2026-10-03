@@ -221,6 +221,14 @@ The first release: the library both Gerfaut apps are built on.
   before an `@` keeps its own.
 - The ids the premium server hands out are percent-encoded before they go
   into a URL path.
+- The live watch asks a server for its genesis block before it hears of
+  any script, over Electrum as over Esplora, and refuses one of another
+  network: a signet port typed for testnet4 reported changes that never
+  happened on the wallet's network. A refused server is left alone for a
+  quarter of an hour while the next one is tried. A sync whose server
+  disagrees with the wallet on a block now asks for its genesis block
+  too, and says "the server is on another network" at once, instead of
+  walking the wallet's chain down to it one request a block.
 - A watched address is never read from a server of another network.
   Testnet, testnet4 and signet spell an address alike, and a server of
   the wrong one answered for it with transactions the wallet's network

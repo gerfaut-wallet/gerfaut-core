@@ -283,7 +283,7 @@ pub(crate) fn canonical_host(host: &str) -> Result<String, ParseError> {
 }
 
 /// One concrete server to talk to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Endpoint {
     Esplora(String),
     Electrum(electrum::Target),

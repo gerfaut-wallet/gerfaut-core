@@ -9,15 +9,18 @@
 //! twice while the connection lives.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
 
+use bdk_wallet::bitcoin::block::Header;
+use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
 use serde_json::{Value, json};
-use tokio::io::{AsyncWriteExt, WriteHalf};
+use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::time::Instant;
 
 use super::net::{self, BoxStream, LineReader, Security};
 use super::{ChangeReason, Exit, Hub, Wake, WatchState, WatchTransport};
-use crate::chain::Endpoint;
 use crate::chain::electrum::{CLIENT_NAME, Target, parse};
+use crate::chain::{ANOTHER_NETWORK, Endpoint, is_genesis_of};
 
 /// The longest line read. A status is 64 characters and a header 160;
 /// a server sending more than this is not speaking the protocol.
@@ -85,6 +88,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
     };
     let budget = hub.connect_budget(endpoint);
     let pin = target.pin.clone();
+    let network = hub.config.network;
     let opening = async move {
         let security = if tls {
             Security::Electrum {
@@ -93,7 +97,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         } else {
             Security::Plain
         };
-        let stream = net::open(&host, port, security, proxy.as_deref(), budget).await?;
+        let stream = net::open(&host, port, security, proxy.as_deref(), budget)
+            .await
+            .map_err(Exit::Unreachable)?;
         let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = LineReader::new(reader, MAX_LINE);
         // `server.version` is the first call a server expects, and the
@@ -102,39 +108,39 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
             "jsonrpc": "2.0", "id": 0, "method": "server.version",
             "params": [CLIENT_NAME, [PROTOCOL_MIN, PROTOCOL_MAX]],
         });
-        send(&mut writer, &hello).await?;
-        let negotiated = tokio::time::timeout(budget, async {
-            loop {
-                let line = reader
-                    .next_line()
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "the connection was closed".to_owned())?;
-                let Ok(message) = serde_json::from_slice::<Value>(&line) else {
-                    return Err("unexpected response".to_owned());
-                };
-                if message.get("id").and_then(Value::as_u64) != Some(0) {
-                    continue;
-                }
-                if let Some(error) = message.get("error").filter(|e| !e.is_null()) {
-                    return Err(format!("the server refused the request: {}", words(error)));
-                }
-                return Ok(message["result"][1].as_str().unwrap_or_default().to_owned());
-            }
-        })
-        .await
-        .map_err(|_| format!("timed out after {} s", budget.as_secs()))??;
-        Ok::<_, String>((reader, writer, negotiated))
+        send(&mut writer, &hello).await.map_err(Exit::Unreachable)?;
+        let version = answer(&mut reader, 0, budget)
+            .await
+            .map_err(Exit::Unreachable)?;
+        let negotiated = version[1].as_str().unwrap_or_default().to_owned();
+        // Then its genesis block, before it hears of any script: a
+        // server of another network, a signet port typed for testnet4,
+        // would report changes that never happened on the wallet's.
+        let genesis = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "blockchain.block.header", "params": [0],
+        });
+        send(&mut writer, &genesis)
+            .await
+            .map_err(Exit::Unreachable)?;
+        let genesis = answer(&mut reader, 1, budget)
+            .await
+            .map_err(Exit::Unreachable)?;
+        let genesis = genesis
+            .as_str()
+            .and_then(|hex| deserialize_hex::<Header>(hex).ok());
+        if !genesis.is_some_and(|header| is_genesis_of(network, header.block_hash())) {
+            return Err(Exit::Refused(ANOTHER_NETWORK.to_owned()));
+        }
+        Ok((reader, writer, negotiated))
     };
     let (mut reader, writer, negotiated) = match hub.during(opening).await {
         Ok(Ok(opened)) => opened,
-        Ok(Err(detail)) => return Exit::Unreachable(detail),
-        Err(exit) => return exit,
+        Ok(Err(exit)) | Err(exit) => return exit,
     };
 
     let mut session = Session {
         writer,
-        next_id: 1,
+        next_id: 2,
         in_flight: HashMap::new(),
         queue: VecDeque::new(),
         subscribed: HashSet::new(),
@@ -417,6 +423,37 @@ impl Session {
             ChangeReason::Started
         }
     }
+}
+
+/// The result of the request numbered `id`, past whatever the server
+/// says before it, within `budget`.
+async fn answer(
+    reader: &mut LineReader<ReadHalf<BoxStream>>,
+    id: u64,
+    budget: Duration,
+) -> Result<Value, String> {
+    let read = async {
+        loop {
+            let line = reader
+                .next_line()
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "the connection was closed".to_owned())?;
+            let Ok(mut message) = serde_json::from_slice::<Value>(&line) else {
+                return Err("unexpected response".to_owned());
+            };
+            if message.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = message.get("error").filter(|e| !e.is_null()) {
+                return Err(format!("the server refused the request: {}", words(error)));
+            }
+            return Ok(message["result"].take());
+        }
+    };
+    tokio::time::timeout(budget, read)
+        .await
+        .map_err(|_| format!("timed out after {} s", budget.as_secs()))?
 }
 
 async fn send(writer: &mut WriteHalf<BoxStream>, message: &Value) -> Result<(), String> {

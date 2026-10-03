@@ -18,8 +18,8 @@ use bdk_wallet::bitcoin::ScriptBuf;
 use tokio::time::Instant;
 
 use super::{ChangeReason, Exit, Hub, Wake, WatchState, WatchTransport, Watched};
-use crate::chain::Endpoint;
 use crate::chain::esplora::{self, Client};
+use crate::chain::{ANOTHER_NETWORK, Endpoint};
 
 /// Script lookups in one round.
 pub(super) const ROUND_BUDGET: usize = 3;
@@ -96,6 +96,22 @@ impl Plan {
     }
 }
 
+/// Refuses a server of another network before it hears of any script,
+/// from its genesis block: it would report changes that never happened
+/// on the wallet's.
+pub(super) async fn same_network(hub: &mut Hub, poller: &Poller) -> Result<(), Exit> {
+    let client = poller.client.clone();
+    let network = hub.config.network;
+    match hub
+        .during(async move { esplora::check_network(&client, network).await })
+        .await?
+    {
+        Ok(()) => Ok(()),
+        Err(detail) if detail == ANOTHER_NETWORK => Err(Exit::Refused(detail)),
+        Err(detail) => Err(Exit::Unreachable(detail)),
+    }
+}
+
 /// Compares what a round found with what was known: a reading that
 /// differs from the one before is a change. The first reading of a
 /// script is compared with what its wallets hold instead: the list
@@ -132,6 +148,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         Ok(poller) => poller,
         Err(detail) => return Exit::Unreachable(detail),
     };
+    if let Err(exit) = same_network(hub, &poller).await {
+        return exit;
+    }
     let mut tip: Option<String> = None;
     let mut failed = 0u32;
     let started = Instant::now();

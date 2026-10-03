@@ -239,6 +239,7 @@ fn timings() -> crate::watch::Timings {
         hold: Duration::from_millis(100),
         hold_cap: Duration::from_millis(400),
         due: Duration::from_millis(100),
+        refused: Duration::from_millis(600),
     }
 }
 
@@ -832,9 +833,9 @@ async fn a_sync_never_takes_a_watch_server_of_another_network() {
 }
 
 /// A server behind the wallet whose chain never meets the wallet's, one
-/// of another network: the sync fails, and the payment the wallet holds
-/// is not taken for gone from the chain. A server that only lags is
-/// read as before.
+/// of another network: the sync fails, saying so once the first block
+/// differs, and the payment the wallet holds is not taken for gone from
+/// the chain. A server that only lags is read as before.
 #[tokio::test]
 async fn a_server_behind_on_another_chain_is_refused() {
     let server = FakeElectrum::start().await;
@@ -855,7 +856,10 @@ async fn a_server_behind_on_another_chain_is_refused() {
         state.histories.clear();
     }
     let refused = manager.rescan_wallet(&wallet).await.unwrap_err();
-    assert!(refused.to_string().contains("never meets"), "{refused}");
+    assert!(
+        refused.to_string().contains(crate::chain::ANOTHER_NETWORK),
+        "{refused}"
+    );
     assert!(manager.sync_wallet(&wallet).await.is_err());
     assert!(held().await, "the payment was taken for gone");
 

@@ -39,6 +39,7 @@ use super::{Client, Counts, PARALLEL_REQUESTS};
 use crate::chain::{
     Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX, height_limit,
 };
+use crate::network::Network;
 
 /// Confirmed transactions an Esplora server lists per page.
 const PAGE: usize = 25;
@@ -144,7 +145,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, String> {
         } else {
             (tip, None)
         };
-    let meeting = Meeting::find(client, &latest, &tip).await?;
+    let meeting = Meeting::find(client, network, &latest, &tip).await?;
     let mut found = Found::new(start_time);
 
     let mut covered: HashSet<ScriptBuf> = scripts.iter().cloned().collect();
@@ -541,9 +542,12 @@ struct Meeting {
 
 impl Meeting {
     /// Walks the wallet's chain down from its tip to a block the server
-    /// has too.
+    /// has too. The first block they disagree on has the server's
+    /// genesis block checked: one of another network would otherwise
+    /// cost a request for every block the wallet holds.
     async fn find(
         client: &Client,
+        network: Network,
         latest: &BTreeMap<u32, BlockHash>,
         local_tip: &CheckPoint,
     ) -> Result<Self, String> {
@@ -563,6 +567,9 @@ impl Meeting {
                     agreement: local,
                     conflicts,
                 });
+            }
+            if conflicts.is_empty() {
+                super::check_network(client, network).await?;
             }
             conflicts.push(BlockId {
                 height: local.height(),

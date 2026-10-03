@@ -35,6 +35,7 @@ fn timings() -> Timings {
         hold: Duration::from_millis(100),
         hold_cap: Duration::from_millis(400),
         due: Duration::from_secs(3600),
+        refused: Duration::from_millis(600),
     }
 }
 
@@ -445,6 +446,58 @@ async fn electrum_gives_up_on_a_server_that_stops_answering() {
         s.state == WatchState::Connected && s.pushed_scripts == 1
     })
     .await;
+}
+
+/// A server of another network is refused before it hears of a script,
+/// over Electrum as over Esplora, and left alone a while: it would
+/// report changes that never happened on the wallet's network. Once it
+/// serves the wallet's network, the watch takes it.
+#[tokio::test]
+async fn a_server_of_another_network_is_refused_and_left_alone() {
+    let electrum = FakeElectrum::start().await;
+    electrum.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    let wallets = vec![wallet("a", &[1], &[], false)];
+    let (watch, _events) = LiveWatch::start_with(
+        config(electrum.backend()),
+        wallets.clone(),
+        Some(Timings {
+            refused: Duration::from_secs(3600),
+            ..timings()
+        }),
+    );
+    let status = until(&watch, "refused", |s| s.state == WatchState::Reconnecting).await;
+    assert_eq!(
+        status.detail.as_deref(),
+        Some(crate::chain::ANOTHER_NETWORK)
+    );
+    assert!(!electrum.was_asked("blockchain.scripthash.subscribe"));
+    // Left alone, whatever the host asks meanwhile.
+    watch.tick();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(electrum.subscriptions().len(), 1);
+    // A new configuration tries it again at once.
+    electrum.state.lock().unwrap().genesis = None;
+    watch.reconfigure(config(electrum.backend()), wallets);
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+
+    let mempool = FakeMempool::start(false, 0).await;
+    mempool.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    let (watch, _events) = LiveWatch::start_with(
+        config(mempool.backend()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(timings()),
+    );
+    let status = until(&watch, "refused", |s| s.state == WatchState::Reconnecting).await;
+    assert_eq!(
+        status.detail.as_deref(),
+        Some(crate::chain::ANOTHER_NETWORK)
+    );
+    assert!(mempool.state.lock().unwrap().looked_up.is_empty());
+    mempool.state.lock().unwrap().genesis = None;
+    until(&watch, "polling", |s| s.state == WatchState::Polling).await;
 }
 
 /// An onion backend with no Tor to go through: the watcher says why and
