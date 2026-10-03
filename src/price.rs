@@ -198,7 +198,8 @@ pub(crate) fn client_through(proxy: Option<&str>) -> CoreResult<reqwest::Client>
         } else {
             15
         }))
-        .user_agent("gerfaut");
+        .user_agent("gerfaut")
+        .redirect(crate::chain::redirects());
     if let Some(proxy) = proxy {
         builder = builder.proxy(
             reqwest::Proxy::all(format!("socks5h://{proxy}"))

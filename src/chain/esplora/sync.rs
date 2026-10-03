@@ -28,7 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
-use bdk_esplora::esplora_client::api::{ScriptHashStats, TxStatus};
+use super::api::{ScriptHashStats, TxStatus};
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
 use bdk_wallet::bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
@@ -36,7 +36,10 @@ use futures_util::future::try_join_all;
 
 use super::page::PageTx;
 use super::{Client, Counts, PARALLEL_REQUESTS};
-use crate::chain::{Held, Plan, Reading, Scan, ScriptFacts};
+use crate::chain::{
+    Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX, height_limit,
+};
+use crate::network::Network;
 
 /// Confirmed transactions an Esplora server lists per page.
 const PAGE: usize = 25;
@@ -45,11 +48,17 @@ const PAGE: usize = 25;
 /// read on until the deadline, holding every page in memory.
 const MAX_PAGES: usize = 400;
 
+/// Latest blocks kept of what a server lists: the ten Esplora lists.
+const LATEST: usize = 10;
+
 /// The part of a block summary that is read.
 #[derive(serde::Deserialize)]
 struct Block {
     id: BlockHash,
     height: u32,
+    /// `None` for the genesis block alone.
+    #[serde(default)]
+    previousblockhash: Option<BlockHash>,
 }
 
 /// A transaction a history lists: where it stands, and, when the wallet
@@ -107,8 +116,9 @@ struct Read {
 }
 
 /// Runs a plan against one instance.
-pub(crate) async fn run(client: &Client, plan: Plan) -> Result<bdk_wallet::Update, String> {
+pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, String> {
     let Plan {
+        network,
         tip,
         start_time,
         scripts,
@@ -119,8 +129,23 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<bdk_wallet::Updat
     } = plan;
     // Before any history, and so never past it: the tip of the answer
     // is what the wallet counts itself synced up to.
-    let latest = latest_blocks(client).await?;
-    let meeting = Meeting::find(client, &latest, &tip).await?;
+    let limit = height_limit(network, start_time);
+    let latest = latest_blocks(client, limit).await?;
+    let server_tip = latest.keys().next_back().copied().unwrap_or_default();
+    // The wallet's blocks far above the server's tip, or past any height
+    // a chain can have reached, came from a server that made them up:
+    // left out of the walk, and dropped (see [`Synced::drop_above`]).
+    let (tip, dropped) =
+        if tip.height() > server_tip.saturating_add(TIP_LAG_MAX) || tip.height() > limit {
+            let kept = tip
+                .iter()
+                .find(|checkpoint| checkpoint.height() <= server_tip)
+                .unwrap_or_else(|| tip.clone());
+            (kept, Some(server_tip))
+        } else {
+            (tip, None)
+        };
+    let meeting = Meeting::find(client, network, &latest, &tip).await?;
     let mut found = Found::new(start_time);
 
     let mut covered: HashSet<ScriptBuf> = scripts.iter().cloned().collect();
@@ -183,10 +208,14 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<bdk_wallet::Updat
 
     let update = found.update;
     let chain = meeting.chain(client, &latest, &update.anchors).await?;
-    Ok(bdk_wallet::Update {
-        last_active_indices: last_active,
-        tx_update: update,
-        chain: Some(chain),
+    Ok(Synced {
+        update: bdk_wallet::Update {
+            last_active_indices: last_active,
+            tx_update: update,
+            chain: Some(chain),
+        },
+        orders: Vec::new(),
+        drop_above: dropped,
     })
 }
 
@@ -438,11 +467,33 @@ impl Found {
     }
 }
 
-/// The latest blocks, by height: ten on the instances there are.
-async fn latest_blocks(client: &Client) -> Result<BTreeMap<u32, BlockHash>, String> {
-    let blocks: Vec<Block> = client.get_json("/blocks").await?;
-    if blocks.is_empty() {
-        return Err("unexpected response".to_owned());
+/// The latest blocks, by height: ten on the instances there are,
+/// checked ([`checked_latest`]).
+async fn latest_blocks(client: &Client, limit: u32) -> Result<BTreeMap<u32, BlockHash>, String> {
+    checked_latest(client.get_json("/blocks").await?, limit)
+}
+
+/// The latest blocks a server listed, checked, as they go into the
+/// wallet's chain: the highest [`LATEST`] kept, one for each height down
+/// from the tip, each the parent of the one above it, and the tip no
+/// higher than `limit`, the most a chain can have reached
+/// ([`height_limit`]). A server that lists blocks that do not chain is
+/// refused, and so is one past the limit.
+fn checked_latest(mut blocks: Vec<Block>, limit: u32) -> Result<BTreeMap<u32, BlockHash>, String> {
+    blocks.sort_by_key(|block| std::cmp::Reverse(block.height));
+    blocks.truncate(LATEST);
+    let tip = blocks
+        .first()
+        .ok_or_else(|| "unexpected response".to_owned())?;
+    if tip.height > limit {
+        return Err(IMPOSSIBLE_TIP.to_owned());
+    }
+    let chained = blocks.windows(2).all(|pair| {
+        pair[1].height.checked_add(1) == Some(pair[0].height)
+            && pair[0].previousblockhash == Some(pair[1].id)
+    });
+    if !chained {
+        return Err("the server's latest blocks do not chain".to_owned());
     }
     Ok(blocks
         .into_iter()
@@ -483,13 +534,20 @@ struct Meeting {
     /// it sits in a block the server no longer has.
     height: u32,
     conflicts: Vec<BlockId>,
+    /// The wallet's tip, when the server is behind it and agrees with it
+    /// on every block both have: a server that lags, whose answer keeps
+    /// the wallet's chain as it is.
+    ahead: Option<CheckPoint>,
 }
 
 impl Meeting {
     /// Walks the wallet's chain down from its tip to a block the server
-    /// has too.
+    /// has too. The first block they disagree on has the server's
+    /// genesis block checked: one of another network would otherwise
+    /// cost a request for every block the wallet holds.
     async fn find(
         client: &Client,
+        network: Network,
         latest: &BTreeMap<u32, BlockHash>,
         local_tip: &CheckPoint,
     ) -> Result<Self, String> {
@@ -499,11 +557,19 @@ impl Meeting {
                 continue;
             };
             if remote == local.hash() {
+                let behind = latest
+                    .keys()
+                    .next_back()
+                    .is_some_and(|&tip| tip < local_tip.height());
                 return Ok(Meeting {
                     height: local.height(),
+                    ahead: (behind && conflicts.is_empty()).then(|| local_tip.clone()),
                     agreement: local,
                     conflicts,
                 });
+            }
+            if conflicts.is_empty() {
+                super::check_network(client, network).await?;
             }
             conflicts.push(BlockId {
                 height: local.height(),
@@ -516,7 +582,9 @@ impl Meeting {
     /// The wallet's chain as the server sees it: from the meeting point,
     /// the server's blocks where the wallet's differ, one per height a
     /// transaction confirmed at, and the latest ones. The engine of BDK
-    /// builds it this way.
+    /// builds it this way. A server behind the wallet leaves the
+    /// wallet's blocks above its tip where they are, which an update
+    /// built from the meeting point could not.
     async fn chain(
         self,
         client: &Client,
@@ -524,10 +592,13 @@ impl Meeting {
         anchors: &BTreeSet<(ConfirmationBlockTime, Txid)>,
     ) -> Result<CheckPoint, String> {
         let meeting = self.height;
-        let mut tip = self
-            .agreement
-            .extend(self.conflicts.into_iter().rev())
-            .map_err(|_| "the server's chain never meets the wallet's".to_owned())?;
+        let mut tip = match self.ahead {
+            Some(local) => local,
+            None => self
+                .agreement
+                .extend(self.conflicts.into_iter().rev())
+                .map_err(|_| "the server's chain never meets the wallet's".to_owned())?,
+        };
         for (anchor, _) in anchors {
             let height = anchor.block_id.height;
             if tip.get(height).is_none()
@@ -580,6 +651,7 @@ mod tests {
             agreement: local.clone(),
             height: 1,
             conflicts: Vec::new(),
+            ahead: None,
         };
         // Never asked anything: every height it needs is in the latest.
         let client = super::super::client("http://127.0.0.1:9", None).unwrap();
@@ -597,5 +669,50 @@ mod tests {
             .unwrap();
         assert_eq!(tip.height(), 2);
         assert_eq!(tip.get(0).unwrap().hash(), hash(0));
+    }
+
+    /// The latest blocks go into the wallet's chain only as a chain: the
+    /// highest ten, one per height, each the parent of the one above it,
+    /// under a tip a chain can have reached.
+    #[test]
+    fn the_latest_blocks_must_chain() {
+        let hash = |height: u32| {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&height.to_le_bytes());
+            BlockHash::from_byte_array(bytes)
+        };
+        let block = |height: u32| Block {
+            id: hash(height),
+            height,
+            previousblockhash: height.checked_sub(1).map(hash),
+        };
+        let latest = |range: std::ops::RangeInclusive<u32>| range.rev().map(block).collect();
+        let read = checked_latest(latest(91..=100), 1_000).unwrap();
+        assert_eq!(
+            read.keys().copied().collect::<Vec<_>>(),
+            (91..=100).collect::<Vec<_>>()
+        );
+        // More than ten: the highest ten are read, in any order given.
+        let mut many: Vec<Block> = latest(0..=100);
+        many.reverse();
+        assert_eq!(checked_latest(many, 1_000).unwrap(), read);
+        // A tip past what a chain can have reached.
+        assert_eq!(
+            checked_latest(latest(91..=100), 99).unwrap_err(),
+            IMPOSSIBLE_TIP
+        );
+        // A gap, a block twice, a parent that is not the block below.
+        let mut gap: Vec<Block> = latest(91..=100);
+        gap.remove(3);
+        assert!(checked_latest(gap, 1_000).is_err());
+        let mut twice: Vec<Block> = latest(91..=100);
+        twice.push(block(95));
+        assert!(checked_latest(twice, 1_000).is_err());
+        let mut forged: Vec<Block> = latest(91..=100);
+        forged[0].previousblockhash = Some(hash(7));
+        assert!(checked_latest(forged, 1_000).is_err());
+        // A lone tip of four billion, once refused for its height alone.
+        assert!(checked_latest(vec![block(4_000_000_000)], 1_000).is_err());
+        assert!(checked_latest(Vec::new(), 1_000).is_err());
     }
 }

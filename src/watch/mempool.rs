@@ -3,10 +3,12 @@
 //! connection.
 //!
 //! That number is `MAX_TRACKED_ADDRESSES` on the server: one by
-//! default, ten on the public instances. The server names it when it
-//! refuses a longer list, and the list is cut to it: the head of every
-//! wallet is pushed, and the scripts past it are polled over the REST
-//! API of the same server, three a minute.
+//! default, ten on the public instances of mainnet, 1,337 on those of
+//! signet and the testnets. The first list asked for is as long as one
+//! message may be; the server names its number when it refuses a longer
+//! list, and the list is cut to it: the head of every wallet is pushed,
+//! and the scripts past it are polled over the REST API of the same
+//! server, three a minute, thirty on the user's own node.
 //!
 //! Any Esplora address is tried. A server that is not a mempool
 //! instance answers the upgrade with an HTTP status, which is how the
@@ -32,8 +34,13 @@ use crate::chain::Endpoint;
 /// transactions, so it can be large; past this the connection is
 /// dropped and reopened, which reports every wallet once.
 const MAX_MESSAGE: usize = 4 << 20;
-/// Scripts asked for before the server has named its limit.
-const FIRST_ASK: usize = 100;
+/// Scripts asked for before the server has named its limit: past what
+/// any instance tracks on one connection, held to what one message
+/// carries ([`TRACK_MAX`]).
+const FIRST_ASK: usize = 2_000;
+/// The longest list of scripts sent at once, in bytes: a mempool
+/// instance cuts the connection that sends it a message past 50,000.
+const TRACK_MAX: usize = 45_000;
 
 type Socket = WebSocketStream<BoxStream>;
 
@@ -77,6 +84,13 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         Err(Exit::Lost(detail)) => return Exit::Unreachable(detail),
         Err(exit) => return exit,
     };
+    let mut poller = match Poller::new(base, proxy.as_deref(), hub.config.backend.is_own_node()) {
+        Ok(poller) => poller,
+        Err(detail) => return Exit::Unreachable(detail),
+    };
+    if let Err(exit) = poll::same_network(hub, &poller).await {
+        return exit;
+    }
     // Credentials in the address travel as a header, the way the HTTP
     // client of a sync sends them, and not in the request line.
     let authorization = (!url.username().is_empty()).then(|| {
@@ -140,6 +154,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         status.server = Some(label.clone());
         status.detail = None;
         status.pushed_scripts = 0;
+        status.server_software = None;
     });
     let mut tracked: Vec<String> = Vec::new();
     let want = json!({ "action": "want", "data": ["blocks"] });
@@ -152,16 +167,11 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
     // This transport keeps no record of what it missed: at the start,
     // and after a loss, every wallet is worth one sync.
     hub.ready(false);
-    let mut poller = match Poller::new(base, proxy.as_deref()) {
-        Ok(poller) => poller,
-        Err(detail) => return Exit::Lost(detail),
-    };
 
-    let mut keepalive = tokio::time::interval_at(
-        Instant::now() + hub.timings.keepalive,
-        hub.timings.keepalive,
-    );
-    let mut round = tokio::time::interval_at(Instant::now() + hub.timings.poll, hub.timings.poll);
+    let mut next_ping = Instant::now() + hub.timings.keepalive_wait();
+    // The REST rounds keep the pace polling keeps: see [`poll::Pace`].
+    let mut pace = poll::Pace::default();
+    let mut next_round = Instant::now() + hub.timings.poll;
     let mut pong_by: Option<Instant> = None;
     loop {
         let outcome: Result<(), String> = tokio::select! {
@@ -210,11 +220,12 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
                 }
                 Wake::Flushed => Ok(()),
             },
-            _ = keepalive.tick() => {
+            () = tokio::time::sleep_until(next_ping) => {
+                next_ping = Instant::now() + hub.timings.keepalive_wait();
                 pong_by.get_or_insert(Instant::now() + hub.pong_budget(endpoint));
                 say(&mut socket, &json!({ "action": "ping" })).await
             }
-            _ = round.tick() => {
+            () = tokio::time::sleep_until(next_round) => {
                 // The scripts the server does not push, and only those.
                 let plan = poller.plan(&hub.watched, tracked.len(), 0);
                 match hub.during(plan.check()).await {
@@ -224,6 +235,10 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
                     Ok(Err(_)) => {}
                     Err(exit) => return exit,
                 }
+                if let Some(pause) = poller.take_rate_limit() {
+                    pace.limited(pause, Instant::now());
+                }
+                next_round = Instant::now() + pace.wait(hub.timings.poll, Instant::now());
                 Ok(())
             }
             () = super::sleep_until(pong_by), if pong_by.is_some() => {
@@ -243,14 +258,7 @@ async fn track(
     socket: &mut Socket,
     tracked: &mut Vec<String>,
 ) -> Result<(), String> {
-    let limit = hub.track_limit.unwrap_or(FIRST_ASK);
-    let wanted: Vec<String> = hub
-        .watched
-        .entries
-        .iter()
-        .take(limit)
-        .map(|entry| entry.hex.clone())
-        .collect();
+    let wanted = head(&hub.watched, hub.track_limit.unwrap_or(FIRST_ASK));
     if wanted == *tracked {
         return Ok(());
     }
@@ -259,6 +267,23 @@ async fn track(
     let pushed = tracked.len() as u32;
     hub.set_status(|status| status.pushed_scripts = pushed);
     Ok(())
+}
+
+/// The head of the list, as long as a server is asked to track it:
+/// `limit` scripts at most, in a message of [`TRACK_MAX`] bytes at most.
+fn head(watched: &super::Watched, limit: usize) -> Vec<String> {
+    let mut size = json!({ "track-scriptpubkeys": [] }).to_string().len();
+    watched
+        .entries
+        .iter()
+        .take(limit)
+        .map(|entry| entry.hex.clone())
+        .take_while(|hex| {
+            // The script, its quotes and the comma before the next.
+            size += hex.len() + 3;
+            size <= TRACK_MAX
+        })
+        .collect()
 }
 
 /// What is read of a message: the scripts it names, never the
@@ -336,6 +361,36 @@ fn describe(error: &WsError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A list of the largest scripts a wallet watches, two thousand of
+    /// them, goes out in a message the server takes: well past the
+    /// hundred scripts asked for first before, and under its 50,000
+    /// bytes.
+    #[test]
+    fn a_list_to_track_fits_in_one_message() {
+        use crate::watch::{WatchLimits, WatchedScript, WatchedWallet};
+        let wallet = WatchedWallet {
+            wallet_id: "w".to_owned(),
+            scripts: (0..2_000u32)
+                .map(|n| WatchedScript {
+                    script: format!("0020{n:064x}"),
+                    lookahead: false,
+                    status: None,
+                    counts: None,
+                })
+                .collect(),
+            has_pending: false,
+            pinned: false,
+            holds_coins: false,
+            unlisted: 0,
+        };
+        let watched = super::super::Watched::new(vec![wallet], WatchLimits::OWN_NODE);
+        let wanted = head(&watched, FIRST_ASK);
+        let message = json!({ "track-scriptpubkeys": wanted }).to_string();
+        assert!(message.len() <= TRACK_MAX, "{}", message.len());
+        assert!(wanted.len() > 600, "{}", wanted.len());
+        assert_eq!(head(&watched, 10).len(), 10);
+    }
 
     #[test]
     fn the_websocket_address_follows_the_esplora_one() {

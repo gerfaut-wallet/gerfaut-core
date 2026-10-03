@@ -22,12 +22,16 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use bdk_electrum::electrum_client::{self, ElectrumApi, GetHistoryRes};
 use bdk_wallet::bitcoin::block::Header;
 use bdk_wallet::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
+use electrum_client::{self, ElectrumApi, GetHistoryRes};
 
-use crate::chain::{Held, Plan, Scan, Synced};
+use crate::chain::{
+    ANOTHER_NETWORK, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX, has_proof_of_work,
+    height_limit,
+};
+use crate::network::Network;
 
 /// Requests per batch.
 const BATCH: usize = 10;
@@ -40,6 +44,7 @@ type Error = electrum_client::Error;
 /// Runs a plan on an open connection.
 pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error> {
     let Plan {
+        network,
         tip,
         start_time,
         scripts,
@@ -48,7 +53,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
         held,
         ..
     } = plan;
-    let mut chain = Chain::read(client, &tip)?;
+    let mut chain = Chain::read(client, &tip, network, start_time)?;
     let mut pass = Pass {
         held: &held,
         start_time,
@@ -115,6 +120,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
             chain: Some(tip),
         },
         orders: pass.orders,
+        drop_above: chain.dropped,
     })
 }
 
@@ -130,6 +136,10 @@ struct Chain {
     headers: HashMap<u32, Header>,
     /// The height of the last block both chains agree on.
     agreement: u32,
+    /// The wallet's blocks above this height are no chain's, and the
+    /// chain of the update was built without them: see
+    /// [`Synced::drop_above`].
+    dropped: Option<u32>,
 }
 
 impl Chain {
@@ -139,8 +149,36 @@ impl Chain {
     /// a server whose chain never meets the wallet's, one of another
     /// network, is refused rather than read, or every transaction the
     /// wallet holds would look gone from the chain.
-    fn read(client: &impl ElectrumApi, local: &CheckPoint) -> Result<Self, Error> {
-        let height = client.block_headers_subscribe()?.height as u32;
+    ///
+    /// The tip is a claim, refused past any height a chain of the
+    /// network can have reached ([`height_limit`]), and the latest
+    /// blocks under it are checked ([`checked_suffix`]). The wallet's
+    /// own blocks are read the same way: those far above the server's
+    /// tip, or past that height, came from a server that made them up.
+    /// They are left out of the walk, and dropped.
+    fn read(
+        client: &impl ElectrumApi,
+        local: &CheckPoint,
+        network: Network,
+        now: u64,
+    ) -> Result<Self, Error> {
+        let limit = height_limit(network, now);
+        let notification = client.block_headers_subscribe()?;
+        let height = u32::try_from(notification.height)
+            .ok()
+            .filter(|height| *height <= limit)
+            .ok_or_else(|| Error::Message(IMPOSSIBLE_TIP.to_owned()))?;
+        let (local, dropped) =
+            if local.height() > height.saturating_add(TIP_LAG_MAX) || local.height() > limit {
+                let kept = local
+                    .iter()
+                    .find(|checkpoint| checkpoint.height() <= height)
+                    .unwrap_or_else(|| local.clone());
+                (kept, Some(height))
+            } else {
+                (local.clone(), None)
+            };
+        let mut network_checked = false;
         if height < local.height() {
             let mut hashes = BTreeMap::new();
             let mut headers = HashMap::new();
@@ -159,8 +197,10 @@ impl Chain {
                         hashes,
                         headers,
                         agreement: at,
+                        dropped,
                     });
                 }
+                same_network(client, &local, &mut network_checked)?;
             }
             return Err(Error::Message(
                 "the server's chain never meets the wallet's".to_owned(),
@@ -168,9 +208,10 @@ impl Chain {
         }
         let start = height.saturating_sub(CHAIN_SUFFIX - 1);
         let latest = client.block_headers(start as usize, CHAIN_SUFFIX as usize)?;
+        let latest = checked_suffix(network, start, height, &notification.header, latest.headers)?;
         let mut headers = HashMap::new();
         let mut hashes = BTreeMap::new();
-        for (at, header) in (start..).zip(latest.headers) {
+        for (at, header) in (start..).zip(latest) {
             hashes.insert(at, header.block_hash());
             headers.insert(at, header);
         }
@@ -191,6 +232,7 @@ impl Chain {
                 agreement = Some(checkpoint);
                 break;
             }
+            same_network(client, &local, &mut network_checked)?;
         }
         let agreement = agreement.ok_or_else(|| {
             Error::Message("the server's chain never meets the wallet's".to_owned())
@@ -210,6 +252,7 @@ impl Chain {
             hashes,
             headers,
             agreement: agreement.height(),
+            dropped,
         })
     }
 
@@ -242,6 +285,59 @@ impl Chain {
         }
         tip
     }
+}
+
+/// The latest headers a server sent, from `start` up to its tip at
+/// `height`, checked: one for each height, the extra ones dropped, each
+/// the parent of the next, the last one the tip the server announced,
+/// and each with the work its network asks for ([`has_proof_of_work`]).
+/// They go into the wallet's chain as they are: a server that sends
+/// fewer, or headers that do not chain to its tip, is refused.
+fn checked_suffix(
+    network: Network,
+    start: u32,
+    height: u32,
+    tip: &Header,
+    mut headers: Vec<Header>,
+) -> Result<Vec<Header>, Error> {
+    let wanted = height.saturating_sub(start) as usize + 1;
+    if headers.len() >= wanted {
+        headers.truncate(wanted);
+        let chained = headers
+            .windows(2)
+            .all(|pair| pair[1].prev_blockhash == pair[0].block_hash());
+        let at_tip = headers
+            .last()
+            .is_some_and(|last| last.block_hash() == tip.block_hash());
+        let worked = headers
+            .iter()
+            .all(|header| has_proof_of_work(network, header));
+        if chained && at_tip && worked {
+            return Ok(headers);
+        }
+    }
+    Err(Error::Message(
+        "the server's latest blocks do not chain".to_owned(),
+    ))
+}
+
+/// Refuses a server of another network, once its chain and the
+/// wallet's have disagreed on a block: their genesis blocks differ, and
+/// walking down to it would take a request for every block the wallet
+/// holds. Asked once a walk.
+fn same_network(
+    client: &impl ElectrumApi,
+    local: &CheckPoint,
+    checked: &mut bool,
+) -> Result<(), Error> {
+    if std::mem::replace(checked, true) {
+        return Ok(());
+    }
+    let ours = local.iter().last().map(|genesis| genesis.hash());
+    if Some(client.block_header(0)?.block_hash()) != ours {
+        return Err(Error::Message(ANOTHER_NETWORK.to_owned()));
+    }
+    Ok(())
 }
 
 /// The update being put together.
@@ -412,4 +508,56 @@ fn fetch_txs(
         }
     }
     Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use bdk_wallet::bitcoin::block::{Header, Version};
+    use bdk_wallet::bitcoin::hashes::Hash;
+    use bdk_wallet::bitcoin::{CompactTarget, TxMerkleNode};
+
+    use super::*;
+
+    /// Headers on top of one another, from a parent of none.
+    fn headers(count: u32) -> Vec<Header> {
+        let mut chain: Vec<Header> = Vec::new();
+        for at in 0..count {
+            chain.push(Header {
+                version: Version::TWO,
+                prev_blockhash: chain
+                    .last()
+                    .map_or_else(BlockHash::all_zeros, Header::block_hash),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_700_000_000 + at,
+                bits: CompactTarget::from_consensus(0x1e03_77ae),
+                nonce: 0,
+            });
+        }
+        chain
+    }
+
+    /// The latest headers are taken only as a chain that ends at the tip
+    /// the server announced; extra ones are dropped, and missing ones,
+    /// one that does not follow the one before, or a tip of another
+    /// chain, refuse the server.
+    #[test]
+    fn the_latest_headers_must_chain_to_the_tip() {
+        let chain = headers(8);
+        let tip = chain[7];
+        let suffix = checked_suffix(Network::Signet, 92, 99, &tip, chain.clone()).unwrap();
+        assert_eq!(suffix.len(), 8);
+        let mut longer = chain.clone();
+        longer.extend(headers(3));
+        assert_eq!(
+            checked_suffix(Network::Signet, 92, 99, &tip, longer).unwrap(),
+            chain
+        );
+        assert!(checked_suffix(Network::Signet, 92, 99, &tip, chain[..7].to_vec()).is_err());
+        let mut broken = chain.clone();
+        broken[4].prev_blockhash = BlockHash::all_zeros();
+        assert!(checked_suffix(Network::Signet, 92, 99, &tip, broken).is_err());
+        assert!(checked_suffix(Network::Signet, 92, 99, &chain[6], chain.clone()).is_err());
+        // On mainnet, none of them was mined.
+        assert!(checked_suffix(Network::Mainnet, 92, 99, &tip, chain).is_err());
+    }
 }

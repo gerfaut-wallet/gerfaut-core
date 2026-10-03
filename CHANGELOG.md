@@ -83,6 +83,12 @@ The first release: the library both Gerfaut apps are built on.
   `sync_only`, with the scripts it watches and the ones it leaves to the
   regular syncs, and `left_out_scripts` and `left_out_wallets` add them
   up, so an app can say when a payment will only show at the next sync.
+- `WatchStatus.server_software` gives what an Electrum server says it
+  runs, as it answers `server.version` ("ElectrumX 1.18.0", "Fulcrum
+  1.12.0"), so that on the user's own node, when the watch leaves
+  scripts out, an app can name the setting of that server that takes
+  more. It is `None` over the other transports, and absent from a
+  status written before.
 - The premium client reads a wallet the server refused: `watching` is false
   and `refusal` says why, in the list and in a `wallet_refused` event. A
   single address can be registered like a descriptor.
@@ -192,6 +198,44 @@ The first release: the library both Gerfaut apps are built on.
   addresses, that is milliseconds instead of seconds. While an Electrum
   server takes the subscriptions, the count the status gives moves in
   steps of a hundred, not one event per script.
+- The live watch lists each wallet's scripts that hold coins first, where
+  a spend shows, then the newest receive addresses it revealed and has
+  not seen used, up to the gap limit, and the gap limit ahead of them,
+  then the change addresses the same way, then the rest, newest first.
+  The unused receive addresses used to come first, oldest first: a
+  merchant's wallet that reveals an address per invoice, many never
+  paid, filled the 200 scripts a watch takes of a wallet with them, and
+  neither a spend of its coins nor a payment to its next addresses was
+  heard before the next sync.
+- A sync of a watched address reads only what is new or moved. Over
+  Electrum, a transaction the wallet holds, at the height the server
+  lists it now, is kept as it is, with the time of its block, and only
+  the others are fetched, with the transactions their inputs spend. Over
+  Esplora, the reading stops at the first page that lists nothing but
+  what the wallet holds, and the rest of the round comes from it. An
+  address paid a thousand times, watched live, used to cost thousands of
+  requests and megabytes for each payment.
+- The core no longer depends on `bdk_esplora`, nor on `esplora-client`
+  with it: it already spoke to Esplora on its own, and kept them for six
+  types of what a server answers, which it now reads itself. Nor on
+  `bdk_electrum`, kept only to reach `electrum-client`, on which it now
+  depends directly, at the same version and with the same features.
+- On the WebSocket of a mempool instance, the live watch asks for as
+  many scripts as one message carries, some six hundred, instead of a
+  hundred: the public instances of signet and the testnets track 1,337
+  on one connection, and the rest were polled three a minute. The
+  message stays under the 50,000 bytes past which such an instance cuts
+  the connection.
+- The keepalive ping of the live watch comes at random between seven
+  tenths of its wait and all of it, never later: a ping every four
+  minutes on the dot marked the connection even through Tor.
+- On the user's own node, polling reads thirty scripts a minute, four at
+  a time, instead of three. Polling reads the head of the list every
+  round and the rest in turn, so with N scripts past what a server
+  pushes, each is read about every N/3 minutes on any server, and every
+  N/30 minutes on one's own node; all of them at the next regular sync.
+  Every minute for each would be N requests a minute, which no public
+  server would take from every client.
 - The live watch keeps each wallet complete on its own. At each block,
   and every ten minutes, it reruns any sync that failed, and reads every
   script of any wallet that has gone a day without a complete sync. A
@@ -221,6 +265,92 @@ The first release: the library both Gerfaut apps are built on.
   before an `@` keeps its own.
 - The ids the premium server hands out are percent-encoded before they go
   into a URL path.
+- The live watch asks a server for its genesis block before it hears of
+  any script, over Electrum as over Esplora, and refuses one of another
+  network: a signet port typed for testnet4 reported changes that never
+  happened on the wallet's network. A refused server is left alone for a
+  quarter of an hour while the next one is tried. A sync whose server
+  disagrees with the wallet on a block now asks for its genesis block
+  too, and says "the server is on another network" at once, instead of
+  walking the wallet's chain down to it one request a block.
+- The live watch remembers what an Electrum server refuses, for as long
+  as its configuration holds. A server takes so many subscriptions on one
+  connection, 100 on the Electrum server of mempool.space, and at each
+  reconnection the watch used to ask it for the whole list again, be
+  refused the rest, and sync every script it gave up on. Now a refused
+  script is synced once, when it is refused, and the next connection asks
+  only for the head of the list, up to what the server took; the rest is
+  left to the regular syncs. The status counts those scripts out, so
+  `WatchStatus.wallets` and `left_out_scripts` say what the server really
+  took, on the user's own node as on a public server.
+- An Electrum server that cuts the live watch for what it costs, an
+  ElectrumX past its budget, is left alone for a quarter of an hour, as
+  one of another network is, and asked for half as many scripts when the
+  watch comes back to it. ElectrumX keeps that cost against the address
+  for a while, and the watch used to come back within two minutes with
+  the same burst. Subscriptions go out ten at a time instead of 25, as
+  many as ElectrumX serves at once before it slows a session down.
+- Over Electrum, a block now syncs a wallet waiting for a confirmation
+  when the live watch does not hear all of its scripts, past the caps on
+  the list or refused by the server. The confirmation comes as news on
+  the scripts of the transaction, and on a script nobody pushes it used
+  to wait for the next regular sync.
+- An Esplora server that limits the rate of requests (HTTP 429) is asked
+  again once, after the wait its `Retry-After` names, five seconds at
+  least, instead of three times within two seconds; past a minute the
+  request fails at once and says how long the server asked for.
+  mempool.space bans a client that keeps coming back too soon. Polling
+  a server that limits it waits twice as long between rounds each time,
+  up to ten minutes, and back to a minute half an hour after the last
+  limit; a round turned away no longer counts as a server lost.
+- A sync of a watched address keeps 256 MiB at most of the transactions
+  it reads, as a sync of a descriptor wallet already did: each one is
+  kept whole, its raw bytes and every input and output, and a server
+  could list transactions of hundreds of thousands of inputs until the
+  phone ran out of memory. Over Electrum, a connection of that sync also
+  reads 256 MiB at most, every answer together.
+- The HTTP clients of the core no longer follow a redirection anywhere:
+  an Esplora server's not at all, and the price and update services'
+  only to their own host, over HTTPS. A redirection carried the request,
+  the scripts of a wallet among them, where its route was never checked:
+  in the clear, or an onion name to the system's resolver.
+- What a server writes in a refusal or an error reaches a screen as one
+  short line on every path: 200 characters at most, without control
+  characters or the marks that turn the text around them, the line and
+  paragraph separators included. A sync over Electrum passed a server's
+  error on whole, sixteen megabytes or a text that read backwards.
+- A watched address sums the amounts a server lists without wrapping
+  around, over Esplora as it already did over Electrum, and the net of a
+  transaction stops at what a signed number holds. A made-up amount past
+  what any coin holds made a build that checks panic, and showed in one
+  that does not as a huge payment out.
+- On a desktop, the built-in Tor client checks again, as arti does by
+  default, that no other account of the machine can write to its state,
+  where it keeps its guards and the directory it trusts. Only a phone,
+  whose app storage the system keeps private to the app, skips it.
+- A server that drops the live watch's connection again and again, and
+  names scripts it made up as moved on each new one, has the syncs they
+  ask for wait longer and longer, as a server that pushes made-up changes
+  already did. A connection dropped every minute had those scripts
+  synced every minute, day and night.
+- Over Electrum, where a broadcast transaction stands is read through
+  an output a coin may sit on, an OP_RETURN only last, and through the
+  next one when the server refuses a history. It was read through the
+  first output, an OP_RETURN or an exchange's deposit address with a
+  history too long for the server, and failed while the transaction
+  confirmed.
+- An incoming payment announced as pending is said dropped only once a
+  second sync, ten minutes or more after the first one that missed it,
+  has read its scripts again and not seen it either. A server that lags,
+  or one of the rotation that never heard of the payment, made a single
+  sync announce as dropped a payment that was still coming. A sync that
+  sees the payment again, or a fee bump of it, forgets it; a sync that
+  did not read its scripts says nothing of it; a replacement that cuts
+  the payment down is still said at once. The vault keeps what this
+  needs only while such a payment waits, so a vault written before reads
+  and writes the same. While the live watch runs, it reads the scripts
+  of such a payment again itself ten minutes on, nothing moving on them
+  once it left.
 - A watched address is never read from a server of another network.
   Testnet, testnet4 and signet spell an address alike, and a server of
   the wrong one answered for it with transactions the wallet's network
@@ -229,9 +359,10 @@ The first release: the library both Gerfaut apps are built on.
   for its genesis block first, over Electrum and Esplora, and is refused
   by one of another network.
 - An OP_RETURN payload that holds a character changing the direction of
-  the text, a bidirectional mark, embedding, override or isolate, is no
-  longer read as text: shown as text, it could make an amount or an
-  address beside it read backwards. Its bytes are shown in hex instead.
+  the text, a bidirectional mark, embedding, override or isolate, or a
+  line or paragraph separator, is no longer read as text: shown as text,
+  it could make an amount or an address beside it read backwards, or push
+  it onto a line of its own. Its bytes are shown in hex instead.
 - A 401, 403, 404 or 410 from the premium server counts as its answer only
   when it comes in the server's own error body. The bare status is what a
   captive portal or a proxy answers, and it no longer makes the app forget
@@ -306,9 +437,13 @@ The first release: the library both Gerfaut apps are built on.
 - A sync that brings a transaction worth more than 21 million bitcoin,
   which only a lying server can send for one still out of a block, is
   refused like a failed server, and the next one is tried. Stored, such a
-  transaction made every later look at the wallet crash the app. The
-  balance of a watched address saturates instead of wrapping around when
-  a server lists coins no one can hold.
+  transaction made every later look at the wallet crash the app. So is
+  one that spends the same coin twice, and an answer whose amounts,
+  added to what the wallet already holds, pass what the wallet's sums
+  can hold: thousands of invented unconfirmed payments, each within the
+  21 million, crashed the app the same way once added up into a balance.
+  The balance of a watched address saturates instead of wrapping around
+  when a server lists coins no one can hold.
 - The transaction preview reads the signature hash type of every
   signature it finds, and a signature made with `SIGHASH_NONE` or
   `SIGHASH_SINGLE` gets a warning of its own, `uncommitted_outputs`,
@@ -352,6 +487,19 @@ The first release: the library both Gerfaut apps are built on.
 - A live watch that read an impossible tip height, from a lying server or
   a slip, no longer ignores every block after it: a height more than a
   day of blocks below the one kept becomes the baseline again.
+- A server can no longer put made-up blocks into a wallet's chain for
+  good. Its tip is refused past any height a chain can have reached (one
+  block a minute since the genesis block, with a clock set back read as
+  the day this release was written), and its latest blocks are taken
+  only as a chain: one per height, each the parent of the next, and over
+  Electrum the last one the tip it announced, with the work mainnet and
+  testnet4 ask for. A wallet that already holds such blocks, far above
+  the tip of the server it syncs with next, drops them: a single answer
+  with a height of four billion used to give every transaction billions
+  of confirmations, every timelock of the policy as expired, and every
+  later Esplora sync a failure, even on an honest server. An Esplora
+  server a little behind the wallet now leaves its chain as it is, as an
+  Electrum server already did, instead of failing the sync.
 - The update check keeps the page it links to only when it is one of the
   repository's release pages on GitHub, and falls back to the latest
   release page otherwise. A tag longer than 32 characters, or with

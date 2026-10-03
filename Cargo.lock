@@ -388,28 +388,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bdk_electrum"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00a9846105bf6e751adbb6946b000ff919ce24a15a941cbfe68485549b552a9c"
-dependencies = [
- "bdk_core",
- "electrum-client",
-]
-
-[[package]]
-name = "bdk_esplora"
-version = "0.22.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83986307ea92997c3d051e8c306af8115a05add601e22acb7c1903008e6b614e"
-dependencies = [
- "async-trait",
- "bdk_core",
- "esplora-client",
- "futures",
-]
-
-[[package]]
 name = "bdk_wallet"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1464,21 +1442,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "esplora-client"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f19e3ea99dbfbef0c1ec26d83e69de0c579f6aa6aaac4f44597805fcc27e97af"
-dependencies = [
- "bitcoin",
- "hex-conservative 0.2.2",
- "log",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "event-listener"
 version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1771,12 +1734,11 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "arti-client",
- "bdk_electrum",
- "bdk_esplora",
  "bdk_wallet",
  "chacha20poly1305",
  "ciborium",
  "data-encoding",
+ "electrum-client",
  "flate2",
  "fs4",
  "futures-util",

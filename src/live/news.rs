@@ -38,13 +38,24 @@
 //! by one that pays elsewhere, one that pays the wallet a few sats, or
 //! evicted, is news of its own: [`TxStage::Dropped`], said once.
 //!
+//! A payment seen replaced by one that pays the wallet a few sats is
+//! said dropped at once: the server has that replacement in its place.
+//! One that only stopped being listed may be missing from one server
+//! and not the others, a server that lags or one of a rotation that
+//! never heard of it: it is kept aside ([`Vanishing`]), and said dropped
+//! only once a later sync, [`DROPPED_AFTER`] or more after the first,
+//! has read its scripts again and not seen it either ([`settle`]). A
+//! sync that did not read them says nothing of it, one that sees it
+//! again forgets it, and one that sees a fee bump of it takes the bump
+//! for it, as when both are seen at once.
+//!
 //! Every function here works on the payload, under the lock of the
 //! caller, and does no I/O.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::live::{ANNOUNCED_MAX, LiveTx};
-use crate::store::{Announced, TxStage, Unclaimed, VaultPayload};
+use crate::store::{Announced, TxStage, Unclaimed, Vanishing, VaultPayload};
 use crate::wallet::snapshot::NewTx;
 
 /// A transaction as a sync saw it: enough to tell a replacement from a
@@ -142,6 +153,13 @@ fn conflicting<'a>(
 /// Unclaimed news kept, at most. Past this the oldest goes: it is news
 /// no caller took for hundreds of transactions.
 pub(crate) const UNCLAIMED_MAX: usize = 500;
+/// How long after a sync first missed a payment a sync that misses it
+/// again says it dropped, in seconds: see the module documentation.
+pub(crate) const DROPPED_AFTER: u64 = 10 * 60;
+/// How long a payment that vanished waits for that sync, in seconds.
+/// The daily sync that reads every script comes well before; past this
+/// the app was not opened for days, and it is not news any more.
+const VANISHING_FOR: u64 = 3 * 24 * 3600;
 /// How long news waits for a claim, in seconds. Longer and it is not
 /// news any more: whoever syncs with alerts off and claims nothing
 /// would have it all said the day the alerts are turned on.
@@ -297,7 +315,8 @@ pub(crate) fn push(
 }
 
 /// Records what one sync of a wallet found: what it saw for the first
-/// time, what it saw confirm, and the payments it saw vanish. A
+/// time, what it saw confirm, and the payments it saw vanish, kept aside
+/// for [`settle`] unless a transaction seen now replaces them. A
 /// wallet's first sync records nothing: its whole history is "new",
 /// and that is an import, not news.
 pub(crate) fn record(
@@ -323,7 +342,21 @@ pub(crate) fn record(
             now,
         );
     }
-    let before = by_spent(&moves.pending_before);
+    // What was pending before the sync, and the payments earlier syncs
+    // saw vanish: what a transaction seen now may replace.
+    let vanished: Vec<Seen> = payload
+        .vanishing
+        .iter()
+        .filter(|entry| entry.wallet_id == wallet_id)
+        .map(seen_of)
+        .collect();
+    let pending: Vec<Seen> = moves
+        .pending_before
+        .iter()
+        .chain(&vanished)
+        .cloned()
+        .collect();
+    let before = by_spent(&pending);
     for tx in &moves.new {
         if tx.confirmed {
             // A fee bump seen for the first time in a block: its
@@ -358,7 +391,6 @@ pub(crate) fn record(
             ),
         }
     }
-    let arrived = by_spent(&moves.new);
     for old in &moves.gone {
         // Never said: nothing to take back.
         if unsay_arrival(payload, wallet_id, &old.txid) {
@@ -369,22 +401,146 @@ pub(crate) fn record(
         if !said_pending || old.net_sats <= 0 {
             continue;
         }
-        let paid_instead = conflicting(&arrived, old).any(|tx| tx.bumps(old));
-        if !paid_instead {
-            // Under the txid the app was told of, a fee bump the app
-            // never saw its own id for included.
-            let told_as =
-                announced_under(payload, wallet_id, &old.txid).unwrap_or_else(|| old.txid.clone());
-            push(
-                payload,
-                wallet_id,
-                &told_as,
-                old.net_sats,
-                TxStage::Dropped,
-                None,
-                now,
-            );
+        // Under the txid the app was told of, a fee bump the app never
+        // saw its own id for included.
+        let told_as =
+            announced_under(payload, wallet_id, &old.txid).unwrap_or_else(|| old.txid.clone());
+        vanish(payload, wallet_id, old, told_as, now);
+    }
+    // A payment gone, at this sync or an earlier one, that a transaction
+    // seen now replaces: paid instead by a fee bump, there is nothing to
+    // say; cut down, it is said dropped at once.
+    let arrived = by_spent(&moves.new);
+    let mut cut = Vec::new();
+    payload.vanishing.retain(|entry| {
+        if entry.wallet_id != wallet_id {
+            return true;
         }
+        let old = seen_of(entry);
+        if conflicting(&arrived, &old).next().is_none() {
+            return true;
+        }
+        if !conflicting(&arrived, &old).any(|tx| tx.bumps(&old)) {
+            cut.push(entry.clone());
+        }
+        false
+    });
+    for entry in cut {
+        push(
+            payload,
+            wallet_id,
+            &entry.told_as,
+            entry.net_sats,
+            TxStage::Dropped,
+            None,
+            now,
+        );
+    }
+}
+
+/// Outputs of a payment that vanished kept to recognise a replacement,
+/// at most: a replacement spends one of them, mostly the first, and a
+/// sender's transaction of thousands of inputs would otherwise be kept
+/// whole in the vault for days.
+const SPENDS_KEPT: usize = 100;
+
+/// A payment that vanished, as a sync sees a transaction.
+fn seen_of(entry: &Vanishing) -> Seen {
+    Seen {
+        txid: entry.txid.clone(),
+        net_sats: entry.net_sats,
+        confirmed: false,
+        spends: entry.spends.clone(),
+    }
+}
+
+/// Keeps aside a payment a sync no longer saw, unless it is already.
+fn vanish(payload: &mut VaultPayload, wallet_id: &str, old: &Seen, told_as: String, now: u64) {
+    if payload
+        .vanishing
+        .iter()
+        .any(|entry| entry.wallet_id == wallet_id && entry.txid == old.txid)
+    {
+        return;
+    }
+    payload.vanishing.push(Vanishing {
+        wallet_id: wallet_id.to_owned(),
+        txid: old.txid.clone(),
+        told_as,
+        net_sats: old.net_sats,
+        spends: old.spends.iter().take(SPENDS_KEPT).cloned().collect(),
+        missed_at: now,
+    });
+    let excess = payload.vanishing.len().saturating_sub(UNCLAIMED_MAX);
+    payload.vanishing.drain(..excess);
+}
+
+/// The payments of a wallet earlier syncs saw vanish, by txid: what a
+/// sync of the wallet looks for, for [`settle`].
+pub(crate) fn vanishing(payload: &VaultPayload, wallet_id: &str) -> Vec<String> {
+    payload
+        .vanishing
+        .iter()
+        .filter(|entry| entry.wallet_id == wallet_id)
+        .map(|entry| entry.txid.clone())
+        .collect()
+}
+
+/// Those whose second look is due at `now`: [`DROPPED_AFTER`] or more
+/// since a sync first missed them.
+pub(crate) fn vanishing_due(payload: &VaultPayload, wallet_id: &str, now: u64) -> Vec<String> {
+    payload
+        .vanishing
+        .iter()
+        .filter(|entry| entry.wallet_id == wallet_id)
+        .filter(|entry| now >= entry.missed_at.saturating_add(DROPPED_AFTER))
+        .map(|entry| entry.txid.clone())
+        .collect()
+}
+
+/// What a sync of a wallet found of the payments earlier syncs saw
+/// vanish, by txid: the ones the wallet holds again, and the ones whose
+/// scripts it read again without seeing them.
+#[derive(Debug, Default)]
+pub(crate) struct Recheck {
+    pub held: HashSet<String>,
+    pub reread: HashSet<String>,
+}
+
+/// Settles, after a sync of a wallet, the payments earlier syncs saw
+/// vanish: one the wallet holds again came back, and is forgotten; one
+/// the sync read the scripts of again, [`DROPPED_AFTER`] or more after
+/// the first missed it, and did not see either, is said dropped. One a
+/// sync did not read again waits, [`VANISHING_FOR`] at most.
+pub(crate) fn settle(payload: &mut VaultPayload, wallet_id: &str, recheck: &Recheck, now: u64) {
+    let mut dropped = Vec::new();
+    payload.vanishing.retain(|entry| {
+        if entry.missed_at.saturating_add(VANISHING_FOR) < now {
+            return false;
+        }
+        if entry.wallet_id != wallet_id {
+            return true;
+        }
+        if recheck.held.contains(&entry.txid) {
+            return false;
+        }
+        let due = now >= entry.missed_at.saturating_add(DROPPED_AFTER);
+        if due && recheck.reread.contains(&entry.txid) {
+            dropped.push(entry.clone());
+            return false;
+        }
+        true
+    });
+    for entry in dropped {
+        push(
+            payload,
+            wallet_id,
+            &entry.told_as,
+            entry.net_sats,
+            TxStage::Dropped,
+            None,
+            now,
+        );
     }
 }
 
@@ -494,6 +650,16 @@ mod tests {
             .iter()
             .map(|tx| (tx.txid.as_str(), tx.stage))
             .collect()
+    }
+
+    /// A later sync, `after` seconds past [`NOW`], that read the scripts
+    /// of every payment of the wallet that vanished and saw none of them.
+    fn reread(payload: &mut VaultPayload, wallet_id: &str, after: u64) {
+        let recheck = Recheck {
+            held: HashSet::new(),
+            reread: vanishing(payload, wallet_id).into_iter().collect(),
+        };
+        settle(payload, wallet_id, &recheck, NOW + after);
     }
 
     #[test]
@@ -666,6 +832,9 @@ mod tests {
         };
         record(&mut payload, "a", false, &gone(&out), NOW);
         record(&mut payload, "b", false, &gone(&into), NOW);
+        assert!(claim(&mut payload, "b", 10, NOW).is_empty());
+        reread(&mut payload, "a", DROPPED_AFTER);
+        reread(&mut payload, "b", DROPPED_AFTER);
         assert!(claim(&mut payload, "a", 10, NOW).is_empty());
         assert_eq!(
             stages(&claim(&mut payload, "b", 10, NOW)),
@@ -872,10 +1041,13 @@ mod tests {
             ..Moves::default()
         };
         record(&mut payload, "w", false, &vanished, NOW);
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+        reread(&mut payload, "w", DROPPED_AFTER);
         let claimed = claim(&mut payload, "w", 10, NOW);
         assert_eq!(replacing_of(&claimed), [("a", TxStage::Dropped, None)]);
         assert_eq!(claimed[0].net_sats, 49_800);
         record(&mut payload, "w", false, &vanished, NOW);
+        reread(&mut payload, "w", 2 * DROPPED_AFTER);
         assert!(claim(&mut payload, "w", 10, NOW).is_empty());
     }
 
@@ -948,10 +1120,12 @@ mod tests {
             ..Moves::default()
         };
         record(&mut payload, "w", false, &vanished, NOW);
+        reread(&mut payload, "w", DROPPED_AFTER);
         let claimed = claim(&mut payload, "w", 10, NOW);
         assert_eq!(stages(&claimed), [("a", TxStage::Dropped)]);
         assert_eq!(claimed[0].net_sats, 50_000);
         record(&mut payload, "w", false, &vanished, NOW);
+        reread(&mut payload, "w", 2 * DROPPED_AFTER);
         assert!(claim(&mut payload, "w", 10, NOW).is_empty());
 
         let x = seen("x", 1_000, false);
@@ -969,6 +1143,152 @@ mod tests {
         };
         record(&mut payload, "w", false, &unsaid, NOW);
         assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+    }
+
+    /// A payment one sync no longer sees is said dropped only once a
+    /// later sync, ten minutes or more after it, has read its scripts
+    /// again and not seen it either: not sooner, not on a sync that did
+    /// not read them, and once.
+    #[test]
+    fn a_payment_is_said_dropped_by_a_second_sync_ten_minutes_on() {
+        let mut payload = VaultPayload::default();
+        let a = seen("a", 50_000, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(std::slice::from_ref(&a)),
+            NOW,
+        );
+        claim(&mut payload, "w", 10, NOW);
+        let vanished = Moves {
+            pending_before: vec![a.clone()],
+            gone: vec![a],
+            ..Moves::default()
+        };
+        record(&mut payload, "w", false, &vanished, NOW);
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+        reread(&mut payload, "w", DROPPED_AFTER - 1);
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty(), "too soon");
+        settle(&mut payload, "w", &Recheck::default(), NOW + DROPPED_AFTER);
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty(), "not read");
+        reread(&mut payload, "w", DROPPED_AFTER);
+        assert_eq!(
+            stages(&claim(&mut payload, "w", 10, NOW)),
+            [("a", TxStage::Dropped)]
+        );
+        assert!(payload.vanishing.is_empty());
+        reread(&mut payload, "w", 2 * DROPPED_AFTER);
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+    }
+
+    /// A payment one sync no longer saw comes back, as it was or bumped,
+    /// at a later sync: nothing is said, and the bump confirms under the
+    /// txid announced first. One cut down at a later sync is said dropped
+    /// at once, the replacement said for what it pays.
+    #[test]
+    fn a_payment_that_comes_back_is_not_said_dropped() {
+        let vanished = |payload: &mut VaultPayload, a: &Seen| {
+            record(payload, "w", false, &arrived(std::slice::from_ref(a)), NOW);
+            claim(payload, "w", 10, NOW);
+            let moves = Moves {
+                pending_before: vec![a.clone()],
+                gone: vec![a.clone()],
+                ..Moves::default()
+            };
+            record(payload, "w", false, &moves, NOW);
+        };
+        let a = seen("a", 50_000, false);
+
+        let mut payload = VaultPayload::default();
+        vanished(&mut payload, &a);
+        let back = Recheck {
+            held: HashSet::from(["a".to_owned()]),
+            reread: HashSet::new(),
+        };
+        settle(&mut payload, "w", &back, NOW + DROPPED_AFTER);
+        reread(&mut payload, "w", 2 * DROPPED_AFTER);
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+
+        let mut payload = VaultPayload::default();
+        vanished(&mut payload, &a);
+        let bump = replacing(&a, "b", 49_800, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(std::slice::from_ref(&bump)),
+            NOW,
+        );
+        reread(&mut payload, "w", DROPPED_AFTER);
+        assert!(claim(&mut payload, "w", 10, NOW).is_empty());
+        let mined = Seen {
+            confirmed: true,
+            ..bump.clone()
+        };
+        record(&mut payload, "w", false, &confirmed(&[mined]), NOW);
+        assert_eq!(
+            replacing_of(&claim(&mut payload, "w", 10, NOW)),
+            [("b", TxStage::Confirmed, Some("a"))]
+        );
+
+        let mut payload = VaultPayload::default();
+        vanished(&mut payload, &a);
+        let cut = replacing(&a, "c", 1, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(std::slice::from_ref(&cut)),
+            NOW,
+        );
+        assert_eq!(
+            stages(&claim(&mut payload, "w", 10, NOW)),
+            [("c", TxStage::Mempool), ("a", TxStage::Dropped)]
+        );
+        assert!(payload.vanishing.is_empty());
+    }
+
+    /// A payment kept aside that no sync reads again for days is
+    /// forgotten, said by none.
+    #[test]
+    fn a_payment_kept_aside_for_days_is_forgotten() {
+        let mut payload = VaultPayload::default();
+        let a = seen("a", 50_000, false);
+        record(
+            &mut payload,
+            "w",
+            false,
+            &arrived(std::slice::from_ref(&a)),
+            NOW,
+        );
+        claim(&mut payload, "w", 10, NOW);
+        let moves = Moves {
+            pending_before: vec![a.clone()],
+            gone: vec![a],
+            ..Moves::default()
+        };
+        record(&mut payload, "w", false, &moves, NOW);
+        // Another wallet's sync forgets it too.
+        settle(
+            &mut payload,
+            "other",
+            &Recheck::default(),
+            NOW + VANISHING_FOR + 1,
+        );
+        assert!(payload.vanishing.is_empty());
+        reread(&mut payload, "w", VANISHING_FOR + 2);
+        assert!(claim(&mut payload, "w", 10, NOW + VANISHING_FOR).is_empty());
+    }
+
+    /// A vault from before payments were kept aside reads with none, and
+    /// one with none is written as it was before.
+    #[test]
+    fn a_vault_with_no_payment_kept_aside_reads_and_writes_as_before() {
+        let stored = serde_json::to_value(VaultPayload::default()).unwrap();
+        assert!(stored.get("vanishing").is_none());
+        let payload: VaultPayload = serde_json::from_value(stored).unwrap();
+        assert!(payload.vanishing.is_empty());
     }
 
     /// The sender replaces a payment with one that still pays the

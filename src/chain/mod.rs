@@ -139,6 +139,168 @@ pub(crate) fn is_genesis_of(network: Network, hash: bdk_wallet::bitcoin::BlockHa
     bdk_wallet::bitcoin::constants::genesis_block(network.to_bitcoin()).block_hash() == hash
 }
 
+/// How far below the height a wallet or a watch holds a server's tip may
+/// read and still be a server that lags: past a day of blocks, the
+/// height held was never a real one.
+pub(crate) const TIP_LAG_MAX: u32 = 144;
+
+/// What a server whose tip is higher than any chain of its network can
+/// have reached is refused with.
+pub(crate) const IMPOSSIBLE_TIP: &str = "the server claims a block height no chain has reached";
+
+/// What a transaction does to an address, from what it pays it and what
+/// it spends of it, as a server tells both: past what a signed number
+/// holds, which no coin comes near and a server may still claim, it
+/// stops there instead of wrapping around to its opposite.
+pub(crate) fn net_sats(received: u64, spent: u64) -> i64 {
+    let signed = |sats: u64| i64::try_from(sats).unwrap_or(i64::MAX);
+    signed(received).saturating_sub(signed(spent))
+}
+
+/// The longest a server's words are shown, in characters.
+const SERVER_WORDS_MAX: usize = 200;
+
+/// What a server wrote, a refusal or an error, kept to what a screen may
+/// show it as: one line of 200 characters at most, an ellipsis past them,
+/// without the control characters that break a line or the marks that
+/// turn the text around them
+/// ([`crate::wallet::tx_extras::is_bidi_control`]). Anyone who runs a
+/// server writes them, and they end up on a screen beside amounts.
+pub(crate) fn server_words(text: &str) -> String {
+    let mut kept = text
+        .chars()
+        .filter(|c| !c.is_control() && !crate::wallet::tx_extras::is_bidi_control(*c));
+    let mut short: String = kept.by_ref().take(SERVER_WORDS_MAX).collect();
+    if kept.next().is_some() {
+        short.push('\u{2026}');
+    }
+    short
+}
+
+/// The redirections an HTTP client of the core follows, to fixed public
+/// services: to the same host, port and scheme, over HTTPS, five at
+/// most. One anywhere else ends there, as an answer that is no success:
+/// it would carry the request where its route was never checked, in the
+/// clear, or an onion name to the system's resolver.
+pub(crate) fn redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin());
+        if same && attempt.url().scheme() == "https" && attempt.previous().len() <= 5 {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// What one sync may keep of the transactions it reads, those the wallet
+/// lacks: what it stores then. A wallet paid dozens of the largest
+/// inscriptions there are fits; a server that invents transactions to
+/// fill memory does not.
+pub(crate) const KEEP_MAX: usize = 256 << 20;
+
+/// What a sync kept so far of the transactions it read, held to a cap.
+#[derive(Debug)]
+pub(crate) struct Kept {
+    bytes: std::sync::atomic::AtomicUsize,
+    max: usize,
+}
+
+impl Kept {
+    pub(crate) fn up_to(max: usize) -> Self {
+        Kept {
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            max,
+        }
+    }
+
+    /// Counts `bytes` of transactions against the cap.
+    pub(crate) fn add(&self, bytes: usize) -> Result<(), String> {
+        let kept = self
+            .bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(bytes);
+        if kept > self.max {
+            return Err(format!(
+                "the server sent more than {} MiB of transactions for one sync",
+                self.max >> 20
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// About what a transaction of a watched address holds in memory, all of
+/// which its sync keeps and stores: its raw bytes in hex, and each of its
+/// inputs and outputs, however many a server lists.
+pub(crate) fn held_by(tx: &crate::wallet::AddressTx) -> usize {
+    use crate::wallet::snapshot::TxIo;
+    let text = |text: &Option<String>| text.as_ref().map_or(0, String::len);
+    let side = |io: &TxIo| {
+        std::mem::size_of::<TxIo>()
+            + text(&io.address)
+            + text(&io.prev_txid)
+            + io.op_return.as_ref().map_or(0, |data| {
+                data.hex.len() + text(&data.text) + text(&data.label)
+            })
+    };
+    let extras = tx.extras.as_ref().map_or(0, |extras| {
+        extras.raw_hex.len() + text(&extras.coinbase_pool) + text(&extras.coinbase_tag)
+    });
+    std::mem::size_of::<crate::wallet::AddressTx>()
+        + tx.txid.len()
+        + extras
+        + tx.inputs.iter().chain(&tx.outputs).map(side).sum::<usize>()
+}
+
+/// The fastest a chain is taken to have grown since its genesis block,
+/// in seconds per block: ten times the pace of every network there is.
+const FASTEST_BLOCK_SECS: u64 = 60;
+/// A time this code was written after, 1 October 2026: a device clock
+/// that reads earlier is wrong, and is not believed over it.
+const WRITTEN_AFTER: u64 = 1_790_812_800;
+
+/// The highest block a chain of `network` can have reached at `now`, in
+/// unix seconds: one block a minute since its genesis block, ten times
+/// any pace there is, with a clock set back read as the day this was
+/// written. Loose on purpose, since a clock may be wrong, and enough to
+/// refuse a tip of four billion, which a lying server once had only to
+/// send for it to stay in the wallet's chain for good. A regtest chain
+/// is made at will, and has none.
+pub(crate) fn height_limit(network: Network, now: u64) -> u32 {
+    if network == Network::Regtest {
+        return u32::MAX;
+    }
+    let genesis = bdk_wallet::bitcoin::constants::genesis_block(network.to_bitcoin());
+    let elapsed = now
+        .max(WRITTEN_AFTER)
+        .saturating_sub(u64::from(genesis.header.time));
+    u32::try_from(elapsed / FASTEST_BLOCK_SECS).unwrap_or(u32::MAX)
+}
+
+/// Whether a header carries the proof of work its target asks for, and
+/// that target is one the network allows. Signet blocks are made valid
+/// by a signature, not by work, and regtest blocks by nobody, so only
+/// mainnet and testnet4 are held to it. It does not prove the work the
+/// chain asks for at that height, which takes every header since the
+/// last retarget: a server that mines a header at the easiest target
+/// passes. What it refuses is a header no one mined at all.
+pub(crate) fn has_proof_of_work(
+    network: Network,
+    header: &bdk_wallet::bitcoin::block::Header,
+) -> bool {
+    if !matches!(network, Network::Mainnet | Network::Testnet4) {
+        return true;
+    }
+    let easiest =
+        bdk_wallet::bitcoin::params::Params::new(network.to_bitcoin()).max_attainable_target;
+    let target = header.target();
+    target <= easiest && target.is_met_by(header.block_hash())
+}
+
 /// Whether a backend URL points at a Tor hidden service. Onion hosts
 /// are routed through the Tor proxy [`tor`] resolves, never looked up.
 ///
@@ -229,7 +391,7 @@ pub(crate) fn canonical_host(host: &str) -> Result<String, ParseError> {
 }
 
 /// One concrete server to talk to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Endpoint {
     Esplora(String),
     Electrum(electrum::Target),
@@ -341,6 +503,8 @@ async fn within<T>(
 /// already holds: built under the lock of the vault, consumed by one
 /// attempt against one endpoint.
 pub(crate) struct Plan {
+    /// The network of the wallet, whose chain the server's must be.
+    pub network: Network,
     /// The wallet's chain, which the answer extends.
     pub tip: CheckPoint,
     /// The time a transaction seen in the mempool is stamped with.
@@ -392,6 +556,9 @@ pub(crate) struct Held {
     /// What the wallet holds for each script it revealed, and each
     /// script of the plan.
     pub scripts: HashMap<ScriptBuf, ScriptFacts>,
+    /// Every output of the graph's transactions and every coin it holds
+    /// alone, added up: see [`check_amounts`].
+    pub sats: u64,
 }
 
 impl Held {
@@ -439,41 +606,75 @@ pub(crate) struct ScriptFacts {
 /// What one sync attempt brought back.
 pub(crate) struct Synced {
     pub update: bdk_wallet::Update,
+    /// Set when the wallet's chain holds blocks above the server's tip
+    /// that no server will ever have: far above that tip, or above any
+    /// height a chain can have reached ([`TIP_LAG_MAX`],
+    /// [`height_limit`]). A lying server put them there, once, and an
+    /// update cannot take them out. The blocks above this height are to
+    /// be dropped before the update is applied, which was built as if
+    /// they were gone.
+    pub drop_above: Option<u32>,
     /// The histories an Electrum server listed, in its order, by script:
     /// the order its statuses hash them in.
     pub orders: Vec<(ScriptBuf, Vec<(Txid, i32)>)>,
 }
 
-/// Refuses an update that holds an amount no transaction can carry: an
-/// output, or the outputs of one transaction together, above the 21
-/// million bitcoin there will ever be. Nothing in a block can, but an
+/// The most the transactions of one wallet may carry, every output of
+/// each of them and every coin of another they spend added up: past
+/// whatever a wallet ever sees, by millions of times, and short of what
+/// the sums the wallet engine makes, and the signed figures shown from
+/// them, can hold.
+const HELD_MAX_SATS: u64 = i64::MAX as u64;
+
+/// Refuses an update holding amounts no chain can carry: an output, or
+/// the outputs of one transaction together, above the 21 million bitcoin
+/// there will ever be; a transaction that spends one coin twice; or,
+/// with what the wallet holds (`held_sats`, see [`Held::sats`]), more
+/// than [`HELD_MAX_SATS`] in all. Nothing in a block can, but an
 /// unconfirmed transaction is only the server's word, and the wallet
-/// engine adds amounts up with a panic on overflow: once stored, such a
-/// transaction brought down every later look at the wallet.
-pub(crate) fn check_amounts(update: &bdk_wallet::Update) -> Result<(), String> {
+/// engine adds amounts up with a panic on overflow, across transactions
+/// for a balance and across the coins one spends: once stored, such an
+/// update brought down every later look at the wallet. Each amount it
+/// can add is one of those counted here, once, so none of its sums can
+/// pass the bound.
+pub(crate) fn check_amounts(update: &bdk_wallet::Update, held_sats: u64) -> Result<(), String> {
     let refused = || "the server sent a transaction worth more than every bitcoin".to_owned();
+    let max_money = bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat();
+    let mut total = held_sats;
     for tx in &update.tx_update.txs {
-        tx.output
+        let paid = tx
+            .output
             .iter()
             .try_fold(0u64, |sum, out| sum.checked_add(out.value.to_sat()))
-            .filter(|&total| total <= bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat())
+            .filter(|&paid| paid <= max_money)
             .ok_or_else(refused)?;
+        let mut spent = HashSet::with_capacity(tx.input.len());
+        if !tx
+            .input
+            .iter()
+            .all(|input| spent.insert(input.previous_output))
+        {
+            return Err("the server sent a transaction that spends one coin twice".to_owned());
+        }
+        total = total.saturating_add(paid);
     }
-    if update
-        .tx_update
-        .txouts
-        .values()
-        .any(|out| out.value > bdk_wallet::bitcoin::Amount::MAX_MONEY)
-    {
-        return Err(refused());
+    for out in update.tx_update.txouts.values() {
+        if out.value.to_sat() > max_money {
+            return Err(refused());
+        }
+        total = total.saturating_add(out.value.to_sat());
+    }
+    if total > HELD_MAX_SATS {
+        return Err("the server sent more bitcoin than a wallet can hold".to_owned());
     }
     Ok(())
 }
 
 /// Runs one sync attempt against one endpoint, within the deadline of
-/// a scan. The error is a plain string: the caller owns retry logic and
-/// error wrapping. Dropping the future abandons the attempt, an
-/// Electrum connection included.
+/// a scan, and refuses an answer whose amounts no chain can carry (see
+/// [`check_amounts`]). The error is a plain string: the caller owns
+/// retry logic and error wrapping. Dropping the future abandons the
+/// attempt, an Electrum connection included.
 ///
 /// `proxy`, here and below, is the Tor SOCKS proxy the caller resolved
 /// for this operation; `None` when no endpoint of the list is an onion.
@@ -483,42 +684,42 @@ pub(crate) async fn sync_engine(
     proxy: Option<&str>,
 ) -> Result<Synced, String> {
     let deadline = scan_deadline(endpoint);
-    match endpoint {
+    let held_sats = plan.held.sats;
+    let synced = match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client_for_run(url, proxy)?;
-            within(deadline, esplora::sync::run(&client, plan))
-                .await
-                .map(|update| Synced {
-                    update,
-                    orders: Vec::new(),
-                })
+            within(deadline, esplora::sync::run(&client, plan)).await
         }
         Endpoint::Electrum(target) => electrum::sync(target, plan, proxy, deadline).await,
-    }
+    }?;
+    check_amounts(&synced.update, held_sats)?;
+    Ok(synced)
 }
 
 /// Fetches the state of a single watched address from one endpoint,
 /// within the deadline of a scan: the same state from an Esplora or an
-/// Electrum server.
+/// Electrum server. `held`, what the wallet holds of it, is not read
+/// again where the server lists it as it was.
 pub(crate) async fn fetch_address_state(
     endpoint: &Endpoint,
     address: &str,
     network: Network,
     proxy: Option<&str>,
+    held: &[crate::wallet::AddressTx],
 ) -> Result<AddressWatchState, String> {
     match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client_for_run(url, proxy)?;
             within(
                 scan_deadline(endpoint),
-                esplora::fetch_address_state(&client, address, network),
+                esplora::fetch_address_state(&client, address, network, held),
             )
             .await
         }
         Endpoint::Electrum(target) => {
             within(
                 scan_deadline(endpoint),
-                electrum::address::fetch_state(target, address, network, proxy),
+                electrum::address::fetch_state(target, address, network, proxy, held),
             )
             .await
         }
@@ -631,8 +832,28 @@ pub(crate) async fn fetch_prevout(
     }
 }
 
-/// Where a transaction stands at one endpoint. `script` is one of the
-/// transaction's output scripts, the handle Electrum needs.
+/// The output scripts of a transaction an Electrum server can be asked
+/// for it through, in the order they are tried: the ones a coin may sit
+/// on first, an OP_RETURN, whose history only says who else wrote one,
+/// last, and four at most, each once.
+pub(crate) fn lookup_scripts(tx: &Transaction) -> Vec<ScriptBuf> {
+    let mut scripts: Vec<ScriptBuf> = Vec::new();
+    let (data, coins): (Vec<&TxOut>, Vec<&TxOut>) = tx
+        .output
+        .iter()
+        .partition(|output| output.script_pubkey.is_op_return());
+    for output in coins.into_iter().chain(data) {
+        if !scripts.contains(&output.script_pubkey) {
+            scripts.push(output.script_pubkey.clone());
+        }
+    }
+    scripts.truncate(4);
+    scripts
+}
+
+/// Where a transaction stands at one endpoint. `scripts` are output
+/// scripts of the transaction, the handle Electrum needs: see
+/// [`lookup_scripts`].
 pub(crate) struct TxStanding {
     pub found: bool,
     pub block_height: Option<u32>,
@@ -642,7 +863,7 @@ pub(crate) struct TxStanding {
 pub(crate) async fn tx_standing(
     endpoint: &Endpoint,
     txid: Txid,
-    script: ScriptBuf,
+    scripts: Vec<ScriptBuf>,
     proxy: Option<&str>,
 ) -> Result<TxStanding, String> {
     match endpoint {
@@ -660,7 +881,7 @@ pub(crate) async fn tx_standing(
         }
         Endpoint::Electrum(target) => {
             let (found, block_height, tip_height) =
-                electrum::tx_standing(target, txid, script, proxy).await?;
+                electrum::tx_standing(target, txid, scripts, proxy).await?;
             Ok(TxStanding {
                 found,
                 block_height,
@@ -1092,13 +1313,201 @@ mod tests {
         let max = Amount::MAX_MONEY.to_sat();
         use bdk_wallet::bitcoin::hashes::Hash;
 
-        assert!(check_amounts(&full(vec![tx(&[max])], vec![max])).is_ok());
+        assert!(check_amounts(&full(vec![tx(&[max])], vec![max]), 0).is_ok());
         for update in [
             full(vec![tx(&[1 << 63, 1 << 63])], Vec::new()),
             full(vec![tx(&[max, 1])], Vec::new()),
             full(Vec::new(), vec![max + 1]),
         ] {
-            assert!(check_amounts(&update).is_err());
+            assert!(check_amounts(&update, 0).is_err());
+        }
+    }
+
+    /// Each transaction within the bound, and thousands of them paying
+    /// every bitcoin there is, all unconfirmed: the wallet engine would
+    /// add them up into a balance and panic. Refused, whether the excess
+    /// comes from the answer alone or from the answer and what the wallet
+    /// holds already; so is a transaction spending one coin twice, whose
+    /// spent amount the engine adds up as many times.
+    #[test]
+    fn a_response_whose_sums_overflow_is_refused() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::{Amount, Sequence, TxIn, Witness, absolute, transaction};
+        use std::sync::Arc;
+        let max = Amount::MAX_MONEY;
+        let paying = |n: u32, inputs: Vec<OutPoint>| {
+            Arc::new(Transaction {
+                version: transaction::Version::TWO,
+                lock_time: absolute::LockTime::from_consensus(n),
+                input: inputs
+                    .into_iter()
+                    .map(|previous_output| TxIn {
+                        previous_output,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                        witness: Witness::new(),
+                    })
+                    .collect(),
+                output: vec![TxOut {
+                    value: max,
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            })
+        };
+        let flood = |count: u32| {
+            let mut update = bdk_wallet::Update::default();
+            update.tx_update.txs = (0..count).map(|n| paying(n, Vec::new())).collect();
+            update
+        };
+        assert!(check_amounts(&flood(9_000), 0).is_err());
+        assert!(check_amounts(&flood(10), 0).is_ok());
+        // Within the bound alone, past it with what the wallet holds.
+        assert!(check_amounts(&flood(10), HELD_MAX_SATS - max.to_sat()).is_err());
+        assert!(check_amounts(&flood(1), HELD_MAX_SATS - max.to_sat()).is_ok());
+        // The coins of others an answer brings count too.
+        let mut coins = bdk_wallet::Update::default();
+        coins.tx_update.txouts = (0..9_000u32)
+            .map(|vout| {
+                (
+                    OutPoint::new(Txid::from_byte_array([7; 32]), vout),
+                    TxOut {
+                        value: max,
+                        script_pubkey: ScriptBuf::new(),
+                    },
+                )
+            })
+            .collect();
+        assert!(check_amounts(&coins, 0).is_err());
+
+        let coin = OutPoint::new(Txid::from_byte_array([8; 32]), 0);
+        let mut twice = bdk_wallet::Update::default();
+        twice.tx_update.txs = vec![paying(0, vec![coin, coin])];
+        assert_eq!(
+            check_amounts(&twice, 0).unwrap_err(),
+            "the server sent a transaction that spends one coin twice"
+        );
+        twice.tx_update.txs = vec![paying(0, vec![coin, OutPoint { vout: 1, ..coin }])];
+        assert!(check_amounts(&twice, 0).is_ok());
+    }
+
+    /// The highest tip a chain can have is far past the real one, with
+    /// room for a clock that is wrong, and far short of four billion.
+    #[test]
+    fn a_tip_is_bounded_by_the_clock() {
+        let now = 1_790_812_800 + 365 * 24 * 3600;
+        for network in [Network::Mainnet, Network::Signet, Network::Testnet4] {
+            let limit = height_limit(network, now);
+            assert!(limit > 1_000_000, "{network}: {limit}");
+            assert!(limit < 20_000_000, "{network}: {limit}");
+            // A clock set back to 1970 is not believed over the code.
+            assert!(height_limit(network, 0) > 1_000_000, "{network}");
+        }
+        assert_eq!(height_limit(Network::Regtest, now), u32::MAX);
+    }
+
+    /// A mainnet header is held to the work its target asks for; a signet
+    /// one, made valid by a signature, is not.
+    #[test]
+    fn a_header_no_one_mined_has_no_work() {
+        use bdk_wallet::bitcoin::constants::genesis_block;
+        let genesis = genesis_block(bdk_wallet::bitcoin::Network::Bitcoin).header;
+        assert!(has_proof_of_work(Network::Mainnet, &genesis));
+        let unmined = bdk_wallet::bitcoin::block::Header {
+            nonce: genesis.nonce.wrapping_add(1),
+            ..genesis
+        };
+        assert!(!has_proof_of_work(Network::Mainnet, &unmined));
+        // The easiest target there is, on a network that asks for more.
+        let easy = bdk_wallet::bitcoin::block::Header {
+            bits: bdk_wallet::bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+            ..genesis
+        };
+        assert!(!has_proof_of_work(Network::Testnet4, &easy));
+        assert!(has_proof_of_work(Network::Signet, &unmined));
+    }
+
+    /// A descriptor wallet on signet whose backend is `backend`, synced
+    /// once.
+    async fn synced_wallet(
+        dir: &std::path::Path,
+        backend: BackendConfig,
+    ) -> (crate::WalletManager, String) {
+        const WALLET: &str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)";
+        let manager =
+            crate::WalletManager::open(dir, crate::store::VaultKey::Raw([7; 32])).unwrap();
+        manager.set_backend(Network::Signet, backend).await.unwrap();
+        let parsed = crate::input::parse_input(WALLET).unwrap();
+        let wallet = manager
+            .add_wallet("Watched", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        manager.sync_wallet(&wallet.id).await.unwrap();
+        (manager, wallet.id)
+    }
+
+    /// A tip of four billion, from either kind of server, is refused,
+    /// and the wallet syncs as before once the server stops lying.
+    #[tokio::test]
+    async fn a_tip_no_chain_has_reached_is_refused() {
+        let electrum = crate::testkit::FakeElectrum::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, wallet) = synced_wallet(dir.path(), electrum.backend()).await;
+        electrum.state.lock().unwrap().height = 4_000_000_000;
+        let refused = manager.sync_wallet(&wallet).await.unwrap_err().to_string();
+        assert!(refused.contains(IMPOSSIBLE_TIP), "{refused}");
+        electrum.state.lock().unwrap().height = 100;
+        assert_eq!(manager.sync_wallet(&wallet).await.unwrap().tip_height, 100);
+
+        let esplora = crate::testkit::FakeMempool::start(false, 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, wallet) = synced_wallet(dir.path(), esplora.backend()).await;
+        esplora.state.lock().unwrap().tip = 4_000_000_000;
+        let refused = manager.sync_wallet(&wallet).await.unwrap_err().to_string();
+        assert!(refused.contains(IMPOSSIBLE_TIP), "{refused}");
+        esplora.state.lock().unwrap().tip = 500;
+        assert_eq!(manager.sync_wallet(&wallet).await.unwrap().tip_height, 500);
+    }
+
+    /// A block a lying server once put in a wallet's chain, far above
+    /// any real tip, is stored with it. No update can take it out, and
+    /// every Esplora sync failed on it for good. The next sync, on an
+    /// honest server of either kind, drops it, and the wallet's chain
+    /// is back on the server's, in the vault too.
+    #[tokio::test]
+    async fn a_block_a_lying_server_left_is_dropped() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        let forged = bdk_wallet::chain::BlockId {
+            height: 4_000_000_000,
+            hash: bdk_wallet::bitcoin::BlockHash::from_byte_array([0xee; 32]),
+        };
+        let electrum = crate::testkit::FakeElectrum::start().await;
+        let esplora = crate::testkit::FakeMempool::start(false, 0).await;
+        for (backend, honest) in [(electrum.backend(), 100), (esplora.backend(), 500)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (manager, wallet) = synced_wallet(dir.path(), backend.clone()).await;
+            {
+                let mut state = manager.state.lock().await;
+                crate::manager::store_block(&mut state, &wallet, forged).unwrap();
+                assert_eq!(
+                    crate::manager::stored_tip(&mut state, &wallet).unwrap(),
+                    forged.height
+                );
+            }
+            let report = manager.sync_wallet(&wallet).await.unwrap();
+            assert_eq!(report.tip_height, honest, "{backend:?}");
+            drop(manager);
+            let manager =
+                crate::WalletManager::open(dir.path(), crate::store::VaultKey::Raw([7; 32]))
+                    .unwrap();
+            assert_eq!(
+                crate::manager::stored_tip(&mut *manager.state.lock().await, &wallet).unwrap(),
+                honest,
+                "{backend:?}"
+            );
+            assert_eq!(
+                manager.sync_wallet(&wallet).await.unwrap().tip_height,
+                honest
+            );
         }
     }
 

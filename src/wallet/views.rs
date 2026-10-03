@@ -7,7 +7,7 @@ use bdk_wallet::bitcoin::{Script, Txid};
 use bdk_wallet::chain::ChainPosition;
 
 use crate::error::{CoreError, CoreResult};
-use crate::live::news::{Moves, Seen};
+use crate::live::news::{Moves, Recheck, Seen};
 use crate::network::Network;
 use crate::wallet::policy::Coin;
 use crate::wallet::snapshot::{
@@ -150,11 +150,15 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
 
 /// The scripts worth watching live for a descriptor wallet, the ones
 /// most likely to move first, since a transport may only cover the
-/// head of the list: the unused receive addresses, the scripts holding
-/// coins (a spend shows there first), the receive addresses within the
-/// gap limit past the last revealed one, the change addresses the same
-/// way, and then the used, empty ones, newest first. A script past the
-/// revealed range is marked as such. Each comes with the Electrum
+/// head of the list: the scripts holding coins, where a spend shows and
+/// what a thief would move; the newest receive addresses the wallet
+/// revealed and has not seen used, up to the gap limit, the ones a
+/// payer was last handed, and the gap limit past the last revealed one;
+/// the change addresses the same way; and then the rest, newest first,
+/// older unused addresses and used, empty ones. A merchant's wallet
+/// reveals an address per invoice, and many are never paid: the oldest
+/// of them never come before its coins. A script past the revealed
+/// range is marked as such. Each comes with the Electrum
 /// status of the history the wallet holds for it, as
 /// [`electrum_statuses`] computes it, and the counters an Esplora server
 /// would keep for that history.
@@ -199,14 +203,21 @@ pub(crate) fn watch_scripts(
                 .unwrap_or_else(|| wallet.peek_address(keychain, at).script_pubkey())
         })
     };
+    let newest_unused = |keychain: KeychainKind| {
+        index
+            .unused_keychain_spks(keychain)
+            .rev()
+            .take(gap_limit as usize)
+            .map(|(_, script)| script)
+    };
     let cut = 'full: {
-        for (_, script) in index.unused_keychain_spks(KeychainKind::External) {
-            if push(script, false) {
+        for coin in wallet.list_unspent() {
+            if push(coin.txout.script_pubkey, false) {
                 break 'full true;
             }
         }
-        for coin in wallet.list_unspent() {
-            if push(coin.txout.script_pubkey, false) {
+        for script in newest_unused(KeychainKind::External) {
+            if push(script, false) {
                 break 'full true;
             }
         }
@@ -216,7 +227,7 @@ pub(crate) fn watch_scripts(
             }
         }
         if keychains.contains(&KeychainKind::Internal) {
-            for (_, script) in index.unused_keychain_spks(KeychainKind::Internal) {
+            for script in newest_unused(KeychainKind::Internal) {
                 if push(script, false) {
                     break 'full true;
                 }
@@ -437,6 +448,13 @@ pub(crate) fn held(
             .collect(),
         ..Held::default()
     };
+    held.sats = held
+        .txs
+        .values()
+        .flat_map(|tx| &tx.output)
+        .map(|out| out.value.to_sat())
+        .chain(graph.floating_txouts().map(|(_, out)| out.value.to_sat()))
+        .fold(0, u64::saturating_add);
     for wtx in wallet.transactions() {
         if let ChainPosition::Confirmed {
             anchor,
@@ -514,23 +532,102 @@ pub(crate) fn script_facts(
 /// they pay the wallet on, and those of the wallet's coins they spend.
 /// A block that confirms them moves these and no other.
 pub(crate) fn pending_scripts(wallet: &bdk_wallet::Wallet) -> Vec<bdk_wallet::bitcoin::ScriptBuf> {
-    let graph = wallet.tx_graph();
     let mut scripts = std::collections::BTreeSet::new();
     for wtx in standing(wallet).filter(|wtx| !wtx.chain_position.is_confirmed()) {
-        for output in &wtx.tx_node.tx.output {
-            if wallet.is_mine(output.script_pubkey.clone()) {
-                scripts.insert(output.script_pubkey.clone());
-            }
-        }
-        for input in &wtx.tx_node.tx.input {
-            if let Some(previous) = graph.get_txout(input.previous_output)
-                && wallet.is_mine(previous.script_pubkey.clone())
-            {
-                scripts.insert(previous.script_pubkey.clone());
-            }
+        scripts.extend(touched(wallet, &wtx.tx_node.tx));
+    }
+    scripts.into_iter().collect()
+}
+
+/// The scripts of the wallet a transaction touches: those it pays, and
+/// those of the wallet's coins it spends.
+fn touched<'w>(
+    wallet: &'w bdk_wallet::Wallet,
+    tx: &'w bdk_wallet::bitcoin::Transaction,
+) -> impl Iterator<Item = bdk_wallet::bitcoin::ScriptBuf> + 'w {
+    let graph = wallet.tx_graph();
+    let paid = tx.output.iter().map(|output| output.script_pubkey.clone());
+    let spent = tx
+        .input
+        .iter()
+        .filter_map(move |input| graph.get_txout(input.previous_output))
+        .map(|previous| previous.script_pubkey.clone());
+    paid.chain(spent)
+        .filter(move |script| wallet.is_mine(script.clone()))
+}
+
+/// What a sync of a descriptor wallet found of the payments earlier
+/// syncs saw vanish, `txids`: the ones it holds again, and the ones the
+/// sync read the scripts of again, every script when `read` is `None`,
+/// without seeing them. The wallet engine keeps a transaction that left,
+/// and with it the scripts it touched.
+pub(crate) fn recheck(
+    wallet: &bdk_wallet::Wallet,
+    txids: &[String],
+    read: Option<&std::collections::HashSet<bdk_wallet::bitcoin::ScriptBuf>>,
+) -> Recheck {
+    let looked_for: std::collections::HashSet<&str> = txids.iter().map(String::as_str).collect();
+    let held: std::collections::HashSet<String> = wallet
+        .transactions()
+        .map(|wtx| wtx.tx_node.txid.to_string())
+        .filter(|txid| looked_for.contains(txid.as_str()))
+        .collect();
+    let reread = txids
+        .iter()
+        .filter(|txid| !held.contains(*txid))
+        .filter(|txid| match read {
+            None => true,
+            Some(read) => txid
+                .parse::<Txid>()
+                .ok()
+                .and_then(|txid| wallet.tx_graph().get_tx(txid))
+                .is_some_and(|tx| touched(wallet, &tx).any(|script| read.contains(&script))),
+        })
+        .cloned()
+        .collect();
+    Recheck { held, reread }
+}
+
+/// The scripts of the wallet the transactions `txids` touch, in hex:
+/// what a sync reads to look for them again.
+pub(crate) fn scripts_touched_by(wallet: &bdk_wallet::Wallet, txids: &[String]) -> Vec<String> {
+    let mut scripts = std::collections::BTreeSet::new();
+    for txid in txids {
+        if let Some(tx) = txid
+            .parse::<Txid>()
+            .ok()
+            .and_then(|txid| wallet.tx_graph().get_tx(txid))
+        {
+            scripts.extend(touched(wallet, &tx).map(|script| script.to_hex_string()));
         }
     }
     scripts.into_iter().collect()
+}
+
+/// The same for a watched address, from the state a sync read. A sync
+/// reads its one script whole, unless the page of its unconfirmed
+/// transactions came back full: see [`address_moves`].
+pub(crate) fn address_recheck(txids: &[String], watch: &AddressWatchState) -> Recheck {
+    let now: std::collections::HashSet<&str> =
+        watch.txs.iter().map(|tx| tx.txid.as_str()).collect();
+    let (held, gone): (Vec<&String>, Vec<&String>) =
+        txids.iter().partition(|txid| now.contains(txid.as_str()));
+    Recheck {
+        held: held.into_iter().cloned().collect(),
+        reread: if mempool_page_full(watch) {
+            Default::default()
+        } else {
+            gone.into_iter().cloned().collect()
+        },
+    }
+}
+
+/// Whether a sync of an address read as many unconfirmed transactions
+/// as it reads at most: one missing from them may only have been pushed
+/// off the page.
+fn mempool_page_full(watch: &AddressWatchState) -> bool {
+    watch.txs.iter().filter(|tx| tx.height.is_none()).count()
+        >= crate::chain::electrum::address::MEMPOOL_PER_ROUND
 }
 
 /// Whether the wallet holds a transaction still waiting for a block, one
@@ -637,8 +734,7 @@ pub(crate) fn address_moves(
     // came back full, one missing from it may only have been pushed
     // off the page, by anyone who sends the address enough dust: that
     // is no sign it left the mempool, and nothing is said gone.
-    let page_full = watch.txs.iter().filter(|tx| tx.height.is_none()).count()
-        >= crate::chain::electrum::address::MEMPOOL_PER_ROUND;
+    let page_full = mempool_page_full(watch);
     Moves {
         new: watch
             .txs
@@ -1232,20 +1328,24 @@ mod tests {
         assert_eq!(unlisted, 1_001 + 20 + 20 - 200);
         let (whole, unlisted) = watch_scripts(&wallet, 20, &HistoryOrders::new(), 5_000);
         assert_eq!((whole.len(), unlisted), (1_041, 0));
-        assert_eq!(
-            scripts[0].script,
+        // The newest first, the oldest left out.
+        let derived = |index| {
             wallet
-                .peek_address(KeychainKind::External, 0)
+                .peek_address(KeychainKind::External, index)
                 .script_pubkey()
                 .to_hex_string()
-        );
-        assert!(scripts.iter().all(|script| !script.lookahead));
+        };
+        assert_eq!(scripts[0].script, derived(1_000));
+        assert!(!scripts.iter().any(|script| script.script == derived(0)));
+        // A gap limit past the last revealed address of each keychain.
+        let ahead = scripts.iter().filter(|script| script.lookahead).count();
+        assert_eq!(ahead, 40);
     }
 
     /// The scripts read from the index are the ones a derivation gives,
-    /// in the same order: the unused receive addresses, the coins, a gap
-    /// limit past the last revealed address on each keychain, further
-    /// than the index looks ahead, then the used ones, newest first.
+    /// in the same order: the coins, the unused addresses newest first, a
+    /// gap limit past the last revealed address on each keychain, further
+    /// than the index looks ahead, then the rest, newest first.
     #[test]
     fn the_listed_scripts_are_the_derived_ones() {
         let mut wallet = bdk_wallet::Wallet::create(EXTERNAL, INTERNAL)
@@ -1277,15 +1377,14 @@ mod tests {
         let gap = 40;
         let (scripts, unlisted) = watch_scripts(&wallet, gap, &HistoryOrders::new(), usize::MAX);
         assert_eq!(unlisted, 0);
-        let mut expected: Vec<(String, bool)> = Vec::new();
-        for index in [0, 1, 2, 4, 5, 6, 7, 8, 9] {
+        let mut expected: Vec<(String, bool)> = vec![(paid.clone(), false)];
+        for index in [9, 8, 7, 6, 5, 4, 2, 1, 0] {
             expected.push((derived(&wallet, KeychainKind::External, index), false));
         }
-        expected.push((paid.clone(), false));
         for index in 10..10 + gap {
             expected.push((derived(&wallet, KeychainKind::External, index), true));
         }
-        for index in [0, 1] {
+        for index in [1, 0] {
             expected.push((derived(&wallet, KeychainKind::Internal, index), false));
         }
         for index in 2..2 + gap {

@@ -6,7 +6,7 @@
 //! blocks reads: requests are built under the lock, executed outside it,
 //! and applied back under the lock.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -284,6 +284,7 @@ fn plan_for(engine: &bdk_wallet::Wallet, reach: &Reach, gap_limit: u32) -> (chai
         views::held(engine, &all)
     };
     let plan = chain::Plan {
+        network: Network::from_bitcoin(engine.network()),
         tip: engine.latest_checkpoint(),
         start_time: now_secs(),
         scripts,
@@ -1088,14 +1089,16 @@ impl WalletManager {
                 (plan, views::known(engine), reach)
             };
 
-            let response = chain::sync_engine(endpoint, plan, proxy)
-                .await
-                .and_then(|synced| chain::check_amounts(&synced.update).map(|()| synced));
+            let response = chain::sync_engine(endpoint, plan, proxy).await;
             match response {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(synced) => {
                     let mut state = self.state.lock().await;
                     state.orders.extend(synced.orders);
+                    let vanishing = crate::live::news::vanishing(&state.payload, &meta.id);
+                    if let Some(height) = synced.drop_above {
+                        drop_blocks_above(&mut state, &meta.id, height)?;
+                    }
                     let engine = ensure_engine(&mut state, &meta.id)?;
                     engine
                         .apply_update(synced.update)
@@ -1108,19 +1111,26 @@ impl WalletManager {
                     let tip_height = views::tip_height(engine);
                     let tx_count_after = engine.transactions().count() as u32;
                     let moves = views::moves(engine, &known);
+                    let read = match &reach {
+                        Reach::Scripts(scripts) => Some(scripts.iter().cloned().collect()),
+                        _ => None,
+                    };
+                    let recheck = views::recheck(engine, &vanishing, read.as_ref());
                     let (new_txs, confirmed_txs) = moves.lines();
                     let staged = engine.take_staged();
 
                     if let Some(staged) = staged {
                         merge_changeset(&mut state, &meta.id, staged)?;
                     }
+                    let now = now_secs();
                     crate::live::news::record(
                         &mut state.payload,
                         &meta.id,
                         meta.last_sync.is_none(),
                         &moves,
-                        now_secs(),
+                        now,
                     );
+                    crate::live::news::settle(&mut state.payload, &meta.id, &recheck, now);
                     let report = SyncReport {
                         wallet_id: meta.id.clone(),
                         new_tx_count: new_txs.len() as u32,
@@ -1162,8 +1172,18 @@ impl WalletManager {
         started: Instant,
     ) -> CoreResult<(SyncReport, Endpoint)> {
         let mut attempts: Vec<String> = Vec::new();
+        // What the wallet holds: what the server lists as it was is not
+        // read again.
+        let held: Vec<AddressTx> = {
+            let state = self.state.lock().await;
+            find_record(&state.payload, &meta.id)?
+                .address_state
+                .as_ref()
+                .map(|watch| watch.txs.clone())
+                .unwrap_or_default()
+        };
         for endpoint in endpoints {
-            match chain::fetch_address_state(endpoint, address, meta.network, proxy).await {
+            match chain::fetch_address_state(endpoint, address, meta.network, proxy, &held).await {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(mut watch) => {
                     let mut state = self.state.lock().await;
@@ -1173,6 +1193,10 @@ impl WalletManager {
                         find_record(&state.payload, &meta.id)?
                             .address_state
                             .as_ref(),
+                        &watch,
+                    );
+                    let recheck = views::address_recheck(
+                        &crate::live::news::vanishing(&state.payload, &meta.id),
                         &watch,
                     );
                     let (new_txs, confirmed_txs) = moves.lines();
@@ -1186,13 +1210,15 @@ impl WalletManager {
                         keep_older_history(&mut watch, previous);
                     }
                     let tx_count_after = watch.txs.len() as u32;
+                    let now = now_secs();
                     crate::live::news::record(
                         &mut state.payload,
                         &meta.id,
                         meta.last_sync.is_none(),
                         &moves,
-                        now_secs(),
+                        now,
                     );
+                    crate::live::news::settle(&mut state.payload, &meta.id, &recheck, now);
                     let report = SyncReport {
                         wallet_id: meta.id.clone(),
                         new_tx_count: new_txs.len() as u32,
@@ -1519,21 +1545,19 @@ impl WalletManager {
     ) -> CoreResult<BroadcastStatus> {
         let decoded = broadcast::decode_transaction(hex)?;
         let txid = decoded.tx.compute_txid();
-        let script = decoded
-            .tx
-            .output
-            .first()
-            .map(|o| o.script_pubkey.clone())
-            .ok_or_else(|| CoreError::InvalidInput {
+        let scripts = chain::lookup_scripts(&decoded.tx);
+        if scripts.is_empty() {
+            return Err(CoreError::InvalidInput {
                 kind: "transaction",
                 detail: "the transaction creates nothing".to_owned(),
-            })?;
+            });
+        }
         let (config, certs) = self.state.lock().await.chain_setup(network);
         let endpoints = chain::endpoints(&config, network, &certs)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
         let mut attempts: Vec<String> = Vec::new();
         for endpoint in &endpoints {
-            match chain::tx_standing(endpoint, txid, script.clone(), proxy.as_deref()).await {
+            match chain::tx_standing(endpoint, txid, scripts.clone(), proxy.as_deref()).await {
                 Ok(standing) => {
                     let confirmations = standing
                         .block_height
@@ -2560,6 +2584,27 @@ pub(crate) fn watched_wallet(
     })
 }
 
+/// The scripts a sync reads to look again for the payments of a wallet
+/// earlier syncs saw vanish, those whose second look is due at `now`:
+/// `None` when none is, empty for a watched address, whose sync reads
+/// its one script whatever it is asked.
+pub(crate) fn vanished_scripts(
+    state: &mut ManagerState,
+    id: &str,
+    now: u64,
+) -> Option<Vec<String>> {
+    let due = crate::live::news::vanishing_due(&state.payload, id, now);
+    if due.is_empty() {
+        return None;
+    }
+    let record = find_record(&state.payload, id).ok()?;
+    if matches!(record.meta.kind, WalletKind::SingleAddress { .. }) {
+        return Some(Vec::new());
+    }
+    let engine = ensure_engine(state, id).ok()?;
+    Some(views::scripts_touched_by(engine, &due)).filter(|scripts| !scripts.is_empty())
+}
+
 fn find_record<'a>(payload: &'a VaultPayload, id: &str) -> CoreResult<&'a WalletRecord> {
     payload
         .wallets
@@ -2740,6 +2785,66 @@ fn merge_changeset(
         None => staged,
     });
     Ok(())
+}
+
+/// Takes every block above `height` out of a wallet's chain: blocks a
+/// lying server put there, which no update can take out, since none
+/// will ever hold a block at their height (see
+/// [`chain::Synced::drop_above`]). The engine is loaded again from its
+/// stored change set, what it staged merged in first, with those
+/// heights removed.
+fn drop_blocks_above(state: &mut ManagerState, id: &str, height: u32) -> CoreResult<()> {
+    let engine = ensure_engine(state, id)?;
+    let above: BTreeMap<u32, Option<bdk_wallet::bitcoin::BlockHash>> = engine
+        .checkpoints()
+        .map(|checkpoint| checkpoint.height())
+        .take_while(|at| *at > height)
+        .map(|at| (at, None))
+        .collect();
+    if above.is_empty() {
+        return Ok(());
+    }
+    if let Some(staged) = engine.take_staged() {
+        merge_changeset(state, id, staged)?;
+    }
+    let mut dropped = bdk_wallet::ChangeSet::default();
+    dropped.local_chain.blocks = above;
+    merge_changeset(state, id, dropped)?;
+    state.engines.remove(id);
+    ensure_engine(state, id).map(|_| ())
+}
+
+/// Puts a block in a wallet's stored chain, the way a sync that took it
+/// from a lying server stored it before such blocks were refused.
+#[cfg(test)]
+pub(crate) fn store_block(
+    state: &mut ManagerState,
+    id: &str,
+    block: bdk_wallet::chain::BlockId,
+) -> CoreResult<()> {
+    let engine = ensure_engine(state, id)?;
+    let tip = engine
+        .latest_checkpoint()
+        .push(block)
+        .map_err(|_| CoreError::Internal("a block below the tip".to_owned()))?;
+    engine
+        .apply_update(bdk_wallet::Update {
+            chain: Some(tip),
+            ..Default::default()
+        })
+        .map_err(|e| CoreError::Internal(e.to_string()))?;
+    if let Some(staged) = engine.take_staged() {
+        merge_changeset(state, id, staged)?;
+    }
+    state.engines.remove(id);
+    Ok(())
+}
+
+/// The height of a wallet's tip, as its stored change set gives it.
+#[cfg(test)]
+pub(crate) fn stored_tip(state: &mut ManagerState, id: &str) -> CoreResult<u32> {
+    state.engines.remove(id);
+    Ok(ensure_engine(state, id)?.latest_checkpoint().height())
 }
 
 /// Updates cached totals and the sync stamp, then persists the vault.

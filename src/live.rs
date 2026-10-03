@@ -53,9 +53,11 @@
 //! connection is doing: the watcher is dropped where it waits, the
 //! syncs it started are abandoned with their connections, and the
 //! receiver of the events ends right after what it already holds.
-//! Nothing of the core runs on the blocking pool of the runtime (a name
-//! lookup aside, which the system resolver bounds), so a host can then
-//! exit the process, or drop its runtime with
+//! Nothing of the core waits on a server from the blocking pool of the
+//! runtime: what runs there is a name lookup, which the system resolver
+//! bounds, and the parsing of an Esplora answer as it arrives, which
+//! ends the moment the answer stops coming. So a host can then exit the
+//! process, or drop its runtime with
 //! [`tokio::runtime::Runtime::shutdown_timeout`], without waiting on a
 //! server. A sync the host started itself is abandoned the same way
 //! when its future is dropped.
@@ -219,6 +221,15 @@ impl Asked {
         }
     }
 
+    /// Whether this is the server's word that scripts moved: a change it
+    /// pushed, or the scripts whose status differs at a start or after a
+    /// reconnection. A block is not, nor a catch-up that cannot say what
+    /// moved, nor what the watch reads of its own accord.
+    fn claimed(&self) -> bool {
+        self.reason == ChangeReason::Activity
+            || (self.scripts.is_some() && self.reason != ChangeReason::NewBlock)
+    }
+
     /// How much of the wallet the sync reads: the scripts that moved; the
     /// ones waiting for a block, for a block; every script, counters
     /// first, when the transport cannot say which moved. A script past
@@ -252,16 +263,19 @@ type Synced = Result<SyncReport, String>;
 /// app pay that for as long as the watch runs. So past [`FREE_FUTILE`]
 /// such changes in a row, the sync the next one asks for waits, twice
 /// as long each time, up to a cap. A sync that finds something,
-/// whatever asked for it, ends the wait. A block, a reconnection and
-/// the catch-up of a start never wait: only what the server claims
-/// about a script does.
+/// whatever asked for it, ends the wait. A block, and the catch-up of a
+/// start or a reconnection that cannot say what moved, never wait: only
+/// what the server claims about a script does ([`Asked::claimed`]). A
+/// status that differs after a reconnection is such a claim: a server
+/// that drops the connection every minute and answers with statuses it
+/// made up would otherwise have them synced as often.
 #[derive(Debug, Default)]
 struct Futile(HashMap<String, u32>);
 
 impl Futile {
     /// How long the sync `asked` for this wallet waits before it runs.
     fn hold(&self, wallet_id: &str, asked: &Asked, timings: &Timings) -> Duration {
-        if asked.reason != ChangeReason::Activity {
+        if !asked.claimed() {
             return Duration::ZERO;
         }
         let futile = self.0.get(wallet_id).copied().unwrap_or(0);
@@ -279,7 +293,7 @@ impl Futile {
     fn settle(&mut self, wallet_id: &str, asked: &Asked, found: bool) {
         if found {
             self.0.remove(wallet_id);
-        } else if asked.reason == ChangeReason::Activity {
+        } else if asked.claimed() {
             let futile = self.0.entry(wallet_id.to_owned()).or_default();
             *futile = futile.saturating_add(1);
         }
@@ -625,6 +639,8 @@ impl WalletManager {
         // When the watch last ran the complete sync of a wallet it found
         // due: one that failed is not tried again at every look.
         let mut tried: HashMap<String, tokio::time::Instant> = HashMap::new();
+        // The same for the look at a payment a sync saw vanish.
+        let mut rechecked: HashMap<String, tokio::time::Instant> = HashMap::new();
         // How often the watch looks for both, besides at each block.
         let mut looks = tokio::time::interval_at(tokio::time::Instant::now() + pace.due, pace.due);
         looks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -661,7 +677,7 @@ impl WalletManager {
                             continue;
                         }
                         WatchEvent::NewBlock { height } => {
-                            self.look(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, &mut owed, &mut tried).await;
+                            self.look(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, &mut owed, &mut tried, &mut rechecked).await;
                             LiveEvent::NewBlock { height }
                         }
                         WatchEvent::Status(status) => LiveEvent::Status(status),
@@ -680,6 +696,7 @@ impl WalletManager {
                     again.clear();
                     owed.clear();
                     tried.clear();
+                    rechecked.clear();
                 }
                 Some(report) = offered.recv() => {
                     // A sync of the watch's own under way claims it.
@@ -700,7 +717,7 @@ impl WalletManager {
                     }
                 }
                 _ = looks.tick() => {
-                    self.look(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, &mut owed, &mut tried).await;
+                    self.look(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, &mut owed, &mut tried, &mut rechecked).await;
                 }
                 Some(done) = syncs.join_next_with_id() => {
                     let (task, outcome) = match done {
@@ -847,7 +864,9 @@ impl WalletManager {
     /// day. The syncs the watch asks for read only what moved, and a
     /// phone can keep a watch for days with no other sync: this is what
     /// reads, once a day, whatever the watch cannot hear, such as a
-    /// script past what it follows of a wallet.
+    /// script past what it follows of a wallet. And the scripts of a
+    /// payment a sync saw vanish, ten minutes on, for a second sync to
+    /// say whether it dropped: nothing moves on them after it left.
     #[allow(clippy::too_many_arguments)]
     async fn look(
         &self,
@@ -859,12 +878,14 @@ impl WalletManager {
         pace: &Timings,
         owed: &mut HashMap<String, Asked>,
         tried: &mut HashMap<String, tokio::time::Instant>,
+        rechecked: &mut HashMap<String, tokio::time::Instant>,
     ) {
         if self.watch_serving().is_none() {
             return;
         }
         let now = tokio::time::Instant::now();
         tried.retain(|_, at| now.duration_since(*at) < DUE_RETRY);
+        rechecked.retain(|_, at| now.duration_since(*at) < DUE_RETRY);
         let mut asks: Vec<(String, Asked)> = owed.drain().collect();
         for wallet_id in self.due_complete().await {
             if tried.contains_key(&wallet_id) {
@@ -872,6 +893,14 @@ impl WalletManager {
             }
             tried.insert(wallet_id.clone(), now);
             asks.push((wallet_id, Asked::of(ChangeReason::Started, Vec::new())));
+        }
+        for (wallet_id, scripts) in self.due_rechecks().await {
+            if rechecked.contains_key(&wallet_id) {
+                continue;
+            }
+            rechecked.insert(wallet_id.clone(), now);
+            // Read as for a block: what is named, and no wait.
+            asks.push((wallet_id, Asked::of(ChangeReason::NewBlock, scripts)));
         }
         for (wallet_id, asked) in asks {
             self.ask(
@@ -893,6 +922,26 @@ impl WalletManager {
             .filter(|record| record.meta.network == network)
             .filter(|record| !crate::manager::complete_lately(&record.meta, now))
             .map(|record| record.meta.id.clone())
+            .collect()
+    }
+
+    /// The wallets of the watched network with a payment a sync saw
+    /// vanish whose second look is due, and the scripts to read for it.
+    async fn due_rechecks(&self) -> Vec<(String, Vec<String>)> {
+        let now = crate::manager::now_secs();
+        let mut state = self.state.lock().await;
+        let network = state.payload.settings.active_network;
+        let ids: Vec<String> = state
+            .payload
+            .wallets
+            .iter()
+            .filter(|record| record.meta.network == network)
+            .map(|record| record.meta.id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| {
+                crate::manager::vanished_scripts(&mut state, &id, now).map(|scripts| (id, scripts))
+            })
             .collect()
     }
 
