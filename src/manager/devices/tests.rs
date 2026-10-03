@@ -5,7 +5,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::error::{CoreError, PremiumError};
 use crate::manager::WalletManager;
-use crate::manager::tests::{TOKEN, connected, store_premium, stored_premium};
+use crate::manager::tests::support::{TOKEN, connected, store_premium, stored_premium};
 use crate::premium::licence::{self, fixtures};
 use crate::premium::{DeviceAccess, DevicePlatform, PremiumState, Secret};
 use crate::store::VaultKey;
