@@ -12,7 +12,7 @@
 //! moving the clock forward buys a shorter wait, never a free guess.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 use crate::error::{CoreError, CoreResult};
+use crate::now_secs;
 use crate::store::cipher;
 
 /// What kind of secret unlocks the app. Kept next to the hash so the
@@ -128,7 +129,7 @@ impl LockAttempts {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<StoredAttempts>(&bytes).ok())
             .unwrap_or_default();
-        let mut attempts = Self::restore(stored, unix_now(), Instant::now());
+        let mut attempts = Self::restore(stored, now_secs(), Instant::now());
         attempts.path = Some(path);
         attempts
     }
@@ -216,7 +217,7 @@ impl LockAttempts {
         let Some(path) = &self.path else {
             return;
         };
-        let stored = self.stored(unix_now(), Instant::now());
+        let stored = self.stored(now_secs(), Instant::now());
         let _ = write_whole(path, &stored);
     }
 
@@ -226,13 +227,6 @@ impl LockAttempts {
             let _ = std::fs::remove_file(path);
         }
     }
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn write_whole(path: &Path, stored: &StoredAttempts) -> std::io::Result<()> {

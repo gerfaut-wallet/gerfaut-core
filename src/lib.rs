@@ -31,3 +31,11 @@ pub mod watch;
 pub use error::{CoreError, CoreResult};
 pub use manager::WalletManager;
 pub use network::Network;
+
+/// Seconds since the Unix epoch; zero on a clock set before it.
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}

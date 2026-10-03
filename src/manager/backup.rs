@@ -10,10 +10,11 @@ use crate::backup::{
 use crate::chain;
 use crate::error::{CoreError, CoreResult};
 use crate::input::RecognizedKind;
+use crate::now_secs;
 use crate::store::WalletRecord;
 use crate::wallet::meta::WalletKind;
 
-use super::{WalletManager, build_record, find_record, find_watched, fresh_meta, now_secs};
+use super::{WalletManager, build_record, find_record, find_watched, fresh_meta};
 
 impl WalletManager {
     /// Seals the chosen wallets (every wallet by default) and, on

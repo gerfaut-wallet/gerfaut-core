@@ -5,6 +5,7 @@ use crate::error::{CoreError, CoreResult};
 use crate::export::{ExportOptions, ExportResult};
 use crate::input::{ParsedInput, ParsedPayload};
 use crate::network::Network;
+use crate::now_secs;
 use crate::store::WalletRecord;
 use crate::wallet::meta::{WalletIcon, WalletKind, WalletMeta};
 use crate::wallet::policy::{self, PolicySnapshot};
@@ -13,7 +14,7 @@ use crate::wallet::views;
 
 use super::{
     WalletManager, build_record, ensure_engine, find_record, find_record_mut, find_watched,
-    fresh_meta, merge_changeset, now_secs,
+    fresh_meta, merge_changeset,
 };
 
 impl WalletManager {

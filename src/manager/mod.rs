@@ -42,6 +42,7 @@ use crate::error::{CoreError, CoreResult};
 use crate::input::RecognizedKind;
 use crate::lock::LockAttempts;
 use crate::network::Network;
+use crate::now_secs;
 use crate::store::{Vault, VaultKey, VaultPayload, WalletRecord};
 use crate::wallet::meta::{CachedTotals, WalletIcon, WalletKind, WalletMeta};
 use crate::wallet::snapshot::SyncReport;
@@ -164,13 +165,6 @@ impl std::ops::Deref for WalletManager {
     fn deref(&self) -> &Shared {
         &self.shared
     }
-}
-
-pub(crate) fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 impl WalletManager {

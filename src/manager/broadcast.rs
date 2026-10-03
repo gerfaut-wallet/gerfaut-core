@@ -11,11 +11,12 @@ use crate::broadcast::{
 use crate::chain;
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
+use crate::now_secs;
 use crate::wallet::meta::WalletKind;
 use crate::wallet::views;
 
 use super::sync::sync_failure;
-use super::{WalletManager, ensure_engine, find_record, now_secs};
+use super::{WalletManager, ensure_engine, find_record};
 
 impl WalletManager {
     /// Decodes a transaction and shows what it does, before anything

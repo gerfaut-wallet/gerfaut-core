@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::chain::{self, Endpoint};
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
+use crate::now_secs;
 use crate::wallet::meta::{CachedTotals, SyncStamp, WalletKind, WalletMeta};
 use crate::wallet::snapshot::SyncReport;
 use crate::wallet::views;
@@ -17,7 +18,7 @@ use crate::wallet::{AddressTx, AddressWatchState};
 
 use super::{
     ManagerState, SyncSlot, WalletManager, drop_blocks_above, ensure_engine, find_record,
-    find_record_mut, merge_changeset, now_secs,
+    find_record_mut, merge_changeset,
 };
 
 /// Outcome of syncing every wallet of a workspace.

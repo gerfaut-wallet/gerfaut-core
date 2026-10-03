@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, CoreResult};
+use crate::now_secs;
 
 /// Where the quote comes from. All endpoints are public and keyless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,13 +253,6 @@ fn price_error(detail: String) -> CoreError {
         backend: "price".to_owned(),
         detail,
     }
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Fetches the current BTC price from one source. The source must quote

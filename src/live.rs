@@ -672,7 +672,7 @@ impl WalletManager {
 
     /// Takes up to `max` pieces of the news waiting for a wallet.
     async fn claim_news(&self, wallet_id: &str, max: usize) -> CoreResult<Vec<LiveTx>> {
-        let now = crate::manager::now_secs();
+        let now = crate::now_secs();
         let mut state = self.state.lock().await;
         if max == 0 || news::waiting(&state.payload, wallet_id, now) == 0 {
             return Ok(Vec::new());
@@ -683,7 +683,7 @@ impl WalletManager {
     /// The wallets of the watched network with news nobody claimed, each
     /// with a report of its last sync, as the vault keeps it.
     async fn unclaimed_reports(&self) -> Vec<SyncReport> {
-        let now = crate::manager::now_secs();
+        let now = crate::now_secs();
         let state = self.state.lock().await;
         let network = state.payload.settings.active_network;
         state
@@ -716,7 +716,7 @@ impl WalletManager {
 
     /// How much news waits for a wallet.
     async fn news_waiting(&self, wallet_id: &str) -> usize {
-        let now = crate::manager::now_secs();
+        let now = crate::now_secs();
         news::waiting(&self.state.lock().await.payload, wallet_id, now)
     }
 
@@ -1018,7 +1018,7 @@ impl WalletManager {
     /// The wallets of the watched network whose last complete sync is a
     /// day old, or that never had one.
     async fn due_complete(&self) -> Vec<String> {
-        let now = crate::manager::now_secs();
+        let now = crate::now_secs();
         let state = self.state.lock().await;
         let network = state.payload.settings.active_network;
         state
@@ -1034,7 +1034,7 @@ impl WalletManager {
     /// The wallets of the watched network with a payment a sync saw
     /// vanish whose second look is due, and the scripts to read for it.
     async fn due_rechecks(&self) -> Vec<(String, Vec<String>)> {
-        let now = crate::manager::now_secs();
+        let now = crate::now_secs();
         let mut state = self.state.lock().await;
         let network = state.payload.settings.active_network;
         let ids: Vec<String> = state

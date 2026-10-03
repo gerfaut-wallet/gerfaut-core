@@ -645,7 +645,7 @@ async fn cold_wallet(dir: &std::path::Path, server: &FakeElectrum) -> (WalletMan
 
 /// Makes the last complete sync of a wallet a day and an hour old.
 async fn age(manager: &WalletManager, wallet: &str) -> u64 {
-    let old = crate::manager::now_secs() - 25 * 60 * 60;
+    let old = crate::now_secs() - 25 * 60 * 60;
     let mut state = manager.state.lock().await;
     let record = state
         .payload
