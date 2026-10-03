@@ -303,6 +303,26 @@ pub struct DecodedInput {
 /// transaction, or a QR envelope around one of those. Binary files are
 /// passed as hex by the apps.
 pub fn decode_transaction(input: &str) -> CoreResult<DecodedTx> {
+    let mut text = squeezed(input)?;
+    if crate::input::qr::is_envelope(&text) {
+        let progress = crate::input::qr::assemble(std::slice::from_ref(&text))?;
+        let Some(inner) = progress.text else {
+            return Err(tx_error(format!(
+                "this is part 1 of a {}-part QR code: scan it with the camera",
+                progress.total
+            )));
+        };
+        // Read the way the text around it was, whitespace taken out, so
+        // that an envelope split by a space is seen for one.
+        text = crate::input::qr::opened_once(squeezed(&inner)?)?;
+    }
+    let bytes = decode_bytes(&text)?;
+    decode_bytes_as_transaction(&bytes)
+}
+
+/// The text with all its whitespace taken out, as a transaction is
+/// written with none: refused when nothing is left, or too much.
+fn squeezed(input: &str) -> CoreResult<String> {
     let text: String = input.split_whitespace().collect();
     if text.is_empty() {
         return Err(tx_error("empty input"));
@@ -310,18 +330,7 @@ pub fn decode_transaction(input: &str) -> CoreResult<DecodedTx> {
     if text.len() > MAX_INPUT_LEN {
         return Err(tx_error("input too large"));
     }
-    if crate::input::qr::is_envelope(&text) {
-        let progress = crate::input::qr::assemble(std::slice::from_ref(&text))?;
-        return match progress.text {
-            Some(inner) => decode_transaction(&crate::input::qr::opened_once(inner)?),
-            None => Err(tx_error(format!(
-                "this is part 1 of a {}-part QR code: scan it with the camera",
-                progress.total
-            ))),
-        };
-    }
-    let bytes = decode_bytes(&text)?;
-    decode_bytes_as_transaction(&bytes)
+    Ok(text)
 }
 
 /// Decodes raw bytes: a PSBT file or a serialized transaction.
@@ -1247,8 +1256,14 @@ mod tests {
         };
         let once = wrap(&encode::serialize_hex(&signed_tx()));
         assert!(decode_transaction(&once).unwrap().ready);
-        let error = decode_transaction(&wrap(&once)).unwrap_err().to_string();
-        assert!(error.contains("holds another QR code"), "{error}");
+        // Read as the page reads any text, whitespace taken out: an
+        // envelope split by a space or a line break is one all the same.
+        let split = format!("u r:{}", &once[3..]);
+        let spaced = format!("{}\n{}", &once[..10], &once[10..]);
+        for inner in [once.as_str(), split.as_str(), spaced.as_str()] {
+            let error = decode_transaction(&wrap(inner)).unwrap_err().to_string();
+            assert!(error.contains("holds another QR code"), "{inner}: {error}");
+        }
     }
 
     #[test]
