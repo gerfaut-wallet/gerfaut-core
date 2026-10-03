@@ -495,6 +495,52 @@ async fn a_server_that_cuts_the_watch_for_its_cost_is_asked_less() {
     );
 }
 
+/// Over Electrum a confirmation comes as the new status of the scripts
+/// of the transaction. A wallet waiting for one, whose list the watch
+/// does not hear whole, past the caps or what the server takes, may
+/// wait on a script nothing pushes: a block syncs it. One heard whole
+/// waits for the push.
+#[tokio::test]
+async fn a_block_syncs_a_waiting_wallet_the_watch_does_not_hear_whole() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().subscription_limit =
+        Some((2, "subscription limit reached (2 max per client)"));
+    // The list is 1, 5, 2, 3, 4: the server takes 1 and 5.
+    let (_watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![
+            wallet("a", &[1, 2, 3, 4], &[], true),
+            wallet("b", &[5], &[], true),
+        ],
+        Some(timings()),
+    );
+    let mut refused = BTreeSet::new();
+    while refused.len() < 3 {
+        match next_event(&mut events).await {
+            WatchEvent::WalletChanged {
+                wallet_id, scripts, ..
+            } if wallet_id == "a" => refused.extend(scripts),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    server.push(
+        json!({
+            "jsonrpc": "2.0", "method": "blockchain.headers.subscribe",
+            "params": [{ "height": 101, "hex": "00" }],
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock { height: 101 }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        changed("a", ChangeReason::NewBlock, false)
+    );
+    no_event(&mut events, Duration::from_millis(300)).await;
+}
+
 /// A server that says it takes no more subscriptions is at its limit,
 /// and the scripts still waiting their turn are not asked for. Nothing
 /// watches them from then on, and nothing says what they did while

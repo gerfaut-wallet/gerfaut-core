@@ -246,6 +246,11 @@ The first release: the library both Gerfaut apps are built on.
   for a while, and the watch used to come back within two minutes with
   the same burst. Subscriptions go out ten at a time instead of 25, as
   many as ElectrumX serves at once before it slows a session down.
+- Over Electrum, a block now syncs a wallet waiting for a confirmation
+  when the live watch does not hear all of its scripts, past the caps on
+  the list or refused by the server. The confirmation comes as news on
+  the scripts of the transaction, and on a script nobody pushes it used
+  to wait for the next regular sync.
 - A watched address is never read from a server of another network.
   Testnet, testnet4 and signet spell an address alike, and a server of
   the wrong one answered for it with transactions the wallet's network

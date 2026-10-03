@@ -1037,12 +1037,15 @@ impl Hub {
 
     /// A tip was read. The first one is a baseline; a higher one after
     /// that is a block, and `sync_pending` says whether wallets waiting
-    /// for a confirmation are worth a sync on this transport. A lower
-    /// one is a server that lags, or one of several behind an address.
-    /// One far lower says the height kept was never real, a server's
-    /// invention or a slip: it becomes the baseline again, silently, so
-    /// that one height of four billion does not hide every block after
-    /// it.
+    /// for a confirmation are worth a sync on this transport. One that
+    /// pushes every change it hears says no, and a block then syncs only
+    /// the wallets waiting whose list the watch does not hear whole: the
+    /// scripts of their transaction may be among those it does not. A
+    /// lower one is a server that lags, or one of several behind an
+    /// address. One far lower says the height kept was never real, a
+    /// server's invention or a slip: it becomes the baseline again,
+    /// silently, so that one height of four billion does not hide every
+    /// block after it.
     pub fn new_tip(&mut self, height: u32, sync_pending: bool) {
         let Some(previous) = self.tip else {
             self.tip = Some(height);
@@ -1057,13 +1060,19 @@ impl Hub {
         }
         self.tip = Some(height);
         let _ = self.events.try_send(WatchEvent::NewBlock { height });
-        if sync_pending {
-            let now = Instant::now();
-            for (id, has_pending) in &self.watched.wallets {
-                if *has_pending {
-                    self.debounce
-                        .mark(id, ChangeReason::NewBlock, false, None, now);
-                }
+        let unheard: HashSet<String> = if sync_pending {
+            HashSet::new()
+        } else {
+            self.watched
+                .capped(self.heard_refusals())
+                .into_iter()
+                .collect()
+        };
+        let now = Instant::now();
+        for (id, has_pending) in &self.watched.wallets {
+            if *has_pending && (sync_pending || unheard.contains(id)) {
+                self.debounce
+                    .mark(id, ChangeReason::NewBlock, false, None, now);
             }
         }
     }
