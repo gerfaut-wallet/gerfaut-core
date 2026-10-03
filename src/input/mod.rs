@@ -116,8 +116,9 @@ pub struct ParsedInput {
     pub warnings: Vec<InputWarning>,
     /// Script types the user may pick instead of the one in `payload`.
     /// Non-empty only when the input does not fix the script type by
-    /// itself (a lone extended key). Re-run [`parse_input_with_options`]
-    /// with the choice to rebuild the descriptors.
+    /// itself: a lone extended key with a plain prefix, whose origin, if
+    /// any, only suggests one. Re-run [`parse_input_with_options`] with
+    /// the choice to rebuild the descriptors.
     #[serde(default)]
     pub script_options: Vec<ScriptKind>,
     /// Branches and origin behind `payload` for a lone extended key,
@@ -743,15 +744,21 @@ fn split_key_origin(token: &str) -> Option<(&str, &str)> {
 /// (`[fp/84'/0'/0']`): BIP44, BIP49, BIP84, BIP86. `None` when the path
 /// starts elsewhere.
 fn script_from_origin(origin: &str) -> Option<ScriptKind> {
-    let path = origin.trim_start_matches('[').trim_end_matches(']');
-    let purpose = path.split('/').nth(1)?;
-    match purpose.trim_end_matches(['\'', 'h', 'H']) {
-        "44" => Some(ScriptKind::Legacy),
-        "49" => Some(ScriptKind::NestedSegwit),
-        "84" => Some(ScriptKind::Segwit),
-        "86" => Some(ScriptKind::Taproot),
+    match origin_purpose(origin)? {
+        44 => Some(ScriptKind::Legacy),
+        49 => Some(ScriptKind::NestedSegwit),
+        84 => Some(ScriptKind::Segwit),
+        86 => Some(ScriptKind::Taproot),
         _ => None,
     }
+}
+
+/// The purpose level of a key origin path, the first step after the
+/// fingerprint, hardened or not.
+fn origin_purpose(origin: &str) -> Option<u32> {
+    let path = origin.trim_start_matches('[').trim_end_matches(']');
+    let purpose = path.split('/').nth(1)?;
+    purpose.trim_end_matches(['\'', 'h', 'H']).parse().ok()
 }
 
 /// First hardened index; a public key stops deriving right below it.
@@ -911,12 +918,15 @@ fn effective_derivation(
 
 /// A lone extended key, with or without a key origin.
 ///
-/// The script type comes, in order, from the user's explicit choice,
-/// the SLIP-132 prefix (`ypub`, `zpub`, …), the purpose of the origin
-/// path, and finally the BIP84 default with a warning. The branches
-/// come from the user's choice or the BIP32 convention. In every case
-/// the user may still switch: `script_options` lists the alternatives
-/// and `derivation_editable` opens the paths.
+/// The script type comes, in order, from the SLIP-132 prefix (`ypub`,
+/// `zpub`, …), which no choice overrides, the user's explicit choice,
+/// the purpose of the origin path, and finally the BIP84 default with a
+/// warning. The branches come from the user's choice or the BIP32
+/// convention. The user may still switch the script when the prefix
+/// leaves it open, from `script_options`, and the paths always, from
+/// `derivation_editable`. An origin under purpose 45 or 48 is a
+/// multisig cosigner's, refused like a cosigner prefix: watched alone,
+/// such a key holds nothing.
 fn parse_extended_key(
     token: &str,
     origin: Option<&str>,
@@ -940,22 +950,39 @@ fn parse_extended_key(
         });
     }
     let derivation = effective_derivation(origin, options.derivation.as_ref())?;
+    if derivation
+        .origin
+        .as_deref()
+        .and_then(origin_purpose)
+        .is_some_and(|purpose| matches!(purpose, 45 | 48))
+    {
+        return Err(CoreError::InvalidInput {
+            kind: "extended key",
+            detail: "this origin marks a multisig cosigner key; import the full multisig \
+                     descriptor instead"
+                .to_owned(),
+        });
+    }
 
     let mut warnings = vec![];
     if decoded.converted {
         warnings.push(InputWarning::Slip132Converted);
     }
     let script = match (
-        options.script,
         decoded.script_hint,
+        options.script,
         derivation.origin.as_deref().and_then(script_from_origin),
     ) {
-        (Some(choice), ..) => choice,
-        (None, Some(hint), _) | (None, None, Some(hint)) => hint,
+        (Some(prefix), ..) => prefix,
+        (None, Some(choice), _) | (None, None, Some(choice)) => choice,
         (None, None, None) => {
             warnings.push(InputWarning::AssumedSegwit);
             ScriptKind::Segwit
         }
+    };
+    let script_options = match decoded.script_hint {
+        Some(_) => Vec::new(),
+        None => SINGLE_KEY_SCRIPTS.to_vec(),
     };
     let (external, internal) = descriptors_for_xpub(&decoded.normalized, script, &derivation)?;
     if derivation.receive != RECEIVE_BRANCH || derivation.change.as_deref() != Some(CHANGE_BRANCH) {
@@ -974,7 +1001,7 @@ fn parse_extended_key(
             script,
         },
         warnings,
-        script_options: SINGLE_KEY_SCRIPTS.to_vec(),
+        script_options,
         derivation: Some(derivation),
         derivation_editable: true,
         preview_address: None,
@@ -1748,6 +1775,32 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A SLIP-132 prefix fixes the script: no choice turns a `vpub` into
+    /// a Taproot wallet, and no other script is offered. An origin only
+    /// suggests one. An origin under purpose 48 or 45 is a cosigner's
+    /// key, refused like a cosigner prefix: alone, it watches nothing.
+    #[test]
+    fn a_slip132_prefix_fixes_the_script_and_a_cosigner_origin_is_refused() {
+        let vpub = slip132(TPUB, VPUB);
+        let parsed = parse_input_with(&vpub, Some(ScriptKind::Taproot)).unwrap();
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.starts_with("wpkh("), "{external}");
+        assert!(parsed.script_options.is_empty());
+
+        let origin = format!("[9a6a2580/84'/1'/0']{TPUB}");
+        assert_eq!(
+            parse_input(&origin).unwrap().script_options,
+            SINGLE_KEY_SCRIPTS.to_vec()
+        );
+
+        for purpose in ["48'", "48h", "45'"] {
+            let cosigner = format!("[9a6a2580/{purpose}/1'/0'/2']{TPUB}");
+            let error = parse_input(&cosigner).unwrap_err().to_string();
+            assert!(error.contains("cosigner"), "{purpose}: {error}");
+        }
     }
 
     #[test]
