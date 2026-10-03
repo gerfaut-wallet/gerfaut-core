@@ -7,6 +7,13 @@
 //! connection; one that left the list is unsubscribed where the
 //! protocol allows it and ignored where it does not. Nothing is sent
 //! twice while the connection lives.
+//!
+//! What a server refuses is remembered for the configuration
+//! ([`super::Refusals`]): a script it turned down is not asked for
+//! again, and past the most it takes on one connection, the next one
+//! asks for the head of the list only. Each is reported once, when it
+//! is refused, and left to the regular syncs after that: a reconnection
+//! does not ask the server, or the syncs, for it again.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -27,10 +34,11 @@ use crate::chain::{ANOTHER_NETWORK, Endpoint, is_genesis_of};
 const MAX_LINE: usize = 64 * 1024;
 /// Subscriptions awaiting their answer at any time.
 const WINDOW: usize = 25;
-/// Subscriptions refused in a row before the rest of the queue is given
-/// up: a server at its limit refuses them all, and asking on only costs
-/// it more.
-const REFUSALS: u32 = 5;
+/// Subscriptions refused in a row, in words that do not say why, before
+/// the server is taken to be at its limit and the rest of the queue is
+/// given up: a server at its limit refuses them all, and asking on only
+/// costs it more.
+const REFUSALS: usize = 5;
 /// Subscriptions answered between two counts told in the status, the
 /// last one always told. A list on the user's own node runs to twenty
 /// thousand answers, and each change of the status is an event a screen
@@ -48,6 +56,8 @@ enum Request {
 }
 
 struct Session {
+    /// The server, whose refusals the hub keeps.
+    endpoint: Endpoint,
     writer: WriteHalf<BoxStream>,
     next_id: u64,
     in_flight: HashMap<u64, Request>,
@@ -55,7 +65,10 @@ struct Session {
     /// Script hashes the server was asked to watch on this connection.
     subscribed: HashSet<String>,
     acknowledged: u32,
-    refused: u32,
+    /// Script hashes refused since the last subscription taken.
+    refused_run: Vec<String>,
+    /// The server takes no more on this connection.
+    at_limit: bool,
     can_unsubscribe: bool,
     /// When the ping in flight, if any, is given up on.
     pong_by: Option<Instant>,
@@ -139,13 +152,15 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
     };
 
     let mut session = Session {
+        endpoint: endpoint.clone(),
         writer,
         next_id: 2,
         in_flight: HashMap::new(),
         queue: VecDeque::new(),
         subscribed: HashSet::new(),
         acknowledged: 0,
-        refused: 0,
+        refused_run: Vec::new(),
+        at_limit: false,
         can_unsubscribe: at_least_1_4_2(&negotiated),
         pong_by: None,
         opening: HashSet::new(),
@@ -249,9 +264,10 @@ impl Session {
         hub.ready(true);
     }
 
-    /// Queues every script of the list not yet asked for.
+    /// Queues every script of the list the server is asked for and was
+    /// not yet: see [`super::Watched::heard`].
     fn enqueue(&mut self, hub: &Hub) {
-        for entry in &hub.watched.entries {
+        for entry in hub.watched.heard(hub.refusals.get(&self.endpoint)) {
             if self.subscribed.insert(entry.scripthash.clone()) {
                 self.queue.push_back(entry.scripthash.clone());
             }
@@ -324,8 +340,15 @@ impl Session {
                     }
                 }
                 Request::Subscribe(scripthash) if !refused => {
-                    self.refused = 0;
+                    self.refused_run.clear();
                     self.acknowledged += 1;
+                    if self.at_limit {
+                        // Taken after all, answered out of order: the
+                        // limit is what the connection holds.
+                        let limit =
+                            &mut hub.refusals.entry(self.endpoint.clone()).or_default().limit;
+                        *limit = (*limit).max(Some(self.acknowledged as usize));
+                    }
                     if self.acknowledged.is_multiple_of(STATUS_STEP) || !self.subscribing() {
                         let acknowledged = self.acknowledged;
                         hub.set_status(|status| status.pushed_scripts = acknowledged);
@@ -333,39 +356,14 @@ impl Session {
                     self.status(hub, &scripthash, &message["result"], true);
                     self.opening.remove(&scripthash);
                 }
-                // One script refused, a history too long for the server
-                // to hash in time for instance, is left to the regular
-                // syncs, after one of its own now: what it did while
-                // nothing listened is unknown, whatever a session before
-                // this one heard of it. Several in a row is a server at
-                // its limit: what it took is watched, and the rest is
-                // not asked for.
                 Request::Subscribe(scripthash) => {
-                    if let Some(entry) = hub.watched.by_scripthash(&scripthash) {
-                        let hex = entry.hex.clone();
-                        hub.mark_entry(&hex, self.opening_reason());
-                    }
-                    self.opening.remove(&scripthash);
-                    self.refused += 1;
                     let refusal = words(&message["error"]);
+                    self.refused(hub, &scripthash, &refusal);
                     let acknowledged = self.acknowledged;
                     hub.set_status(|status| {
                         status.detail = Some(refusal);
                         status.pushed_scripts = acknowledged;
                     });
-                    if self.refused >= REFUSALS {
-                        // Not watched from now on, and what they did
-                        // while nothing listened is as unknown as for
-                        // the one refused: a sync of their own each.
-                        let reason = self.opening_reason();
-                        for given_up in self.queue.drain(..) {
-                            self.opening.remove(&given_up);
-                            if let Some(entry) = hub.watched.by_scripthash(&given_up) {
-                                let hex = entry.hex.clone();
-                                hub.mark_entry(&hex, reason);
-                            }
-                        }
-                    }
                 }
                 _ => {}
             }
@@ -385,6 +383,46 @@ impl Session {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The server refused to watch a script. One script refused, a
+    /// history too long for the server to hash in time for instance, is
+    /// not asked of that server again, and is left to the regular syncs
+    /// after one of its own now: what it did while nothing listened is
+    /// unknown, whatever a session before this one heard of it. A
+    /// refusal that names a limit, or several in a row, is a server at
+    /// the most it takes on one connection: what it took is watched, and
+    /// the rest is not asked for, on this connection or the next. Each
+    /// script given up is as unknown as the one refused, and has a sync
+    /// of its own too.
+    fn refused(&mut self, hub: &mut Hub, scripthash: &str, refusal: &str) {
+        let mut given_up = vec![scripthash.to_owned()];
+        if !self.at_limit {
+            let refusals = hub.refusals.entry(self.endpoint.clone()).or_default();
+            self.refused_run.push(scripthash.to_owned());
+            if names_a_limit(refusal) || self.refused_run.len() >= REFUSALS {
+                self.at_limit = true;
+                // Past the limit, not refused for themselves.
+                for past in self.refused_run.drain(..) {
+                    refusals.scripts.remove(&past);
+                }
+                // What this connection took, rather than a number the
+                // server's words may give: a limit per address counts
+                // the other connections from it too.
+                refusals.limit = Some(self.acknowledged as usize);
+                given_up.extend(self.queue.drain(..));
+            } else {
+                refusals.scripts.insert(scripthash.to_owned());
+            }
+        }
+        let reason = self.opening_reason();
+        for scripthash in given_up {
+            self.opening.remove(&scripthash);
+            if let Some(entry) = hub.watched.by_scripthash(&scripthash) {
+                let hex = entry.hex.clone();
+                hub.mark_entry(&hex, reason);
+            }
         }
     }
 
@@ -475,6 +513,15 @@ fn height_of(header: &Value) -> Option<u32> {
         .get("height")
         .and_then(Value::as_u64)
         .and_then(|height| u32::try_from(height).ok())
+}
+
+/// Whether a refusal says the server takes no more subscriptions on the
+/// connection: "Too many subscriptions on this connection (limit: N)"
+/// from electrs, "subscription limit reached (N max per client)" from
+/// the electrs of mempool, "Subscription limit reached" from Fulcrum.
+fn names_a_limit(refusal: &str) -> bool {
+    let refusal = refusal.to_lowercase();
+    refusal.contains("subscription") && (refusal.contains("limit") || refusal.contains("too many"))
 }
 
 /// The message of a JSON-RPC error, kept short: it comes from the

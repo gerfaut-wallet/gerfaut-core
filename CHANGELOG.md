@@ -229,6 +229,16 @@ The first release: the library both Gerfaut apps are built on.
   disagrees with the wallet on a block now asks for its genesis block
   too, and says "the server is on another network" at once, instead of
   walking the wallet's chain down to it one request a block.
+- The live watch remembers what an Electrum server refuses, for as long
+  as its configuration holds. A server takes so many subscriptions on one
+  connection, 100 on the Electrum server of mempool.space, and at each
+  reconnection the watch used to ask it for the whole list again, be
+  refused the rest, and sync every script it gave up on. Now a refused
+  script is synced once, when it is refused, and the next connection asks
+  only for the head of the list, up to what the server took; the rest is
+  left to the regular syncs. The status counts those scripts out, so
+  `WatchStatus.wallets` and `left_out_scripts` say what the server really
+  took, on the user's own node as on a public server.
 - A watched address is never read from a server of another network.
   Testnet, testnet4 and signet spell an address alike, and a server of
   the wrong one answered for it with transactions the wallet's network

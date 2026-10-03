@@ -157,6 +157,9 @@ pub(crate) struct ElectrumState {
     pub txs: HashMap<Txid, String>,
     /// Methods answered with this error message instead.
     pub refuse: HashMap<&'static str, String>,
+    /// The most subscriptions one connection holds, and the words that
+    /// refuse the next ones.
+    pub subscription_limit: Option<(usize, &'static str)>,
     /// A method whose answer starts and never ends: the connection
     /// answers nothing more after it.
     pub stall: Option<&'static str>,
@@ -335,6 +338,12 @@ impl FakeElectrum {
         };
         if let Some(message) = state.refuse.get(method) {
             return refusal(message);
+        }
+        if let Some((limit, words)) = state.subscription_limit
+            && method == "blockchain.scripthash.subscribe"
+            && state.connections[index].0.len() >= limit
+        {
+            return refusal(words);
         }
         let param = request["params"][0].clone();
         let scripthash = param.as_str().unwrap_or_default().to_owned();
