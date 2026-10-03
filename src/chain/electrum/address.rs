@@ -585,7 +585,7 @@ fn to_address_tx(
     let extras = tx_extras::analyze(tx, |outpoint| prevouts.get(outpoint).cloned());
     AddressTx {
         txid: tx.compute_txid().to_string(),
-        net_sats: (received as i64).saturating_sub(spent as i64),
+        net_sats: crate::chain::net_sats(received, spent),
         fee_sats: fee,
         height,
         timestamp: None,

@@ -304,6 +304,11 @@ The first release: the library both Gerfaut apps are built on.
   characters or the marks that turn the text around them, the line and
   paragraph separators included. A sync over Electrum passed a server's
   error on whole, sixteen megabytes or a text that read backwards.
+- A watched address sums the amounts a server lists without wrapping
+  around, over Esplora as it already did over Electrum, and the net of a
+  transaction stops at what a signed number holds. A made-up amount past
+  what any coin holds made a build that checks panic, and showed in one
+  that does not as a huge payment out.
 - An incoming payment announced as pending is said dropped only once a
   second sync, ten minutes or more after the first one that missed it,
   has read its scripts again and not seen it either. A server that lags,

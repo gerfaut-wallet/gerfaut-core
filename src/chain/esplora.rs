@@ -672,8 +672,14 @@ pub(crate) async fn fetch_address_state(
         txs: round.txs,
         utxos,
         tip_height,
-        funded_sats: stats.chain_stats.funded_txo_sum + stats.mempool_stats.funded_txo_sum,
-        spent_sats: stats.chain_stats.spent_txo_sum + stats.mempool_stats.spent_txo_sum,
+        funded_sats: stats
+            .chain_stats
+            .funded_txo_sum
+            .saturating_add(stats.mempool_stats.funded_txo_sum),
+        spent_sats: stats
+            .chain_stats
+            .spent_txo_sum
+            .saturating_add(stats.mempool_stats.spent_txo_sum),
         truncated: round.cursor.is_some(),
         history_cursor: round.cursor,
     })
@@ -861,19 +867,21 @@ fn to_address_tx(
     our_script: &bdk_wallet::bitcoin::ScriptBuf,
     network: Network,
 ) -> AddressTx {
+    // Amounts as the server tells them: summed without wrapping around,
+    // as the Electrum path and the balance do.
     let received: u64 = tx
         .vout
         .iter()
         .filter(|v| v.scriptpubkey == *our_script)
         .map(|v| v.value)
-        .sum();
+        .fold(0, u64::saturating_add);
     let spent: u64 = tx
         .vin
         .iter()
         .filter_map(|v| v.prevout.as_ref())
         .filter(|p| p.scriptpubkey == *our_script)
         .map(|p| p.value)
-        .sum();
+        .fold(0, u64::saturating_add);
     let inputs = tx
         .vin
         .iter()
@@ -925,7 +933,7 @@ fn to_address_tx(
     let extras = tx_extras::analyze(&tx.to_tx(), |op| prevouts.get(op).cloned());
     AddressTx {
         txid: tx.txid.to_string(),
-        net_sats: received as i64 - spent as i64,
+        net_sats: crate::chain::net_sats(received, spent),
         fee_sats: (!is_coinbase).then_some(tx.fee),
         height: tx.status.block_height,
         timestamp: tx.status.block_time,
@@ -1411,6 +1419,30 @@ mod error_tests {
             .unwrap();
         assert_eq!(answer.status().as_u16(), 301);
         assert_eq!(*reached.lock().unwrap(), 0);
+    }
+
+    /// Amounts a server makes up, past what any coin holds, stop where
+    /// a number does: nothing panics in a build that checks, and nothing
+    /// wraps around to a payment out in one that does not.
+    #[test]
+    fn amounts_a_server_makes_up_do_not_wrap_around() {
+        use crate::testkit::ADDRESS_SCRIPT;
+        let listed = format!(
+            r#"{{"txid": "{txid}", "version": 2, "locktime": 0, "weight": 400, "fee": 0,
+                "vin": [{{"txid": "{txid}", "vout": 0, "is_coinbase": false, "sequence": 0, "scriptsig": "",
+                    "prevout": {{"scriptpubkey": "0014aa", "value": 1}}}}],
+                "vout": [{{"scriptpubkey": "{ours}", "value": {max}}},
+                    {{"scriptpubkey": "{ours}", "value": {max}}}],
+                "status": {{"confirmed": false}}}}"#,
+            txid = "01".repeat(32),
+            ours = ADDRESS_SCRIPT,
+            max = u64::MAX,
+        );
+        let page: PageTx = serde_json::from_str(&listed).unwrap();
+        let ours = ScriptBuf::from_hex(ADDRESS_SCRIPT).unwrap();
+        let read = to_address_tx(page, &ours, Network::Signet);
+        assert_eq!(read.net_sats, i64::MAX);
+        assert_eq!(crate::chain::net_sats(0, u64::MAX), -i64::MAX);
     }
 
     /// A gzipped answer of a sensible size reads as it always did.

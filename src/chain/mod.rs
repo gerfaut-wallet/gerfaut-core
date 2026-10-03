@@ -148,6 +148,15 @@ pub(crate) const TIP_LAG_MAX: u32 = 144;
 /// have reached is refused with.
 pub(crate) const IMPOSSIBLE_TIP: &str = "the server claims a block height no chain has reached";
 
+/// What a transaction does to an address, from what it pays it and what
+/// it spends of it, as a server tells both: past what a signed number
+/// holds, which no coin comes near and a server may still claim, it
+/// stops there instead of wrapping around to its opposite.
+pub(crate) fn net_sats(received: u64, spent: u64) -> i64 {
+    let signed = |sats: u64| i64::try_from(sats).unwrap_or(i64::MAX);
+    signed(received).saturating_sub(signed(spent))
+}
+
 /// The longest a server's words are shown, in characters.
 const SERVER_WORDS_MAX: usize = 200;
 
