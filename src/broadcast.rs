@@ -21,7 +21,7 @@ use bdk_wallet::bitcoin::script::Instruction;
 use bdk_wallet::bitcoin::secp256k1::Secp256k1;
 use bdk_wallet::bitcoin::sighash::{EcdsaSighashType, TapSighashType};
 use bdk_wallet::bitcoin::{
-    Address, Amount, OutPoint, Psbt, Script, ScriptBuf, Transaction, TxIn, TxOut, Witness,
+    Address, OutPoint, Psbt, Script, ScriptBuf, Transaction, TxIn, TxOut, Witness,
 };
 use bdk_wallet::miniscript::psbt::PsbtExt;
 use serde::{Deserialize, Serialize};
@@ -898,11 +898,6 @@ pub fn outpoints(decoded: &DecodedTx) -> Vec<OutPoint> {
     decoded.tx.input.iter().map(|i| i.previous_output).collect()
 }
 
-/// Amount helper for callers that hold satoshis.
-pub fn sats(amount: Amount) -> u64 {
-    amount.to_sat()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,7 +943,9 @@ mod tests {
         );
     }
     use bdk_wallet::bitcoin::hashes::Hash;
-    use bdk_wallet::bitcoin::{Sequence, TxIn, Txid, WPubkeyHash, Witness, absolute, transaction};
+    use bdk_wallet::bitcoin::{
+        Amount, Sequence, TxIn, Txid, WPubkeyHash, Witness, absolute, transaction,
+    };
 
     /// A well-formed DER signature with r = s = 1, then its type byte.
     /// Only its shape matters here: nothing checks it against a key.
