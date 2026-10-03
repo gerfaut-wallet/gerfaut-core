@@ -279,6 +279,29 @@ pub struct Channel {
     pub enabled: bool,
     /// Unix seconds.
     pub created_at: i64,
+    /// Unix seconds when a message, an alert or a test, last went
+    /// through on the channel. `None` before any, and from a server that
+    /// predates it.
+    #[serde(default)]
+    pub last_sent_at: Option<i64>,
+    /// Unix seconds since the attempts on the channel fail, kept while
+    /// they go on failing; `None` again at the first that goes through,
+    /// and from a server that predates it. A channel failing for an hour
+    /// or more delivers nothing: a blocked bot, an expired webhook
+    /// domain, and nothing else says so.
+    #[serde(default)]
+    pub failing_since: Option<i64>,
+    /// Why the last attempt failed, in the server's words, one short
+    /// line: `the channel answered <status>` or `the channel could not
+    /// be reached`. `None` while nothing fails.
+    #[serde(default, deserialize_with = "one_line")]
+    pub last_failure: Option<String>,
+}
+
+/// A sentence of the server's that the screen shows as it came, held to
+/// what [`shown_words`] keeps.
+fn one_line<'de, D: serde::Deserializer<'de>>(words: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(words)?.map(|words| shown_words(&words)))
 }
 
 /// What happened to a watched wallet. A kind this build does not know
@@ -1729,6 +1752,61 @@ mod tests {
         // both read as no date.
         assert_eq!(channels[1].linked_at, None);
         assert_eq!(channels[2].linked_at, None);
+        // A server that says nothing of deliveries: nothing sent, and
+        // nothing failing.
+        for channel in &channels {
+            assert_eq!(channel.last_sent_at, None);
+            assert_eq!(channel.failing_since, None);
+            assert_eq!(channel.last_failure, None);
+        }
+    }
+
+    /// When each channel last delivered, and since when it fails, reach
+    /// the apps under the server's names; the reason is one short line
+    /// whatever the server wrote.
+    #[tokio::test]
+    async fn a_channel_says_when_it_last_delivered_and_since_when_it_fails() {
+        let long = format!("the channel answered 403\n\u{202E}{}", "x".repeat(500));
+        let body = serde_json::json!({ "channels": [
+            {
+                "id": "c1", "kind": "telegram", "target": "…4242", "linked": true,
+                "enabled": true, "created_at": 1_789_000_000,
+                "last_sent_at": 1_789_000_100, "failing_since": 1_789_003_700,
+                "last_failure": "the channel answered 403",
+            },
+            {
+                "id": "c2", "kind": "webhook", "target": "https://hooks.example.org/g",
+                "linked": true, "enabled": true, "created_at": 1_789_000_000,
+                "last_sent_at": 1_789_000_200, "failing_since": null, "last_failure": null,
+            },
+            {
+                "id": "c3", "kind": "ntfy", "target": "abc…xyz", "linked": true,
+                "enabled": true, "created_at": 1_789_000_000,
+                "last_sent_at": null, "failing_since": 1_789_000_050, "last_failure": long,
+            },
+        ]});
+        let listed = stub(200, &body.to_string()).await;
+        let channels = device(&listed).channels().await.unwrap();
+
+        assert_eq!(channels[0].last_sent_at, Some(1_789_000_100));
+        assert_eq!(channels[0].failing_since, Some(1_789_003_700));
+        assert_eq!(
+            channels[0].last_failure.as_deref(),
+            Some("the channel answered 403")
+        );
+        assert_eq!(channels[1].last_sent_at, Some(1_789_000_200));
+        assert_eq!(channels[1].failing_since, None);
+        assert_eq!(channels[1].last_failure, None);
+        assert_eq!(channels[2].last_sent_at, None);
+        let reason = channels[2].last_failure.as_deref().unwrap();
+        assert!(reason.starts_with("the channel answered 403x"), "{reason}");
+        assert_eq!(reason.chars().count(), WORDS_MAX + 1);
+
+        // The apps get the same names, `null` for what is not there.
+        let view = serde_json::to_value(&channels[1]).unwrap();
+        assert_eq!(view["last_sent_at"], 1_789_000_200);
+        assert!(view["failing_since"].is_null());
+        assert!(view["last_failure"].is_null());
     }
 
     /// A server from before the flag says nothing about the scan. The
