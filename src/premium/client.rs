@@ -1031,7 +1031,11 @@ fn decode<'a, T: Deserialize<'a>>(body: &'a [u8]) -> CoreResult<T> {
 /// in the server's own words: a bare 404 is what a captive portal or a
 /// proxy without a route answers, a bare 401 or 403 what one that wants
 /// a login first answers, and neither says anything about what the
-/// server holds, a key it would no longer know least of all.
+/// server holds, a key it would no longer know least of all. A bare 4xx
+/// is no refusal either, but an answer the route does not promise: a
+/// refusal settles the connection or the key change sent again, and a
+/// proxy's page during a deployment must not drop the only copy of a
+/// new key.
 ///
 /// Among the server's words, the code of a device refusal comes first,
 /// then its sentence: see [`device_refusal`]. A 401 in the server's
@@ -1060,7 +1064,10 @@ fn refusal(status: u16, retry_after: Option<u64>, body: &[u8], auth: Auth) -> Pr
         401 if words.is_some() && auth != Auth::Device => PremiumError::UnknownKey,
         403 if words.is_some() => PremiumError::NoPaidTime,
         404 | 410 if words.is_some() => PremiumError::NotFound,
-        400..=499 => PremiumError::Rejected(words.unwrap_or_else(|| format!("HTTP {status}"))),
+        400..=499 => match words {
+            Some(words) => PremiumError::Rejected(words),
+            None => PremiumError::UnexpectedResponse(format!("HTTP {status}")),
+        },
         _ => PremiumError::Unreachable(match words {
             Some(words) => format!("HTTP {status}: {words}"),
             None => format!("HTTP {status}"),
@@ -1887,11 +1894,12 @@ mod tests {
             ),
             PremiumError::Rejected(sentence.to_owned())
         );
-        // A refusal without the promised body still names its status.
+        // A status without the promised body is no refusal of the
+        // server's: it names the status, and settles nothing.
         let bare = stub(405, "method not allowed").await;
         assert_eq!(
             premium_error(device(&bare).delete_channel("nope").await.unwrap_err()),
-            PremiumError::Rejected("HTTP 405".to_owned())
+            PremiumError::UnexpectedResponse("HTTP 405".to_owned())
         );
         // Nothing under that id, whether the server says so or says it
         // is gone, in its own words: one answer, not a refusal to read
@@ -1906,14 +1914,13 @@ mod tests {
         }
         // The same status without the server's envelope is the page of
         // a captive portal or a proxy without a route, not the server
-        // saying there is nothing there: a refusal, which settles
-        // nothing. A rate limit is a refusal like any other, and says
-        // nothing about what the server holds.
+        // saying there is nothing there: an answer the route does not
+        // promise, which settles nothing.
         for status in [404, 410] {
             let portal = stub(status, "<html><body>Not Found</body></html>").await;
             assert_eq!(
                 premium_error(device(&portal).delete_channel("nope").await.unwrap_err()),
-                PremiumError::Rejected(format!("HTTP {status}")),
+                PremiumError::UnexpectedResponse(format!("HTTP {status}")),
                 "HTTP {status}"
             );
         }
@@ -1924,7 +1931,7 @@ mod tests {
             let portal = stub(status, "<html><body>Sign in to continue</body></html>").await;
             assert_eq!(
                 premium_error(device(&portal).delete_account().await.unwrap_err()),
-                PremiumError::Rejected(format!("HTTP {status}")),
+                PremiumError::UnexpectedResponse(format!("HTTP {status}")),
                 "HTTP {status}"
             );
         }
@@ -2487,20 +2494,20 @@ mod tests {
         // No sentence: not the server's envelope.
         assert_eq!(
             refused(401, r#"{"code":"device_disconnected"}"#),
-            PremiumError::Rejected("HTTP 401".to_owned())
+            PremiumError::UnexpectedResponse("HTTP 401".to_owned())
         );
         assert_eq!(
             refused(401, "device_disconnected"),
-            PremiumError::Rejected("HTTP 401".to_owned())
+            PremiumError::UnexpectedResponse("HTTP 401".to_owned())
         );
         // A bare 401 or 403 still settles nothing.
         assert_eq!(
             refused(401, "<html>Sign in</html>"),
-            PremiumError::Rejected("HTTP 401".to_owned())
+            PremiumError::UnexpectedResponse("HTTP 401".to_owned())
         );
         assert_eq!(
             refused(403, ""),
-            PremiumError::Rejected("HTTP 403".to_owned())
+            PremiumError::UnexpectedResponse("HTTP 403".to_owned())
         );
         // A server failing is a server failing, whatever it names.
         assert_eq!(

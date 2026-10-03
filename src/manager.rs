@@ -5260,7 +5260,7 @@ mod tests {
         let (base_url, _) = premium_answering(401, "<html>Sign in to continue</html>").await;
         let error = kept.premium_delete_account(&base_url).await.unwrap_err();
         assert!(
-            matches!(&error, CoreError::Premium(PremiumError::Rejected(words)) if words == "HTTP 401"),
+            matches!(&error, CoreError::Premium(PremiumError::UnexpectedResponse(words)) if words == "HTTP 401"),
             "{error}"
         );
         assert_eq!(stored_premium(&kept).await, premium_account());
