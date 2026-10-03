@@ -134,6 +134,10 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
             .await
             .map_err(Exit::Unreachable)?;
         let negotiated = version[1].as_str().unwrap_or_default().to_owned();
+        let software = version[0]
+            .as_str()
+            .map(crate::chain::server_words)
+            .filter(|software| !software.is_empty());
         // Then its genesis block, before it hears of any script: a
         // server of another network, a signet port typed for testnet4,
         // would report changes that never happened on the wallet's.
@@ -152,9 +156,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         if !genesis.is_some_and(|header| is_genesis_of(network, header.block_hash())) {
             return Err(Exit::Refused(ANOTHER_NETWORK.to_owned()));
         }
-        Ok((reader, writer, negotiated))
+        Ok((reader, writer, negotiated, software))
     };
-    let (mut reader, writer, negotiated) = match hub.during(opening).await {
+    let (mut reader, writer, negotiated, software) = match hub.during(opening).await {
         Ok(Ok(opened)) => opened,
         Ok(Err(exit)) | Err(exit) => return exit,
     };
@@ -184,6 +188,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         status.server = Some(label.clone());
         status.detail = None;
         status.pushed_scripts = 0;
+        status.server_software = software;
     });
     if let Err(detail) = session
         .request(Request::Headers, "blockchain.headers.subscribe", json!([]))

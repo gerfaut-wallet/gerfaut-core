@@ -291,6 +291,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
                     status.server = Some(label.clone());
                     status.detail = None;
                     status.pushed_scripts = 0;
+                    status.server_software = None;
                 });
             }
             // Turned away for asking too often: the server is there, and

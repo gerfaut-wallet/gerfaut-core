@@ -83,6 +83,12 @@ The first release: the library both Gerfaut apps are built on.
   `sync_only`, with the scripts it watches and the ones it leaves to the
   regular syncs, and `left_out_scripts` and `left_out_wallets` add them
   up, so an app can say when a payment will only show at the next sync.
+- `WatchStatus.server_software` gives what an Electrum server says it
+  runs, as it answers `server.version` ("ElectrumX 1.18.0", "Fulcrum
+  1.12.0"), so that on the user's own node, when the watch leaves
+  scripts out, an app can name the setting of that server that takes
+  more. It is `None` over the other transports, and absent from a
+  status written before.
 - The premium client reads a wallet the server refused: `watching` is false
   and `refusal` says why, in the list and in a `wallet_refused` event. A
   single address can be registered like a descriptor.

@@ -329,6 +329,14 @@ pub struct WatchStatus {
     /// order of the list.
     #[serde(default)]
     pub wallets: Vec<WalletCoverage>,
+    /// What an Electrum server says it runs, the way it answers
+    /// `server.version`: "ElectrumX 1.18.0", "Fulcrum 1.12.0" and the
+    /// like, so that on the user's own node, an app that sees scripts
+    /// left out can name the setting of that server which takes more.
+    /// `None` over the other transports. Kept to one short line, as any
+    /// words of a server.
+    #[serde(default)]
+    pub server_software: Option<String>,
 }
 
 /// How much of one wallet the live watch hears.

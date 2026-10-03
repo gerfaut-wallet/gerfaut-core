@@ -154,6 +154,8 @@ async fn electrum_pushes_a_change_once_per_burst() {
     assert_eq!(status.state, WatchState::Connected);
     assert_eq!(status.transport, Some(WatchTransport::Electrum));
     assert_eq!(status.server.as_deref(), Some("127.0.0.1"));
+    // What the server says it runs, for the settings of a node.
+    assert_eq!(status.server_software.as_deref(), Some("fake 1.0"));
     assert_eq!(status.watched_scripts, 4);
     // The head of every wallet first, then the next rank.
     assert_eq!(
@@ -1391,6 +1393,7 @@ fn a_status_and_a_list_from_before_coverage_still_read() {
     .unwrap();
     assert_eq!((status.left_out_scripts, status.left_out_wallets), (0, 0));
     assert!(status.wallets.is_empty());
+    assert_eq!(status.server_software, None);
     let wallet: WatchedWallet =
         serde_json::from_str(r#"{"wallet_id":"w","scripts":[],"has_pending":false}"#).unwrap();
     assert!(!wallet.pinned && !wallet.holds_coins);
