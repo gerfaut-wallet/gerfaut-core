@@ -313,7 +313,7 @@ pub fn decode_transaction(input: &str) -> CoreResult<DecodedTx> {
     if crate::input::qr::is_envelope(&text) {
         let progress = crate::input::qr::assemble(std::slice::from_ref(&text))?;
         return match progress.text {
-            Some(inner) => decode_transaction(&inner),
+            Some(inner) => decode_transaction(&crate::input::qr::opened_once(inner)?),
             None => Err(tx_error(format!(
                 "this is part 1 of a {}-part QR code: scan it with the camera",
                 progress.total
@@ -1236,6 +1236,22 @@ mod tests {
         let unsigned = decode_transaction(&encode::serialize_hex(&unsigned_tx())).unwrap();
         assert!(!unsigned.ready);
         assert!(!unsigned.inputs[0].signed);
+    }
+
+    /// One envelope is opened, never one inside another: no wallet
+    /// nests them, and every level opened would cost the stack a frame.
+    #[test]
+    fn an_envelope_inside_an_envelope_is_refused() {
+        let wrap = |text: &str| {
+            let mut cbor = Vec::new();
+            ciborium::into_writer(&ciborium::Value::Bytes(text.as_bytes().to_vec()), &mut cbor)
+                .unwrap();
+            ur::ur::encode(&cbor, &ur::ur::Type::Bytes)
+        };
+        let once = wrap(&encode::serialize_hex(&signed_tx()));
+        assert!(decode_transaction(&once).unwrap().ready);
+        let error = decode_transaction(&wrap(&once)).unwrap_err().to_string();
+        assert!(error.contains("holds another QR code"), "{error}");
     }
 
     #[test]

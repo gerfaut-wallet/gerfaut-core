@@ -278,7 +278,7 @@ fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
     if qr::is_envelope(trimmed) {
         let progress = qr::assemble(&[trimmed.to_owned()])?;
         return match progress.text {
-            Some(text) => classify(&text, options),
+            Some(text) => classify(&qr::opened_once(text)?, options),
             None => Err(CoreError::InvalidInput {
                 kind: "qr",
                 detail: format!(
@@ -1405,6 +1405,32 @@ mod tests {
         let mut cbor = Vec::new();
         ciborium::into_writer(&ciborium::Value::Bytes(bytes), &mut cbor).unwrap();
         refused(&ur::ur::encode(&cbor, &ur::ur::Type::Bytes));
+    }
+
+    /// One envelope is opened, never one inside another: no wallet
+    /// nests them, and every level opened would cost the stack a frame.
+    #[test]
+    fn an_envelope_inside_an_envelope_is_refused() {
+        let wrap = |text: &str| {
+            let mut cbor = Vec::new();
+            ciborium::into_writer(&ciborium::Value::Bytes(text.as_bytes().to_vec()), &mut cbor)
+                .unwrap();
+            ur::ur::encode(&cbor, &ur::ur::Type::Bytes)
+        };
+        let once = wrap(MULTIPATH);
+        assert_eq!(
+            parse_input(&once).unwrap().kind,
+            RecognizedKind::MultipathDescriptor
+        );
+        let error = parse_input(&wrap(&once)).unwrap_err();
+        assert!(
+            matches!(error, CoreError::InvalidInput { kind: "qr", .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("holds another QR code"),
+            "{error}"
+        );
     }
 
     #[test]

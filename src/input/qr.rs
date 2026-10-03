@@ -72,6 +72,21 @@ fn is_ur(frame: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(b"ur:"))
 }
 
+/// The text an envelope held, refused when it is an envelope itself. No
+/// wallet puts one QR code inside another, and each level opened costs
+/// the stack a frame: a level of compressed BBQr fits in a hundred
+/// characters, so a pasted text holds hundreds of them and a file
+/// dropped on the broadcast page tens of thousands, past what the stack
+/// of the thread reading them takes.
+pub(crate) fn opened_once(text: String) -> CoreResult<String> {
+    if is_envelope(&text) {
+        return Err(qr_error(
+            "this QR code holds another QR code, which no wallet makes",
+        ));
+    }
+    Ok(text)
+}
+
 /// Assembles the frames scanned so far. Frames may repeat and arrive in
 /// any order; the caller keeps feeding the growing list until
 /// `complete` is true, then hands `text` to the classifier.
