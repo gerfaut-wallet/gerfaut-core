@@ -23,7 +23,11 @@
 //! (HTTP 429) is asked less often ([`Pace`]): each time it does, the
 //! wait between rounds doubles, up to ten minutes, never shorter than
 //! the wait it named, and comes back to a minute half an hour after the
-//! last time. A round it turned away is no failure of the server.
+//! last time. A round it turned away is no failure of the server. The
+//! pace is the server's, not a session's: a session that ends, every
+//! half hour to try push again, or on a lost connection, leaves it to
+//! the next one, which asks nothing of that server before the round
+//! the last one had in view.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +66,8 @@ pub(super) struct Pace {
     limited_at: Option<Instant>,
     /// No round before this: the wait the server named.
     not_before: Option<Instant>,
+    /// When the next round is due, as the last wait set it.
+    due: Option<Instant>,
 }
 
 impl Pace {
@@ -72,8 +78,18 @@ impl Pace {
         self.not_before = Some(now + pause);
     }
 
+    /// How long a session that opens at `now` waits before it asks the
+    /// server anything: until the round the last wait set, and the end
+    /// of the wait the server named.
+    pub(super) fn first_wait(&self, now: Instant) -> Duration {
+        self.due
+            .max(self.not_before)
+            .map_or(Duration::ZERO, |due| due.saturating_duration_since(now))
+    }
+
     /// The wait before the next round, `every` being the usual one, a
-    /// little more or less so that clients do not fall in step.
+    /// little more or less so that clients do not fall in step. The
+    /// round is due at its end, for this session or the next.
     pub(super) fn wait(&mut self, every: Duration, now: Instant) -> Duration {
         if self
             .limited_at
@@ -89,7 +105,9 @@ impl Pace {
         let named = self
             .not_before
             .map_or(Duration::ZERO, |until| until.saturating_duration_since(now));
-        wait.max(named)
+        let wait = wait.max(named);
+        self.due = Some(now + wait);
+        wait
     }
 }
 
@@ -189,19 +207,53 @@ impl Plan {
     }
 }
 
-/// Refuses a server of another network before it hears of any script,
-/// from its genesis block: it would report changes that never happened
-/// on the wallet's.
-pub(super) async fn same_network(hub: &mut Hub, poller: &Poller) -> Result<(), Exit> {
+/// Opens a session with the server at `endpoint`: waits for the round
+/// its pace has in view, if an earlier session left one, then refuses a
+/// server of another network before it hears of any script, from its
+/// genesis block: it would report changes that never happened on the
+/// wallet's.
+pub(super) async fn same_network(
+    hub: &mut Hub,
+    endpoint: &Endpoint,
+    poller: &Poller,
+) -> Result<(), Exit> {
+    let first = hub.pace(endpoint).first_wait(Instant::now());
+    rest(hub, first).await?;
     let client = poller.client.clone();
     let network = hub.config.network;
-    match hub
+    let checked = hub
         .during(async move { esplora::check_network(&client, network).await })
-        .await?
-    {
+        .await?;
+    if let Some(pause) = poller.take_rate_limit() {
+        hub.pace(endpoint).limited(pause, Instant::now());
+    }
+    match checked {
         Ok(()) => Ok(()),
         Err(detail) if detail == ANOTHER_NETWORK => Err(Exit::Refused(detail)),
         Err(detail) => Err(Exit::Unreachable(detail)),
+    }
+}
+
+/// Waits `wait` before the next request; a tick from the host ends the
+/// wait as soon as it is over by the wall clock, timers having stopped
+/// with the device. An error is the session ending instead.
+async fn rest(hub: &mut Hub, wait: Duration) -> Result<(), Exit> {
+    if wait.is_zero() {
+        return Ok(());
+    }
+    let until = Instant::now() + wait;
+    let waiting = std::time::SystemTime::now();
+    loop {
+        tokio::select! {
+            wake = hub.wake() => match wake {
+                Wake::Stop => return Err(Exit::Stop),
+                Wake::Reconfigured => return Err(Exit::Reconfigured),
+                Wake::Tick { .. } if waiting.elapsed().unwrap_or_default() >= wait => return Ok(()),
+                Wake::Wallets if hub.watched.entries.is_empty() => return Err(Exit::Reprobe),
+                Wake::Tick { .. } | Wake::Wallets | Wake::Flushed => {}
+            },
+            () = tokio::time::sleep_until(until) => return Ok(()),
+        }
     }
 }
 
@@ -241,12 +293,11 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         Ok(poller) => poller,
         Err(detail) => return Exit::Unreachable(detail),
     };
-    if let Err(exit) = same_network(hub, &poller).await {
+    if let Err(exit) = same_network(hub, endpoint, &poller).await {
         return exit;
     }
     let mut tip: Option<String> = None;
     let mut failed = 0u32;
-    let mut pace = Pace::default();
     let started = Instant::now();
     loop {
         // One round: the tip, then the scripts.
@@ -265,7 +316,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         let outcome = hub.during(round).await;
         let limited = poller.take_rate_limit();
         if let Some(pause) = limited {
-            pace.limited(pause, Instant::now());
+            hub.pace(endpoint).limited(pause, Instant::now());
         }
         match outcome {
             Err(exit) => return exit,
@@ -309,26 +360,15 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
                 }
             }
         }
+        // The next round, set before the session may end: the next
+        // session keeps to it.
+        let every = hub.timings.poll;
+        let wait = hub.pace(endpoint).wait(every, Instant::now());
         if started.elapsed() >= hub.timings.reprobe {
             return Exit::Reprobe;
         }
-        // The next round; a tick from the host runs it now if it is due.
-        let wait = pace.wait(hub.timings.poll, Instant::now());
-        let until = Instant::now() + wait;
-        let waiting = std::time::SystemTime::now();
-        loop {
-            tokio::select! {
-                wake = hub.wake() => match wake {
-                    Wake::Stop => return Exit::Stop,
-                    Wake::Reconfigured => return Exit::Reconfigured,
-                    // Timers stopped with the device: the round is due
-                    // by the wall clock.
-                    Wake::Tick { .. } if waiting.elapsed().unwrap_or_default() >= wait => break,
-                    Wake::Wallets if hub.watched.entries.is_empty() => return Exit::Reprobe,
-                    Wake::Tick { .. } | Wake::Wallets | Wake::Flushed => {}
-                },
-                () = tokio::time::sleep_until(until) => break,
-            }
+        if let Err(exit) = rest(hub, wait).await {
+            return exit;
         }
     }
 }

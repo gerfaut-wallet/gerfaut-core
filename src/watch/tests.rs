@@ -1598,15 +1598,51 @@ fn a_server_that_limits_the_rate_is_polled_less_often() {
         pace.limited(Duration::from_secs(5), now);
     }
     around(pace.wait(every, now), Duration::from_secs(600));
-    // A wait the server named longer than that is waited out.
+    // A wait the server named longer than that is waited out, by the
+    // session that set it as by the next one.
     pace.limited(Duration::from_secs(3_600), now);
     assert!(pace.wait(every, now) >= Duration::from_secs(3_600));
+    assert!(pace.first_wait(now) >= Duration::from_secs(3_600));
     // Half an hour after the last limit, the usual pace, the wait the
     // server named still kept to.
     let later = now + Duration::from_secs(30 * 60);
     assert!(pace.wait(every, later) >= Duration::from_secs(30 * 60));
     let past = now + Duration::from_secs(3_600);
     around(pace.wait(every, past), every);
+    assert_eq!(poll::Pace::default().first_wait(now), Duration::ZERO);
+}
+
+/// The pace of the rounds is the server's, not a session's: a session
+/// that ends, here after each round, leaves the next round where it
+/// set it, and the next session asks nothing of the server before.
+#[tokio::test]
+async fn the_next_polling_session_keeps_the_pace() {
+    let server = FakeMempool::start(false, 0).await;
+    let every = Duration::from_millis(300);
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            poll: every,
+            reprobe: Duration::ZERO,
+            ..timings()
+        }),
+    );
+    let rounds = 4;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while server.state.lock().unwrap().tips_asked.len() < rounds {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no {rounds} rounds within {WAIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.stop();
+    let asked = server.state.lock().unwrap().tips_asked.clone();
+    for (round, pair) in asked.windows(2).enumerate() {
+        let gap = pair[1] - pair[0];
+        assert!(gap >= every.mul_f64(0.85), "round {round}: {gap:?}");
+    }
 }
 
 // --- the manager ---------------------------------------------------------------

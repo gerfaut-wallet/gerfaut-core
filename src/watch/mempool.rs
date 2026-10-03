@@ -88,7 +88,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         Ok(poller) => poller,
         Err(detail) => return Exit::Unreachable(detail),
     };
-    if let Err(exit) = poll::same_network(hub, &poller).await {
+    if let Err(exit) = poll::same_network(hub, endpoint, &poller).await {
         return exit;
     }
     // Credentials in the address travel as a header, the way the HTTP
@@ -169,9 +169,10 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
     hub.ready(false);
 
     let mut next_ping = Instant::now() + hub.timings.keepalive_wait();
-    // The REST rounds keep the pace polling keeps: see [`poll::Pace`].
-    let mut pace = poll::Pace::default();
-    let mut next_round = Instant::now() + hub.timings.poll;
+    // The REST rounds keep the pace polling keeps, the server's: see
+    // [`poll::Pace`].
+    let first = hub.pace(endpoint).first_wait(Instant::now());
+    let mut next_round = Instant::now() + first.max(hub.timings.poll);
     let mut pong_by: Option<Instant> = None;
     loop {
         let outcome: Result<(), String> = tokio::select! {
@@ -236,9 +237,10 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
                     Err(exit) => return exit,
                 }
                 if let Some(pause) = poller.take_rate_limit() {
-                    pace.limited(pause, Instant::now());
+                    hub.pace(endpoint).limited(pause, Instant::now());
                 }
-                next_round = Instant::now() + pace.wait(hub.timings.poll, Instant::now());
+                let every = hub.timings.poll;
+                next_round = Instant::now() + hub.pace(endpoint).wait(every, Instant::now());
                 Ok(())
             }
             () = super::sleep_until(pong_by), if pong_by.is_some() => {

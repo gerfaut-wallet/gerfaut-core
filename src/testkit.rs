@@ -536,6 +536,9 @@ pub(crate) struct MempoolState {
     /// Transactions counted per script hex, for the REST side.
     pub counts: HashMap<String, u64>,
     pub looked_up: Vec<String>,
+    /// When the REST side was asked for the tip, as each round of
+    /// polling opens.
+    pub tips_asked: Vec<std::time::Instant>,
     pub tip: u32,
     /// The transactions of the one address the REST side knows, as
     /// Esplora spells them, for a sync to read: the unconfirmed ones,
@@ -681,6 +684,7 @@ impl FakeMempool {
         let (status, body) = {
             let mut state = state.lock().unwrap();
             if path.ends_with("/blocks/tip/hash") {
+                state.tips_asked.push(std::time::Instant::now());
                 ("200 OK", format!("{:064x}", state.tip))
             } else if path.ends_with("/blocks/tip/height") {
                 ("200 OK", state.tip.to_string())

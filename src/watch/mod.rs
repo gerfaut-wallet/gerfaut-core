@@ -541,6 +541,7 @@ impl LiveWatch {
             track_limit: None,
             shunned: HashMap::new(),
             refusals: HashMap::new(),
+            paces: HashMap::new(),
             heard_by: None,
             last_alive: SystemTime::now(),
             fixed_timings,
@@ -979,6 +980,9 @@ pub(crate) struct Hub {
     shunned: HashMap<Endpoint, Instant>,
     /// What each Electrum server refused of the list.
     pub refusals: HashMap<Endpoint, Refusals>,
+    /// How often each Esplora server is read: its own, kept from one
+    /// session to the next.
+    paces: HashMap<Endpoint, poll::Pace>,
     /// The server of the last session to open, whose refusals say how
     /// much of each wallet is heard.
     heard_by: Option<Endpoint>,
@@ -1227,6 +1231,11 @@ impl Hub {
             .refused
             .mul_f64(0.8 + 0.4 * rand::random::<f64>());
         self.shunned.insert(endpoint.clone(), Instant::now() + wait);
+    }
+
+    /// The pace of the rounds that read an Esplora server.
+    fn pace(&mut self, endpoint: &Endpoint) -> &mut poll::Pace {
+        self.paces.entry(endpoint.clone()).or_default()
     }
 
     /// Whether a server is being left alone, and until when.
