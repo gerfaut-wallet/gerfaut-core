@@ -313,6 +313,11 @@ The first release: the library both Gerfaut apps are built on.
   default, that no other account of the machine can write to its state,
   where it keeps its guards and the directory it trusts. Only a phone,
   whose app storage the system keeps private to the app, skips it.
+- A server that drops the live watch's connection again and again, and
+  names scripts it made up as moved on each new one, has the syncs they
+  ask for wait longer and longer, as a server that pushes made-up changes
+  already did. A connection dropped every minute had those scripts
+  synced every minute, day and night.
 - An incoming payment announced as pending is said dropped only once a
   second sync, ten minutes or more after the first one that missed it,
   has read its scripts again and not seen it either. A server that lags,

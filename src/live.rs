@@ -219,6 +219,15 @@ impl Asked {
         }
     }
 
+    /// Whether this is the server's word that scripts moved: a change it
+    /// pushed, or the scripts whose status differs at a start or after a
+    /// reconnection. A block is not, nor a catch-up that cannot say what
+    /// moved, nor what the watch reads of its own accord.
+    fn claimed(&self) -> bool {
+        self.reason == ChangeReason::Activity
+            || (self.scripts.is_some() && self.reason != ChangeReason::NewBlock)
+    }
+
     /// How much of the wallet the sync reads: the scripts that moved; the
     /// ones waiting for a block, for a block; every script, counters
     /// first, when the transport cannot say which moved. A script past
@@ -252,16 +261,19 @@ type Synced = Result<SyncReport, String>;
 /// app pay that for as long as the watch runs. So past [`FREE_FUTILE`]
 /// such changes in a row, the sync the next one asks for waits, twice
 /// as long each time, up to a cap. A sync that finds something,
-/// whatever asked for it, ends the wait. A block, a reconnection and
-/// the catch-up of a start never wait: only what the server claims
-/// about a script does.
+/// whatever asked for it, ends the wait. A block, and the catch-up of a
+/// start or a reconnection that cannot say what moved, never wait: only
+/// what the server claims about a script does ([`Asked::claimed`]). A
+/// status that differs after a reconnection is such a claim: a server
+/// that drops the connection every minute and answers with statuses it
+/// made up would otherwise have them synced as often.
 #[derive(Debug, Default)]
 struct Futile(HashMap<String, u32>);
 
 impl Futile {
     /// How long the sync `asked` for this wallet waits before it runs.
     fn hold(&self, wallet_id: &str, asked: &Asked, timings: &Timings) -> Duration {
-        if asked.reason != ChangeReason::Activity {
+        if !asked.claimed() {
             return Duration::ZERO;
         }
         let futile = self.0.get(wallet_id).copied().unwrap_or(0);
@@ -279,7 +291,7 @@ impl Futile {
     fn settle(&mut self, wallet_id: &str, asked: &Asked, found: bool) {
         if found {
             self.0.remove(wallet_id);
-        } else if asked.reason == ChangeReason::Activity {
+        } else if asked.claimed() {
             let futile = self.0.entry(wallet_id.to_owned()).or_default();
             *futile = futile.saturating_add(1);
         }

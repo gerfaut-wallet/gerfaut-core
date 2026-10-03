@@ -1058,9 +1058,9 @@ async fn next_sync(events: &mut LiveEvents, wallet: &str) -> (SyncReport, Durati
 }
 
 /// Past two pushed changes in a row that a sync found nothing behind,
-/// the next one waits, twice as long each time, up to the cap. Blocks,
-/// reconnections and starts never wait, nor does another wallet, and a
-/// sync that finds something ends the wait.
+/// the next one waits, twice as long each time, up to the cap. Blocks
+/// never wait, nor does another wallet, and a sync that finds something
+/// ends the wait.
 #[test]
 fn a_change_no_sync_finds_is_heard_less_and_less_often() {
     let second = Duration::from_secs(1);
@@ -1091,6 +1091,20 @@ fn a_change_no_sync_finds_is_heard_less_and_less_often() {
     assert_eq!(futile.hold("w", pushed, &pace), second * 5);
     futile.settle("w", block, true);
     assert_eq!(futile.hold("w", pushed, &pace), Duration::ZERO);
+
+    // Statuses that differ after a reconnection are the server's word as
+    // much as a pushed change: one that drops the connection again and
+    // again with statuses it made up is held the same. What the watch
+    // reads of its own accord is not.
+    let reconnected = &Asked::of(ChangeReason::Reconnected, vec!["00".to_owned()]);
+    let looked = &Asked::of(ChangeReason::NewBlock, vec!["00".to_owned()]);
+    let mut futile = Futile::default();
+    for _ in 0..FREE_FUTILE {
+        futile.settle("w", reconnected, false);
+        futile.settle("w", looked, false);
+    }
+    assert_eq!(futile.hold("w", reconnected, &pace), second);
+    assert_eq!(futile.hold("w", looked, &pace), Duration::ZERO);
 }
 
 /// A server forges a new status for the watched address again and
