@@ -227,14 +227,32 @@ pub fn parse_input_with_options(input: &str, options: &ImportOptions) -> CoreRes
 /// A BSMS record is its descriptor plus a promise: the first address the
 /// coordinator derived. Gerfaut derives it too and refuses the record
 /// when the two differ, the same check every signer makes.
+///
+/// Test networks share their keys, not their addresses: the address in
+/// the record also says which of the networks the keys allow it is for,
+/// regtest included.
 fn parse_bsms_record(input: &str) -> CoreResult<ParsedInput> {
+    if input.trim().len() > MAX_INPUT_LEN {
+        return Err(CoreError::UnrecognizedInput("input too large".to_owned()));
+    }
     reject_private_material(input.trim())?;
     let record = bsms::parse_bsms(input)?;
     let mut parsed = classify(&record.descriptor, &ImportOptions::default())?;
-    parsed.preview_address = preview_address(&parsed);
-    match parsed.preview_address.as_deref() {
-        Some(derived) if derived.eq_ignore_ascii_case(&record.first_address) => {}
-        Some(derived) => {
+    let derived: Vec<(Network, String)> = parsed
+        .networks
+        .iter()
+        .filter_map(|network| Some((*network, first_address(&parsed.payload, *network)?)))
+        .collect();
+    let matching: Vec<&(Network, String)> = derived
+        .iter()
+        .filter(|(_, address)| address.eq_ignore_ascii_case(&record.first_address))
+        .collect();
+    match (matching.first(), derived.first()) {
+        (Some((_, address)), _) => {
+            parsed.preview_address = Some(address.clone());
+            parsed.networks = matching.iter().map(|(network, _)| *network).collect();
+        }
+        (None, Some((_, derived))) => {
             return Err(CoreError::InvalidInput {
                 kind: "bsms",
                 detail: format!(
@@ -243,7 +261,7 @@ fn parse_bsms_record(input: &str) -> CoreResult<ParsedInput> {
                 ),
             });
         }
-        None => {
+        (None, None) => {
             return Err(CoreError::InvalidInput {
                 kind: "bsms",
                 detail: "the descriptor in the record derives no address".to_owned(),
@@ -279,7 +297,11 @@ fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
     if qr::is_envelope(trimmed) {
         let progress = qr::assemble(&[trimmed.to_owned()])?;
         return match progress.text {
-            Some(text) => classify(&qr::opened_once(text)?, options),
+            // A BSMS record in an envelope is checked as one pasted bare.
+            Some(text) => match qr::opened_once(text)? {
+                text if bsms::is_bsms(&text) => parse_bsms_record(&text),
+                text => classify(&text, options),
+            },
             None => Err(CoreError::InvalidInput {
                 kind: "qr",
                 detail: format!(
@@ -964,13 +986,20 @@ fn parse_extended_key(
 /// (bare miniscript, no wildcard on a script we cannot address) yields
 /// `None` rather than an error, the import itself is unaffected.
 fn preview_address(parsed: &ParsedInput) -> Option<String> {
-    let ParsedPayload::Descriptors { external, .. } = &parsed.payload else {
+    first_address(&parsed.payload, *parsed.networks.first()?)
+}
+
+/// The first receive address of descriptors on `network`.
+fn first_address(payload: &ParsedPayload, network: Network) -> Option<String> {
+    let ParsedPayload::Descriptors { external, .. } = payload else {
         return None;
     };
-    let network = parsed.networks.first()?.to_bitcoin();
     let descriptor = external.parse::<Descriptor<DescriptorPublicKey>>().ok()?;
     let definite = descriptor.at_derivation_index(0).ok()?;
-    definite.address(network).ok().map(|a| a.to_string())
+    definite
+        .address(network.to_bitcoin())
+        .ok()
+        .map(|a| a.to_string())
 }
 
 // --- addresses ---------------------------------------------------------
@@ -1825,6 +1854,40 @@ mod tests {
             parse_input(&private),
             Err(CoreError::PrivateMaterialRejected)
         ));
+    }
+
+    /// The address in a record says which network it is for, regtest
+    /// included, and a record that comes in a QR envelope is checked as
+    /// one pasted bare.
+    #[test]
+    fn a_bsms_record_names_its_network_and_opens_from_an_envelope() {
+        let template = format!(
+            "wsh(sortedmulti(1,[9a6a2580/48'/1'/0'/2']{TPUB}/**,[00000000/48'/1'/0'/2']{TPUB}/**))"
+        );
+        let truth = parse_input(&template.replace("/**", "/<0;1>/*")).unwrap();
+        let regtest = first_address(&truth.payload, Network::Regtest).unwrap();
+        assert!(regtest.starts_with("bcrt1"), "{regtest}");
+
+        let record = format!("BSMS 1.0\n{template}\n/0/*,/1/*\n{regtest}\n");
+        let parsed = parse_input(&record).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::Bsms);
+        assert_eq!(parsed.networks, vec![Network::Regtest]);
+        assert_eq!(parsed.preview_address.as_deref(), Some(regtest.as_str()));
+
+        let signet = truth.preview_address.clone().unwrap();
+        let record = format!("BSMS 1.0\n{template}\n/0/*,/1/*\n{signet}\n");
+        let parsed = parse_input(&record).unwrap();
+        assert!(!parsed.networks.contains(&Network::Regtest));
+        assert!(parsed.networks.contains(&Network::Signet));
+
+        let hex = |text: &str| -> String { text.bytes().map(|b| format!("{b:02X}")).collect() };
+        let parsed = parse_input(&format!("B$HU0100{}", hex(&record))).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::Bsms);
+        let tampered = record.replace(&signet, "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx");
+        let error = parse_input(&format!("B$HU0100{}", hex(&tampered)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("first address"), "{error}");
     }
 
     #[test]
