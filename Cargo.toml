@@ -77,7 +77,7 @@ zeroize = { version = "1", features = ["derive"] }
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 # Constant-time comparison of the app lock hash.
 subtle = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4"] }
 ur = "0.5"
 ciborium = "0.2"
 flate2 = "1"
@@ -94,12 +94,7 @@ tor-config = { version = "0.45", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-# Gzips the answers of a test server; already built for reqwest.
-flate2 = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-# So `tests/tls_provider.rs` can name the backend it expects. Already a
-# dependency above; this only makes it visible to the test crates.
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 # arti pulls in `saturating-time`, whose limit search never terminates
 # on a clock coarser than a nanosecond: Windows counts 100 ns intervals,
