@@ -382,7 +382,7 @@ pub(crate) fn reject_private_material(input: &str) -> CoreResult<()> {
         if token.len() < 20 {
             continue;
         }
-        if xpub::PRIVATE_PREFIXES.iter().any(|p| token.starts_with(p)) {
+        if xpub::has_private_prefix(token) {
             return Err(CoreError::PrivateMaterialRejected);
         }
         // WIF: 51-52 base58check chars, version byte 0x80 (mainnet) or
