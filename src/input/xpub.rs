@@ -19,8 +19,6 @@ use crate::input::ScriptKind;
 /// Outcome of decoding a SLIP-132 or standard extended public key.
 #[derive(Debug, Clone)]
 pub struct DecodedXpub {
-    /// The key, normalized to standard version bytes.
-    pub xpub: Xpub,
     /// Standard-encoded string (`xpub...` / `tpub...`).
     pub normalized: String,
     /// Mainnet or test key.
@@ -278,13 +276,12 @@ pub fn decode_extended_key(token: &str) -> CoreResult<DecodedXpub> {
     normalized_bytes[..4].copy_from_slice(&standard);
     let normalized = base58::encode_check(&normalized_bytes);
 
-    let xpub = Xpub::decode(&normalized_bytes).map_err(|e| CoreError::InvalidInput {
+    Xpub::decode(&normalized_bytes).map_err(|e| CoreError::InvalidInput {
         kind: "extended key",
         detail: format!("invalid BIP32 payload: {e}"),
     })?;
 
     Ok(DecodedXpub {
-        xpub,
         normalized,
         network_kind: if mainnet {
             NetworkKind::Main

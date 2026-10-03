@@ -749,7 +749,6 @@ pub(crate) fn tx_detail(
 }
 
 pub(crate) fn utxos(wallet: &bdk_wallet::Wallet, network: Network) -> Vec<UtxoInfo> {
-    let tip = tip_height(wallet);
     let mut utxos: Vec<UtxoInfo> = wallet
         .list_unspent()
         .map(|output| UtxoInfo {
@@ -765,7 +764,6 @@ pub(crate) fn utxos(wallet: &bdk_wallet::Wallet, network: Network) -> Vec<UtxoIn
             derivation_index: Some(output.derivation_index),
         })
         .collect();
-    let _ = tip; // confirmations live in `status`; tip kept for future use
     utxos.sort_by_key(|utxo| std::cmp::Reverse(utxo.value_sats));
     utxos
 }
