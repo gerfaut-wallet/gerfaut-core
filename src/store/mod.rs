@@ -2,10 +2,11 @@
 //!
 //! The vault is a single encrypted file (see [`cipher`]) containing the
 //! wallet list, per-wallet chain state (BDK change sets, address-watch
-//! state), and settings. Wallet-scale data is small, so the whole
-//! payload is rewritten atomically on each save — no partial-write
-//! states to reason about, and the file is unreadable at rest without
-//! the key.
+//! state), and settings. The whole payload is rewritten atomically on
+//! each save — no partial-write states to reason about, and the file is
+//! unreadable at rest without the key. The price is a save that grows
+//! with the wallets: a BDK change set keeps every transaction, and a
+//! setting toggled rewrites them all.
 
 pub mod cipher;
 
