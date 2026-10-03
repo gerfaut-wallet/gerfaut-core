@@ -254,7 +254,6 @@ const TAG_MULTI: u64 = 406;
 const TAG_SORTED_MULTI: u64 = 407;
 const TAG_TR: u64 = 409;
 const TAG_HDKEY: u64 = 303;
-const TAG_KEYPATH: u64 = 304;
 const TAG_ECKEY: u64 = 306;
 
 /// Renders a `crypto-output` tree as a descriptor string. Checksums are
@@ -351,7 +350,7 @@ fn hdkey_expression(map: &Value) -> CoreResult<String> {
     let origin = map_get(map, 6).map(tagged);
     let components = origin
         .and_then(|o| map_get(o, 1))
-        .and_then(keypath_components)
+        .map(keypath_components)
         .transpose()?;
     let source_fingerprint = origin.and_then(|o| map_get(o, 2)).and_then(as_u64);
     let depth = origin
@@ -394,9 +393,7 @@ fn hdkey_expression(map: &Value) -> CoreResult<String> {
     };
     let children = match map_get(map, 7).map(tagged).and_then(|c| map_get(c, 1)) {
         Some(components) => {
-            let components = keypath_components(components)
-                .transpose()?
-                .unwrap_or_default();
+            let components = keypath_components(components)?;
             if components.is_empty() {
                 "/<0;1>/*".to_owned()
             } else {
@@ -417,14 +414,14 @@ enum Component {
 }
 
 /// Parses `[index-or-wildcard-or-pair, hardened, …]` pairs.
-fn keypath_components(value: &Value) -> Option<CoreResult<Vec<Component>>> {
+fn keypath_components(value: &Value) -> CoreResult<Vec<Component>> {
     let Value::Array(items) = value else {
-        return Some(Err(qr_error("key path is not an array")));
+        return Err(qr_error("key path is not an array"));
     };
     let mut components = Vec::new();
     for pair in items.chunks(2) {
         let [item, hardened] = pair else {
-            return Some(Err(qr_error("key path with a dangling component")));
+            return Err(qr_error("key path with a dangling component"));
         };
         let hardened = as_bool(hardened).unwrap_or(false);
         let component = match item {
@@ -438,11 +435,11 @@ fn keypath_components(value: &Value) -> Option<CoreResult<Vec<Component>>> {
                 high: as_u64(&inner[1]).unwrap_or(0) as u32,
                 hardened,
             },
-            _ => return Some(Err(qr_error("unsupported key path component"))),
+            _ => return Err(qr_error("unsupported key path component")),
         };
         components.push(component);
     }
-    Some(Ok(components))
+    Ok(components)
 }
 
 fn render_components(components: &[Component]) -> String {
@@ -465,9 +462,11 @@ fn tick(hardened: bool) -> &'static str {
     if hardened { "'" } else { "" }
 }
 
+/// What a tag wraps, whichever tag it is: a keypath (304) or a
+/// use-info (305) is read by its place in the map, not by its tag.
 fn tagged(value: &Value) -> &Value {
     match value {
-        Value::Tag(TAG_KEYPATH, inner) | Value::Tag(_, inner) => inner,
+        Value::Tag(_, inner) => inner,
         other => other,
     }
 }
