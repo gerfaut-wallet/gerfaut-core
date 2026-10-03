@@ -53,9 +53,11 @@
 //! connection is doing: the watcher is dropped where it waits, the
 //! syncs it started are abandoned with their connections, and the
 //! receiver of the events ends right after what it already holds.
-//! Nothing of the core runs on the blocking pool of the runtime (a name
-//! lookup aside, which the system resolver bounds), so a host can then
-//! exit the process, or drop its runtime with
+//! Nothing of the core waits on a server from the blocking pool of the
+//! runtime: what runs there is a name lookup, which the system resolver
+//! bounds, and the parsing of an Esplora answer as it arrives, which
+//! ends the moment the answer stops coming. So a host can then exit the
+//! process, or drop its runtime with
 //! [`tokio::runtime::Runtime::shutdown_timeout`], without waiting on a
 //! server. A sync the host started itself is abandoned the same way
 //! when its future is dropped.
