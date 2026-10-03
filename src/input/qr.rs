@@ -543,7 +543,7 @@ fn as_bool(value: &Value) -> Option<bool> {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    data_encoding::HEXLOWER.encode(bytes)
 }
 
 // --- BBQr ----------------------------------------------------------------
@@ -664,7 +664,7 @@ fn assemble_bbqr(frames: &[&str]) -> CoreResult<QrProgress> {
     // accepts: a PSBT as base64, a transaction as hex.
     let text = match first.file_type {
         'P' => data_encoding::BASE64.encode(&bytes),
-        'T' => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        'T' => hex(&bytes),
         _ => String::from_utf8(bytes).map_err(|_| qr_error("BBQr payload is not text"))?,
     };
     Ok(QrProgress {
