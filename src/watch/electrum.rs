@@ -26,7 +26,7 @@ use tokio::time::Instant;
 
 use super::net::{self, BoxStream, LineReader, Security};
 use super::{ChangeReason, Exit, Hub, Wake, WatchState, WatchTransport};
-use crate::chain::electrum::{CLIENT_NAME, Target, parse};
+use crate::chain::electrum::{CLIENT_NAME, Target, parse, words};
 use crate::chain::{ANOTHER_NETWORK, Endpoint, is_genesis_of};
 
 /// The longest line read. A status is 64 characters and a header 160;
@@ -567,16 +567,6 @@ fn costs_too_much(error: &Value) -> bool {
 fn names_a_limit(refusal: &str) -> bool {
     let refusal = refusal.to_lowercase();
     refusal.contains("subscription") && (refusal.contains("limit") || refusal.contains("too many"))
-}
-
-/// The message of a JSON-RPC error, kept short: it comes from the
-/// server and ends up on a screen.
-fn words(error: &Value) -> String {
-    let text = error
-        .get("message")
-        .and_then(Value::as_str)
-        .map_or_else(|| error.to_string(), str::to_owned);
-    text.chars().take(200).collect()
 }
 
 fn at_least_1_4_2(version: &str) -> bool {

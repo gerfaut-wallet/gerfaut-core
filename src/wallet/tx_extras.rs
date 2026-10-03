@@ -160,7 +160,7 @@ pub fn op_return_of(script: &Script) -> Option<OpReturnData> {
 /// can write that holds one, shown as text, could make what follows it
 /// on screen, an amount or an address, read backwards or on a line of
 /// its own. Such a payload is shown in hex.
-fn is_bidi_control(c: char) -> bool {
+pub(crate) fn is_bidi_control(c: char) -> bool {
     matches!(
         c,
         '\u{061C}'

@@ -961,23 +961,13 @@ pub(crate) async fn broadcast(client: &Client, tx: &Transaction) -> Result<(), S
     client.post_tx(tx).await
 }
 
-/// Longest refusal shown, in characters, as for any other sentence a
-/// server writes.
-const NODE_MESSAGE_MAX: usize = 200;
-
 /// The reason inside a `sendrawtransaction` refusal, whichever way the
 /// server spelled it; the whole text when it is not one. Shown as the
 /// node's words, so kept to one short line: a server that answers a
 /// page of text, or instructions of its own, gets its first 200
-/// characters on screen, control characters dropped.
+/// characters on screen ([`crate::chain::server_words`]).
 pub(crate) fn node_message(text: &str) -> String {
-    let words = node_words(text);
-    let mut kept = words.chars().filter(|c| !c.is_control());
-    let mut short: String = kept.by_ref().take(NODE_MESSAGE_MAX).collect();
-    if kept.next().is_some() {
-        short.push('\u{2026}');
-    }
-    short
+    crate::chain::server_words(&node_words(text))
 }
 
 fn node_words(text: &str) -> String {

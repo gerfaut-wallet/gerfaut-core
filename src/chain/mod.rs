@@ -148,6 +148,26 @@ pub(crate) const TIP_LAG_MAX: u32 = 144;
 /// have reached is refused with.
 pub(crate) const IMPOSSIBLE_TIP: &str = "the server claims a block height no chain has reached";
 
+/// The longest a server's words are shown, in characters.
+const SERVER_WORDS_MAX: usize = 200;
+
+/// What a server wrote, a refusal or an error, kept to what a screen may
+/// show it as: one line of 200 characters at most, an ellipsis past them,
+/// without the control characters that break a line or the marks that
+/// turn the text around them
+/// ([`crate::wallet::tx_extras::is_bidi_control`]). Anyone who runs a
+/// server writes them, and they end up on a screen beside amounts.
+pub(crate) fn server_words(text: &str) -> String {
+    let mut kept = text
+        .chars()
+        .filter(|c| !c.is_control() && !crate::wallet::tx_extras::is_bidi_control(*c));
+    let mut short: String = kept.by_ref().take(SERVER_WORDS_MAX).collect();
+    if kept.next().is_some() {
+        short.push('\u{2026}');
+    }
+    short
+}
+
 /// The redirections an HTTP client of the core follows, to fixed public
 /// services: to the same host, port and scheme, over HTTPS, five at
 /// most. One anywhere else ends there, as an answer that is no success:

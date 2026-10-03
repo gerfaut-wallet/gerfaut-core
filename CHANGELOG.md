@@ -299,6 +299,11 @@ The first release: the library both Gerfaut apps are built on.
   only to their own host, over HTTPS. A redirection carried the request,
   the scripts of a wallet among them, where its route was never checked:
   in the clear, or an onion name to the system's resolver.
+- What a server writes in a refusal or an error reaches a screen as one
+  short line on every path: 200 characters at most, without control
+  characters or the marks that turn the text around them, the line and
+  paragraph separators included. A sync over Electrum passed a server's
+  error on whole, sixteen megabytes or a text that read backwards.
 - An incoming payment announced as pending is said dropped only once a
   second sync, ten minutes or more after the first one that missed it,
   has read its scripts again and not seen it either. A server that lags,

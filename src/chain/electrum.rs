@@ -536,13 +536,7 @@ fn describe(error: &electrum_client::Error, timeout: Duration) -> String {
         },
         Error::IOError(io) => describe_io(io, timeout),
         Error::SharedIOError(io) => describe_io(io, timeout),
-        Error::Protocol(value) => {
-            let message = value
-                .get("message")
-                .and_then(|m| m.as_str())
-                .map_or_else(|| value.to_string(), str::to_owned);
-            format!("the server refused the request: {message}")
-        }
+        Error::Protocol(value) => format!("the server refused the request: {}", words(value)),
         Error::Message(text) => text.clone(),
         Error::InvalidDNSNameError(host) => format!("{host} is not a valid TLS host name"),
         Error::CouldNotCreateConnection(_) => "TLS handshake failed".to_owned(),
@@ -551,6 +545,16 @@ fn describe(error: &electrum_client::Error, timeout: Duration) -> String {
         }
         _ => "request failed".to_owned(),
     }
+}
+
+/// The message of a JSON-RPC error, as a screen may show it: see
+/// [`crate::chain::server_words`].
+pub(crate) fn words(error: &serde_json::Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| error.to_string(), str::to_owned);
+    crate::chain::server_words(&message)
 }
 
 fn describe_io(error: &std::io::Error, timeout: Duration) -> String {
@@ -1078,6 +1082,19 @@ mod tests {
             describe(&refusal, TIMEOUT),
             "the server refused the request: unknown method"
         );
+        // Whatever the server wrote, one short line: no line break, no
+        // mark that turns the text around, nothing past 200 characters.
+        let written = Error::Protocol(serde_json::json!({
+            "code": 1,
+            "message": format!("history \u{202E}too long\nsee {}", "x".repeat(300)),
+        }));
+        let shown = describe(&written, TIMEOUT);
+        let words = shown
+            .strip_prefix("the server refused the request: ")
+            .unwrap();
+        assert!(words.starts_with("history too longsee xx"), "{words}");
+        assert_eq!(words.chars().count(), 201);
+        assert!(words.ends_with('\u{2026}'));
         let garbled = Error::JSON(serde_json::from_str::<u32>("x").unwrap_err());
         assert_eq!(describe(&garbled, TIMEOUT), "unexpected response");
         assert_eq!(

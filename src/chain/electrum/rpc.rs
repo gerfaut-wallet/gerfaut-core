@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 
 use super::{
-    CLIENT_NAME, MAX_LINE, MAX_READ, PROTOCOL, TIMEOUT, TOR_TIMEOUT, Target, parse, too_long,
+    CLIENT_NAME, MAX_LINE, MAX_READ, PROTOCOL, TIMEOUT, TOR_TIMEOUT, Target, parse, too_long, words,
 };
 use crate::watch::net::{self, BoxStream, LineReader, LineTooLong, Security};
 
@@ -232,16 +232,6 @@ impl Connection {
             "the server sends answers to nothing it was asked".to_owned(),
         ))
     }
-}
-
-/// The message of a JSON-RPC error, kept short: it comes from the
-/// server and ends up on a screen.
-fn words(error: &Value) -> String {
-    let text = error
-        .get("message")
-        .and_then(Value::as_str)
-        .map_or_else(|| error.to_string(), str::to_owned);
-    text.chars().take(200).collect()
 }
 
 #[cfg(test)]
