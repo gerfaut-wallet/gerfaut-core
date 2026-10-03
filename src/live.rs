@@ -84,7 +84,7 @@ use crate::wallet::snapshot::SyncReport;
 use crate::wallet::views;
 use crate::watch::{
     ChangeReason, LiveWatch, Timings, WatchConfig, WatchEvent, WatchEvents, WatchLimits,
-    WatchStatus, WatchedWallet,
+    WatchStatus, WatchedScript, WatchedWallet,
 };
 
 pub(crate) mod news;
@@ -367,7 +367,7 @@ fn watched_wallet(
     id: &str,
     gap_limit: u32,
     per_wallet: usize,
-) -> Option<crate::watch::WatchedWallet> {
+) -> Option<WatchedWallet> {
     let record = find_record(&state.payload, id).ok()?;
     let pinned = record.meta.live_pinned;
     let (scripts, has_pending, holds_coins) = match &record.meta.kind {
@@ -386,7 +386,7 @@ fn watched_wallet(
                 .as_ref()
                 .is_some_and(|watch| !watch.utxos.is_empty());
             let scripts = (
-                vec![crate::watch::WatchedScript {
+                vec![WatchedScript {
                     script: script.to_hex_string(),
                     lookahead: false,
                     status: record
@@ -425,7 +425,7 @@ fn watched_wallet(
     let (scripts, unlisted) = scripts;
     let scripts = scripts
         .into_iter()
-        .map(|script| crate::watch::WatchedScript {
+        .map(|script| WatchedScript {
             status: if never_synced {
                 Some(String::new())
             } else {
@@ -434,7 +434,7 @@ fn watched_wallet(
             ..script
         })
         .collect();
-    Some(crate::watch::WatchedWallet {
+    Some(WatchedWallet {
         wallet_id: id.to_owned(),
         scripts,
         has_pending,
@@ -449,7 +449,7 @@ fn watched_wallet(
 /// `None` when none is, empty for a watched address, whose sync reads
 /// its one script whatever it is asked.
 fn vanished_scripts(state: &mut ManagerState, id: &str, now: u64) -> Option<Vec<String>> {
-    let due = crate::live::news::vanishing_due(&state.payload, id, now);
+    let due = news::vanishing_due(&state.payload, id, now);
     if due.is_empty() {
         return None;
     }
