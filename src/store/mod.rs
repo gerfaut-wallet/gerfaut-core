@@ -25,9 +25,17 @@ use crate::wallet::meta::WalletMeta;
 
 pub use cipher::{VaultKdf, VaultKey};
 
-/// Current payload schema version. Bump on breaking changes and migrate
-/// in [`Vault::load`].
-const PAYLOAD_VERSION: u32 = 1;
+/// Current payload schema version. A build refuses a vault of a later
+/// version rather than read it without the fields it does not know and
+/// write it back without them, so the version goes up with every field
+/// whose loss costs something, not only with a breaking change. An
+/// earlier version is read as it is, new fields at their defaults, and
+/// written back as the current one; a migration that needs more goes in
+/// [`Vault::load`]. Version 2 holds what came after the first: this
+/// device's Premium token and the key change or connection under way,
+/// whose loss to an older build meant a new connection that waits ten
+/// days, or the only copy of a new Premium key.
+const PAYLOAD_VERSION: u32 = 2;
 
 /// One wallet and its chain state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,13 +275,14 @@ impl Vault {
     pub fn load(&self) -> Result<VaultPayload, VaultError> {
         let file = std::fs::read(&self.path)?;
         let plaintext = cipher::unseal(&file, &self.key)?;
-        let payload: VaultPayload = serde_json::from_slice(&plaintext)
+        let mut payload: VaultPayload = serde_json::from_slice(&plaintext)
             .map_err(|e| VaultError::CorruptedPayload(e.to_string()))?;
         if payload.version > PAYLOAD_VERSION {
             return Err(VaultError::UnsupportedVersion(
                 payload.version.min(255) as u8
             ));
         }
+        payload.version = PAYLOAD_VERSION;
         Ok(payload)
     }
 
@@ -515,6 +524,37 @@ mod tests {
         assert_eq!(reloaded.wallets.len(), 1);
         assert_eq!(reloaded.wallets[0].meta.name, "Cold storage");
         assert_eq!(reloaded.settings.active_network, Network::Signet);
+    }
+
+    /// A vault of an earlier version opens and is written back as the
+    /// current one, so that a build older than this one refuses it
+    /// instead of dropping what it cannot read; a later one is refused
+    /// here for the same reason.
+    #[test]
+    fn a_vault_is_written_back_at_the_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let written_at = |version: u32| {
+            let payload = VaultPayload {
+                version,
+                ..VaultPayload::default()
+            };
+            let sealed = cipher::seal(&serde_json::to_vec(&payload).unwrap(), &key()).unwrap();
+            std::fs::write(&path, sealed).unwrap();
+        };
+
+        written_at(1);
+        let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(payload.version, PAYLOAD_VERSION);
+        vault.save(&payload).unwrap();
+        assert_eq!(vault.load().unwrap().version, PAYLOAD_VERSION);
+        drop(vault);
+
+        written_at(PAYLOAD_VERSION + 1);
+        assert!(matches!(
+            Vault::open_or_create(&path, key()),
+            Err(VaultError::UnsupportedVersion(3))
+        ));
     }
 
     #[test]
