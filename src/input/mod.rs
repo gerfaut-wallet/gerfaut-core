@@ -91,7 +91,7 @@ pub enum InputWarning {
 }
 
 /// Normalized wallet material produced by the classifier.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ParsedPayload {
     /// Canonical descriptors, checksummed.
@@ -304,14 +304,19 @@ fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
         });
     }
 
+    // A line that opens with `#` is a comment, as in the descriptor file
+    // Sparrow exports: a checksum never starts a line.
     let lines: Vec<&str> = trimmed
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
 
     if lines.len() == 2 && lines[0].contains('(') && lines[1].contains('(') {
         return parse_descriptor_pair(lines[0], lines[1]);
+    }
+    if lines.len() == 3 && lines.iter().all(|l| l.contains('(')) {
+        return parse_descriptor_file(&lines);
     }
     if lines.len() != 1 {
         return Err(CoreError::UnrecognizedInput(
@@ -599,6 +604,42 @@ fn parse_descriptor_pair(first: &str, second: &str) -> CoreResult<ParsedInput> {
         derivation_editable: false,
         preview_address: None,
     })
+}
+
+/// A descriptor file as Sparrow exports it: the wallet once as one
+/// multipath descriptor, then as its receive and change descriptors,
+/// in any order. The multipath one is the wallet, and the other two
+/// must say the same, or the file is refused: one of the three would
+/// otherwise be watched, unread, in place of another.
+fn parse_descriptor_file(lines: &[&str]) -> CoreResult<ParsedInput> {
+    let refuse = |detail: &str| CoreError::InvalidInput {
+        kind: "descriptor",
+        detail: detail.to_owned(),
+    };
+    let mut parsed = lines
+        .iter()
+        .map(|line| parse_single_descriptor(line))
+        .collect::<CoreResult<Vec<_>>>()?;
+    let whole: Vec<usize> = (0..parsed.len())
+        .filter(|&i| parsed[i].kind == RecognizedKind::MultipathDescriptor)
+        .collect();
+    let [whole] = whole[..] else {
+        return Err(refuse(
+            "expected one multipath descriptor beside its receive and change descriptors",
+        ));
+    };
+    let pair: Vec<&str> = (0..lines.len())
+        .filter(|&i| i != whole)
+        .map(|i| lines[i])
+        .collect();
+    let pair = parse_descriptor_pair(pair[0], pair[1])?;
+    let wallet = parsed.swap_remove(whole);
+    if wallet.payload != pair.payload {
+        return Err(refuse(
+            "the descriptors in this file do not describe the same wallet",
+        ));
+    }
+    Ok(wallet)
 }
 
 /// Holds the change descriptor of a pair to the receive one. The two
@@ -1685,6 +1726,43 @@ mod tests {
         let unknown_purpose = format!("[9a6a2580/0'/1'/0']{TPUB}");
         let parsed = parse_input(&unknown_purpose).unwrap();
         assert!(parsed.warnings.contains(&InputWarning::AssumedSegwit));
+    }
+
+    /// Sparrow's descriptor file: comments, then the wallet three times,
+    /// as one multipath descriptor and as its two branches. It reads as
+    /// the multipath one, and only while the three agree.
+    #[test]
+    fn a_sparrow_descriptor_file_reads_as_its_wallet() {
+        let alone = parse_input(MULTIPATH).unwrap();
+        let (receive, change, _) = descriptors(&alone);
+        let whole: Descriptor<DescriptorPublicKey> = MULTIPATH.parse().unwrap();
+        let file = |receive: &str, change: &str| {
+            format!(
+                "# Receive and change descriptor:
+{whole}
+
+# Receive descriptor:
+{receive}
+
+                 # Change descriptor:
+{change}
+"
+            )
+        };
+        let parsed = parse_input(&file(receive, change.unwrap())).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
+        assert_eq!(parsed.payload, alone.payload);
+        assert_eq!(parsed.preview_address, alone.preview_address);
+
+        let elsewhere = format!("wpkh([9a6a2580/84'/1'/0']{TPUB}/2/*)");
+        let error = parse_input(&file(receive, &elsewhere))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("same wallet"), "{error}");
+        let error = parse_input(&file(receive, receive))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("the same"), "{error}");
     }
 
     #[test]
