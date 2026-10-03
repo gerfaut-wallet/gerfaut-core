@@ -454,16 +454,22 @@ fn lift(descriptor: &Descriptor<DescriptorPublicKey>) -> CoreResult<Semantic> {
     descriptor.lift().map_err(unreadable)
 }
 
-/// Whether a key is the BIP 341 unspendable point, written x-only or
-/// with the even-parity prefix of a full key.
+/// Whether a key is the BIP 341 unspendable point, whatever its form:
+/// x-only, a full key of either parity, or an extended key built on the
+/// point, which is how Liana writes the internal key of a vault whose
+/// primary path takes several keys. A child of such an extended key is
+/// the point plus a tweak anyone can compute, and nobody holds it
+/// either.
 fn is_unspendable(key: &DescriptorPublicKey) -> bool {
-    let DescriptorPublicKey::Single(single) = key else {
-        return false;
+    let point = match key {
+        DescriptorPublicKey::Single(single) => match single.key {
+            SinglePubKey::XOnly(key) => key,
+            SinglePubKey::FullKey(key) => key.inner.x_only_public_key().0,
+        },
+        DescriptorPublicKey::XPub(xkey) => xkey.xkey.public_key.x_only_public_key().0,
+        DescriptorPublicKey::MultiXPub(xkey) => xkey.xkey.public_key.x_only_public_key().0,
     };
-    match single.key {
-        SinglePubKey::XOnly(key) => key.to_string() == UNSPENDABLE_INTERNAL_KEY,
-        SinglePubKey::FullKey(key) => key.to_string() == format!("02{UNSPENDABLE_INTERNAL_KEY}"),
-    }
+    point.to_string() == UNSPENDABLE_INTERNAL_KEY
 }
 
 /// The top-level alternatives: the items of an outer "or", flattened,
@@ -2018,6 +2024,57 @@ mod tests {
         assert!(
             matches!(refused, Err(CoreError::Descriptor(ref detail)) if detail.contains("no one")),
             "{refused:?}"
+        );
+
+        // Written as a full key of the other parity, the point is just
+        // as nobody's.
+        let descriptor = format!("tr(03{UNSPENDABLE_INTERNAL_KEY},{{pk({B}/0/*),pk({C}/0/*)}})");
+        let snapshot = analyze_with(&descriptor, ScriptKind::Taproot, Vec::new());
+        assert_eq!(snapshot.keys.len(), 2);
+    }
+
+    /// The BIP 341 point as Liana writes the internal key of a taproot
+    /// vault whose primary path takes several keys: an extended key at
+    /// depth zero built on the point, here with SHA-256 of the public
+    /// keys of A, B and C for its chain code, derived on `<0;1>/*` like
+    /// the keys of the tree.
+    const NUMS_XPUB: &str = "xpub661MyMwAqRbcGsLpni91inzhhEbBpW2cGZFA476zeaNJtHUb7BVZ1cv4a6zPeKU4SCA773hHndeBrUPrEV5paZX4gfMgS4JhYM4zNJr5yNF";
+
+    #[test]
+    fn a_liana_taproot_vault_has_no_key_path() {
+        let descriptor = format!(
+            "tr({NUMS_XPUB}/<0;1>/*,{{multi_a(2,{A}/<0;1>/*,{B}/<0;1>/*),and_v(v:pk({C}/<0;1>/*),older(52560))}})"
+        );
+        let snapshot = analyze_with(&descriptor, ScriptKind::Taproot, Vec::new());
+        assert_eq!(
+            snapshot.policy,
+            "or(and(pk(Key A),pk(Key B)),and(pk(Key C),older(52560)))"
+        );
+        let keys: Vec<&str> = snapshot.keys.iter().map(|k| k.key_short.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![shorten(A), shorten(B), shorten(C)],
+            "the point is nobody's key"
+        );
+        let roles: Vec<(BranchRole, &str, &str)> = snapshot
+            .branches
+            .iter()
+            .map(|b| (b.role, b.label.as_str(), b.summary.as_str()))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (BranchRole::Primary, "Primary", "Keys A and B"),
+                (
+                    BranchRole::Recovery,
+                    "Recovery",
+                    "Key C, once a coin has waited 52,560 blocks"
+                ),
+            ]
+        );
+        assert!(
+            snapshot.branches.iter().all(|b| b.summary != "Key A"),
+            "no key spends this vault alone"
         );
     }
 
