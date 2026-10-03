@@ -150,11 +150,15 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
 
 /// The scripts worth watching live for a descriptor wallet, the ones
 /// most likely to move first, since a transport may only cover the
-/// head of the list: the unused receive addresses, the scripts holding
-/// coins (a spend shows there first), the receive addresses within the
-/// gap limit past the last revealed one, the change addresses the same
-/// way, and then the used, empty ones, newest first. A script past the
-/// revealed range is marked as such. Each comes with the Electrum
+/// head of the list: the scripts holding coins, where a spend shows and
+/// what a thief would move; the newest receive addresses the wallet
+/// revealed and has not seen used, up to the gap limit, the ones a
+/// payer was last handed, and the gap limit past the last revealed one;
+/// the change addresses the same way; and then the rest, newest first,
+/// older unused addresses and used, empty ones. A merchant's wallet
+/// reveals an address per invoice, and many are never paid: the oldest
+/// of them never come before its coins. A script past the revealed
+/// range is marked as such. Each comes with the Electrum
 /// status of the history the wallet holds for it, as
 /// [`electrum_statuses`] computes it, and the counters an Esplora server
 /// would keep for that history.
@@ -199,14 +203,21 @@ pub(crate) fn watch_scripts(
                 .unwrap_or_else(|| wallet.peek_address(keychain, at).script_pubkey())
         })
     };
+    let newest_unused = |keychain: KeychainKind| {
+        index
+            .unused_keychain_spks(keychain)
+            .rev()
+            .take(gap_limit as usize)
+            .map(|(_, script)| script)
+    };
     let cut = 'full: {
-        for (_, script) in index.unused_keychain_spks(KeychainKind::External) {
-            if push(script, false) {
+        for coin in wallet.list_unspent() {
+            if push(coin.txout.script_pubkey, false) {
                 break 'full true;
             }
         }
-        for coin in wallet.list_unspent() {
-            if push(coin.txout.script_pubkey, false) {
+        for script in newest_unused(KeychainKind::External) {
+            if push(script, false) {
                 break 'full true;
             }
         }
@@ -216,7 +227,7 @@ pub(crate) fn watch_scripts(
             }
         }
         if keychains.contains(&KeychainKind::Internal) {
-            for (_, script) in index.unused_keychain_spks(KeychainKind::Internal) {
+            for script in newest_unused(KeychainKind::Internal) {
                 if push(script, false) {
                     break 'full true;
                 }
@@ -1317,20 +1328,24 @@ mod tests {
         assert_eq!(unlisted, 1_001 + 20 + 20 - 200);
         let (whole, unlisted) = watch_scripts(&wallet, 20, &HistoryOrders::new(), 5_000);
         assert_eq!((whole.len(), unlisted), (1_041, 0));
-        assert_eq!(
-            scripts[0].script,
+        // The newest first, the oldest left out.
+        let derived = |index| {
             wallet
-                .peek_address(KeychainKind::External, 0)
+                .peek_address(KeychainKind::External, index)
                 .script_pubkey()
                 .to_hex_string()
-        );
-        assert!(scripts.iter().all(|script| !script.lookahead));
+        };
+        assert_eq!(scripts[0].script, derived(1_000));
+        assert!(!scripts.iter().any(|script| script.script == derived(0)));
+        // A gap limit past the last revealed address of each keychain.
+        let ahead = scripts.iter().filter(|script| script.lookahead).count();
+        assert_eq!(ahead, 40);
     }
 
     /// The scripts read from the index are the ones a derivation gives,
-    /// in the same order: the unused receive addresses, the coins, a gap
-    /// limit past the last revealed address on each keychain, further
-    /// than the index looks ahead, then the used ones, newest first.
+    /// in the same order: the coins, the unused addresses newest first, a
+    /// gap limit past the last revealed address on each keychain, further
+    /// than the index looks ahead, then the rest, newest first.
     #[test]
     fn the_listed_scripts_are_the_derived_ones() {
         let mut wallet = bdk_wallet::Wallet::create(EXTERNAL, INTERNAL)
@@ -1362,15 +1377,14 @@ mod tests {
         let gap = 40;
         let (scripts, unlisted) = watch_scripts(&wallet, gap, &HistoryOrders::new(), usize::MAX);
         assert_eq!(unlisted, 0);
-        let mut expected: Vec<(String, bool)> = Vec::new();
-        for index in [0, 1, 2, 4, 5, 6, 7, 8, 9] {
+        let mut expected: Vec<(String, bool)> = vec![(paid.clone(), false)];
+        for index in [9, 8, 7, 6, 5, 4, 2, 1, 0] {
             expected.push((derived(&wallet, KeychainKind::External, index), false));
         }
-        expected.push((paid.clone(), false));
         for index in 10..10 + gap {
             expected.push((derived(&wallet, KeychainKind::External, index), true));
         }
-        for index in [0, 1] {
+        for index in [1, 0] {
             expected.push((derived(&wallet, KeychainKind::Internal, index), false));
         }
         for index in 2..2 + gap {

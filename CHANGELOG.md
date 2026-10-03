@@ -192,6 +192,15 @@ The first release: the library both Gerfaut apps are built on.
   addresses, that is milliseconds instead of seconds. While an Electrum
   server takes the subscriptions, the count the status gives moves in
   steps of a hundred, not one event per script.
+- The live watch lists each wallet's scripts that hold coins first, where
+  a spend shows, then the newest receive addresses it revealed and has
+  not seen used, up to the gap limit, and the gap limit ahead of them,
+  then the change addresses the same way, then the rest, newest first.
+  The unused receive addresses used to come first, oldest first: a
+  merchant's wallet that reveals an address per invoice, many never
+  paid, filled the 200 scripts a watch takes of a wallet with them, and
+  neither a spend of its coins nor a payment to its next addresses was
+  heard before the next sync.
 - On the user's own node, polling reads thirty scripts a minute, four at
   a time, instead of three. Polling reads the head of the list every
   round and the rest in turn, so with N scripts past what a server

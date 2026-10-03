@@ -348,9 +348,9 @@ pub struct WalletCoverage {
 pub enum Coverage {
     /// Every script worth watching is: a payment shows at once.
     Live,
-    /// The head of the wallet is: the unused addresses first, then the
-    /// coins, then the addresses ahead. A payment to the rest shows at
-    /// the next sync.
+    /// The head of the wallet is: its coins first, then its newest
+    /// unused addresses and the ones ahead. A payment to the rest
+    /// shows at the next sync.
     Partial,
     /// None is: every payment shows at the next sync.
     SyncOnly,
