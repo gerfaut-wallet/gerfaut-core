@@ -654,6 +654,13 @@ async fn a_mempool_websocket_pushes_what_it_tracks_and_polls_the_rest() {
     assert_eq!(status.state, WatchState::Connected);
     assert_eq!(status.transport, Some(WatchTransport::MempoolWebsocket));
     assert_eq!(status.watched_scripts, 4);
+    // The status counts the list once it is sent, the server answering
+    // only a refusal: what the server read is what it records, a moment
+    // later on a loaded machine.
+    within("tracked", WAIT, || {
+        !server.state.lock().unwrap().tracked.is_empty()
+    })
+    .await;
     assert_eq!(
         server.state.lock().unwrap().tracked,
         vec![vec![script(1), script(4)]]
