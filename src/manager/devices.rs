@@ -25,7 +25,7 @@ use crate::premium::device::{self, PendingConnect, Secret};
 use crate::premium::licence;
 use crate::premium::{Device, DevicePlatform, Licence};
 
-use super::{WalletManager, same_key};
+use super::WalletManager;
 
 /// How long a connection waits after a rate limit that named no wait.
 const CONNECT_WAIT_UNNAMED: Duration = Duration::from_secs(300);
@@ -731,6 +731,12 @@ fn settles_key_change(error: &CoreError) -> bool {
                     | PremiumError::NotFound
             )
     )
+}
+
+/// Whether two premium keys are the same account key, however each was
+/// typed; two absent keys are the same absence.
+fn same_key(a: Option<&str>, b: Option<&str>) -> bool {
+    a.map(crate::premium::licence::normalize_key) == b.map(crate::premium::licence::normalize_key)
 }
 
 #[cfg(test)]
