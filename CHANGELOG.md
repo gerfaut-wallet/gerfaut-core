@@ -61,6 +61,28 @@ The first release: the library both Gerfaut apps are built on.
   repeats one. Settings and wallets change under a running watch without a
   call from the app, and a host whose timers sleep can ask for a connection
   check from an alarm.
+- "This is my node". A custom backend can be marked as the user's own
+  node with `own_node`, on `BackendConfig::CustomElectrum` and
+  `CustomEsplora`. It is off by default and left out of the stored form
+  while off, so a vault or a backup written before it reads and writes
+  back the same; the public backend cannot be one, and nothing checks the
+  claim. On the user's own node the live watch takes 20,000 scripts in all
+  instead of 2,000, and one wallet may take all of them instead of 200:
+  a public server charges every subscription and refuses them past its
+  own limit, a node of one's own does not. The switch travels with the
+  backend in a backup.
+- The live watch shares its scripts out between wallets rank by rank, the
+  first script of every wallet, then the second, and so on. Wallets the
+  user pinned come first, up to what a watch takes of one wallet; then,
+  at each rank, a wallet that holds coins goes before an empty one.
+  `WalletManager::set_wallet_live_pinned` pins a wallet, and
+  `WalletMeta.live_pinned`, kept in the vault and carried by backups,
+  says which are.
+- The status of the live watch says how much of each wallet it hears.
+  `WatchStatus.wallets` gives each wallet `live`, `partial` or
+  `sync_only`, with the scripts it watches and the ones it leaves to the
+  regular syncs, and `left_out_scripts` and `left_out_wallets` add them
+  up, so an app can say when a payment will only show at the next sync.
 - The premium client reads a wallet the server refused: `watching` is false
   and `refusal` says why, in the list and in a `wallet_refused` event. A
   single address can be registered like a descriptor.
@@ -164,6 +186,12 @@ The first release: the library both Gerfaut apps are built on.
   announced. A change heard on one script at the same time as a
   reconnection no longer narrows the whole-wallet sync the reconnection
   asks for.
+- The list of scripts the live watch follows, built after every sync,
+  reads each script the wallet revealed from the wallet's index instead
+  of deriving it again. On a wallet that revealed tens of thousands of
+  addresses, that is milliseconds instead of seconds. While an Electrum
+  server takes the subscriptions, the count the status gives moves in
+  steps of a hundred, not one event per script.
 - The live watch keeps each wallet complete on its own. At each block,
   and every ten minutes, it reruns any sync that failed, and reads every
   script of any wallet that has gone a day without a complete sync. A
@@ -193,12 +221,24 @@ The first release: the library both Gerfaut apps are built on.
   before an `@` keeps its own.
 - The ids the premium server hands out are percent-encoded before they go
   into a URL path.
+- A watched address is never read from a server of another network.
+  Testnet, testnet4 and signet spell an address alike, and a server of
+  the wrong one answered for it with transactions the wallet's network
+  never saw. A descriptor wallet's sync already caught it, walking the
+  wallet's chain; an address keeps none, so its sync now asks the server
+  for its genesis block first, over Electrum and Esplora, and is refused
+  by one of another network.
+- An OP_RETURN payload that holds a character changing the direction of
+  the text, a bidirectional mark, embedding, override or isolate, is no
+  longer read as text: shown as text, it could make an amount or an
+  address beside it read backwards. Its bytes are shown in hex instead.
 - A 401, 403, 404 or 410 from the premium server counts as its answer only
   when it comes in the server's own error body. The bare status is what a
   captive portal or a proxy answers, and it no longer makes the app forget
   a key or a wallet the server still holds.
 - A 429 from the premium server that names a wait is a rate limit of its
-  own, with the wait it named, an hour at most. Telling the server about
+  own, with the wait it named, a day at most: what the server holds back
+  for the day comes back the next day. Telling the server about
   removed wallets stops at one and keeps the rest for later, instead of
   sending every request behind it to be turned away too.
 - The update check takes the route the syncs take. With an onion backend
