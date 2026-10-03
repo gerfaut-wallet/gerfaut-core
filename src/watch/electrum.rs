@@ -28,6 +28,11 @@ const WINDOW: usize = 25;
 /// up: a server at its limit refuses them all, and asking on only costs
 /// it more.
 const REFUSALS: u32 = 5;
+/// Subscriptions answered between two counts told in the status, the
+/// last one always told. A list on the user's own node runs to twenty
+/// thousand answers, and each change of the status is an event a screen
+/// redraws for.
+const STATUS_STEP: u32 = 100;
 /// The protocol range asked for. 1.4 is what a sync speaks; 1.4.2 adds
 /// `unsubscribe`, used when the server has it.
 const PROTOCOL_MIN: &str = "1.4";
@@ -220,6 +225,15 @@ impl Session {
         send(&mut self.writer, &message).await
     }
 
+    /// Whether a subscription is still to be sent or answered.
+    fn subscribing(&self) -> bool {
+        !self.queue.is_empty()
+            || self
+                .in_flight
+                .values()
+                .any(|request| matches!(request, Request::Subscribe(_)))
+    }
+
     /// Tells the hub once every script of the first pass has its answer.
     fn check_ready(&mut self, hub: &mut Hub) {
         if !self.opening.is_empty() || self.ready_told {
@@ -306,8 +320,10 @@ impl Session {
                 Request::Subscribe(scripthash) if !refused => {
                     self.refused = 0;
                     self.acknowledged += 1;
-                    let acknowledged = self.acknowledged;
-                    hub.set_status(|status| status.pushed_scripts = acknowledged);
+                    if self.acknowledged.is_multiple_of(STATUS_STEP) || !self.subscribing() {
+                        let acknowledged = self.acknowledged;
+                        hub.set_status(|status| status.pushed_scripts = acknowledged);
+                    }
                     self.status(hub, &scripthash, &message["result"], true);
                     self.opening.remove(&scripthash);
                 }
@@ -326,7 +342,11 @@ impl Session {
                     self.opening.remove(&scripthash);
                     self.refused += 1;
                     let refusal = words(&message["error"]);
-                    hub.set_status(|status| status.detail = Some(refusal));
+                    let acknowledged = self.acknowledged;
+                    hub.set_status(|status| {
+                        status.detail = Some(refusal);
+                        status.pushed_scripts = acknowledged;
+                    });
                     if self.refused >= REFUSALS {
                         // Not watched from now on, and what they did
                         // while nothing listened is as unknown as for

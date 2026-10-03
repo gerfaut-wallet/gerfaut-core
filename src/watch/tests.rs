@@ -1061,6 +1061,31 @@ async fn the_status_says_how_much_of_each_wallet_is_live() {
     );
 }
 
+/// A long list is told in steps as the server answers, the last count
+/// always: not one status per script.
+#[tokio::test]
+async fn subscriptions_are_told_in_steps() {
+    let server = FakeElectrum::start().await;
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![numbered("large", 0, 150), numbered("small", 1_000, 50)],
+        Some(timings()),
+    );
+    let mut told = Vec::new();
+    while told.last() != Some(&200) {
+        match tokio::time::timeout(WAIT, events.next()).await {
+            Ok(Some(WatchEvent::Status(status))) if status.pushed_scripts > 0 => {
+                told.push(status.pushed_scripts);
+            }
+            Ok(Some(_)) => {}
+            other => panic!("never subscribed whole: {other:?}, told {told:?}"),
+        }
+    }
+    told.dedup();
+    assert_eq!(told, [100, 200]);
+    assert_eq!(watch.status().pushed_scripts, 200);
+}
+
 /// A status, or a wallet list, written before coverage and pinning
 /// existed still reads, with nothing left out and nothing pinned.
 #[test]

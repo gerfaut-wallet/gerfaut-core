@@ -297,6 +297,8 @@ pub struct WatchStatus {
     /// Scripts in the list.
     pub watched_scripts: u32,
     /// Scripts the server pushes changes for; the rest are polled.
+    /// Counted in steps of a hundred while an Electrum server answers
+    /// the subscriptions, the last count always.
     pub pushed_scripts: u32,
     /// Scripts worth watching that the watch leaves to the regular
     /// syncs, past what it takes of one wallet or of all of them: a
