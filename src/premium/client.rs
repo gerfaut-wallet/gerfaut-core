@@ -348,7 +348,7 @@ impl ErrorBody {
     fn read(body: &[u8]) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_slice(body).ok()?;
         Some(ErrorBody {
-            error: value.get("error")?.as_str()?.to_owned(),
+            error: shown_words(value.get("error")?.as_str()?),
             code: value
                 .get("code")
                 .and_then(serde_json::Value::as_str)
@@ -358,6 +358,26 @@ impl ErrorBody {
                 .and_then(serde_json::Value::as_i64),
         })
     }
+}
+
+/// Most characters of the server's sentence kept, as for the words of
+/// a node: one short line on screen.
+const WORDS_MAX: usize = 200;
+
+/// The server's sentence as the screen shows it and the vault keeps it
+/// (a refusal of the connection is stored to say why): its first 200
+/// characters, an ellipsis after, control characters and those that
+/// turn the text around dropped. The body it comes in may run to
+/// [`MAX_BODY`], and the vault is rewritten whole at every save.
+fn shown_words(text: &str) -> String {
+    let mut kept = text
+        .chars()
+        .filter(|c| !c.is_control() && !crate::wallet::tx_extras::is_bidi_control(*c));
+    let mut words: String = kept.by_ref().take(WORDS_MAX).collect();
+    if kept.next().is_some() {
+        words.push('\u{2026}');
+    }
+    words
 }
 
 #[derive(Deserialize)]
@@ -2438,6 +2458,25 @@ mod tests {
         assert_eq!(
             refused(404, r#"{"error":"no such device","code":42}"#),
             PremiumError::NotFound
+        );
+    }
+
+    /// The server's sentence is shown, and a refusal of the connection
+    /// kept in the vault: one short line, whatever the body held.
+    #[test]
+    fn the_server_words_are_one_short_line() {
+        let long = format!("first\nline \u{202E}reversed {}", "x".repeat(10_000));
+        let PremiumError::Rejected(words) =
+            refused(400, &serde_json::json!({ "error": long }).to_string())
+        else {
+            panic!("a refusal in the server's words");
+        };
+        assert_eq!(words.chars().count(), WORDS_MAX + 1);
+        assert!(words.starts_with("firstline reversed x"), "{words}");
+        assert!(words.ends_with('\u{2026}'));
+        assert_eq!(
+            refused(400, r#"{"error":"not now"}"#),
+            PremiumError::Rejected("not now".to_owned())
         );
     }
 
