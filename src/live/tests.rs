@@ -864,6 +864,31 @@ async fn a_server_behind_on_another_chain_is_refused() {
     manager.sync_wallet(&wallet).await.unwrap();
 }
 
+/// A watched address keeps no chain to hold a server to: the server is
+/// asked for its genesis block instead, over either protocol, and one of
+/// another network is refused before it answers for an address that
+/// network spells alike.
+#[tokio::test]
+async fn an_address_is_never_read_on_another_network() {
+    let electrum = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), electrum.backend()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    electrum.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    let refused = manager.sync_wallet(&wallet).await.unwrap_err();
+    assert!(refused.to_string().contains("another network"), "{refused}");
+
+    let esplora = FakeMempool::start(false, 0).await;
+    manager
+        .set_backend(Network::Signet, esplora.backend())
+        .await
+        .unwrap();
+    manager.sync_wallet(&wallet).await.unwrap();
+    esplora.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    let refused = manager.sync_wallet(&wallet).await.unwrap_err();
+    assert!(refused.to_string().contains("another network"), "{refused}");
+}
+
 /// The watch moves to another network while it owes a wallet of the old
 /// one a sync that failed. That sync is dropped with the old network:
 /// a block on the new one runs nothing for the old wallet.

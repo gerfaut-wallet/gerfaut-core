@@ -579,6 +579,7 @@ pub(crate) async fn fetch_address_state(
 ) -> Result<AddressWatchState, String> {
     let address = parse_address(address, network)?;
     let our_script = address.script_pubkey();
+    check_network(client, network).await?;
 
     let tip_height = client.height().await?;
     let stats = client.address_stats(&address).await?;
@@ -631,7 +632,26 @@ pub(crate) async fn fetch_address_history(
     let from: Txid = from
         .parse()
         .map_err(|_| format!("invalid history cursor: {from}"))?;
+    check_network(client, network).await?;
     history_round(client, &address, &our_script, network, Some(from), None).await
+}
+
+/// Refuses a server whose genesis block is not the network's. Testnet,
+/// testnet4 and signet spell an address alike, and a server of another
+/// of them answers for it, with transactions the wallet's network never
+/// saw. A descriptor wallet's sync finds that out walking the wallet's
+/// chain down to the server's; a watched address keeps no chain, and
+/// asks.
+pub(crate) async fn check_network(client: &Client, network: Network) -> Result<(), String> {
+    let text = client.get_bytes("/block-height/0").await?;
+    let genesis: BlockHash = std::str::from_utf8(&text)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .ok_or_else(|| "unexpected response".to_owned())?;
+    if !crate::chain::is_genesis_of(network, genesis) {
+        return Err(crate::chain::ANOTHER_NETWORK.to_owned());
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_address(address: &str, network: Network) -> Result<Address, String> {

@@ -106,6 +106,7 @@ async fn state_in_rounds_of(
     let ours = parse_address(address, network)?.script_pubkey();
     let hash = scripthash(&ours);
     let mut connection = Connection::open(target, proxy).await?;
+    check_network(&mut connection, network).await?;
     let tip: Tip = connection
         .call("blockchain.headers.subscribe", json!([]))
         .await?;
@@ -166,6 +167,7 @@ async fn history_in_rounds_of(
         .parse()
         .map_err(|_| format!("invalid history cursor: {from}"))?;
     let mut connection = Connection::open(target, proxy).await?;
+    check_network(&mut connection, network).await?;
     let history = history(&mut connection, &scripthash(&ours)).await?;
     let (round, cursor) = round_of(&history, Some(from), per_round)?;
     let mut txs = read(&mut connection, &round, &ours, network).await?;
@@ -404,6 +406,19 @@ async fn fetch_outputs(
             },
         )
         .await?;
+    Ok(())
+}
+
+/// Refuses a server whose genesis block is not the network's, as
+/// [`crate::chain::esplora::check_network`] does over Esplora.
+async fn check_network(connection: &mut Connection, network: Network) -> Result<(), String> {
+    let hex: String = connection
+        .call("blockchain.block.header", json!([0]))
+        .await?;
+    let genesis: Header = deserialize_hex(&hex).map_err(|_| "unexpected response".to_owned())?;
+    if !crate::chain::is_genesis_of(network, genesis.block_hash()) {
+        return Err(crate::chain::ANOTHER_NETWORK.to_owned());
+    }
     Ok(())
 }
 

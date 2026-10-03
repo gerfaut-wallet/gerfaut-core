@@ -130,6 +130,15 @@ impl BackendConfig {
     }
 }
 
+/// What a server whose genesis block is another network's is refused
+/// with.
+pub(crate) const ANOTHER_NETWORK: &str = "the server is on another network";
+
+/// Whether a block is the genesis block of `network`.
+pub(crate) fn is_genesis_of(network: Network, hash: bdk_wallet::bitcoin::BlockHash) -> bool {
+    bdk_wallet::bitcoin::constants::genesis_block(network.to_bitcoin()).block_hash() == hash
+}
+
 /// Whether a backend URL points at a Tor hidden service. Onion hosts
 /// are routed through the Tor proxy [`tor`] resolves, never looked up.
 ///

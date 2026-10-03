@@ -488,6 +488,9 @@ pub(crate) struct MempoolState {
     /// The transactions of the one address the REST side knows, as
     /// Esplora spells them, for a sync to read.
     pub address_txs: Vec<Value>,
+    /// The network whose genesis block the REST side names at height 0,
+    /// signet when `None`.
+    pub genesis: Option<bdk_wallet::bitcoin::Network>,
 }
 
 #[derive(Clone)]
@@ -588,6 +591,12 @@ impl FakeMempool {
                 ("200 OK", format!("{:064x}", state.tip))
             } else if path.ends_with("/blocks/tip/height") {
                 ("200 OK", state.tip.to_string())
+            } else if path.ends_with("/block-height/0") {
+                let network = state
+                    .genesis
+                    .unwrap_or(bdk_wallet::bitcoin::Network::Signet);
+                let genesis = bdk_wallet::bitcoin::constants::genesis_block(network);
+                ("200 OK", genesis.block_hash().to_string())
             } else if path.ends_with("/utxo") || path.contains("/txs/chain/") {
                 ("200 OK", "[]".to_owned())
             } else if path.ends_with("/txs") {
