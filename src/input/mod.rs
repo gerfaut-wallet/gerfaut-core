@@ -334,7 +334,7 @@ fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
     if xpub::looks_like_extended_key(token) {
         return parse_extended_key(token, None, options);
     }
-    if let Ok(address) = token.parse::<Address<_>>() {
+    if let Ok(address) = payment_address(token).parse::<Address<_>>() {
         return classify_address(address);
     }
 
@@ -974,6 +974,19 @@ fn preview_address(parsed: &ParsedInput) -> Option<String> {
 }
 
 // --- addresses ---------------------------------------------------------
+
+/// The address of a payment URI (BIP21, `bitcoin:bc1q…?amount=…`, the
+/// scheme in any case), as the receive screen of another wallet shows
+/// it in a QR code; the token itself otherwise.
+fn payment_address(token: &str) -> &str {
+    match token.get(..8) {
+        Some(scheme) if scheme.eq_ignore_ascii_case("bitcoin:") => {
+            let rest = &token[8..];
+            rest.split_once('?').map_or(rest, |(address, _)| address)
+        }
+        _ => token,
+    }
+}
 
 fn classify_address(
     address: Address<bdk_wallet::bitcoin::address::NetworkUnchecked>,
@@ -1763,6 +1776,25 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("the same"), "{error}");
+    }
+
+    /// A payment URI scanned from another wallet's receive screen is its
+    /// address, whatever it asks for and in whichever case it comes.
+    #[test]
+    fn a_payment_uri_reads_as_its_address() {
+        let address = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+        let alone = parse_input(address).unwrap();
+        for uri in [
+            format!("bitcoin:{address}"),
+            format!("bitcoin:{address}?amount=0.001&label=Rent"),
+            format!("BITCOIN:{}?AMOUNT=0.001", address.to_uppercase()),
+        ] {
+            let parsed = parse_input(&uri).unwrap();
+            assert_eq!(parsed.kind, RecognizedKind::Address, "{uri}");
+            assert_eq!(parsed.payload, alone.payload, "{uri}");
+        }
+        assert!(parse_input("bitcoin:").is_err());
+        assert!(parse_input("bitcoin:?amount=1").is_err());
     }
 
     #[test]
