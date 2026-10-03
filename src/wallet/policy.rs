@@ -26,13 +26,16 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use bdk_wallet::bitcoin::AddressType;
 use bdk_wallet::bitcoin::address::{Address, NetworkUnchecked};
 use bdk_wallet::miniscript::descriptor::SinglePubKey;
 use bdk_wallet::miniscript::policy::Liftable;
 use bdk_wallet::miniscript::policy::semantic::Policy;
-use bdk_wallet::miniscript::{AbsLockTime, Descriptor, DescriptorPublicKey, RelLockTime};
+use bdk_wallet::miniscript::{
+    AbsLockTime, Descriptor, DescriptorPublicKey, RelLockTime, Threshold,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, CoreResult};
@@ -343,7 +346,7 @@ pub fn analyze(input: PolicyInput<'_>) -> CoreResult<PolicySnapshot> {
     };
     let drafts = disjuncts(&policy)
         .into_iter()
-        .map(|branch| draft(branch, &book, &input.coins, &clock))
+        .map(|branch| draft(&branch, &book, &input.coins, &clock))
         .collect::<CoreResult<Vec<Draft>>>()?;
     let roles = assign_roles(&drafts);
     let branches: Vec<PolicyBranch> = drafts
@@ -476,19 +479,41 @@ fn is_unspendable(key: &DescriptorPublicKey) -> bool {
 }
 
 /// The top-level alternatives: the items of an outer "or", flattened,
-/// or the whole policy when it has none. An "or" of plain keys stays
-/// whole: a 1-of-n multisig, however the descriptor spells it, is one
-/// way to spend, open to any of its keys, not one way per key.
-fn disjuncts(policy: &Semantic) -> Vec<&Semantic> {
-    match policy {
-        Policy::Thresh(thresh) if thresh.k() == 1 && thresh.n() > 1 && !is_multisig(policy) => {
-            thresh
-                .iter()
-                .flat_map(|sub| disjuncts(sub.as_ref()))
-                .collect()
+/// or the whole policy when it has none. The plain keys among them stay
+/// together, where the first of them stands: a 1-of-n multisig, however
+/// the descriptor spells it and whatever path stands beside it, is one
+/// way to spend, open to any of its keys, not one way per key. The
+/// normalized policy no longer tells "A or B, or C after a year" from
+/// "A, or B, or C after a year", and the two spend alike.
+fn disjuncts(policy: &Semantic) -> Vec<Semantic> {
+    fn flatten<'p>(policy: &'p Semantic, into: &mut Vec<&'p Semantic>) {
+        match policy {
+            Policy::Thresh(thresh) if thresh.k() == 1 && thresh.n() > 1 && !is_multisig(policy) => {
+                for sub in thresh.iter() {
+                    flatten(sub.as_ref(), into);
+                }
+            }
+            other => into.push(other),
         }
-        other => vec![other],
     }
+    let mut alternatives = Vec::new();
+    flatten(policy, &mut alternatives);
+    let keys: Vec<Arc<Semantic>> = alternatives
+        .iter()
+        .filter(|alternative| matches!(alternative, Policy::Key(_)))
+        .map(|key| Arc::new((*key).clone()))
+        .collect();
+    if keys.len() < 2 {
+        return alternatives.into_iter().cloned().collect();
+    }
+    let mut group = Some(Policy::Thresh(Threshold::or_n(keys)));
+    alternatives
+        .into_iter()
+        .filter_map(|alternative| match alternative {
+            Policy::Key(_) => group.take(),
+            other => Some(other.clone()),
+        })
+        .collect()
 }
 
 /// A threshold of plain keys, nothing else under it.
@@ -1751,6 +1776,33 @@ mod tests {
         assert!(snapshot.branches[0].spendable_now);
     }
 
+    /// Two everyday keys, either of them, and a third after a year: the
+    /// normalized policy holds three alternatives, and the two keys are
+    /// still one way to spend.
+    #[test]
+    fn a_one_of_n_beside_a_timed_path_stays_one_branch() {
+        let descriptor =
+            format!("wsh(or_d(multi(1,{A}/0/*,{B}/0/*),and_v(v:pkh({C}/0/*),older(52560))))");
+        let snapshot = wsh(&descriptor, Vec::new());
+        let roles: Vec<(BranchRole, &str, &str)> = snapshot
+            .branches
+            .iter()
+            .map(|b| (b.role, b.label.as_str(), b.summary.as_str()))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (BranchRole::Primary, "Primary", "Any of 2 keys"),
+                (
+                    BranchRole::Recovery,
+                    "Recovery",
+                    "Key C, once a coin has waited 52,560 blocks"
+                ),
+            ]
+        );
+        assert!(snapshot.branches[0].spendable_now);
+    }
+
     #[test]
     fn a_recovery_path_counts_per_coin() {
         let snapshot = wsh(
@@ -2067,8 +2119,10 @@ mod tests {
         );
     }
 
+    /// The key path and a leaf of a single key are any of two keys: one
+    /// way to spend, beside the timed leaf.
     #[test]
-    fn a_taproot_tree_has_a_branch_per_leaf() {
+    fn a_taproot_tree_reads_as_its_ways_to_spend() {
         let descriptor = format!("tr({A}/0/*,{{and_v(v:pk({B}/0/*),older(144)),pk({C}/0/*)}})");
         let snapshot = analyze_with(&descriptor, ScriptKind::Taproot, Vec::new());
         assert_eq!(snapshot.kind, PolicyKind::Miniscript);
@@ -2085,14 +2139,28 @@ mod tests {
         assert_eq!(
             roles,
             vec![
-                (BranchRole::Primary, "Primary", "Key A"),
+                (BranchRole::Primary, "Primary", "Any of 2 keys"),
                 (
                     BranchRole::Recovery,
                     "Recovery",
                     "Key B, once a coin has waited 144 blocks"
                 ),
-                (BranchRole::Primary, "Primary B", "Key C"),
             ]
+        );
+        assert_eq!(
+            snapshot.branches[0].condition,
+            Condition::Thresh {
+                k: 1,
+                n: 2,
+                items: vec![
+                    Condition::Key {
+                        key_id: "k0".into()
+                    },
+                    Condition::Key {
+                        key_id: "k2".into()
+                    },
+                ],
+            }
         );
         // Keys without an origin still carry their own fingerprint.
         assert_eq!(snapshot.keys[0].fingerprint, Some("3442193e".into()));
