@@ -47,8 +47,34 @@ pub struct WalletRecord {
     #[serde(default)]
     pub changeset: Option<bdk_wallet::ChangeSet>,
     /// State of single-address wallets.
-    #[serde(default)]
+    #[serde(default, serialize_with = "address_state_as_stored")]
     pub address_state: Option<AddressWatchState>,
+}
+
+/// A watched address as the vault keeps it: with two totals that vaults
+/// of the first version carried, written as zero. No build reads them
+/// any more, but a build of that version requires them, and reads the
+/// whole payload before its version: without them, it would call a
+/// vault of a later build corrupted instead of refusing it as one.
+fn address_state_as_stored<S: serde::Serializer>(
+    state: &Option<AddressWatchState>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Stored<'a> {
+        #[serde(flatten)]
+        state: &'a AddressWatchState,
+        funded_sats: u64,
+        spent_sats: u64,
+    }
+    state
+        .as_ref()
+        .map(|state| Stored {
+            state,
+            funded_sats: 0,
+            spent_sats: 0,
+        })
+        .serialize(serializer)
 }
 
 /// Global settings stored in the vault.
@@ -582,6 +608,55 @@ mod tests {
             Vault::open_or_create(&path, key()),
             Err(VaultError::UnsupportedVersion(3))
         ));
+    }
+
+    /// A build of the first version reads the whole payload before its
+    /// version, a watched address with the two totals it requires: it
+    /// reads a vault of this build that far, and refuses it for its
+    /// version, never as a corrupted one. This build reads it back as
+    /// it was.
+    #[test]
+    fn a_first_version_build_reaches_the_version_of_a_vault() {
+        #[derive(Deserialize)]
+        struct FirstAddressState {
+            tip_height: u32,
+            funded_sats: u64,
+            spent_sats: u64,
+        }
+        #[derive(Deserialize)]
+        struct FirstRecord {
+            address_state: Option<FirstAddressState>,
+        }
+        #[derive(Deserialize)]
+        struct FirstPayload {
+            version: u32,
+            wallets: Vec<FirstRecord>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let (vault, mut payload) = Vault::open_or_create(&path, key()).unwrap();
+        payload.wallets.push(WalletRecord {
+            meta: sample_meta(),
+            changeset: None,
+            address_state: Some(AddressWatchState {
+                tip_height: 7,
+                ..AddressWatchState::default()
+            }),
+        });
+        vault.save(&payload).unwrap();
+
+        let plaintext = cipher::unseal(&std::fs::read(&path).unwrap(), &key()).unwrap();
+        let first: FirstPayload = serde_json::from_slice(&plaintext).unwrap();
+        assert!(first.version > 1);
+        let state = first.wallets[0].address_state.as_ref().unwrap();
+        assert_eq!(
+            (state.tip_height, state.funded_sats, state.spent_sats),
+            (7, 0, 0)
+        );
+        assert_eq!(
+            vault.load().unwrap().wallets[0].address_state,
+            payload.wallets[0].address_state
+        );
     }
 
     #[test]
