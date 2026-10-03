@@ -554,8 +554,9 @@ The first release: the library both Gerfaut apps are built on.
   page, could hold enough of them to end the app.
 - "Forget this key" first tells the Premium server about the wallets
   removed from this device, and the removals it could not send stay queued
-  for the same key, entered again. They used to be dropped, and the server
-  went on watching wallets the app no longer had.
+  for the same key, entered again, along with any watched wallet removed
+  in between. They used to be dropped, and the server went on watching
+  wallets the app no longer had.
 - A Premium connection the vault failed to record stays on the server and
   is sent again. It used to be revoked, and the retry made a new device
   that waited ten days for an approval, the account's first one included.

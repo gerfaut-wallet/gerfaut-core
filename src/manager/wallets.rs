@@ -193,6 +193,8 @@ impl WalletManager {
     /// too, in the same write: the promise is that removing a wallet
     /// here removes it there, and the removal cannot wait for the
     /// network. [`Self::premium_flush_unwatch`] carries the message.
+    /// With the key logged out, the removal waits for that same key to
+    /// be entered again.
     pub async fn remove_wallet(&self, id: &str) -> CoreResult<()> {
         let result: CoreResult<()> = async {
             let mut state = self.state.lock().await;
@@ -205,7 +207,8 @@ impl WalletManager {
                 payload.unclaimed.retain(|news| news.wallet_id != id);
                 payload.announced.retain(|told| told.wallet_id != id);
                 let premium = &mut payload.settings.premium;
-                if premium.has_key() && premium.is_consented(id) {
+                let account = premium.has_key() || premium.pending_unwatch_account.is_some();
+                if account && premium.is_consented(id) {
                     premium.queue_unwatch(id);
                 }
                 Ok(())

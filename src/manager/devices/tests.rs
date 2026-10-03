@@ -664,7 +664,8 @@ async fn changing_the_key_stores_it_and_its_certificate() {
 }
 
 /// Logging out tells the server when it can, and clears the account
-/// whether it could or not; the consents stay.
+/// whether it could or not; the consents stay, with the account a wallet
+/// removed meanwhile is owed to.
 #[tokio::test]
 async fn logging_out_clears_the_account_even_when_the_server_is_away() {
     let dir = tempfile::tempdir().unwrap();
@@ -680,6 +681,13 @@ async fn logging_out_clears_the_account_even_when_the_server_is_away() {
     account.consent("w1", 100);
     let mut left = PremiumState::default();
     left.consent("w1", 100);
+    let kept = |stored: PremiumState| {
+        assert!(stored.unwatch_owed_to(KEY));
+        PremiumState {
+            pending_unwatch_account: None,
+            ..stored
+        }
+    };
 
     let (base_url, mut seen) = scripted(vec![answer(
         "200 OK",
@@ -694,13 +702,13 @@ async fn logging_out_clears_the_account_even_when_the_server_is_away() {
         "{request}"
     );
     assert_eq!(bearer(&request), Some(TOKEN));
-    assert_eq!(stored_premium(&manager).await, left);
+    assert_eq!(kept(stored_premium(&manager).await), left);
 
     // A token the server no longer knows is as good as told.
     let (disowning, _) = scripted(vec![answer("401 Unauthorized", DISOWNED)]).await;
     store_premium(&manager, account.clone()).await;
     manager.premium_log_out(&disowning).await.unwrap();
-    assert_eq!(stored_premium(&manager).await, left);
+    assert_eq!(kept(stored_premium(&manager).await), left);
 
     // The server is gone now: the account is cleared all the same, and
     // the token, still live there, waits to be dropped, never shown.
@@ -708,7 +716,7 @@ async fn logging_out_clears_the_account_even_when_the_server_is_away() {
     manager.premium_log_out(&base_url).await.unwrap();
     let stored = stored_premium(&manager).await;
     assert_eq!(
-        stored,
+        kept(stored.clone()),
         PremiumState {
             pending_logouts: vec![Secret::new(TOKEN.to_owned())],
             ..left.clone()
@@ -733,7 +741,7 @@ async fn logging_out_clears_the_account_even_when_the_server_is_away() {
         "{request}"
     );
     assert_eq!(bearer(&request), Some(TOKEN));
-    assert_eq!(stored_premium(&reopened).await, left);
+    assert_eq!(kept(stored_premium(&reopened).await), left);
     // Nothing left: no request.
     assert_eq!(reopened.premium_flush_logouts(&base_url).await.unwrap(), 0);
 }
@@ -826,6 +834,55 @@ async fn logging_out_keeps_the_removals_the_account_never_heard_of() {
     let stored = stored_premium(&manager).await;
     assert!(stored.pending_unwatch.is_empty());
     assert!(stored.pending_unwatch_account.is_none());
+}
+
+/// A wallet the account watches, removed once the key is gone, is owed
+/// to that account all the same: the same key entered again tells the
+/// server, and another key drops it. Either way its yes goes with it.
+#[tokio::test]
+async fn a_wallet_removed_after_a_log_out_is_still_unwatched() {
+    use crate::input::parse_input;
+    use crate::manager::tests::support::MULTIPATH;
+    use crate::network::Network;
+
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    let mut removed = Vec::new();
+    for key in [KEY, OTHER_KEY] {
+        let wallet = manager
+            .add_wallet("Cold", &parse_input(MULTIPATH).unwrap(), Network::Signet)
+            .await
+            .unwrap();
+        let mut account = connected(PremiumState {
+            key: Some(KEY.to_owned()),
+            ..PremiumState::default()
+        });
+        account.consent(&wallet.id, 1_790_000_000);
+        store_premium(&manager, account).await;
+        let (base_url, mut seen) = scripted(vec![
+            deleted_answer(THIS_DEVICE),
+            connected_answer("full"),
+            licence_answer(fixtures::VALID_CERTIFICATE),
+        ])
+        .await;
+        manager.premium_log_out(&base_url).await.unwrap();
+        manager.remove_wallet(&wallet.id).await.unwrap();
+        let stored = stored_premium(&manager).await;
+        assert_eq!(stored.pending_unwatch, [wallet.id.as_str()]);
+        assert!(!stored.is_consented(&wallet.id));
+
+        manager
+            .premium_connect(&base_url, key, DevicePlatform::Linux)
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            seen.recv().await.unwrap();
+        }
+        removed.push(stored_premium(&manager).await.pending_unwatch);
+    }
+    let [same, other] = removed.try_into().unwrap();
+    assert_eq!(same.len(), 1);
+    assert!(other.is_empty());
 }
 
 /// Tokens the server could not be told about leave one by one: a

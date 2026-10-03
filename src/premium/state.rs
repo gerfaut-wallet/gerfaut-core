@@ -223,15 +223,16 @@ impl PremiumState {
     /// certificate and what the screens remembered about it go. The
     /// consents stay, so the same key entered again asks nothing twice,
     /// and so do the removals the server has yet to hear of, marked
-    /// with the account they are owed to: the same key entered again
-    /// sends them, another drops them. The token of a connection sent
-    /// and not answered joins the ones the server is still to be told
-    /// about: it may have made a device of it.
+    /// with the account they are owed to, and so is a wallet with a
+    /// consent removed later: the same key entered again sends them,
+    /// another drops them. The token of a connection sent and not
+    /// answered joins the ones the server is still to be told about: it
+    /// may have made a device of it.
     pub(crate) fn forget_account(&mut self) {
         if let Some(pending) = self.pending_connect.take() {
             self.queue_logout(pending.token());
         }
-        if self.pending_unwatch.is_empty() {
+        if self.pending_unwatch.is_empty() && self.watched.is_empty() {
             self.pending_unwatch_account = None;
         } else if let Some(key) = &self.key {
             self.pending_unwatch_account = Some(account_digest(key));
