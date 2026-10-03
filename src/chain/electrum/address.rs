@@ -973,7 +973,7 @@ mod tests {
                 continue;
             };
             let Ok(stats) = addresses
-                .get_json::<bdk_esplora::esplora_client::api::AddressStats>(&format!(
+                .get_json::<crate::chain::esplora::api::AddressStats>(&format!(
                     "/address/{candidate}"
                 ))
                 .await

@@ -209,6 +209,9 @@ The first release: the library both Gerfaut apps are built on.
   what the wallet holds, and the rest of the round comes from it. An
   address paid a thousand times, watched live, used to cost thousands of
   requests and megabytes for each payment.
+- The core no longer depends on `bdk_esplora`, nor on `esplora-client`
+  with it: it already spoke to Esplora on its own, and kept them for six
+  types of what a server answers, which it now reads itself.
 - On the user's own node, polling reads thirty scripts a minute, four at
   a time, instead of three. Polling reads the head of the list every
   round and the rest in turn, so with N scripts past what a server

@@ -11,7 +11,6 @@
 
 use std::fmt;
 
-use bdk_esplora::esplora_client::api::TxStatus;
 use bdk_wallet::bitcoin::hex::FromHex;
 use bdk_wallet::bitcoin::{
     Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness, absolute,
@@ -19,6 +18,8 @@ use bdk_wallet::bitcoin::{
 };
 use serde::Deserialize;
 use serde::de::{self, SeqAccess, Visitor};
+
+use super::api::TxStatus;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PageTx {
@@ -158,16 +159,27 @@ mod tests {
         "status": {"confirmed": true, "block_height": 7, "block_hash": "0202020202020202020202020202020202020202020202020202020202020202", "block_time": 1700000000}
     }"#;
 
-    /// Read the way the crate reads it, and into the same transaction.
+    /// Read into the transaction the server lists, witness included.
     #[test]
-    fn a_listed_transaction_reads_as_the_crate_reads_it() {
-        use bdk_esplora::esplora_client::api::Tx;
-        let theirs: Tx = serde_json::from_str(&LISTED.replace("TXID", &"00".repeat(32))).unwrap();
-        let txid = theirs.to_tx().compute_txid().to_string();
-        let listed = LISTED.replace("TXID", &txid);
-        let theirs: Tx = serde_json::from_str(&listed).unwrap();
+    fn a_listed_transaction_reads_into_the_transaction() {
+        let hex = |text: &str| Vec::<u8>::from_hex(text).unwrap();
+        let listed_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new("01".repeat(32).parse().unwrap(), 1),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence(4_294_967_293),
+                witness: Witness::from_slice(&[hex("3044"), Vec::new(), hex("02ff")]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_859),
+                script_pubkey: ScriptBuf::from_bytes(hex("0014bb")),
+            }],
+        };
+        let listed = LISTED.replace("TXID", &listed_tx.compute_txid().to_string());
         let ours: PageTx = serde_json::from_str(&listed).unwrap();
-        assert_eq!(ours.to_tx(), theirs.to_tx());
+        assert_eq!(ours.to_tx(), listed_tx);
         assert_eq!(ours.to_tx().compute_txid(), ours.txid);
         assert_eq!(ours.vin[0].witness.len(), 3);
         assert_eq!(ours.prevouts().count(), 1);

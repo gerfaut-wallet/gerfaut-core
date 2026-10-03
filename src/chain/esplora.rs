@@ -2,11 +2,11 @@
 
 use std::time::Duration;
 
-use bdk_esplora::esplora_client::{self, api};
 use bdk_wallet::bitcoin::address::Address;
 
 use bdk_wallet::bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 
+pub(crate) mod api;
 pub(crate) mod page;
 pub(crate) mod sync;
 
@@ -397,8 +397,8 @@ pub(crate) struct Tally {
 }
 
 impl Counts {
-    pub(crate) fn of(stats: &esplora_client::api::ScriptHashStats) -> Self {
-        let tally = |side: &esplora_client::api::ScriptHashTxsSummary| Tally {
+    pub(crate) fn of(stats: &api::ScriptHashStats) -> Self {
+        let tally = |side: &api::ScriptHashTxsSummary| Tally {
             txs: u64::from(side.tx_count),
             funded: u64::from(side.funded_txo_count),
             funded_sats: side.funded_txo_sum,
@@ -658,7 +658,7 @@ pub(crate) async fn fetch_address_state(
         .map(|utxo| AddressUtxo {
             txid: utxo.txid.to_string(),
             vout: utxo.vout,
-            value_sats: utxo.value.to_sat(),
+            value_sats: utxo.value,
             height: utxo.status.block_height,
             timestamp: utxo.status.block_time,
         })
