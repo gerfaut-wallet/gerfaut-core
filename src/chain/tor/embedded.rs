@@ -145,11 +145,16 @@ fn config(data_dir: &Path) -> CoreResult<TorClientConfig> {
     if cfg!(any(target_os = "android", target_os = "ios")) {
         builder.channel().padding(tor_config::PaddingLevel::Reduced);
     }
-    // The data directory already holds the encrypted vault, in the
-    // storage the platform keeps private to the app. arti's own walk up
-    // the Unix permissions of every ancestor would refuse Android's
-    // group-writable `/data`, the very platform this client is for.
-    builder.storage().permissions().dangerously_trust_everyone();
+    // On a phone the data directory already holds the encrypted vault,
+    // in the storage the platform keeps private to the app, and arti's
+    // own walk up the Unix permissions of every ancestor would refuse
+    // Android's group-writable `/data`. A desktop keeps the check: on a
+    // machine shared with other accounts, a directory one of them can
+    // write to would let it swap the guards and the directory the client
+    // trusts.
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        builder.storage().permissions().dangerously_trust_everyone();
+    }
     builder
         .build()
         .map_err(|error| tor(format!("invalid Tor configuration: {error}")))

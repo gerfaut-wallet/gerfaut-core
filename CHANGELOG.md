@@ -309,6 +309,10 @@ The first release: the library both Gerfaut apps are built on.
   transaction stops at what a signed number holds. A made-up amount past
   what any coin holds made a build that checks panic, and showed in one
   that does not as a huge payment out.
+- On a desktop, the built-in Tor client checks again, as arti does by
+  default, that no other account of the machine can write to its state,
+  where it keeps its guards and the directory it trusts. Only a phone,
+  whose app storage the system keeps private to the app, skips it.
 - An incoming payment announced as pending is said dropped only once a
   second sync, ten minutes or more after the first one that missed it,
   has read its scripts again and not seen it either. A server that lags,
