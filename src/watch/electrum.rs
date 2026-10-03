@@ -24,9 +24,9 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::time::Instant;
 
-use super::net::{self, BoxStream, LineReader, Security};
 use super::{ChangeReason, Exit, Hub, Wake, WatchState, WatchTransport};
 use crate::chain::electrum::{CLIENT_NAME, Target, parse, words};
+use crate::chain::net::{self, BoxStream, LineReader, Security};
 use crate::chain::{ANOTHER_NETWORK, Endpoint, is_genesis_of};
 
 /// The longest line read. A status is 64 characters and a header 160;

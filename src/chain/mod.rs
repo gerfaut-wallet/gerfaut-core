@@ -3,6 +3,7 @@
 pub mod connect;
 pub(crate) mod electrum;
 pub(crate) mod esplora;
+pub(crate) mod net;
 pub mod public;
 pub(crate) mod tls;
 pub mod tor;

@@ -87,7 +87,6 @@
 
 mod electrum;
 mod mempool;
-pub(crate) mod net;
 mod poll;
 #[cfg(test)]
 mod tests;

@@ -25,10 +25,10 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{WebSocketStream, client_async_with_config};
 use url::Url;
 
-use super::net::{self, BoxStream, Security};
 use super::poll::{self, Poller};
 use super::{ChangeReason, Exit, Hub, Wake, WatchState, WatchTransport};
 use crate::chain::Endpoint;
+use crate::chain::net::{self, BoxStream, Security};
 
 /// The largest message read. A notification carries whole
 /// transactions, so it can be large; past this the connection is

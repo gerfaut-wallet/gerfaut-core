@@ -4,7 +4,7 @@
 //! socket, and nothing of it waits on a thread.
 //!
 //! The socket is opened the way the live watcher opens its own
-//! ([`crate::watch::net`]): TCP, the Tor proxy in front of it for a
+//! ([`crate::chain::net`]): TCP, the Tor proxy in front of it for a
 //! hidden service and a refusal without one, TLS checked by the
 //! verifier every Electrum connection goes through, an accepted
 //! fingerprint included. Every answer is one line of at most
@@ -24,7 +24,7 @@ use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use super::{
     CLIENT_NAME, MAX_LINE, MAX_READ, PROTOCOL, TIMEOUT, TOR_TIMEOUT, Target, parse, too_long, words,
 };
-use crate::watch::net::{self, BoxStream, LineReader, LineTooLong, Security};
+use crate::chain::net::{self, BoxStream, LineReader, LineTooLong, Security};
 
 /// Requests awaiting their answer at any time.
 const WINDOW: usize = 16;
