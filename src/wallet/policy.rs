@@ -824,7 +824,7 @@ impl Remaining {
         Remaining {
             remaining_blocks: Some(blocks),
             remaining_seconds: Some(seconds),
-            unlocks_at_unix: Some(now + seconds),
+            unlocks_at_unix: Some(now.saturating_add(seconds)),
         }
     }
 
@@ -923,7 +923,12 @@ impl RelativeLock {
                 if waited >= seconds {
                     CoinLock::Unlocked
                 } else {
-                    CoinLock::Locked(Remaining::seconds(seconds - waited, since + seconds))
+                    // `since` is a server's block time: a date no block
+                    // has yet unlocks at the end of time, not in 1970.
+                    CoinLock::Locked(Remaining::seconds(
+                        seconds - waited,
+                        since.saturating_add(seconds),
+                    ))
                 }
             }
         }
@@ -2149,6 +2154,31 @@ mod tests {
                     remaining_blocks: None,
                     remaining_seconds: Some(31_200),
                     unlocks_at_unix: Some(NOW - 20_000 + 51_200),
+                }),
+            }
+        );
+    }
+
+    /// A coin's time is a server's block time, and one past any clock
+    /// still reads as locked, until the end of time rather than 1970.
+    #[test]
+    fn a_coin_dated_past_any_clock_stays_locked() {
+        let sequence = (1u32 << 22) | 100;
+        let descriptor = format!("wsh(or_d(pk({A}/0/*),and_v(v:pkh({B}/0/*),older({sequence}))))");
+        let snapshot = wsh(
+            &descriptor,
+            vec![coin("aa:0", Some(TIP - 10), Some(u64::MAX))],
+        );
+        assert_eq!(
+            snapshot.branches[1].state,
+            BranchState::PerCoin {
+                unlocked: 0,
+                waiting: 0,
+                locked: 1,
+                next: Some(Remaining {
+                    remaining_blocks: None,
+                    remaining_seconds: Some(51_200),
+                    unlocks_at_unix: Some(u64::MAX),
                 }),
             }
         );

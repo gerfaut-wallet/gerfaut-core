@@ -867,12 +867,7 @@ impl WalletManager {
                 let (used, balance_sats) = record
                     .address_state
                     .as_ref()
-                    .map(|s| {
-                        (
-                            !s.txs.is_empty(),
-                            s.utxos.iter().map(|u| u.value_sats).sum(),
-                        )
-                    })
+                    .map(|s| (!s.txs.is_empty(), views::address_balance(s).total))
                     .unwrap_or((false, 0));
                 Ok(AddressList {
                     external: vec![crate::wallet::snapshot::AddressRow {
@@ -3251,6 +3246,36 @@ mod tests {
             manager.wallet_snapshot(&meta.id).await,
             Err(CoreError::WalletNotFound(_))
         ));
+    }
+
+    /// Coins no one can hold, as a hostile server may list them for a
+    /// watched address, show in its row at the largest balance there
+    /// is, as in its snapshot, instead of wrapping around.
+    #[tokio::test]
+    async fn an_address_row_never_overflows() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx").unwrap();
+        let meta = manager
+            .add_wallet("Watched address", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        let coin = |txid: &str| crate::wallet::AddressUtxo {
+            txid: txid.into(),
+            vout: 0,
+            value_sats: u64::MAX,
+            height: Some(1),
+            timestamp: None,
+        };
+        find_record_mut(&mut manager.state.lock().await.payload, &meta.id)
+            .unwrap()
+            .address_state = Some(crate::wallet::AddressWatchState {
+            utxos: vec![coin("aa"), coin("bb")],
+            ..Default::default()
+        });
+
+        let list = manager.address_list(&meta.id).await.unwrap();
+        assert_eq!(list.external[0].balance_sats, u64::MAX);
     }
 
     /// A descriptor with a private key is refused however it arrives:
