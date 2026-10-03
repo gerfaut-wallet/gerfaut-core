@@ -549,8 +549,11 @@ impl PremiumClient {
     }
 
     /// A client over an HTTP client built elsewhere. Signed answers are
-    /// checked against the key [`endpoint`] names.
-    pub fn with_http(base_url: &str, key: Option<String>, http: reqwest::Client) -> Self {
+    /// checked against the key [`endpoint`] names. Kept to the crate:
+    /// an HTTP client built elsewhere would skip the refusal of an
+    /// onion without a proxy, and may follow redirects the token would
+    /// go along with.
+    pub(crate) fn with_http(base_url: &str, key: Option<String>, http: reqwest::Client) -> Self {
         PremiumClient {
             base_url: base_url.trim_end_matches('/').to_owned(),
             key: key.map(|key| licence::normalize_key(&key)),
