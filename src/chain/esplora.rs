@@ -624,11 +624,14 @@ pub(crate) struct HistoryRound {
     pub cursor: Option<String>,
 }
 
-/// Fetches the complete state of a single watched address.
+/// Fetches the complete state of a single watched address. `held` is
+/// what the wallet holds of it, which spares reading again the pages it
+/// already has: see [`history_round`].
 pub(crate) async fn fetch_address_state(
     client: &Client,
     address: &str,
     network: Network,
+    held: &[AddressTx],
 ) -> Result<AddressWatchState, String> {
     let address = parse_address(address, network)?;
     let our_script = address.script_pubkey();
@@ -644,6 +647,7 @@ pub(crate) async fn fetch_address_state(
         network,
         None,
         Some(stats.chain_stats.tx_count as usize),
+        held,
     )
     .await?;
 
@@ -686,7 +690,16 @@ pub(crate) async fn fetch_address_history(
         .parse()
         .map_err(|_| format!("invalid history cursor: {from}"))?;
     check_network(client, network).await?;
-    history_round(client, &address, &our_script, network, Some(from), None).await
+    history_round(
+        client,
+        &address,
+        &our_script,
+        network,
+        Some(from),
+        None,
+        &[],
+    )
+    .await
 }
 
 /// Refuses a server whose genesis block is not the network's. Testnet,
@@ -717,6 +730,13 @@ pub(crate) fn parse_address(address: &str, network: Network) -> Result<Address, 
 
 /// Pages through the address history from `from` (newest first when
 /// `None`), at most [`HISTORY_PAGES_PER_ROUND`] pages.
+///
+/// A page that lists only transactions of `held`, what the wallet holds,
+/// each at the height it holds it, ends the reading: the history below
+/// it is what the wallet holds, and the round is filled from there. An
+/// address paid a thousand times reads one page a sync, not forty. When
+/// what the wallet holds below would come to more than the server counts,
+/// the pages are read on.
 async fn history_round(
     client: &Client,
     address: &Address,
@@ -724,7 +744,12 @@ async fn history_round(
     network: Network,
     from: Option<Txid>,
     confirmed_total: Option<usize>,
+    held: &[AddressTx],
 ) -> Result<HistoryRound, String> {
+    let known: std::collections::HashMap<&str, Option<u32>> = held
+        .iter()
+        .map(|tx| (tx.txid.as_str(), tx.height))
+        .collect();
     // Each page is read into what the app shows as soon as it arrives,
     // and dropped: forty pages are never held as the server spelled them.
     // What is kept of them, every input and output of each transaction,
@@ -733,18 +758,20 @@ async fn history_round(
     let mut confirmed = 0usize;
     let mut last_seen: Option<Txid> = None;
     let mut read = |page: Vec<PageTx>, txs: &mut Vec<AddressTx>| {
+        let mut all_held = true;
         for tx in page {
             if tx.status.confirmed {
                 confirmed += 1;
                 last_seen = Some(tx.txid);
             }
             let tx = to_address_tx(tx, our_script, network);
+            all_held &= known.get(tx.txid.as_str()) == Some(&tx.height);
             client.keep(crate::chain::held_by(&tx))?;
             txs.push(tx);
         }
-        Ok::<_, String>((confirmed, last_seen))
+        Ok::<_, String>((confirmed, last_seen, all_held))
     };
-    let (mut confirmed_so_far, mut last) =
+    let (mut confirmed_so_far, mut last, mut all_held) =
         read(client.address_txs(address, from).await?, &mut txs)?;
     let mut cursor: Option<String> = None;
     let mut pages = 1usize;
@@ -759,6 +786,20 @@ async fn history_round(
         let Some(last_seen) = last else {
             break;
         };
+        if all_held
+            && let Some(total) = confirmed_total
+            && let Some(filled) = fill_from_held(client, &mut txs, held, confirmed_so_far, total)?
+        {
+            confirmed_so_far += filled;
+            if confirmed_so_far < total {
+                cursor = txs
+                    .iter()
+                    .rev()
+                    .find(|tx| tx.height.is_some())
+                    .map(|tx| tx.txid.clone());
+            }
+            break;
+        }
         if pages >= HISTORY_PAGES_PER_ROUND {
             cursor = Some(last_seen.to_string());
             break;
@@ -768,10 +809,47 @@ async fn history_round(
         if page.is_empty() {
             break;
         }
-        (confirmed_so_far, last) = read(page, &mut txs)?;
+        (confirmed_so_far, last, all_held) = read(page, &mut txs)?;
     }
     Ok(HistoryRound { txs, cursor })
 }
+
+/// Fills a round read down to a page the wallet holds whole from the
+/// confirmed transactions it holds below that page, as many as a round
+/// takes. `None`, and nothing filled, when those and what was read
+/// would come to more than the server counts: what the wallet holds
+/// below is then not the server's history, and the pages are read on.
+fn fill_from_held(
+    client: &Client,
+    txs: &mut Vec<AddressTx>,
+    held: &[AddressTx],
+    confirmed_so_far: usize,
+    total: usize,
+) -> Result<Option<usize>, String> {
+    let Some(below) = txs.iter().rev().find_map(|tx| tx.height) else {
+        return Ok(None);
+    };
+    let taken: std::collections::HashSet<&str> = txs.iter().map(|tx| tx.txid.as_str()).collect();
+    let older: Vec<&AddressTx> = held
+        .iter()
+        .filter(|tx| tx.height.is_some_and(|height| height <= below))
+        .filter(|tx| !taken.contains(tx.txid.as_str()))
+        .collect();
+    if confirmed_so_far + older.len() > total {
+        return Ok(None);
+    }
+    let room = (HISTORY_PAGES_PER_ROUND * PAGE).saturating_sub(confirmed_so_far);
+    let older: Vec<AddressTx> = older.into_iter().take(room).cloned().collect();
+    for tx in &older {
+        client.keep(crate::chain::held_by(tx))?;
+    }
+    let filled = older.len();
+    txs.extend(older);
+    Ok(Some(filled))
+}
+
+/// Confirmed transactions in a page of an address history.
+const PAGE: usize = 25;
 
 /// One esplora transaction as seen from the watched address.
 fn to_address_tx(
@@ -1249,7 +1327,7 @@ mod error_tests {
             .collect();
         let base = format!("http://{}/api", server.address);
         let client = client_for_run(&base, None).unwrap();
-        let state = fetch_address_state(&client, ADDRESS, Network::Signet)
+        let state = fetch_address_state(&client, ADDRESS, Network::Signet, &[])
             .await
             .unwrap();
         assert_eq!(state.txs.len(), 3);
@@ -1257,13 +1335,55 @@ mod error_tests {
         assert!(one > state.txs[0].extras.as_ref().unwrap().raw_hex.len());
         let mut tight = client_for_run(&base, None).unwrap();
         tight.kept = crate::chain::Kept::up_to(one * 5 / 2);
-        let refused = fetch_address_state(&tight, ADDRESS, Network::Signet)
+        let refused = fetch_address_state(&tight, ADDRESS, Network::Signet, &[])
             .await
             .unwrap_err();
         assert!(
             refused.starts_with("the server sent more than"),
             "{refused}"
         );
+    }
+
+    /// A page that lists only what the wallet holds, as it holds it, ends
+    /// the reading of an address: the rest of the round comes from what
+    /// it holds, and the state is the one a whole reading gives. A first
+    /// page with news on it is read, and the page under it.
+    #[tokio::test]
+    async fn an_address_reads_no_page_past_one_it_holds() {
+        use crate::testkit::{ADDRESS, FakeMempool, esplora_payment};
+        let server = FakeMempool::start(false, 0).await;
+        server.state.lock().unwrap().address_txs = (1..=60u8)
+            .map(|n| esplora_payment(n, n + 100, 1_000, true))
+            .collect();
+        let base = format!("http://{}/api", server.address);
+        let fetch = |held: Vec<AddressTx>| {
+            let base = base.clone();
+            async move {
+                let client = client_for_run(&base, None).unwrap();
+                fetch_address_state(&client, ADDRESS, Network::Signet, &held)
+                    .await
+                    .unwrap()
+            }
+        };
+        let pages = || server.state.lock().unwrap().history_pages;
+
+        let whole = fetch(Vec::new()).await;
+        assert_eq!((whole.txs.len(), pages()), (60, 3));
+        let again = fetch(whole.txs.clone()).await;
+        assert_eq!(again, whole);
+        assert_eq!(pages(), 4, "one page");
+
+        server
+            .state
+            .lock()
+            .unwrap()
+            .address_txs
+            .insert(0, esplora_payment(61, 161, 2_000, false));
+        let arrived = fetch(again.txs.clone()).await;
+        assert_eq!(pages(), 6, "the first page and the one under it");
+        assert_eq!(arrived, fetch(Vec::new()).await);
+        assert_eq!(arrived.txs.len(), 61);
+        assert_eq!(arrived.txs[0].height, None);
     }
 
     /// A gzipped answer of a sensible size reads as it always did.

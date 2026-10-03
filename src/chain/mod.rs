@@ -650,26 +650,28 @@ pub(crate) async fn sync_engine(
 
 /// Fetches the state of a single watched address from one endpoint,
 /// within the deadline of a scan: the same state from an Esplora or an
-/// Electrum server.
+/// Electrum server. `held`, what the wallet holds of it, is not read
+/// again where the server lists it as it was.
 pub(crate) async fn fetch_address_state(
     endpoint: &Endpoint,
     address: &str,
     network: Network,
     proxy: Option<&str>,
+    held: &[crate::wallet::AddressTx],
 ) -> Result<AddressWatchState, String> {
     match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client_for_run(url, proxy)?;
             within(
                 scan_deadline(endpoint),
-                esplora::fetch_address_state(&client, address, network),
+                esplora::fetch_address_state(&client, address, network, held),
             )
             .await
         }
         Endpoint::Electrum(target) => {
             within(
                 scan_deadline(endpoint),
-                electrum::address::fetch_state(target, address, network, proxy),
+                electrum::address::fetch_state(target, address, network, proxy, held),
             )
             .await
         }

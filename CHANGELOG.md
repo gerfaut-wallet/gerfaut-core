@@ -201,6 +201,14 @@ The first release: the library both Gerfaut apps are built on.
   paid, filled the 200 scripts a watch takes of a wallet with them, and
   neither a spend of its coins nor a payment to its next addresses was
   heard before the next sync.
+- A sync of a watched address reads only what is new or moved. Over
+  Electrum, a transaction the wallet holds, at the height the server
+  lists it now, is kept as it is, with the time of its block, and only
+  the others are fetched, with the transactions their inputs spend. Over
+  Esplora, the reading stops at the first page that lists nothing but
+  what the wallet holds, and the rest of the round comes from it. An
+  address paid a thousand times, watched live, used to cost thousands of
+  requests and megabytes for each payment.
 - On the user's own node, polling reads thirty scripts a minute, four at
   a time, instead of three. Polling reads the head of the list every
   round and the rest in turn, so with N scripts past what a server

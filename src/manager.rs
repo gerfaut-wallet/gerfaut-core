@@ -1172,8 +1172,18 @@ impl WalletManager {
         started: Instant,
     ) -> CoreResult<(SyncReport, Endpoint)> {
         let mut attempts: Vec<String> = Vec::new();
+        // What the wallet holds: what the server lists as it was is not
+        // read again.
+        let held: Vec<AddressTx> = {
+            let state = self.state.lock().await;
+            find_record(&state.payload, &meta.id)?
+                .address_state
+                .as_ref()
+                .map(|watch| watch.txs.clone())
+                .unwrap_or_default()
+        };
         for endpoint in endpoints {
-            match chain::fetch_address_state(endpoint, address, meta.network, proxy).await {
+            match chain::fetch_address_state(endpoint, address, meta.network, proxy, &held).await {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(mut watch) => {
                     let mut state = self.state.lock().await;

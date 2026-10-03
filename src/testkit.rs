@@ -529,14 +529,40 @@ pub(crate) struct MempoolState {
     pub looked_up: Vec<String>,
     pub tip: u32,
     /// The transactions of the one address the REST side knows, as
-    /// Esplora spells them, for a sync to read.
+    /// Esplora spells them, for a sync to read: the unconfirmed ones,
+    /// then the confirmed ones, newest first.
     pub address_txs: Vec<Value>,
+    /// Pages of that history read so far.
+    pub history_pages: usize,
     /// The network whose genesis block the REST side names at height 0,
     /// signet when `None`.
     pub genesis: Option<bdk_wallet::bitcoin::Network>,
 }
 
 impl MempoolState {
+    /// A page of the one history the REST side knows, as Esplora pages
+    /// it: the unconfirmed transactions and the first 25 confirmed ones,
+    /// or the 25 confirmed ones after the txid a path ends with.
+    fn history_page(&self, path: &str) -> Vec<Value> {
+        let confirmed = |tx: &&Value| tx["status"]["confirmed"] == true;
+        let chain = self.address_txs.iter().filter(confirmed);
+        match path.rsplit_once("/txs/chain/") {
+            Some((_, after)) => chain
+                .skip_while(|tx| tx["txid"] != after)
+                .skip(1)
+                .take(25)
+                .cloned()
+                .collect(),
+            None => self
+                .address_txs
+                .iter()
+                .filter(|tx| !confirmed(tx))
+                .chain(chain.take(25))
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// The id of the block at `height`: the genesis block of the network
     /// at 0, signet unless set, and the height in hex above it, as the
     /// tip's hash is read.
@@ -671,13 +697,11 @@ impl FakeMempool {
                 } else {
                     ("404 Not Found", "Block not found".to_owned())
                 }
-            } else if path.ends_with("/utxo") || path.contains("/txs/chain/") {
+            } else if path.ends_with("/utxo") {
                 ("200 OK", "[]".to_owned())
-            } else if path.ends_with("/txs") {
-                (
-                    "200 OK",
-                    Value::Array(state.address_txs.clone()).to_string(),
-                )
+            } else if path.ends_with("/txs") || path.contains("/txs/chain/") {
+                state.history_pages += 1;
+                ("200 OK", Value::Array(state.history_page(path)).to_string())
             } else if let Some(address) = path.rsplit_once("/address/").map(|(_, a)| a) {
                 let count = |confirmed: bool| {
                     let txs = state
