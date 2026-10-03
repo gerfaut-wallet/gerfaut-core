@@ -24,10 +24,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bdk_electrum::electrum_client::raw_client::RawClient;
-use bdk_electrum::electrum_client::socks::Socks5Stream;
-use bdk_electrum::electrum_client::{self, ElectrumApi, Param};
 use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use electrum_client::raw_client::RawClient;
+use electrum_client::socks::Socks5Stream;
+use electrum_client::{self, ElectrumApi, Param};
 
 use super::tls::{self, ConnectError, Verdict};
 

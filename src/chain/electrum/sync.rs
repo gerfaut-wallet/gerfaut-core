@@ -22,10 +22,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use bdk_electrum::electrum_client::{self, ElectrumApi, GetHistoryRes};
 use bdk_wallet::bitcoin::block::Header;
 use bdk_wallet::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
+use electrum_client::{self, ElectrumApi, GetHistoryRes};
 
 use crate::chain::{
     ANOTHER_NETWORK, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX, has_proof_of_work,

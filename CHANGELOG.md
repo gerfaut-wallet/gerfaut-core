@@ -211,7 +211,9 @@ The first release: the library both Gerfaut apps are built on.
   requests and megabytes for each payment.
 - The core no longer depends on `bdk_esplora`, nor on `esplora-client`
   with it: it already spoke to Esplora on its own, and kept them for six
-  types of what a server answers, which it now reads itself.
+  types of what a server answers, which it now reads itself. Nor on
+  `bdk_electrum`, kept only to reach `electrum-client`, on which it now
+  depends directly, at the same version and with the same features.
 - On the user's own node, polling reads thirty scripts a minute, four at
   a time, instead of three. Polling reads the head of the list every
   round and the rest in turn, so with N scripts past what a server
