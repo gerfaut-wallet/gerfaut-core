@@ -247,7 +247,7 @@ The first release: the library both Gerfaut apps are built on.
   script of any wallet that has gone a day without a complete sync. A
   phone can keep a watch running for days with no other sync, and the
   watch cannot hear every script.
-- Backup files are sealed under a heavier Argon2id profile than the vault
+- Backup files are sealed under a heavier Argon2id profile than before
   (64 MiB of memory, three passes): a backup travels, and whoever holds a
   copy can guess at its password offline for as long as the file exists.
   This version still opens backups written under the lighter profile, but
@@ -258,7 +258,10 @@ The first release: the library both Gerfaut apps are built on.
   skipped the refusal of an onion without a proxy and could follow
   redirects. These are gone, since nothing called them: `store::VaultKdf`,
   `cipher::kdf_kind`, `format_btc_signed`, `truncate_middle`,
-  `truncate_address` and `PremiumClient::set_key`.
+  `truncate_address`, `PremiumClient::set_key` and `broadcast::sats`. So
+  are the `funded_sats` and `spent_sats` fields of `AddressWatchState`,
+  which nothing read. A vault still writes them as zero, for the older
+  builds that require them.
 
 ### Fixed
 
