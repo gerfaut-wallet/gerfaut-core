@@ -46,9 +46,11 @@ async fn scripted(answers: Vec<String>) -> (String, UnboundedReceiver<String>) {
 }
 
 /// A premium server that takes one request, hands it to the test, and
-/// gives `answer` only once the test lets it go.
+/// gives `answer` only once the test lets it go; then `after`, in
+/// order, one connection each, like [`scripted`].
 async fn held(
     answer: String,
+    after: Vec<String>,
 ) -> (
     String,
     UnboundedReceiver<String>,
@@ -66,6 +68,12 @@ async fn held(
         let _ = released.await;
         let _ = stream.write_all(answer.as_bytes()).await;
         let _ = stream.shutdown().await;
+        for answer in after {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = sender.send(read_request(&mut stream).await);
+            let _ = stream.write_all(answer.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
     });
     (format!("http://{address}"), seen, release)
 }
@@ -1377,6 +1385,54 @@ async fn a_lost_connection_is_sent_again_as_it_was() {
     assert!(stored.has_device());
 }
 
+/// The server made the device, and the vault could not record it: the
+/// device stays, under the token the connection under way still holds,
+/// and nothing tells the server to drop it. Sent again once the vault
+/// writes, the same request finds the same device, the account's first
+/// one with its full access, rather than a new one that waits.
+#[tokio::test]
+async fn a_device_the_vault_could_not_record_is_kept_for_the_next_try() {
+    let (base_url, mut seen, release) = held(
+        connected_answer("full"),
+        vec![
+            connected_answer("full"),
+            licence_answer(fixtures::VALID_CERTIFICATE),
+        ],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+
+    let connect = manager.premium_connect(&base_url, KEY, DevicePlatform::Linux);
+    tokio::pin!(connect);
+    let request = tokio::select! {
+        request = seen.recv() => request.unwrap(),
+        outcome = &mut connect => panic!("the connection ended before its answer: {outcome:?}"),
+    };
+    let (_, token) = connect_body(&request);
+    manager.state.lock().await.vault.fail_saves(true);
+    release.send(()).unwrap();
+    let failed = connect.await.unwrap_err();
+    assert!(matches!(failed, CoreError::Vault(_)), "{failed}");
+    assert!(seen.try_recv().is_err(), "the server was told nothing more");
+    let stored = stored_premium(&manager).await;
+    assert!(stored.connect_pending() && !stored.has_device());
+
+    manager.state.lock().await.vault.fail_saves(false);
+    let device = manager
+        .premium_ensure_device(&base_url, DevicePlatform::Linux)
+        .await
+        .unwrap()
+        .expect("connected");
+    assert_eq!(device.access, DeviceAccess::Full);
+    let replayed = seen.recv().await.unwrap();
+    assert_eq!(connect_body(&replayed).1, token);
+    seen.recv().await.unwrap();
+    let stored = stored_premium(&manager).await;
+    assert!(stored.has_device() && !stored.connect_pending());
+    assert!(stored.pending_logouts.is_empty());
+}
+
 /// A connection under way for one key is over when another key is
 /// entered: its token, which the server may have made a device of,
 /// waits to be dropped there, and the new key gets a token of its own.
@@ -1899,7 +1955,7 @@ async fn a_stale_copy_cannot_bring_back_the_old_account_removals() {
 /// among them: the old account's answer told the new one nothing.
 #[tokio::test]
 async fn a_flush_answers_for_the_account_it_spoke_to() {
-    let (base_url, mut seen, release) = held(answer("200 OK", "{}")).await;
+    let (base_url, mut seen, release) = held(answer("200 OK", "{}"), Vec::new()).await;
     let dir = tempfile::tempdir().unwrap();
     let manager = premium_manager(dir.path());
     let mut account = connected(PremiumState {

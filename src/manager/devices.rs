@@ -569,11 +569,13 @@ impl WalletManager {
             Ok(dropped) => log::warn!(
                 "{dropped} wallet removals the previous premium account never heard of were dropped"
             ),
-            Err(error) => {
-                // The server holds a device nobody will: it goes.
-                let _ = self.revoke(base_url, connected.token()).await;
-                return Err(error);
-            }
+            // The connection under way still holds the token the server
+            // made a device of, in the vault as in memory: sent again,
+            // the same request finds that device, with nothing announced
+            // and nothing counted. Dropped here, the device would be
+            // made anew, waiting and announced, the account's first one
+            // included.
+            Err(error) => return Err(error),
         }
         if switching {
             let _ = self.premium_flush_logouts(base_url).await;
