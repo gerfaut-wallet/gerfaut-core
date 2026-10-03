@@ -973,9 +973,13 @@ fn confirmed_deleted(body: &[u8]) -> CoreResult<()> {
 }
 
 /// The longest wait a `Retry-After` is believed for, in seconds. The
-/// server's windows are a minute or an hour; a header asking for more
-/// comes from something else on the path.
-const RETRY_AFTER_MAX: u64 = 3_600;
+/// server's windows are a minute, an hour and a day, and what a day
+/// holds back, the messages sent on demand or the e-mails of the day,
+/// comes back the next day at the latest: a wait held to an hour would
+/// have the app say "in an hour" and try again into the same refusal. A
+/// header asking for more than a day comes from something else on the
+/// path.
+const RETRY_AFTER_MAX: u64 = 24 * 60 * 60;
 
 /// The whole seconds a `Retry-After` header asks for, one at least and
 /// [`RETRY_AFTER_MAX`] at most. The date form, which the server never
@@ -1911,7 +1915,9 @@ mod tests {
         for (header, retry_after) in [
             ("Retry-After: 42\r\n", 42),
             ("Retry-After: 0\r\n", 1),
-            ("Retry-After: 999999999\r\n", 3_600),
+            // What is left of a day's window, as said.
+            ("Retry-After: 50000\r\n", 50_000),
+            ("Retry-After: 999999999\r\n", 86_400),
         ] {
             let limited = stub_with(429, header, r#"{"error":"too many requests"}"#).await;
             assert_eq!(
