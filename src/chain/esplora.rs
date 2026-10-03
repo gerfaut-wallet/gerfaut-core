@@ -672,14 +672,6 @@ pub(crate) async fn fetch_address_state(
         txs: round.txs,
         utxos,
         tip_height,
-        funded_sats: stats
-            .chain_stats
-            .funded_txo_sum
-            .saturating_add(stats.mempool_stats.funded_txo_sum),
-        spent_sats: stats
-            .chain_stats
-            .spent_txo_sum
-            .saturating_add(stats.mempool_stats.spent_txo_sum),
         truncated: round.cursor.is_some(),
         history_cursor: round.cursor,
     })

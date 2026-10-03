@@ -157,17 +157,10 @@ async fn state_in_rounds_of(
             }
         })
         .collect();
-    // Esplora counts these over the whole history. Here they cover the
-    // transactions read, which is all of them unless the history is
-    // longer than a round.
-    let funded_sats = sum_of(&txs, |tx| &tx.outputs);
-    let spent_sats = sum_of(&txs, |tx| &tx.inputs);
     Ok(AddressWatchState {
         txs,
         utxos,
         tip_height: tip.height,
-        funded_sats,
-        spent_sats,
         truncated: cursor.is_some(),
         history_cursor: cursor,
     })
@@ -197,14 +190,6 @@ async fn history_in_rounds_of(
         tx.timestamp = tx.height.and_then(|height| times.get(&height).copied());
     }
     Ok(HistoryRound { txs, cursor })
-}
-
-fn sum_of(txs: &[AddressTx], side: impl Fn(&AddressTx) -> &Vec<TxIo>) -> u64 {
-    txs.iter()
-        .flat_map(|tx| side(tx).iter())
-        .filter(|io| io.is_mine)
-        .filter_map(|io| io.value_sats)
-        .fold(0u64, u64::saturating_add)
 }
 
 /// The whole history of a script. A server that will not send one this
@@ -767,7 +752,6 @@ mod tests {
                 timestamp: None,
             }]
         );
-        assert_eq!((state.funded_sats, state.spent_sats), (69_500, 50_000));
         assert!(!state.truncated);
         assert_eq!(state.history_cursor, None);
         assert_eq!(crate::wallet::views::address_balance(&state).total, 19_500);
