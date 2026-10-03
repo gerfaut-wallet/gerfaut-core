@@ -86,9 +86,11 @@ pub struct Coin {
 pub enum PolicyKind {
     /// One key, nothing else.
     SingleKey,
-    /// One threshold of plain keys (`multi`, `sortedmulti`, `multi_a`).
+    /// One threshold of plain keys (`multi`, `sortedmulti`, `multi_a`),
+    /// each a different key.
     Multisig,
-    /// Anything with a timelock, a hash, or nested conditions.
+    /// Anything with a timelock, a hash, nested conditions, or a key
+    /// named twice.
     Miniscript,
     /// A watched address: no descriptor to read.
     Address,
@@ -498,10 +500,25 @@ fn is_multisig(policy: &Semantic) -> bool {
     }
 }
 
+/// The shape of a policy. A threshold that names one key twice, on two
+/// paths, is no plain multisig: "2 of 3" with Key A counted twice is
+/// Key A alone, plus anyone.
 fn kind_of(policy: &Semantic) -> PolicyKind {
     match policy {
         Policy::Key(_) => PolicyKind::SingleKey,
-        multisig if is_multisig(multisig) => PolicyKind::Multisig,
+        Policy::Thresh(thresh) if is_multisig(policy) => {
+            let mut seen = Vec::with_capacity(thresh.n());
+            for sub in thresh.iter() {
+                if let Policy::Key(pk) = sub.as_ref() {
+                    let material = material(pk);
+                    if seen.contains(&material) {
+                        return PolicyKind::Miniscript;
+                    }
+                    seen.push(material);
+                }
+            }
+            PolicyKind::Multisig
+        }
         _ => PolicyKind::Miniscript,
     }
 }
@@ -1249,7 +1266,7 @@ fn summary(condition: &Condition, book: &KeyBook) -> String {
 
     let mut subjects: Vec<String> = Vec::new();
     if !keys.is_empty() {
-        subjects.push(key_list(&keys));
+        subjects.push(counted_list(&keys));
     }
     subjects.extend(groups);
     subjects.extend(preimages);
@@ -1281,20 +1298,25 @@ fn group_phrase(condition: &Condition, book: &KeyBook) -> String {
         .iter()
         .all(|item| matches!(item, Condition::Key { .. }));
     if all_keys {
+        let labels: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                Condition::Key { key_id } => Some(book.label_by_id(key_id)),
+                _ => None,
+            })
+            .collect();
         if k == n {
-            let labels: Vec<&str> = items
-                .iter()
-                .filter_map(|item| match item {
-                    Condition::Key { key_id } => Some(book.label_by_id(key_id)),
-                    _ => None,
-                })
-                .collect();
-            return key_list(&labels);
+            return counted_list(&labels);
         }
-        if *k == 1 {
-            return format!("any of {n} keys");
-        }
-        return format!("any {k} of {n} keys");
+        let group = if *k == 1 {
+            format!("any of {n} keys")
+        } else {
+            format!("any {k} of {n} keys")
+        };
+        return match repeats(&labels) {
+            Some(repeats) => format!("{group}, {repeats}"),
+            None => group,
+        };
     }
     let nouns: Vec<String> = items.iter().map(|item| noun(item, book)).collect();
     if k == n {
@@ -1359,6 +1381,52 @@ fn key_list(labels: &[&str]) -> String {
         [] => "No key".to_owned(),
         [only] => format!("Key {only}"),
         _ => format!("Keys {}", join_and(letters)),
+    }
+}
+
+/// The keys of an "and", each named once, then the ones it names more
+/// than once: "Keys A and B, Key A counted twice". The same extended
+/// key on two paths is two keys to miniscript and one person to the
+/// user, who would otherwise read two letters where one signs twice.
+fn counted_list(labels: &[&str]) -> String {
+    let mut distinct: Vec<&str> = Vec::with_capacity(labels.len());
+    for label in labels {
+        if !distinct.contains(label) {
+            distinct.push(label);
+        }
+    }
+    let list = key_list(&distinct);
+    match repeats(labels) {
+        Some(_) if distinct.len() == 1 => format!("{list}, counted {}", times(labels.len())),
+        Some(repeats) => format!("{list}, {repeats}"),
+        None => list,
+    }
+}
+
+/// The keys a list names more than once, and how often: "Key A counted
+/// twice and Key C counted 3 times". `None` when each comes once.
+fn repeats(labels: &[&str]) -> Option<String> {
+    let mut counted: Vec<(&str, usize)> = Vec::new();
+    for label in labels {
+        match counted.iter_mut().find(|(seen, _)| seen == label) {
+            Some((_, count)) => *count += 1,
+            None => counted.push((label, 1)),
+        }
+    }
+    let phrases: Vec<String> = counted
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(label, count)| format!("{label} counted {}", times(count)))
+        .collect();
+    (!phrases.is_empty()).then(|| join_and(phrases))
+}
+
+/// "twice", then "3 times", "4 times"...
+fn times(count: usize) -> String {
+    if count == 2 {
+        "twice".to_owned()
+    } else {
+        format!("{count} times")
     }
 }
 
@@ -2117,6 +2185,39 @@ mod tests {
             snapshot.branches[1].summary,
             "Key A, once a coin has waited 10 blocks"
         );
+    }
+
+    /// One extended key on two paths of a threshold signs twice: a
+    /// "2 of 3" where Key A counts twice is Key A alone. The sentence
+    /// says so, and the policy is no plain multisig.
+    #[test]
+    fn a_key_counted_twice_is_said_to_be() {
+        let descriptor = format!("wsh(sortedmulti(2,{A}/0/*,{A}/1/*,{B}/0/*))");
+        let snapshot = wsh(&descriptor, Vec::new());
+        assert_eq!(snapshot.kind, PolicyKind::Miniscript);
+        assert_eq!(snapshot.keys.len(), 2);
+        assert_eq!(
+            snapshot.branches[0].summary,
+            "Any 2 of 3 keys, Key A counted twice"
+        );
+
+        let descriptor = format!("wsh(multi(2,{A}/0/*,{A}/1/*))");
+        let snapshot = wsh(&descriptor, Vec::new());
+        assert_eq!(snapshot.kind, PolicyKind::Miniscript);
+        assert_eq!(snapshot.branches[0].summary, "Key A, counted twice");
+
+        let descriptor = format!(
+            "wsh(and_v(v:pk({A}/0/*),and_v(v:pk({B}/0/*),and_v(v:pk({A}/1/*),pk({A}/2/*)))))"
+        );
+        let snapshot = wsh(&descriptor, Vec::new());
+        assert_eq!(
+            snapshot.branches[0].summary,
+            "Keys A and B, Key A counted 3 times"
+        );
+
+        // Each key once is the plain multisig it always was.
+        let descriptor = format!("wsh(sortedmulti(2,{A}/0/*,{B}/0/*,{C}/0/*))");
+        assert_eq!(wsh(&descriptor, Vec::new()).kind, PolicyKind::Multisig);
     }
 
     #[test]
