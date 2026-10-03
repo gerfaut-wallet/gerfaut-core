@@ -372,19 +372,30 @@ impl WalletManager {
     /// or the key that changed, and keeps it: only while the connection
     /// it was asked with is still the stored one, since a device that
     /// logged out or moved to another account meanwhile has no use for
-    /// it.
+    /// it, and only over one issued before it. A refresh asked before a
+    /// key change and answered after the one that change made would
+    /// otherwise bring the old paid time and the old account back. The
+    /// certificate kept is the one returned.
     pub async fn premium_refresh_licence(&self, base_url: &str) -> CoreResult<Licence> {
         let client = self.premium_client(base_url).await?;
         let licence = client.licence().await?;
         let asked_with = client.device_token().unwrap_or_default();
-        self.state.lock().await.commit(|payload| {
+        let newer = self.state.lock().await.commit(|payload| {
             let premium = &mut payload.settings.premium;
-            if premium.holds_token(asked_with) {
+            if !premium.holds_token(asked_with) {
+                return Ok(None);
+            }
+            let newer = premium
+                .certificate
+                .clone()
+                .and_then(|kept| client.read_licence(kept, licence.public_key.clone()).ok())
+                .filter(|kept| kept.claims.iat > licence.claims.iat);
+            if newer.is_none() {
                 premium.certificate = Some(licence.certificate.clone());
             }
-            Ok(())
+            Ok(newer)
         })?;
-        Ok(licence)
+        Ok(newer.unwrap_or(licence))
     }
 
     /// Records whether the user saved the key somewhere safe.

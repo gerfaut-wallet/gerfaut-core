@@ -2092,3 +2092,54 @@ async fn a_bare_status_settles_no_connection_and_no_key_change() {
     assert!(stored.key_change_pending(), "the new key is kept");
     assert_eq!(stored.key.as_deref(), Some(KEY));
 }
+
+/// A certificate is kept only over one issued before it: a refresh that
+/// answers late, after the one a key change made, brings back neither
+/// the old account nor its paid time.
+#[tokio::test]
+async fn a_late_certificate_does_not_replace_a_newer_one() {
+    let (base_url, _) = scripted(vec![
+        licence_answer(fixtures::VALID_CERTIFICATE),
+        licence_answer(fixtures::ACCOUNT_CERTIFICATE),
+        licence_answer(fixtures::ACCOUNT_CERTIFICATE),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    store_premium(
+        &manager,
+        connected(PremiumState {
+            key: Some(KEY.to_owned()),
+            certificate: Some(fixtures::ACCOUNT_CERTIFICATE.to_owned()),
+            ..PremiumState::default()
+        }),
+    )
+    .await;
+
+    // Issued a minute before the stored one: the stored one stays, and
+    // is what the caller gets.
+    let kept = manager.premium_refresh_licence(&base_url).await.unwrap();
+    assert_eq!(kept.certificate, fixtures::ACCOUNT_CERTIFICATE);
+    assert_eq!(
+        stored_premium(&manager).await.certificate.as_deref(),
+        Some(fixtures::ACCOUNT_CERTIFICATE)
+    );
+
+    // The same one again, and one over a certificate older than it.
+    manager.premium_refresh_licence(&base_url).await.unwrap();
+    store_premium(
+        &manager,
+        connected(PremiumState {
+            key: Some(KEY.to_owned()),
+            certificate: Some(fixtures::VALID_CERTIFICATE.to_owned()),
+            ..PremiumState::default()
+        }),
+    )
+    .await;
+    let fresh = manager.premium_refresh_licence(&base_url).await.unwrap();
+    assert_eq!(fresh.certificate, fixtures::ACCOUNT_CERTIFICATE);
+    assert_eq!(
+        stored_premium(&manager).await.certificate.as_deref(),
+        Some(fixtures::ACCOUNT_CERTIFICATE)
+    );
+}

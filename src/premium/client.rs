@@ -767,10 +767,20 @@ impl PremiumClient {
             .send(self.http.get(self.url("/v1/licence")), Auth::Device)
             .await?;
         let parsed: LicenceBody = decode(&body)?;
-        let claims = licence::verify_certificate(&parsed.certificate, &self.public_key_hex)?;
+        self.read_licence(parsed.certificate, parsed.public_key)
+    }
+
+    /// A certificate verified against the trusted key, with the key the
+    /// server says it signs with beside it.
+    pub(crate) fn read_licence(
+        &self,
+        certificate: String,
+        public_key: String,
+    ) -> CoreResult<Licence> {
+        let claims = licence::verify_certificate(&certificate, &self.public_key_hex)?;
         Ok(Licence {
-            certificate: parsed.certificate,
-            public_key: parsed.public_key,
+            certificate,
+            public_key,
             paid_until: claims.exp,
             claims,
         })
