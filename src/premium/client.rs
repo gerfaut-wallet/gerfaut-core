@@ -593,10 +593,6 @@ impl PremiumClient {
         self.key.as_deref()
     }
 
-    pub fn set_key(&mut self, key: Option<String>) {
-        self.key = key.map(|key| licence::normalize_key(&key));
-    }
-
     /// Whether the client carries a device token.
     pub fn has_device_token(&self) -> bool {
         self.token.is_some()
@@ -1495,7 +1491,7 @@ mod tests {
 
     #[test]
     fn the_key_is_kept_normalized_and_out_of_debug_output() {
-        let mut client = PremiumClient::with_http(
+        let client = PremiumClient::with_http(
             DEFAULT_BASE_URL,
             Some("ABCD-EFGH IJKM-NPQR".to_owned()),
             reqwest::Client::new(),
@@ -1507,8 +1503,6 @@ mod tests {
         assert!(!shown.contains(TOKEN), "{shown}");
         assert!(!shown.contains("q83v"), "{shown}");
         assert!(shown.contains(DEFAULT_BASE_URL));
-        client.set_key(None);
-        assert_eq!(client.key(), None);
     }
 
     #[test]
