@@ -1,8 +1,9 @@
-//! Formatting helpers shared by the apps.
+//! Formatting helpers shared by the apps and the core's own texts.
 //!
-//! One implementation, so an amount reads the same on every platform.
-//! The design system's rule applies here: amounts are never silently
-//! rounded (8 decimals in BTC, or explicit sats).
+//! One implementation, so an amount reads the same in a notification, a
+//! screen and a CSV export, and a date the same in an export and on the
+//! policy page. The design system's rule applies here: amounts are never
+//! silently rounded (8 decimals in BTC, or explicit sats).
 
 /// One bitcoin, in satoshis.
 pub const SATS_PER_BTC: u64 = 100_000_000;
@@ -12,6 +13,27 @@ pub const SATS_PER_BTC: u64 = 100_000_000;
 /// `format_btc(123_456) == "0.00123456"`.
 pub fn format_btc(sats: u64) -> String {
     format!("{}.{:08}", sats / SATS_PER_BTC, sats % SATS_PER_BTC)
+}
+
+/// A unix time as its civil date in UTC, `(year, month, day)`, by Howard
+/// Hinnant's `civil_from_days`: no calendar dependency.
+pub(crate) fn civil_date(unix: u64) -> (i64, u32, u32) {
+    let days = i64::try_from(unix / 86_400).unwrap_or(i64::MAX / 2);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month as u32, day as u32)
 }
 
 /// Groups the integer digits of a numeric string by thousands using
@@ -56,6 +78,17 @@ mod tests {
         assert_eq!(format_btc(123_456), "0.00123456");
         assert_eq!(format_btc(SATS_PER_BTC), "1.00000000");
         assert_eq!(format_btc(2_100_000_000_000_000), "21000000.00000000");
+    }
+
+    #[test]
+    fn civil_dates() {
+        assert_eq!(civil_date(0), (1970, 1, 1));
+        assert_eq!(civil_date(951_782_400), (2000, 2, 29));
+        assert_eq!(civil_date(1_756_150_867), (2025, 8, 25));
+        assert_eq!(civil_date(4_107_542_399), (2100, 2, 28));
+        // Past any clock: a date all the same, never a panic.
+        let (year, _, _) = civil_date(u64::MAX);
+        assert!(year > 9_999);
     }
 
     #[test]
