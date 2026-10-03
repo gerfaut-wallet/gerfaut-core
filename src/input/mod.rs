@@ -966,9 +966,12 @@ fn classify_address(
 /// Parses JSON wallet exports.
 ///
 /// Supported today: a top-level `descriptor` field (with an optional
-/// `change_descriptor`), and Coldcard-style exports (`bip44`/`bip49`/
-/// `bip84`/`bip86` account objects with `xpub`, `deriv`, and a master
-/// fingerprint). Other formats are reported as unrecognized.
+/// `change_descriptor`), and Coldcard-style exports: `bip44`/`bip49`/
+/// `bip84`/`bip86` account objects, read through the account's own
+/// descriptor (`desc`) when it has one, else as its `xpub` on its
+/// `deriv` under the file's master fingerprint (`xfp`), and held to the
+/// `first` address they show. Other formats are reported as
+/// unrecognized.
 fn parse_json_export(input: &str) -> CoreResult<ParsedInput> {
     let value: serde_json::Value =
         serde_json::from_str(input).map_err(|e| CoreError::InvalidInput {
@@ -999,79 +1002,133 @@ fn parse_json_export(input: &str) -> CoreResult<ParsedInput> {
         .collect();
     if let Some((account_key, script)) = present.first() {
         let account = &value[*account_key];
-        let key = account
-            .get("xpub")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| CoreError::InvalidInput {
-                kind: "wallet export",
-                detail: format!("`{account_key}` entry has no xpub"),
-            })?;
-        let decoded = xpub::decode_extended_key(key)?;
-        // Held to its prefix as a pasted key is: a SLIP-132 key names
-        // its script, and a cosigner key is no single-key account.
-        if decoded.multisig_only {
-            return Err(CoreError::InvalidInput {
-                kind: "wallet export",
-                detail: format!(
-                    "`{account_key}` holds a multisig cosigner key; import the full multisig \
-                     descriptor instead"
-                ),
-            });
-        }
-        if let Some(hint) = decoded.script_hint
-            && hint != *script
-        {
-            return Err(CoreError::InvalidInput {
-                kind: "wallet export",
-                detail: format!(
-                    "`{account_key}` holds a key whose prefix is for another script type"
-                ),
-            });
-        }
-
-        // Origin: master fingerprint (account-level, else top-level) plus
-        // the account derivation path.
-        let fingerprint = account
-            .get("xfp")
-            .or_else(|| value.get("xfp"))
-            .and_then(|v| v.as_str());
-        let derivation = account.get("deriv").and_then(|v| v.as_str());
-        let origin = match (fingerprint, derivation) {
-            (Some(fp), Some(deriv)) => {
-                let path = deriv.trim_start_matches('m').trim_start_matches('/');
-                Some(format!("[{}/{}]", fp.to_lowercase(), path))
+        let export_error = |detail: String| CoreError::InvalidInput {
+            kind: "wallet export",
+            detail,
+        };
+        let mut parsed = match account.get("desc").and_then(|v| v.as_str()) {
+            // The account's own descriptor: its origin carries the master
+            // fingerprint, the one a signer knows the wallet by.
+            Some(desc) => {
+                let parsed = parse_single_descriptor(desc)?;
+                if !matches!(&parsed.payload, ParsedPayload::Descriptors { script: s, .. } if s == script)
+                {
+                    return Err(export_error(format!(
+                        "`{account_key}` holds a descriptor for another script type"
+                    )));
+                }
+                parsed
             }
-            _ => None,
+            None => coldcard_account(&value, account, account_key, *script)?,
         };
-
-        let derivation = DerivationChoice {
-            origin,
-            ..DerivationChoice::default()
-        };
-        let (external, internal) = descriptors_for_xpub(&decoded.normalized, *script, &derivation)?;
-        let mut warnings = vec![];
-        if present.len() > 1 {
-            warnings.push(InputWarning::MultipleAccountsInFile);
+        // The address the exporting device showed for the account, the
+        // check its user can make by eye.
+        if let Some(first) = account.get("first").and_then(|v| v.as_str())
+            && !derives_first(&parsed, first)
+        {
+            return Err(export_error(format!(
+                "the first address of `{account_key}` ({first}) is not the one its key \
+                 derives; the file may be altered"
+            )));
         }
-        return Ok(ParsedInput {
-            kind: RecognizedKind::WalletExport,
-            networks: networks_for_kind(Some(decoded.network_kind)),
-            payload: ParsedPayload::Descriptors {
-                external,
-                internal,
-                script: *script,
-            },
-            warnings,
-            script_options: vec![],
-            derivation: None,
-            derivation_editable: false,
-            preview_address: None,
-        });
+        parsed.kind = RecognizedKind::WalletExport;
+        if present.len() > 1 {
+            parsed.warnings.push(InputWarning::MultipleAccountsInFile);
+        }
+        return Ok(parsed);
     }
 
     Err(CoreError::UnrecognizedInput(
         "JSON file is not a recognized wallet export".to_owned(),
     ))
+}
+
+/// An account of a Coldcard-style export without a descriptor of its
+/// own: its key, on its path, under the file's master fingerprint. The
+/// `xfp` beside an account is the fingerprint of the account key
+/// itself, which no signer knows the wallet by, and is left out.
+fn coldcard_account(
+    file: &serde_json::Value,
+    account: &serde_json::Value,
+    account_key: &str,
+    script: ScriptKind,
+) -> CoreResult<ParsedInput> {
+    let export_error = |detail: String| CoreError::InvalidInput {
+        kind: "wallet export",
+        detail,
+    };
+    let key = account
+        .get("xpub")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| export_error(format!("`{account_key}` entry has no xpub")))?;
+    let decoded = xpub::decode_extended_key(key)?;
+    // Held to its prefix as a pasted key is: a SLIP-132 key names its
+    // script, and a cosigner key is no single-key account.
+    if decoded.multisig_only {
+        return Err(export_error(format!(
+            "`{account_key}` holds a multisig cosigner key; import the full multisig \
+             descriptor instead"
+        )));
+    }
+    if let Some(hint) = decoded.script_hint
+        && hint != script
+    {
+        return Err(export_error(format!(
+            "`{account_key}` holds a key whose prefix is for another script type"
+        )));
+    }
+
+    let fingerprint = file.get("xfp").and_then(|v| v.as_str());
+    let path = account
+        .get("deriv")
+        .and_then(|v| v.as_str())
+        .map(|deriv| deriv.trim_start_matches('m').trim_start_matches('/'));
+    let origin = match (fingerprint, path) {
+        (Some(fingerprint), Some("")) => Some(canonical_origin(fingerprint)?),
+        (Some(fingerprint), Some(path)) => {
+            Some(canonical_origin(&format!("[{fingerprint}/{path}]"))?)
+        }
+        _ => None,
+    };
+    let derivation = DerivationChoice {
+        origin,
+        ..DerivationChoice::default()
+    };
+    let (external, internal) = descriptors_for_xpub(&decoded.normalized, script, &derivation)?;
+    Ok(ParsedInput {
+        kind: RecognizedKind::WalletExport,
+        networks: networks_for_kind(Some(decoded.network_kind)),
+        payload: ParsedPayload::Descriptors {
+            external,
+            internal,
+            script,
+        },
+        warnings: slip132_warning(decoded.converted),
+        script_options: vec![],
+        derivation: None,
+        derivation_editable: false,
+        preview_address: None,
+    })
+}
+
+/// Whether `first` is the first receive address the descriptors
+/// derive, on any of the input's candidate networks: the test networks
+/// share one key encoding, and regtest spells its addresses its own way.
+fn derives_first(parsed: &ParsedInput, first: &str) -> bool {
+    let ParsedPayload::Descriptors { external, .. } = &parsed.payload else {
+        return false;
+    };
+    let Ok(descriptor) = external.parse::<Descriptor<DescriptorPublicKey>>() else {
+        return false;
+    };
+    let Ok(definite) = descriptor.at_derivation_index(0) else {
+        return false;
+    };
+    parsed.networks.iter().any(|network| {
+        definite
+            .address(network.to_bitcoin())
+            .is_ok_and(|address| address.to_string().eq_ignore_ascii_case(first.trim()))
+    })
 }
 
 #[cfg(test)]
@@ -1734,6 +1791,53 @@ mod tests {
         let (external, _, script) = descriptors(&parsed);
         assert_eq!(script, ScriptKind::Segwit);
         assert!(external.contains("[0f056943/84'/1'/0']"));
+    }
+
+    /// A Coldcard export gives each account the fingerprint of the
+    /// account key itself; the master fingerprint, the one a signer
+    /// knows the wallet by, is the file's, and the one in the account's
+    /// own descriptor. The address the device showed must be the one
+    /// the key derives.
+    #[test]
+    fn a_coldcard_account_carries_the_master_fingerprint() {
+        let account = |extra: &str| {
+            format!(
+                "{{\"chain\": \"XTN\", \"xfp\": \"0F056943\", \"bip84\": {{\"name\": \"p2wpkh\", \
+                 \"xfp\": \"DEADBEEF\", \"deriv\": \"m/84h/1h/0h\", \"xpub\": \"{TPUB}\"{extra}}}}}"
+            )
+        };
+        // Through the account's descriptor, both branches.
+        let desc = format!(
+            ", \"desc\": \"wpkh([0f056943/84h/1h/0h]{TPUB}/<0;1>/*)\", \"first\": \"{DEFAULT_PREVIEW}\""
+        );
+        let parsed = parse_input(&account(&desc)).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::WalletExport);
+        let (external, internal, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(
+            external.starts_with("wpkh([0f056943/84'/1'/0']tpub"),
+            "{external}"
+        );
+        assert!(internal.unwrap().contains("/1/*"));
+        assert!(!external.contains("deadbeef"));
+
+        // Without one, the key under the file's fingerprint.
+        let parsed = parse_input(&account(&format!(", \"first\": \"{DEFAULT_PREVIEW}\""))).unwrap();
+        let (external, _, _) = descriptors(&parsed);
+        assert!(
+            external.starts_with("wpkh([0f056943/84'/1'/0']tpub"),
+            "{external}"
+        );
+
+        // An address the key does not derive: the file was altered.
+        let altered = account(", \"first\": \"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx\"");
+        let error = parse_input(&altered).unwrap_err().to_string();
+        assert!(error.contains("first address"), "{error}");
+
+        // A descriptor for another script than the account's.
+        let other = format!(", \"desc\": \"pkh([0f056943/84h/1h/0h]{TPUB}/<0;1>/*)\"");
+        let error = parse_input(&account(&other)).unwrap_err().to_string();
+        assert!(error.contains("another script type"), "{error}");
     }
 
     #[test]
