@@ -318,6 +318,12 @@ The first release: the library both Gerfaut apps are built on.
   ask for wait longer and longer, as a server that pushes made-up changes
   already did. A connection dropped every minute had those scripts
   synced every minute, day and night.
+- Over Electrum, where a broadcast transaction stands is read through
+  an output a coin may sit on, an OP_RETURN only last, and through the
+  next one when the server refuses a history. It was read through the
+  first output, an OP_RETURN or an exchange's deposit address with a
+  history too long for the server, and failed while the transaction
+  confirmed.
 - An incoming payment announced as pending is said dropped only once a
   second sync, ten minutes or more after the first one that missed it,
   has read its scripts again and not seen it either. A server that lags,

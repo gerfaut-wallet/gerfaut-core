@@ -832,8 +832,28 @@ pub(crate) async fn fetch_prevout(
     }
 }
 
-/// Where a transaction stands at one endpoint. `script` is one of the
-/// transaction's output scripts, the handle Electrum needs.
+/// The output scripts of a transaction an Electrum server can be asked
+/// for it through, in the order they are tried: the ones a coin may sit
+/// on first, an OP_RETURN, whose history only says who else wrote one,
+/// last, and four at most, each once.
+pub(crate) fn lookup_scripts(tx: &Transaction) -> Vec<ScriptBuf> {
+    let mut scripts: Vec<ScriptBuf> = Vec::new();
+    let (data, coins): (Vec<&TxOut>, Vec<&TxOut>) = tx
+        .output
+        .iter()
+        .partition(|output| output.script_pubkey.is_op_return());
+    for output in coins.into_iter().chain(data) {
+        if !scripts.contains(&output.script_pubkey) {
+            scripts.push(output.script_pubkey.clone());
+        }
+    }
+    scripts.truncate(4);
+    scripts
+}
+
+/// Where a transaction stands at one endpoint. `scripts` are output
+/// scripts of the transaction, the handle Electrum needs: see
+/// [`lookup_scripts`].
 pub(crate) struct TxStanding {
     pub found: bool,
     pub block_height: Option<u32>,
@@ -843,7 +863,7 @@ pub(crate) struct TxStanding {
 pub(crate) async fn tx_standing(
     endpoint: &Endpoint,
     txid: Txid,
-    script: ScriptBuf,
+    scripts: Vec<ScriptBuf>,
     proxy: Option<&str>,
 ) -> Result<TxStanding, String> {
     match endpoint {
@@ -861,7 +881,7 @@ pub(crate) async fn tx_standing(
         }
         Endpoint::Electrum(target) => {
             let (found, block_height, tip_height) =
-                electrum::tx_standing(target, txid, script, proxy).await?;
+                electrum::tx_standing(target, txid, scripts, proxy).await?;
             Ok(TxStanding {
                 found,
                 block_height,

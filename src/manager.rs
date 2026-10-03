@@ -1545,21 +1545,19 @@ impl WalletManager {
     ) -> CoreResult<BroadcastStatus> {
         let decoded = broadcast::decode_transaction(hex)?;
         let txid = decoded.tx.compute_txid();
-        let script = decoded
-            .tx
-            .output
-            .first()
-            .map(|o| o.script_pubkey.clone())
-            .ok_or_else(|| CoreError::InvalidInput {
+        let scripts = chain::lookup_scripts(&decoded.tx);
+        if scripts.is_empty() {
+            return Err(CoreError::InvalidInput {
                 kind: "transaction",
                 detail: "the transaction creates nothing".to_owned(),
-            })?;
+            });
+        }
         let (config, certs) = self.state.lock().await.chain_setup(network);
         let endpoints = chain::endpoints(&config, network, &certs)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
         let mut attempts: Vec<String> = Vec::new();
         for endpoint in &endpoints {
-            match chain::tx_standing(endpoint, txid, script.clone(), proxy.as_deref()).await {
+            match chain::tx_standing(endpoint, txid, scripts.clone(), proxy.as_deref()).await {
                 Ok(standing) => {
                     let confirmations = standing
                         .block_height

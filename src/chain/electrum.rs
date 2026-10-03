@@ -656,24 +656,37 @@ pub(crate) async fn fetch_prevout(
 }
 
 /// Where a transaction stands, read off the history of one of its
-/// output scripts: height 0 means mempool, a height means confirmed,
-/// absence means the server does not have it.
+/// output scripts, `scripts` in the order they are tried: height 0
+/// means mempool, a height means confirmed, absence means the server
+/// does not have it. A script whose history the server refuses, one too
+/// long for it, is passed over for the next.
 pub(crate) async fn tx_standing(
     target: &Target,
     txid: Txid,
-    script: ScriptBuf,
+    scripts: Vec<ScriptBuf>,
     proxy: Option<&str>,
 ) -> Result<(bool, Option<u32>, u32), String> {
     let fail = failed(target);
     run(target, proxy, call_deadline(target), move |client| {
         let tip = client.block_headers_subscribe().map_err(&fail)?.height as u32;
-        let history = client.script_get_history(&script).map_err(&fail)?;
-        let entry = history.iter().find(|entry| entry.tx_hash == txid);
-        Ok(match entry {
-            None => (false, None, tip),
-            Some(entry) if entry.height > 0 => (true, Some(entry.height as u32), tip),
-            Some(_) => (true, None, tip),
-        })
+        let mut refused = None;
+        for script in &scripts {
+            let history = match client.script_get_history(script) {
+                Ok(history) => history,
+                Err(error @ electrum_client::Error::Protocol(_)) => {
+                    refused = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(fail(error)),
+            };
+            let entry = history.iter().find(|entry| entry.tx_hash == txid);
+            return Ok(match entry {
+                None => (false, None, tip),
+                Some(entry) if entry.height > 0 => (true, Some(entry.height as u32), tip),
+                Some(_) => (true, None, tip),
+            });
+        }
+        Err(refused.map_or_else(|| "the transaction creates nothing".to_owned(), fail))
     })
     .await
 }
@@ -686,6 +699,40 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    /// A transaction is looked up through one of its scripts: one a coin
+    /// may sit on before an OP_RETURN, and past one whose history the
+    /// server refuses, an exchange's deposit address for instance, the
+    /// next one.
+    #[tokio::test]
+    async fn a_transaction_is_found_past_a_script_the_server_refuses() {
+        use crate::testkit::{FakeElectrum, nowhere, script, scripthash, transaction};
+        let server = FakeElectrum::start().await;
+        let tx = transaction(
+            &[nowhere(1, 0)],
+            &[
+                ("6a0474657374", 0),
+                (&script(1), 1_000),
+                (&script(2), 2_000),
+                (&script(1), 3_000),
+            ],
+        );
+        let scripts = crate::chain::lookup_scripts(&tx);
+        let hex: Vec<String> = scripts.iter().map(|s| s.to_hex_string()).collect();
+        assert_eq!(hex, [script(1), script(2), "6a0474657374".to_owned()]);
+        server.set_history(&script(2), &[(tx.compute_txid(), 90)]);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .refused_histories
+            .insert(scripthash(&script(1)));
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        let standing = tx_standing(&target, tx.compute_txid(), scripts, None)
+            .await
+            .unwrap();
+        assert_eq!(standing, (true, Some(90), 100));
+    }
 
     /// A server that answers `server.version`, then starts its answer
     /// to the next request and never finishes it. It says when that
