@@ -28,8 +28,8 @@ use crate::backup::{
 use crate::broadcast::{
     self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, TxPreview, WalletRef,
 };
-use crate::chain::tor::{self, TorRoute, TorSettings, TorStatus};
-use crate::chain::{self, BackendConfig, CertificateReport, CertificateStatus, Endpoint};
+use crate::chain::tor;
+use crate::chain::{self, BackendConfig, Endpoint};
 use crate::error::PremiumError;
 use crate::error::{CoreError, CoreResult};
 use crate::export::{ExportOptions, ExportResult};
@@ -37,7 +37,7 @@ use crate::input::{ParsedInput, ParsedPayload, RecognizedKind};
 use crate::lock::{self, AppLock, LockAttempts, LockKind, LockVerdict};
 use crate::network::Network;
 use crate::premium::{Channel, PremiumClient, PremiumState};
-use crate::store::{Settings, Vault, VaultKey, VaultPayload, WalletRecord};
+use crate::store::{Vault, VaultKey, VaultPayload, WalletRecord};
 use crate::wallet::meta::{CachedTotals, SyncStamp, WalletIcon, WalletKind, WalletMeta};
 use crate::wallet::policy::{self, PolicySnapshot};
 use crate::wallet::snapshot::{
@@ -47,6 +47,7 @@ use crate::wallet::views;
 use crate::wallet::{AddressTx, AddressWatchState};
 
 mod devices;
+mod settings;
 
 /// Vault file name inside the data directory.
 const VAULT_FILE: &str = "gerfaut.vault";
@@ -359,167 +360,6 @@ impl WalletManager {
                 #[cfg(test)]
                 premium_public_key: std::sync::Mutex::new(None),
             }),
-        })
-    }
-
-    // --- settings ------------------------------------------------------
-
-    /// The settings as the apps may see them: the lock's hash stays in
-    /// the vault, the apps only need to know a lock exists and its kind,
-    /// and the premium device token stays too, as in
-    /// [`Self::premium_state`].
-    pub async fn settings(&self) -> Settings {
-        let mut settings = self.state.lock().await.payload.settings.clone();
-        if let Some(lock) = &mut settings.app_lock {
-            lock.secret = None;
-        }
-        settings.premium.redact();
-        settings
-    }
-
-    pub async fn set_active_network(&self, network: Network) -> CoreResult<()> {
-        let result: CoreResult<()> = async {
-            self.state.lock().await.commit(|payload| {
-                payload.settings.active_network = network;
-                Ok(())
-            })
-        }
-        .await;
-        self.live_refresh().await;
-        result
-    }
-
-    /// Remembers the backend of a network. A custom address is stored
-    /// in the form a scan reads it into, the host in lower case and an
-    /// IPv6 literal in brackets, and refused with the reason when the
-    /// parser the sync reads with cannot read it: stored as typed, an
-    /// address that parser gives up on has no host to be an onion, and
-    /// the sync would hand it to the resolver in the clear. One already
-    /// in that form is stored byte for byte, and the certificate
-    /// accepted for it stays keyed to it.
-    pub async fn set_backend(&self, network: Network, config: BackendConfig) -> CoreResult<()> {
-        let result: CoreResult<()> = async {
-            let config = config.canonical()?;
-            self.state.lock().await.commit(|payload| {
-                payload.settings.backends.insert(network, config);
-                Ok(())
-            })
-        }
-        .await;
-        self.live_refresh().await;
-        result
-    }
-
-    // --- Electrum certificates ------------------------------------------
-
-    /// What this server's certificate amounts to right now, and the
-    /// fingerprint to show when the user has to decide. Reads only: the
-    /// settings screen asks, the user answers.
-    pub async fn inspect_certificate(&self, url: &str) -> CoreResult<CertificateReport> {
-        let host = chain::electrum::certificate_key(url);
-        let pin = self
-            .state
-            .lock()
-            .await
-            .payload
-            .settings
-            .electrum_certs
-            .get(&host)
-            .cloned();
-        let status = match chain::inspect_certificate(url.to_owned(), pin.clone()).await {
-            Ok(chain::electrum::Inspection::NotTls) => CertificateStatus::NotTls,
-            Ok(chain::electrum::Inspection::Tor) => CertificateStatus::Tor,
-            Ok(chain::electrum::Inspection::Tls(verdict)) => match verdict {
-                chain::tls::Verdict::Trusted => CertificateStatus::Trusted,
-                chain::tls::Verdict::Pinned => CertificateStatus::Pinned {
-                    fingerprint: pin.unwrap_or_default(),
-                },
-                chain::tls::Verdict::Unknown {
-                    fingerprint,
-                    reason,
-                    subject,
-                    expires,
-                } => CertificateStatus::Unknown {
-                    fingerprint,
-                    reason,
-                    subject,
-                    expires,
-                },
-                chain::tls::Verdict::Changed { stored, presented } => {
-                    CertificateStatus::Changed { stored, presented }
-                }
-            },
-            Err(detail) => CertificateStatus::Unreachable { detail },
-        };
-        Ok(CertificateReport { host, status })
-    }
-
-    /// Remembers the certificate the user accepted for this server.
-    /// From then on that host must present exactly this certificate:
-    /// anything else is refused, never accepted again in silence.
-    pub async fn trust_certificate(&self, url: &str, fingerprint: &str) -> CoreResult<()> {
-        let result: CoreResult<()> = async {
-            if !chain::tls::is_fingerprint(fingerprint) {
-                return Err(CoreError::InvalidInput {
-                    kind: "certificate fingerprint",
-                    detail: "expected 32 hexadecimal bytes separated by colons".to_owned(),
-                });
-            }
-            let host = chain::electrum::certificate_key(url);
-            self.state.lock().await.commit(|payload| {
-                payload
-                    .settings
-                    .electrum_certs
-                    .insert(host, fingerprint.to_ascii_uppercase());
-                Ok(())
-            })
-        }
-        .await;
-        self.live_refresh().await;
-        result
-    }
-
-    /// Drops an accepted certificate: the next connection to that host
-    /// asks again.
-    pub async fn forget_certificate(&self, host: &str) -> CoreResult<()> {
-        let result: CoreResult<()> = async {
-            self.state.lock().await.commit(|payload| {
-                payload.settings.electrum_certs.remove(host);
-                Ok(())
-            })
-        }
-        .await;
-        self.live_refresh().await;
-        result
-    }
-
-    /// Sets the gap limit shared by every wallet. Takes effect on the
-    /// next sync; a raised limit widens the scan, a lowered one only
-    /// narrows future scans (revealed addresses stay watched).
-    pub async fn set_gap_limit(&self, gap_limit: u32) -> CoreResult<()> {
-        let result: CoreResult<()> = async {
-            if !(1..=500).contains(&gap_limit) {
-                return Err(CoreError::InvalidInput {
-                    kind: "gap limit",
-                    detail: "must be between 1 and 500".to_owned(),
-                });
-            }
-            self.state.lock().await.commit(|payload| {
-                payload.settings.gap_limit = gap_limit;
-                Ok(())
-            })
-        }
-        .await;
-        self.live_refresh().await;
-        result
-    }
-
-    /// Stores one small app preference (theme, hidden balances, ...) in
-    /// the encrypted vault.
-    pub async fn set_app_pref(&self, key: String, value: String) -> CoreResult<()> {
-        self.state.lock().await.commit(|payload| {
-            payload.settings.app_prefs.insert(key, value);
-            Ok(())
         })
     }
 
@@ -1997,70 +1837,6 @@ impl WalletManager {
         result
     }
 
-    // --- tor -----------------------------------------------------------
-
-    /// Where Tor stands: the mode, the proxy in effect, and how far the
-    /// embedded client got. Reads only; nothing is probed or started.
-    pub async fn tor_status(&self) -> TorStatus {
-        let settings = self.state.lock().await.payload.settings.tor.clone();
-        tor::status(&settings).await
-    }
-
-    /// Persists how `.onion` hosts are reached. A proxy address is
-    /// `host:port`, checked here so a typo fails at the settings screen
-    /// and not at the next sync; blank means the default.
-    pub async fn set_tor_settings(&self, settings: TorSettings) -> CoreResult<()> {
-        let result: CoreResult<()> = async {
-            let socks_proxy = settings
-                .socks_proxy
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(tor::parse_socks_address)
-                .transpose()?;
-            self.state.lock().await.commit(|payload| {
-                payload.settings.tor = TorSettings {
-                    mode: settings.mode,
-                    socks_proxy,
-                };
-                Ok(())
-            })
-        }
-        .await;
-        self.live_refresh().await;
-        result
-    }
-
-    /// Reaches Tor now, the way the settings say, so a settings screen
-    /// can show the outcome before any wallet needs it. With the
-    /// embedded client this is its bootstrap: up to about 90 seconds on
-    /// a first run, a few on later ones. A mode that leads to a system
-    /// proxy costs one probe.
-    pub async fn tor_connect(&self) -> CoreResult<TorRoute> {
-        let (settings, data_dir) = self.tor_setup().await;
-        tor::resolve(&settings, &data_dir).await
-    }
-
-    /// The proxy to hand the chain layer for these endpoints: a Tor
-    /// route when at least one host is an onion, nothing otherwise. A
-    /// clearnet-only list never probes for Tor, let alone starts it.
-    /// The lock is released before resolving: a first bootstrap takes
-    /// a while, and reads must not wait on it.
-    async fn tor_proxy_for(&self, endpoints: &[Endpoint]) -> CoreResult<Option<String>> {
-        if !chain::needs_tor(endpoints) {
-            return Ok(None);
-        }
-        let (settings, data_dir) = self.tor_setup().await;
-        let route = tor::resolve(&settings, &data_dir).await?;
-        Ok(Some(route.proxy()))
-    }
-
-    /// What resolving a route needs from the state, copied out.
-    async fn tor_setup(&self) -> (TorSettings, PathBuf) {
-        let state = self.state.lock().await;
-        (state.payload.settings.tor.clone(), state.data_dir.clone())
-    }
-
     // --- premium -------------------------------------------------------
 
     /// The premium account as the vault keeps it, the device token
@@ -2360,80 +2136,6 @@ impl WalletManager {
             Some(e) => Err(e),
             None => Ok(left),
         }
-    }
-
-    /// Whether this user reaches a backend through Tor: the active
-    /// network's, or the one configured for any other network. It
-    /// decides the route of what is not a sync and must not give away
-    /// more than one, the update check first: someone who set an onion
-    /// backend anywhere is not someone whose address GitHub should see.
-    /// For the apps, the reason a check is paused while Tor is down.
-    pub async fn uses_tor(&self) -> bool {
-        if self.backend_needs_tor().await {
-            return true;
-        }
-        let state = self.state.lock().await;
-        let settings = &state.payload.settings;
-        settings.backends.iter().any(|(network, config)| {
-            match chain::endpoints(config, *network, &settings.electrum_certs) {
-                Ok(endpoints) => chain::needs_tor(&endpoints),
-                // An address kept from before addresses were checked,
-                // which no sync will connect to: if it so much as names
-                // an onion, its owner meant Tor.
-                Err(_) => match config {
-                    BackendConfig::CustomEsplora { url, .. }
-                    | BackendConfig::CustomElectrum { url, .. } => {
-                        url.to_ascii_lowercase().contains(".onion")
-                    }
-                    BackendConfig::Public { .. } => false,
-                },
-            }
-        })
-    }
-
-    /// Asks GitHub for the latest release of `owner/repo` and compares
-    /// it with the running version: for the button, and for the check
-    /// the apps run on their own once a day. It takes the route the
-    /// syncs take. When [`Self::uses_tor`] says so it goes through the
-    /// Tor proxy a sync would resolve, and when that proxy cannot be
-    /// had it fails with [`CoreError::Tor`] before any request exists:
-    /// never a request in the clear. Anything else that goes wrong is
-    /// "could not check".
-    pub async fn check_update(
-        &self,
-        repo: &str,
-        current_version: &str,
-    ) -> CoreResult<crate::updates::UpdateCheck> {
-        self.check_update_at(crate::updates::GITHUB_API, repo, current_version)
-            .await
-    }
-
-    pub(crate) async fn check_update_at(
-        &self,
-        api: &str,
-        repo: &str,
-        current_version: &str,
-    ) -> CoreResult<crate::updates::UpdateCheck> {
-        let proxy = if self.uses_tor().await {
-            let (settings, data_dir) = self.tor_setup().await;
-            Some(tor::resolve(&settings, &data_dir).await?.proxy())
-        } else {
-            None
-        };
-        crate::updates::check_update(api, repo, current_version, proxy.as_deref()).await
-    }
-
-    /// Whether the backend of the active network is reached through
-    /// Tor: the same question a sync asks, over the same endpoints.
-    async fn backend_needs_tor(&self) -> bool {
-        let (config, certs, network) = {
-            let state = self.state.lock().await;
-            let network = state.payload.settings.active_network;
-            let (config, certs) = state.chain_setup(network);
-            (config, certs, network)
-        };
-        chain::endpoints(&config, network, &certs)
-            .is_ok_and(|endpoints| chain::needs_tor(&endpoints))
     }
 }
 
@@ -2920,7 +2622,7 @@ mod tests {
     pub(crate) mod support;
 
     use super::*;
-    use crate::chain::tor::TorMode;
+    use crate::chain::tor::{TorMode, TorSettings};
     use crate::input::parse_input;
     use support::*;
 
@@ -3244,41 +2946,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gap_limit_is_global_and_persisted() {
-        let dir = tempfile::tempdir().unwrap();
-        let manager = manager(dir.path()).await;
-        let parsed = parse_input(MULTIPATH).unwrap();
-        let meta = manager
-            .add_wallet("Signet cold", &parsed, Network::Signet)
-            .await
-            .unwrap();
-        assert_eq!(meta.gap_limit, 20, "default follows the setting");
-        assert_eq!(manager.settings().await.gap_limit, 20);
-
-        manager.set_gap_limit(50).await.unwrap();
-        // Every surface presents the new effective value.
-        assert_eq!(manager.settings().await.gap_limit, 50);
-        assert_eq!(manager.list_wallets(None).await[0].gap_limit, 50);
-        assert_eq!(
-            manager
-                .wallet_snapshot(&meta.id)
-                .await
-                .unwrap()
-                .meta
-                .gap_limit,
-            50
-        );
-        // Bounds are enforced.
-        assert!(manager.set_gap_limit(0).await.is_err());
-        assert!(manager.set_gap_limit(501).await.is_err());
-
-        // A fresh manager reloads the value from the vault.
-        drop(manager);
-        let manager = WalletManager::open(dir.path(), key()).unwrap();
-        assert_eq!(manager.settings().await.gap_limit, 50);
-    }
-
-    #[tokio::test]
     async fn duplicates_and_network_mismatch_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(dir.path()).await;
@@ -3523,121 +3190,6 @@ mod tests {
         drop(manager);
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         assert_eq!(names(manager.list_wallets(None).await), ["C", "B", "A"]);
-    }
-
-    #[tokio::test]
-    async fn settings_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let manager = manager(dir.path()).await;
-        manager.set_active_network(Network::Signet).await.unwrap();
-        manager
-            .set_backend(
-                Network::Signet,
-                BackendConfig::CustomEsplora {
-                    url: "https://esplora.example.org/api".to_owned(),
-                    own_node: false,
-                },
-            )
-            .await
-            .unwrap();
-        manager
-            .set_app_pref("theme".to_owned(), "dark".to_owned())
-            .await
-            .unwrap();
-
-        drop(manager);
-        let manager = WalletManager::open(dir.path(), key()).unwrap();
-        let settings = manager.settings().await;
-        assert_eq!(settings.active_network, Network::Signet);
-        assert_eq!(
-            settings.backend_for(Network::Signet),
-            BackendConfig::CustomEsplora {
-                url: "https://esplora.example.org/api".to_owned(),
-                own_node: false,
-            }
-        );
-        assert_eq!(settings.app_prefs.get("theme").unwrap(), "dark");
-    }
-
-    /// A custom address is stored the way a scan reads it, and refused
-    /// when the parser cannot read it: stored as typed, the sync would
-    /// see no onion in `tcp://x.onion:50001:extra` and hand it to the
-    /// resolver in the clear. A refusal leaves the setting as it was.
-    #[tokio::test]
-    async fn a_custom_backend_is_stored_canonical_or_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let manager = manager(dir.path()).await;
-        let electrum = |url: &str| BackendConfig::CustomElectrum {
-            url: url.to_owned(),
-            own_node: false,
-        };
-        let esplora = |url: &str| BackendConfig::CustomEsplora {
-            url: url.to_owned(),
-            own_node: false,
-        };
-
-        manager
-            .set_backend(Network::Signet, electrum("ssl://node.example.org:50002"))
-            .await
-            .unwrap();
-        for (config, problem) in [
-            (electrum("tcp://x.onion:50001:extra"), "more than one colon"),
-            (
-                electrum("ssl://x.onion:99999"),
-                "99999 is not a port number",
-            ),
-            (esplora("ssl://x.onion:50002"), "http:// or https://"),
-        ] {
-            let refused = manager
-                .set_backend(Network::Signet, config.clone())
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(&refused, CoreError::InvalidInput { kind: "server", detail } if detail.contains(problem)),
-                "{config:?}: {refused}"
-            );
-        }
-        assert_eq!(
-            manager.settings().await.backend_for(Network::Signet),
-            electrum("ssl://node.example.org:50002"),
-            "a refused address leaves the setting as it was"
-        );
-
-        manager
-            .set_backend(Network::Signet, electrum("SSL://Node.Example.ORG.:50002"))
-            .await
-            .unwrap();
-        assert_eq!(
-            manager.settings().await.backend_for(Network::Signet),
-            electrum("ssl://node.example.org:50002")
-        );
-        manager
-            .set_backend(
-                Network::Signet,
-                esplora("HTTPS://Esplora.Example.ORG./api/"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            manager.settings().await.backend_for(Network::Signet),
-            esplora("https://esplora.example.org/api")
-        );
-        // Already in that form: byte for byte, the key of an accepted
-        // certificate among what stays the same.
-        for config in [
-            electrum("tcp://x.onion:50001"),
-            electrum("ssl://[2001:db8::1]:50002"),
-            esplora("https://esplora.example.org/api"),
-        ] {
-            manager
-                .set_backend(Network::Signet, config.clone())
-                .await
-                .unwrap();
-            assert_eq!(
-                manager.settings().await.backend_for(Network::Signet),
-                config
-            );
-        }
     }
 
     #[tokio::test]
@@ -4529,74 +4081,6 @@ mod tests {
         assert_eq!(target.settings().await.gap_limit, 50);
     }
 
-    /// "This is my node" is stored with the backend, in its canonical
-    /// form, lifts what the live watch lists of a wallet, and travels in
-    /// a backup with the rest of the node settings.
-    #[tokio::test]
-    async fn the_own_node_switch_lifts_the_list_and_travels_in_a_backup() {
-        let source_dir = tempfile::tempdir().unwrap();
-        let (source, cold, _) = seeded(source_dir.path()).await;
-        {
-            let mut state = source.state.lock().await;
-            let engine = ensure_engine(&mut state, &cold.id).unwrap();
-            let _ = engine
-                .reveal_addresses_to(bdk_wallet::KeychainKind::External, 999)
-                .count();
-        }
-        let listed = async |manager: &WalletManager| {
-            manager
-                .watch_list(Network::Signet)
-                .await
-                .into_iter()
-                .find(|wallet| wallet.wallet_id == cold.id)
-                .map(|wallet| (wallet.scripts.len(), wallet.unlisted))
-                .unwrap()
-        };
-        assert_eq!(
-            listed(&source).await,
-            (crate::watch::MAX_SCRIPTS_PER_WALLET, 840)
-        );
-
-        source
-            .set_backend(
-                Network::Signet,
-                BackendConfig::CustomElectrum {
-                    url: "Node.Example.ORG.:50002".to_owned(),
-                    own_node: true,
-                },
-            )
-            .await
-            .unwrap();
-        let own = BackendConfig::CustomElectrum {
-            url: "ssl://node.example.org:50002".to_owned(),
-            own_node: true,
-        };
-        assert_eq!(source.settings().await.backend_for(Network::Signet), own);
-        // Every revealed receive address, and a gap limit past the last
-        // one on each keychain.
-        assert_eq!(listed(&source).await, (1_000 + 2 * 20, 0));
-
-        let options = BackupOptions {
-            wallet_ids: None,
-            include_settings: true,
-        };
-        let bundle = source
-            .export_backup(&options, BACKUP_PASSWORD)
-            .await
-            .unwrap();
-        let target_dir = tempfile::tempdir().unwrap();
-        let target = manager(target_dir.path()).await;
-        let choices = ImportChoices {
-            indexes: None,
-            apply_settings: true,
-        };
-        target
-            .import_backup(&bundle.data, BACKUP_PASSWORD, &choices)
-            .await
-            .unwrap();
-        assert_eq!(target.settings().await.backend_for(Network::Signet), own);
-    }
-
     /// A pin is kept in the vault and carried by a backup, and the live
     /// watch reads it with whether each wallet holds coins.
     #[tokio::test]
@@ -4989,112 +4473,6 @@ mod tests {
         let reopened = WalletManager::open(target_dir.path(), key()).unwrap();
         assert_eq!(reopened.list_wallets(None).await.len(), 2);
         assert_eq!(reopened.settings().await.gap_limit, 50);
-    }
-
-    #[tokio::test]
-    async fn tor_settings_are_checked_and_persisted() {
-        let dir = tempfile::tempdir().unwrap();
-        let manager = manager(dir.path()).await;
-        assert_eq!(manager.settings().await.tor, TorSettings::default());
-
-        manager
-            .set_tor_settings(TorSettings {
-                mode: TorMode::Embedded,
-                socks_proxy: Some(" 127.0.0.1:9150 ".to_owned()),
-            })
-            .await
-            .unwrap();
-        let status = manager.tor_status().await;
-        assert_eq!(status.mode, TorMode::Embedded);
-        assert_eq!(status.socks_proxy, "127.0.0.1:9150");
-        assert_eq!(status.embedded_available, cfg!(feature = "embedded-tor"));
-        assert_eq!(status.system_socks_trusted, tor::TRUST_LOOPBACK_SOCKS);
-
-        // Blank means the default.
-        manager
-            .set_tor_settings(TorSettings {
-                mode: TorMode::System,
-                socks_proxy: Some("  ".to_owned()),
-            })
-            .await
-            .unwrap();
-        assert_eq!(manager.settings().await.tor.socks_proxy, None);
-
-        // A typo is refused before it is stored.
-        let error = manager
-            .set_tor_settings(TorSettings {
-                mode: TorMode::Auto,
-                socks_proxy: Some("nonsense".to_owned()),
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            CoreError::InvalidInput {
-                kind: "tor proxy",
-                ..
-            }
-        ));
-
-        drop(manager);
-        let manager = WalletManager::open(dir.path(), key()).unwrap();
-        assert_eq!(
-            manager.settings().await.tor,
-            TorSettings {
-                mode: TorMode::System,
-                socks_proxy: None
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn an_onion_backend_without_tor_fails_before_any_connection() {
-        let dir = tempfile::tempdir().unwrap();
-        let manager = manager(dir.path()).await;
-        let parsed = parse_input(MULTIPATH).unwrap();
-        let meta = manager
-            .add_wallet("Over Tor", &parsed, Network::Signet)
-            .await
-            .unwrap();
-        manager
-            .set_backend(
-                Network::Signet,
-                BackendConfig::CustomEsplora {
-                    url: "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/signet/api"
-                        .to_owned(),
-                    own_node: false,
-                },
-            )
-            .await
-            .unwrap();
-        manager
-            .set_tor_settings(TorSettings {
-                mode: TorMode::System,
-                socks_proxy: Some(closed_port().await),
-            })
-            .await
-            .unwrap();
-
-        let started = Instant::now();
-        let error = manager.sync_wallet(&meta.id).await.unwrap_err();
-        assert!(matches!(error, CoreError::Tor(_)), "{error}");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "the onion host is never contacted, let alone looked up"
-        );
-        assert!(matches!(
-            manager.tor_connect().await,
-            Err(CoreError::Tor(_))
-        ));
-
-        // A workspace sync reports it per wallet, like any other failure.
-        let report = manager.sync_all(Some(Network::Signet)).await;
-        assert_eq!(report.failures.len(), 1);
-        assert!(
-            report.failures[0].message.starts_with("tor: "),
-            "{}",
-            report.failures[0].message
-        );
     }
 
     /// The premium client goes through Tor as soon as a backend of any
