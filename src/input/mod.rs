@@ -190,10 +190,13 @@ pub struct ImportOptions {
 
 /// Classifies raw user input into wallet material.
 ///
-/// The classification order is: private material rejection, JSON export,
-/// descriptor(s), extended public key, address. Errors from a recognized
-/// but invalid format are reported as such; only inputs matching nothing
-/// at all yield [`CoreError::UnrecognizedInput`].
+/// The classification order is: BSMS record, private material
+/// rejection, Gerfaut backup (refused: it is restored, not watched), QR
+/// envelope (opened once, its text classified in turn), JSON export,
+/// transaction (refused: it is broadcast, not watched), descriptor(s),
+/// extended public key, address or payment URI. Errors from a
+/// recognized but invalid format are reported as such; only inputs
+/// matching nothing at all yield [`CoreError::UnrecognizedInput`].
 pub fn parse_input(input: &str) -> CoreResult<ParsedInput> {
     parse_input_with_options(input, &ImportOptions::default())
 }

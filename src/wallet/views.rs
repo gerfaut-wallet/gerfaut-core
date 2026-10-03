@@ -1,5 +1,9 @@
 //! Builders turning engine state into the serializable snapshots of
-//! [`crate::wallet::snapshot`]. Pure functions, no I/O.
+//! [`crate::wallet::snapshot`], and into the facts syncs and the live
+//! watch read from it: what the wallet already holds, which scripts to
+//! watch, what moved. No I/O. Two of them change the engine:
+//! `address_list` and `receive_addresses` reveal addresses, a change
+//! set the caller persists.
 
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::address::Address;
@@ -795,9 +799,9 @@ pub(crate) fn coins(wallet: &bdk_wallet::Wallet) -> Vec<Coin> {
 pub(crate) const ADDRESS_LIST_CAP: usize = 200;
 
 /// Revealed addresses of both keychains, ascending, with usage and the
-/// balance currently sitting on each. Reveals the first external
-/// address if nothing is revealed yet: the caller must persist the
-/// staged change set afterwards.
+/// balance currently sitting on each. Reveals the next unused external
+/// address when every revealed one is used, the first one included:
+/// the caller must persist the staged change set afterwards.
 pub(crate) fn address_list(wallet: &mut bdk_wallet::Wallet) -> AddressList {
     // Balance per (keychain, index) from the unspent set.
     let mut balances: std::collections::HashMap<(KeychainKind, u32), u64> =

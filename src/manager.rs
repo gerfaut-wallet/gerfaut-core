@@ -5,6 +5,10 @@
 //! engines in memory, and coordinates syncs so that network I/O never
 //! blocks reads: requests are built under the lock, executed outside it,
 //! and applied back under the lock.
+//!
+//! The facade spans three files: this one, `manager/devices.rs` for the
+//! Premium devices (connecting, logging out, changing the key), and
+//! `live.rs` for the live watch and the alerts it hands out.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
