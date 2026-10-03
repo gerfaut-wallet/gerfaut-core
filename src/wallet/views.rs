@@ -160,15 +160,23 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
 /// would keep for that history.
 ///
 /// The list stops at [`crate::watch::MAX_SCRIPTS_PER_WALLET`], all a
-/// watch takes of one wallet, and nothing past it is derived: this runs
-/// under the lock of the vault after every sync, and a wallet a server
-/// had reveal a hundred thousand addresses would otherwise hold it for
-/// as many derivations each time.
+/// watch takes of one wallet.
+///
+/// This runs under the lock of the vault after every sync, for every
+/// wallet of the network, so nothing past that is looked at, and every
+/// script the wallet revealed is read from its index, where revealing
+/// it stored it, instead of being derived again: a derivation costs
+/// tens of microseconds, a key or two per address and more for a
+/// multisig, where a lookup costs a fraction of one. Only the scripts
+/// past what the index looks ahead are derived, a gap limit's worth at
+/// most.
 pub(crate) fn watch_scripts(
     wallet: &bdk_wallet::Wallet,
     gap_limit: u32,
     orders: &HistoryOrders,
 ) -> Vec<crate::watch::WatchedScript> {
+    let cap = crate::watch::MAX_SCRIPTS_PER_WALLET;
+    let index = wallet.spk_index();
     let mut seen = std::collections::HashSet::new();
     let mut listed: Vec<(bdk_wallet::bitcoin::ScriptBuf, bool)> = Vec::new();
     // True once the list is full.
@@ -176,19 +184,22 @@ pub(crate) fn watch_scripts(
         if seen.insert(script.clone()) {
             listed.push((script, lookahead));
         }
-        listed.len() >= crate::watch::MAX_SCRIPTS_PER_WALLET
+        listed.len() >= cap
     };
     let keychains: Vec<KeychainKind> = wallet.keychains().map(|(keychain, _)| keychain).collect();
     let ahead = |keychain: KeychainKind| {
         let next = wallet
             .derivation_index(keychain)
             .map_or(0, |last| last.saturating_add(1));
-        (next..next.saturating_add(gap_limit))
-            .map(move |index| wallet.peek_address(keychain, index).script_pubkey())
+        (next..next.saturating_add(gap_limit)).map(move |at| {
+            index
+                .spk_at_index(keychain, at)
+                .unwrap_or_else(|| wallet.peek_address(keychain, at).script_pubkey())
+        })
     };
     'full: {
-        for info in wallet.list_unused_addresses(KeychainKind::External) {
-            if push(info.script_pubkey(), false) {
+        for (_, script) in index.unused_keychain_spks(KeychainKind::External) {
+            if push(script, false) {
                 break 'full;
             }
         }
@@ -203,8 +214,8 @@ pub(crate) fn watch_scripts(
             }
         }
         if keychains.contains(&KeychainKind::Internal) {
-            for info in wallet.list_unused_addresses(KeychainKind::Internal) {
-                if push(info.script_pubkey(), false) {
+            for (_, script) in index.unused_keychain_spks(KeychainKind::Internal) {
+                if push(script, false) {
                     break 'full;
                 }
             }
@@ -214,12 +225,9 @@ pub(crate) fn watch_scripts(
                 }
             }
         }
-        for keychain in keychains {
-            let Some(last) = wallet.derivation_index(keychain) else {
-                continue;
-            };
-            for index in (0..=last).rev() {
-                if push(wallet.peek_address(keychain, index).script_pubkey(), false) {
+        for &keychain in &keychains {
+            for (_, script) in index.revealed_keychain_spks(keychain).rev() {
+                if push(script, false) {
                     break 'full;
                 }
             }
@@ -1190,6 +1198,61 @@ mod tests {
                 .to_hex_string()
         );
         assert!(scripts.iter().all(|script| !script.lookahead));
+    }
+
+    /// The scripts read from the index are the ones a derivation gives,
+    /// in the same order: the unused receive addresses, the coins, a gap
+    /// limit past the last revealed address on each keychain, further
+    /// than the index looks ahead, then the used ones, newest first.
+    #[test]
+    fn the_listed_scripts_are_the_derived_ones() {
+        let mut wallet = bdk_wallet::Wallet::create(EXTERNAL, INTERNAL)
+            .network(bdk_wallet::bitcoin::Network::Signet)
+            .create_wallet_no_persist()
+            .unwrap();
+        let _ = wallet
+            .reveal_addresses_to(KeychainKind::External, 9)
+            .count();
+        let _ = wallet
+            .reveal_addresses_to(KeychainKind::Internal, 1)
+            .count();
+        let derived = |wallet: &bdk_wallet::Wallet, keychain, index| {
+            wallet
+                .peek_address(keychain, index)
+                .script_pubkey()
+                .to_hex_string()
+        };
+        let paid = derived(&wallet, KeychainKind::External, 3);
+        wallet.apply_unconfirmed_txs([(
+            crate::testkit::transaction(
+                &[crate::testkit::nowhere(1, 0)],
+                &[(paid.as_str(), 50_000)],
+            ),
+            1_700_000_000,
+        )]);
+        // Past the 25 scripts the index derives ahead of the last one
+        // revealed.
+        let gap = 40;
+        let scripts = watch_scripts(&wallet, gap, &HistoryOrders::new());
+        let mut expected: Vec<(String, bool)> = Vec::new();
+        for index in [0, 1, 2, 4, 5, 6, 7, 8, 9] {
+            expected.push((derived(&wallet, KeychainKind::External, index), false));
+        }
+        expected.push((paid.clone(), false));
+        for index in 10..10 + gap {
+            expected.push((derived(&wallet, KeychainKind::External, index), true));
+        }
+        for index in [0, 1] {
+            expected.push((derived(&wallet, KeychainKind::Internal, index), false));
+        }
+        for index in 2..2 + gap {
+            expected.push((derived(&wallet, KeychainKind::Internal, index), true));
+        }
+        let listed: Vec<(String, bool)> = scripts
+            .iter()
+            .map(|script| (script.script.clone(), script.lookahead))
+            .collect();
+        assert_eq!(listed, expected);
     }
 
     /// The same for a watched address, whose state each sync replaces
