@@ -97,7 +97,10 @@ tor-config = { version = "0.45", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `test-util`: a test can hold the clock of its runtime still, so that a
+# deadline under test runs out when the test says, not when a machine
+# busy with the rest of the suite gets round to it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 
 # arti pulls in `saturating-time`, whose limit search never terminates
 # on a clock coarser than a nanosecond: Windows counts 100 ns intervals,

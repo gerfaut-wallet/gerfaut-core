@@ -788,20 +788,35 @@ mod tests {
 
     /// A call is held to its deadline however the server stalls, and
     /// the connection is shut down when it runs out: the thread does
-    /// not go on reading. The deadline leaves a busy machine the time to
-    /// connect and ask; what is asserted is that the call ends with it.
-    #[tokio::test]
+    /// not go on reading.
+    ///
+    /// The clock of the runtime stands still until the server has the
+    /// request, and only then moves on to the deadline: however long a
+    /// machine busy with the rest of the suite takes to connect and ask,
+    /// the deadline runs out on a call that is waiting on the server,
+    /// and the call ends at the deadline to the millisecond.
+    #[tokio::test(start_paused = true)]
     async fn a_stalled_call_is_abandoned_at_its_deadline() {
         let (url, heard) = stalling_server();
         let deadline = Duration::from_secs(2);
-        let started = Instant::now();
-        let outcome = run(&Target::new(url, None), None, deadline, |client| {
+        // A blocking task holds a paused clock where it is while it runs.
+        let asked = tokio::task::spawn_blocking(move || {
+            within(&heard, "asked");
+            heard
+        });
+        let target = Target::new(url, None);
+        let started = tokio::time::Instant::now();
+        let call = run(&target, None, deadline, |client| {
             client.block_headers_subscribe().map_err(|e| e.to_string())
-        })
-        .await;
+        });
+        let (outcome, heard) = tokio::join!(call, asked);
+        let heard = heard.expect("the server never saw the request");
         assert_eq!(outcome.err().as_deref(), Some("no answer within 2 s"));
-        assert!(started.elapsed() < deadline + Duration::from_secs(2));
-        within(&heard, "asked");
+        let waited = started.elapsed();
+        assert!(
+            waited >= deadline && waited <= deadline + Duration::from_millis(1),
+            "the call ended after {waited:?}"
+        );
         within(&heard, "closed");
     }
 
