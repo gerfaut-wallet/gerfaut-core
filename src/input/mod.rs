@@ -583,6 +583,7 @@ fn parse_descriptor_pair(first: &str, second: &str) -> CoreResult<ParsedInput> {
             detail: "the two descriptors belong to different networks".to_owned(),
         });
     }
+    check_pair(&external, &internal)?;
     Ok(ParsedInput {
         kind: RecognizedKind::DescriptorPair,
         networks: external_networks,
@@ -597,6 +598,39 @@ fn parse_descriptor_pair(first: &str, second: &str) -> CoreResult<ParsedInput> {
         derivation_editable: false,
         preview_address: None,
     })
+}
+
+/// Holds the change descriptor of a pair to the receive one. The two
+/// are one wallet: the same script type, the same keys with the same
+/// say, on other paths. The policy page reads the receive descriptor
+/// alone, and every payment's change goes to the other one: a pair
+/// that disagrees would vouch for one wallet and send change to
+/// another, which is what a coordinator could hide in it.
+fn check_pair(
+    external: &Descriptor<DescriptorPublicKey>,
+    internal: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<()> {
+    let refuse = |detail: &str| {
+        Err(CoreError::InvalidInput {
+            kind: "descriptor",
+            detail: detail.to_owned(),
+        })
+    };
+    if external.to_string() == internal.to_string() {
+        return refuse("the two descriptors are the same; change needs a path of its own");
+    }
+    if external.desc_type() != internal.desc_type() {
+        return refuse("the change descriptor is not of the receive descriptor's script type");
+    }
+    if crate::wallet::policy::policy_by_material(external)?
+        != crate::wallet::policy::policy_by_material(internal)?
+    {
+        return refuse(
+            "the change descriptor does not spend under the receive descriptor's keys and \
+             conditions: change would go to another wallet",
+        );
+    }
+    Ok(())
 }
 
 // --- extended keys -----------------------------------------------------
@@ -1051,6 +1085,10 @@ mod tests {
     const TPUB: &str = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
     /// BIP32 test vector 1, master public key.
     const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+    /// BIP32 test vector 1, chain m/0H.
+    const XPUB_B: &str = "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw";
+    /// BIP32 test vector 1, chain m/0H/1.
+    const XPUB_C: &str = "xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ";
     /// First receive address of `TPUB` on the default derivation.
     const DEFAULT_PREVIEW: &str = "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx";
     /// BIP32 test vector 1, master private key: the one private key
@@ -1439,6 +1477,58 @@ mod tests {
         let parsed = parse_input(&input).unwrap();
         assert_eq!(parsed.kind, RecognizedKind::DescriptorPair);
         assert!(parsed.warnings.is_empty());
+    }
+
+    /// The change descriptor of a pair is held to the receive one: the
+    /// policy page reads the receive one alone, and every change goes
+    /// to the other. Same script type, same keys with the same say, on
+    /// other paths and in any order.
+    #[test]
+    fn a_pair_is_one_wallet_or_nothing() {
+        let refused = |external: String, internal: String| match parse_input(&format!(
+            "{external}\n{internal}"
+        )) {
+            Err(CoreError::InvalidInput {
+                kind: "descriptor",
+                detail,
+            }) => detail,
+            other => panic!("{external} / {internal} should be refused, got {other:?}"),
+        };
+        // A multisig whose change goes to one key.
+        let detail = refused(
+            format!("wsh(sortedmulti(2,{XPUB}/0/*,{XPUB_B}/0/*,{XPUB_C}/0/*))"),
+            format!("wsh(sortedmulti(1,{XPUB_C}/1/*,{XPUB_C}/2/*))"),
+        );
+        assert!(detail.contains("another wallet"), "{detail}");
+        // The same keys, another threshold.
+        refused(
+            format!("wsh(sortedmulti(2,{XPUB}/0/*,{XPUB_B}/0/*,{XPUB_C}/0/*))"),
+            format!("wsh(sortedmulti(1,{XPUB}/1/*,{XPUB_B}/1/*,{XPUB_C}/1/*))"),
+        );
+        // One key standing in for another.
+        refused(
+            format!("wsh(sortedmulti(2,{XPUB}/0/*,{XPUB_B}/0/*,{XPUB_C}/0/*))"),
+            format!("wsh(sortedmulti(2,{XPUB}/1/*,{XPUB_B}/1/*,{XPUB}/2/*))"),
+        );
+        // A recovery path that opens sooner on change.
+        refused(
+            format!("wsh(or_d(pk({XPUB}/0/*),and_v(v:pkh({XPUB_B}/0/*),older(52560))))"),
+            format!("wsh(or_d(pk({XPUB}/1/*),and_v(v:pkh({XPUB_B}/1/*),older(4320))))"),
+        );
+        // Another script type, the same key.
+        let detail = refused(format!("wpkh({XPUB}/0/*)"), format!("tr({XPUB}/1/*)"));
+        assert!(detail.contains("script type"), "{detail}");
+        // The same line twice.
+        let detail = refused(format!("wpkh({XPUB}/0/*)"), format!("wpkh({XPUB}/0/*)"));
+        assert!(detail.contains("the same"), "{detail}");
+
+        // The keys in another order, on the change paths: one wallet.
+        let parsed = parse_input(&format!(
+            "wsh(sortedmulti(2,{XPUB}/0/*,{XPUB_B}/0/*,{XPUB_C}/0/*))\n\
+             wsh(sortedmulti(2,{XPUB_C}/1/*,{XPUB}/1/*,{XPUB_B}/1/*))"
+        ))
+        .unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::DescriptorPair);
     }
 
     #[test]

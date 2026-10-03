@@ -25,6 +25,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -34,7 +35,7 @@ use bdk_wallet::miniscript::descriptor::SinglePubKey;
 use bdk_wallet::miniscript::policy::Liftable;
 use bdk_wallet::miniscript::policy::semantic::Policy;
 use bdk_wallet::miniscript::{
-    AbsLockTime, Descriptor, DescriptorPublicKey, RelLockTime, Threshold,
+    AbsLockTime, Descriptor, DescriptorPublicKey, MiniscriptKey, RelLockTime, Threshold, Translator,
 };
 use serde::{Deserialize, Serialize};
 
@@ -458,6 +459,40 @@ fn lift(descriptor: &Descriptor<DescriptorPublicKey>) -> CoreResult<Semantic> {
         };
     }
     descriptor.lift().map_err(unreadable)
+}
+
+/// The policy of a descriptor with every key reduced to its material,
+/// normalized and sorted: two descriptors that give the same keys the
+/// same say, on whatever paths and in whatever order, come out equal.
+/// What holds the change descriptor of a pair to the receive one, which
+/// alone is read on the policy page.
+pub(crate) fn policy_by_material(
+    descriptor: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<Policy<String>> {
+    type Pk = DescriptorPublicKey;
+    struct ByMaterial;
+    impl Translator<Pk, String, Infallible> for ByMaterial {
+        fn pk(&mut self, pk: &Pk) -> Result<String, Infallible> {
+            Ok(material(pk))
+        }
+        fn sha256(&mut self, hash: &<Pk as MiniscriptKey>::Sha256) -> Result<String, Infallible> {
+            Ok(hash.to_string())
+        }
+        fn hash256(&mut self, hash: &<Pk as MiniscriptKey>::Hash256) -> Result<String, Infallible> {
+            Ok(hash.to_string())
+        }
+        fn ripemd160(
+            &mut self,
+            hash: &<Pk as MiniscriptKey>::Ripemd160,
+        ) -> Result<String, Infallible> {
+            Ok(hash.to_string())
+        }
+        fn hash160(&mut self, hash: &<Pk as MiniscriptKey>::Hash160) -> Result<String, Infallible> {
+            Ok(hash.to_string())
+        }
+    }
+    let Ok(policy) = lift(descriptor)?.translate_pk(&mut ByMaterial);
+    Ok(policy.normalized().sorted())
 }
 
 /// Whether a key is the BIP 341 unspendable point, whatever its form:
