@@ -12,9 +12,10 @@
 //! A branch is read through its thresholds. A threshold is met with the
 //! k-th soonest of its items, so an "and" waits for its last lock, an
 //! "or" for its first, and `thresh(3, A, B, older(N1), older(N2))` for
-//! the nearer of its two locks. Everything said about a branch comes
-//! out of that one reading: whether it is open, when it opens, and
-//! which of its locks hold it back.
+//! the nearer of its two locks. Whether a branch is open, and when it
+//! opens, come out of that one reading. Which of its locks hold it back
+//! comes out of its shape: a lock does when, every key at hand, some
+//! way of meeting the branch turns on it.
 //!
 //! Times are approximate by nature. A block lock is converted at ten
 //! minutes a block, and a time lock is compared with the wall clock
@@ -233,10 +234,10 @@ pub enum LockState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timelock {
     pub lock: TimelockRef,
-    /// Whether the lock holds the branch back: whether meeting it, and
-    /// it alone, would bring the branch nearer to open. False for a lock
-    /// under a threshold that can be met without it, which is listed
-    /// but never holds the branch back.
+    /// Whether the lock holds the branch back: whether, every key at
+    /// hand, some way of meeting the branch turns on it. Both locks of
+    /// an "and" do. False for a lock under a threshold the keys meet
+    /// without it, which is listed but never holds the branch back.
     pub required: bool,
     pub state: LockState,
 }
@@ -1011,9 +1012,6 @@ fn fold<T: Ord + Copy>(condition: &Condition, leaf: &mut impl FnMut(&Condition) 
 
 /// How a reading of a branch values the locks it meets.
 enum Lens<'a> {
-    /// Every lock pending, by an unknown amount: the shape of the
-    /// branch, whatever the chain says.
-    Shape,
     /// Absolute locks against the clock; relative ones as given, there
     /// being no coin to count them from.
     NoCoin(Estimate),
@@ -1022,11 +1020,8 @@ enum Lens<'a> {
 }
 
 /// What `condition` still needs before it can be met, seen through
-/// `lens`. `met` names one lock by its position among the branch's
-/// locks, to be counted as met whatever it says: that is how a lock is
-/// found to hold the branch back, or not.
-fn estimate(condition: &Condition, lens: &Lens<'_>, clock: &Clock, met: Option<usize>) -> Estimate {
-    let mut position = 0usize;
+/// `lens`.
+fn estimate(condition: &Condition, lens: &Lens<'_>, clock: &Clock) -> Estimate {
     fold(condition, &mut |leaf| {
         let lock = match leaf {
             Condition::Key { .. } => return Estimate::Open,
@@ -1036,13 +1031,7 @@ fn estimate(condition: &Condition, lens: &Lens<'_>, clock: &Clock, met: Option<u
             Condition::After { lock } => Lock::Absolute(*lock),
             Condition::Older { lock } => Lock::Relative(*lock),
         };
-        let index = position;
-        position += 1;
-        if met == Some(index) {
-            return Estimate::Open;
-        }
         match (lens, lock) {
-            (Lens::Shape, _) => Estimate::Later(Remaining::default()),
             (_, Lock::Absolute(lock)) => match lock.remaining(clock) {
                 None => Estimate::Open,
                 Some(remaining) => Estimate::Later(remaining),
@@ -1058,7 +1047,7 @@ fn estimate(condition: &Condition, lens: &Lens<'_>, clock: &Clock, met: Option<u
 }
 
 /// The locks of a condition, in the order the policy names them: the
-/// order [`estimate`] counts positions in.
+/// order [`holds_back`] counts positions in.
 fn collect_locks(condition: &Condition, into: &mut Vec<Lock>) {
     match condition {
         Condition::After { lock } => into.push(Lock::Absolute(*lock)),
@@ -1072,13 +1061,81 @@ fn collect_locks(condition: &Condition, into: &mut Vec<Lock>) {
     }
 }
 
-/// Whether the lock at `position` holds the branch back: whether the
-/// branch would stand nearer to open, chain aside, were that lock alone
-/// met. A lock under a threshold that can be met without it is listed,
-/// but never holds the branch back.
-fn holds_back(condition: &Condition, position: usize, clock: &Clock) -> bool {
-    estimate(condition, &Lens::Shape, clock, Some(position))
-        != estimate(condition, &Lens::Shape, clock, None)
+/// What a condition comes to with every key at hand, chain aside.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// Met by the keys alone.
+    Met,
+    /// Never met, whatever the locks and preimages say.
+    Unmet,
+    /// Met or not, depending on its locks and preimages.
+    Turns,
+}
+
+fn shape(condition: &Condition) -> Shape {
+    match condition {
+        Condition::Key { .. } => Shape::Met,
+        Condition::After { .. } | Condition::Older { .. } | Condition::Preimage { .. } => {
+            Shape::Turns
+        }
+        // Miniscript writes no empty threshold; one asks for nothing.
+        Condition::Thresh { items, .. } if items.is_empty() => Shape::Met,
+        Condition::Thresh { k, items, .. } => {
+            let shapes: Vec<Shape> = items.iter().map(shape).collect();
+            let met = shapes.iter().filter(|s| **s == Shape::Met).count();
+            let turns = shapes.iter().filter(|s| **s == Shape::Turns).count();
+            let k = *k as usize;
+            if met >= k {
+                Shape::Met
+            } else if met + turns < k {
+                Shape::Unmet
+            } else {
+                Shape::Turns
+            }
+        }
+    }
+}
+
+/// Whether the lock at `position` holds the branch back: whether, every
+/// key at hand, some way of meeting the branch turns on that lock, the
+/// other locks and preimages met or not. Two locks an "and" needs both
+/// hold it back, each of them; a lock under a threshold the keys meet
+/// without it is listed, but never holds the branch back.
+///
+/// Each lock is a leaf of its own, so the question is asked on the way
+/// down: at every threshold above the lock, the other items have to be
+/// able to make up exactly one less than the threshold asks.
+fn holds_back(condition: &Condition, position: usize) -> bool {
+    fn down(condition: &Condition, position: usize, seen: &mut usize) -> Option<bool> {
+        match condition {
+            Condition::After { .. } | Condition::Older { .. } => {
+                let found = *seen == position;
+                *seen += 1;
+                found.then_some(true)
+            }
+            Condition::Key { .. } | Condition::Preimage { .. } => None,
+            Condition::Thresh { k, items, .. } => {
+                for (index, item) in items.iter().enumerate() {
+                    let Some(below) = down(item, position, seen) else {
+                        continue;
+                    };
+                    let (mut met, mut turns) = (0usize, 0usize);
+                    for (other, item) in items.iter().enumerate() {
+                        match shape(item) {
+                            _ if other == index => {}
+                            Shape::Met => met += 1,
+                            Shape::Turns => turns += 1,
+                            Shape::Unmet => {}
+                        }
+                    }
+                    let needed = (*k as usize).saturating_sub(1);
+                    return Some(below && met <= needed && needed <= met + turns);
+                }
+                None
+            }
+        }
+    }
+    down(condition, position, &mut 0).unwrap_or(false)
 }
 
 fn has_key(condition: &Condition) -> bool {
@@ -1107,8 +1164,8 @@ fn branch_state(condition: &Condition, coins: &[Coin], clock: &Clock) -> BranchS
     // Two readings with no coin, the relative locks taken as the worst
     // they can be, then as the best. Every coin falls between the two,
     // so when they agree the coins have no say and the answer is theirs.
-    let worst = estimate(condition, &Lens::NoCoin(Estimate::NoCoins), clock, None);
-    let best = estimate(condition, &Lens::NoCoin(Estimate::Open), clock, None);
+    let worst = estimate(condition, &Lens::NoCoin(Estimate::NoCoins), clock);
+    let best = estimate(condition, &Lens::NoCoin(Estimate::Open), clock);
     match worst {
         Estimate::Never => return BranchState::NeedsPreimage,
         Estimate::Open => return BranchState::SpendableNow,
@@ -1120,7 +1177,7 @@ fn branch_state(condition: &Condition, coins: &[Coin], clock: &Clock) -> BranchS
     }
     let mut tally = Tally::default();
     for coin in coins {
-        tally.add(match estimate(condition, &Lens::Coin(coin), clock, None) {
+        tally.add(match estimate(condition, &Lens::Coin(coin), clock) {
             Estimate::Open => CoinLock::Unlocked,
             Estimate::Later(remaining) => CoinLock::Locked(remaining),
             // Neither comes out of a reading over a coin once the two
@@ -1158,7 +1215,7 @@ fn draft(policy: &Semantic, book: &KeyBook, coins: &[Coin], clock: &Clock) -> Co
         .enumerate()
         .map(|(position, lock)| Timelock {
             lock: lock.reference(),
-            required: holds_back(&condition, position, clock),
+            required: holds_back(&condition, position),
             state: lock_state(*lock, coins, clock),
         })
         .collect();
@@ -2383,6 +2440,42 @@ mod tests {
             wsh(&descriptor, Vec::new()).branches[0].state,
             BranchState::NoCoins
         );
+    }
+
+    /// Two locks a branch needs together each hold it back: meeting one
+    /// alone leaves the branch as far as it was, which is no reason to
+    /// call either optional. The branch is a timed one, not primary.
+    #[test]
+    fn locks_needed_together_both_hold_the_branch_back() {
+        let descriptor = format!(
+            "wsh(or_d(pk({A}/0/*),and_v(v:pkh({B}/0/*),and_v(v:after(900000),older(100)))))"
+        );
+        let snapshot = wsh(&descriptor, Vec::new());
+        let [primary, timed] = snapshot.branches.as_slice() else {
+            panic!("two branches, got {:?}", snapshot.branches);
+        };
+        assert_eq!(primary.role, BranchRole::Primary);
+        assert_eq!(timed.role, BranchRole::Recovery);
+        assert_eq!(timed.label, "Recovery");
+        assert_eq!(timed.timelocks.len(), 2);
+        assert!(timed.timelocks.iter().all(|lock| lock.required));
+        assert!(!timed.spendable_now);
+
+        // Two relative locks, and a preimage beside a lock, the same.
+        for descriptor in [
+            format!("wsh(and_v(v:pk({A}/0/*),and_v(v:older(100),older(200))))"),
+            format!(
+                "wsh(and_v(v:pk({A}/0/*),and_v(v:sha256({}),older(100))))",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            ),
+        ] {
+            let snapshot = wsh(&descriptor, Vec::new());
+            let branch = &snapshot.branches[0];
+            assert!(
+                branch.timelocks.iter().all(|lock| lock.required),
+                "{descriptor}"
+            );
+        }
     }
 
     #[test]
