@@ -137,13 +137,17 @@ fn ur_header(frame: &str) -> CoreResult<(String, Option<u32>)> {
     Ok((ur_type.to_owned(), total))
 }
 
-/// Most parts a multi-part UR may announce: a 4 MB message in the
-/// smallest fragments any encoder uses, far past anything a wallet
-/// shows as a QR code. The decoder sizes its tables by the announced
-/// count before a single fragment is checked, and a count near four
-/// billion, in one frame anyone can print, asks for tens of gigabytes:
-/// the process dies there, beyond the reach of any error.
-const MAX_UR_PARTS: u32 = 100_000;
+/// Most parts a multi-part UR may announce: a PSBT of a few hundred
+/// kilobytes in the fragments wallets use, far past anything a person
+/// scans. The decoder sizes its tables by the announced count before a
+/// single fragment is checked, and a count near four billion, in one
+/// frame anyone can print, asks for tens of gigabytes: the process dies
+/// there, beyond the reach of any error. The count also prices every
+/// mixed fragment: the decoder draws which parts it mixes out of a list
+/// of them all, and one frame of a few bytes that names half of a
+/// hundred thousand parts cost seconds, paid again for each frame
+/// scanned after it.
+const MAX_UR_PARTS: u32 = 5_000;
 
 /// True when a multi-part frame announces a count the decoder can take.
 fn ur_part_count_is_sane(frame: &str) -> bool {
@@ -803,9 +807,15 @@ mod tests {
     /// One multi-part frame announcing about four billion parts, as its
     /// header and its fountain part both say.
     fn frame_announcing_billions(ur_type: &str) -> String {
+        frame_announcing(ur_type, 4_294_967_295, 4_294_967_294)
+    }
+
+    /// One multi-part frame, fragment `seq` of `total`, as its header
+    /// and its fountain part both say.
+    fn frame_announcing(ur_type: &str, seq: u32, total: u32) -> String {
         let part = Value::Array(vec![
-            Value::Integer(4_294_967_295u32.into()),
-            Value::Integer(4_294_967_294u32.into()),
+            Value::Integer(seq.into()),
+            Value::Integer(total.into()),
             Value::Integer(1.into()),
             Value::Integer(0.into()),
             Value::Bytes(vec![0]),
@@ -813,7 +823,21 @@ mod tests {
         let mut cbor = Vec::new();
         ciborium::into_writer(&part, &mut cbor).unwrap();
         let words = ur::bytewords::encode(&cbor, ur::bytewords::Style::Minimal);
-        format!("ur:{ur_type}/4294967295-4294967294/{words}")
+        format!("ur:{ur_type}/{seq}-{total}/{words}")
+    }
+
+    /// A count past what anyone scans is refused before the decoder
+    /// draws a single mix from it; up to the cap, the scan goes on.
+    #[test]
+    fn a_ur_announcing_more_parts_than_anyone_scans_is_refused() {
+        let hostile = frame_announcing("bytes", 7_000, MAX_UR_PARTS + 1);
+        assert!(matches!(
+            assemble(&[hostile]),
+            Err(CoreError::InvalidInput { kind: "qr", .. })
+        ));
+        let progress = assemble(&[frame_announcing("bytes", 1, MAX_UR_PARTS)]).unwrap();
+        assert!(!progress.complete);
+        assert_eq!(progress.total, MAX_UR_PARTS);
     }
 
     /// Such a frame is refused before the decoder sizes anything by it,
