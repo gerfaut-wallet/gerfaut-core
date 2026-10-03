@@ -16,10 +16,6 @@ use std::time::Instant;
 
 use tokio::sync::Mutex;
 
-use std::str::FromStr;
-
-use bdk_wallet::bitcoin::Address;
-
 use crate::chain::{self, BackendConfig};
 use crate::error::{CoreError, CoreResult};
 use crate::input::RecognizedKind;
@@ -58,7 +54,7 @@ pub(crate) struct ManagerState {
     pub(crate) data_dir: PathBuf,
     /// The order an Electrum server listed each script's history in, as
     /// the syncs read it: what the statuses handed to the watch hash.
-    orders: views::HistoryOrders,
+    pub(crate) orders: views::HistoryOrders,
 }
 
 impl ManagerState {
@@ -194,114 +190,7 @@ impl WalletManager {
 
 // --- helpers -----------------------------------------------------------
 
-/// One wallet as the live watch takes it: its scripts in the order a
-/// transport should cover them, `per_wallet` at most, whether it waits
-/// for a block, whether the user pinned it and whether it holds coins.
-/// `None` for a wallet that cannot be read, which is then not watched.
-pub(crate) fn watched_wallet(
-    state: &mut ManagerState,
-    id: &str,
-    gap_limit: u32,
-    per_wallet: usize,
-) -> Option<crate::watch::WatchedWallet> {
-    let record = find_record(&state.payload, id).ok()?;
-    let pinned = record.meta.live_pinned;
-    let (scripts, has_pending, holds_coins) = match &record.meta.kind {
-        WalletKind::SingleAddress { address } => {
-            let script = Address::from_str(address)
-                .ok()?
-                .require_network(record.meta.network.to_bitcoin())
-                .ok()?
-                .script_pubkey();
-            let has_pending = record
-                .address_state
-                .as_ref()
-                .is_some_and(|watch| watch.txs.iter().any(|tx| tx.height.is_none()));
-            let holds_coins = record
-                .address_state
-                .as_ref()
-                .is_some_and(|watch| !watch.utxos.is_empty());
-            let scripts = (
-                vec![crate::watch::WatchedScript {
-                    script: script.to_hex_string(),
-                    lookahead: false,
-                    status: record
-                        .address_state
-                        .as_ref()
-                        .and_then(views::address_status),
-                    // Its history may be cut short: nothing to compare
-                    // counters with.
-                    counts: None,
-                }],
-                0,
-            );
-            (scripts, has_pending, holds_coins)
-        }
-        WalletKind::Descriptors { .. } => {
-            let orders = std::mem::take(&mut state.orders);
-            let listed = ensure_engine(state, id).ok().map(|engine| {
-                (
-                    views::watch_scripts(engine, gap_limit, &orders, per_wallet),
-                    views::has_pending(engine),
-                    views::holds_coins(engine),
-                )
-            });
-            state.orders = orders;
-            listed?
-        }
-    };
-    // A wallet never synced holds nothing yet, which says nothing of
-    // what its scripts hold: an empty status matches none a server
-    // gives, and the watch syncs it once it starts.
-    let never_synced = find_record(&state.payload, id)
-        .ok()?
-        .meta
-        .last_sync
-        .is_none();
-    let (scripts, unlisted) = scripts;
-    let scripts = scripts
-        .into_iter()
-        .map(|script| crate::watch::WatchedScript {
-            status: if never_synced {
-                Some(String::new())
-            } else {
-                script.status
-            },
-            ..script
-        })
-        .collect();
-    Some(crate::watch::WatchedWallet {
-        wallet_id: id.to_owned(),
-        scripts,
-        has_pending,
-        pinned,
-        holds_coins,
-        unlisted,
-    })
-}
-
-/// The scripts a sync reads to look again for the payments of a wallet
-/// earlier syncs saw vanish, those whose second look is due at `now`:
-/// `None` when none is, empty for a watched address, whose sync reads
-/// its one script whatever it is asked.
-pub(crate) fn vanished_scripts(
-    state: &mut ManagerState,
-    id: &str,
-    now: u64,
-) -> Option<Vec<String>> {
-    let due = crate::live::news::vanishing_due(&state.payload, id, now);
-    if due.is_empty() {
-        return None;
-    }
-    let record = find_record(&state.payload, id).ok()?;
-    if matches!(record.meta.kind, WalletKind::SingleAddress { .. }) {
-        return Some(Vec::new());
-    }
-    let engine = ensure_engine(state, id).ok()?;
-    Some(views::scripts_touched_by(engine, &due)).filter(|scripts| !scripts.is_empty())
-}
-
-fn find_record<'a>(payload: &'a VaultPayload, id: &str) -> CoreResult<&'a WalletRecord> {
+pub(crate) fn find_record<'a>(payload: &'a VaultPayload, id: &str) -> CoreResult<&'a WalletRecord> {
     payload
         .wallets
         .iter()
@@ -439,7 +328,7 @@ fn build_record(meta: WalletMeta) -> CoreResult<(WalletRecord, Option<bdk_wallet
 
 /// Loads the BDK engine for a wallet from its stored change set, caching
 /// it for the manager's lifetime.
-fn ensure_engine<'a>(
+pub(crate) fn ensure_engine<'a>(
     state: &'a mut ManagerState,
     id: &str,
 ) -> CoreResult<&'a mut bdk_wallet::Wallet> {
