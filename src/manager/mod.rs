@@ -1,4 +1,4 @@
-//! The wallet manager: the single facade every consumer talks to.
+//! The wallet manager: the facade every consumer talks to.
 //!
 //! Desktop (Tauri commands), mobile (FFI bridge), and later the server
 //! all drive this type. It owns the encrypted vault, keeps loaded BDK
@@ -6,9 +6,30 @@
 //! blocks reads: requests are built under the lock, executed outside it,
 //! and applied back under the lock.
 //!
-//! The facade spans three files: this one, `manager/devices.rs` for the
-//! Premium devices (connecting, logging out, changing the key), and
-//! `live.rs` for the live watch and the alerts it hands out.
+//! [`WalletManager`] is one type, its methods in the file that answers
+//! their question:
+//!
+//! - `settings.rs`: which backend and which certificates, the gap limit,
+//!   the app's preferences, and whether a connection goes through Tor;
+//!   the update check, for that last reason.
+//! - `wallets.rs`: which wallets, in which order, and what each holds.
+//! - `sync.rs`: how far a sync reads, and which caller waits for which.
+//! - `broadcast.rs`: what a transaction does, and where it stands once
+//!   sent.
+//! - `app_lock.rs`: who may open the app.
+//! - `backup.rs`: what a backup carries, and what a restore brings back.
+//! - `premium.rs`: what the premium account holds, and which wallets the
+//!   server is told to stop watching.
+//! - `devices.rs`: whether this device is connected to the account, and
+//!   which other devices are.
+//! - `live.rs`, beside this module: what the live watch follows, and
+//!   what is worth announcing.
+//!
+//! This file holds what they share: the vault and the loaded engines
+//! behind one lock, the commit every decision of the user goes through,
+//! and the helpers that find, build and load a wallet's record and
+//! engine. The tests of each file are in its folder, `sync/tests.rs` for
+//! `sync.rs`, and what they share is in `tests/support.rs`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
