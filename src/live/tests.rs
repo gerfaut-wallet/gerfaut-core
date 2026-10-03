@@ -1181,14 +1181,27 @@ async fn a_fee_bump_is_announced_once_and_confirms_once() {
     assert!(sync_and_claim(&manager, &wallet).await.is_empty());
 }
 
+/// Moves the payments a sync saw vanish ten minutes back, as if the
+/// next sync came that much later.
+async fn ten_minutes_on(manager: &WalletManager) {
+    for entry in &mut manager.state.lock().await.payload.vanishing {
+        entry.missed_at -= news::DROPPED_AFTER;
+    }
+}
+
 /// The sender replaces the payment with one that no longer pays the
-/// address: it vanishes, and that is said once.
+/// address: it vanishes, and that is said once, by the sync that does
+/// not see it either ten minutes after the first.
 #[tokio::test]
 async fn a_bump_that_stops_paying_is_announced_as_dropped_once() {
     let server = FakeMempool::start(false, 0).await;
     let dir = tempfile::tempdir().unwrap();
     let (manager, wallet) = paid(&server, dir.path()).await;
     server.state.lock().unwrap().address_txs = Vec::new();
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    // Read again at once: the same server may still lag.
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    ten_minutes_on(&manager).await;
     let claimed = sync_and_claim(&manager, &wallet).await;
     assert_eq!(
         claimed,
@@ -1200,6 +1213,23 @@ async fn a_bump_that_stops_paying_is_announced_as_dropped_once() {
             replaces: None,
         }]
     );
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+}
+
+/// A server that does not list the payment, one that lags or one of a
+/// rotation that never heard of it, and the next sync lists it again:
+/// it is never said dropped, and the vault keeps nothing of it.
+#[tokio::test]
+async fn a_payment_one_sync_misses_is_not_announced_as_dropped() {
+    let server = FakeMempool::start(false, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = paid(&server, dir.path()).await;
+    server.state.lock().unwrap().address_txs = Vec::new();
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    server.state.lock().unwrap().address_txs = vec![esplora_payment(0x11, 0x22, 50_000, false)];
+    ten_minutes_on(&manager).await;
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    assert!(manager.state.lock().await.payload.vanishing.is_empty());
     assert!(sync_and_claim(&manager, &wallet).await.is_empty());
 }
 
@@ -1267,13 +1297,24 @@ fn a_descriptor_wallet_tells_replacements_and_vanished_payments() {
         .to_hex_string();
     let theirs = crate::testkit::script(9);
     let mut payload = VaultPayload::default();
-    // One sync: what the engine holds after `change`, against before.
-    let mut sync = |engine: &mut bdk_wallet::Wallet, change: &dyn Fn(&mut bdk_wallet::Wallet)| {
+    // One sync at `now` that read `read` of the wallet's scripts, all of
+    // them with `None`: what the engine holds after `change`, against
+    // before.
+    let mut sync_reading = |engine: &mut bdk_wallet::Wallet,
+                            now: u64,
+                            read: Option<&std::collections::HashSet<ScriptBuf>>,
+                            change: &dyn Fn(&mut bdk_wallet::Wallet)| {
+        let vanishing = news::vanishing(&payload, "w");
         let before = views::known(engine);
         change(engine);
         let moves = views::moves(engine, &before);
-        news::record(&mut payload, "w", false, &moves, NOW);
-        news::claim(&mut payload, "w", 10, NOW)
+        let recheck = views::recheck(engine, &vanishing, read);
+        news::record(&mut payload, "w", false, &moves, now);
+        news::settle(&mut payload, "w", &recheck, now);
+        news::claim(&mut payload, "w", 10, now)
+    };
+    let mut sync = |engine: &mut bdk_wallet::Wallet, change: &dyn Fn(&mut bdk_wallet::Wallet)| {
+        sync_reading(engine, NOW, None, change)
     };
     let pays = |n: u8, sats: u64| transaction(&[nowhere(n, 0)], &[(ours.as_str(), sats)]);
 
@@ -1328,12 +1369,20 @@ fn a_descriptor_wallet_tells_replacements_and_vanished_payments() {
         engine.apply_unconfirmed_txs([(elsewhere.clone(), 500)]);
         engine.apply_evicted_txs([(second.compute_txid(), 500)]);
     });
+    assert!(claimed.is_empty(), "one sync says nothing yet");
+    // Ten minutes on, a sync that read other scripts says nothing either;
+    // one that read the payment's says it dropped.
+    let later = NOW + news::DROPPED_AFTER;
+    let other = std::collections::HashSet::from([ScriptBuf::from_hex(&theirs).unwrap()]);
+    assert!(sync_reading(&mut engine, later, Some(&other), &|_| {}).is_empty());
+    let paid_to = std::collections::HashSet::from([ScriptBuf::from_hex(&ours).unwrap()]);
+    let claimed = sync_reading(&mut engine, later, Some(&paid_to), &|_| {});
     assert_eq!(
         staged(&claimed),
         [(second.compute_txid().to_string(), TxStage::Dropped)]
     );
     assert_eq!(claimed[0].net_sats, 20_000);
-    assert!(sync(&mut engine, &|_| {}).is_empty());
+    assert!(sync_reading(&mut engine, later, None, &|_| {}).is_empty());
 }
 
 /// A block heard in the same burst as a start or a reconnection, which

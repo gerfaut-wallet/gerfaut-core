@@ -169,6 +169,26 @@ pub struct Unclaimed {
     pub replaces: Option<String>,
 }
 
+/// An incoming payment announced as pending that a sync no longer saw,
+/// nothing paying the wallet in its place: it is said dropped once a
+/// later sync has read its scripts again and not seen it either. See
+/// [`crate::live::news`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Vanishing {
+    pub wallet_id: String,
+    pub txid: String,
+    /// The txid the payment was announced under: its own, or the first
+    /// one of the payment it is a fee bump of.
+    pub told_as: String,
+    /// Net effect on the wallet, in satoshis.
+    pub net_sats: i64,
+    /// The outputs it spends, txid and index: a replacement spends one
+    /// of them too.
+    pub spends: Vec<(String, u32)>,
+    /// When a sync first missed it, unix seconds.
+    pub missed_at: u64,
+}
+
 /// Everything the vault persists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultPayload {
@@ -186,6 +206,11 @@ pub struct VaultPayload {
     /// nothing.
     #[serde(default)]
     pub unclaimed: Vec<Unclaimed>,
+    /// Payments a sync saw vanish, oldest first, waiting for another
+    /// sync to say whether they dropped. Absent while there are none, and
+    /// from vaults written before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) vanishing: Vec<Vanishing>,
 }
 
 impl Default for VaultPayload {
@@ -196,6 +221,7 @@ impl Default for VaultPayload {
             wallets: Vec::new(),
             announced: Vec::new(),
             unclaimed: Vec::new(),
+            vanishing: Vec::new(),
         }
     }
 }

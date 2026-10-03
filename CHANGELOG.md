@@ -272,6 +272,16 @@ The first release: the library both Gerfaut apps are built on.
   could list transactions of hundreds of thousands of inputs until the
   phone ran out of memory. Over Electrum, a connection of that sync also
   reads 256 MiB at most, every answer together.
+- An incoming payment announced as pending is said dropped only once a
+  second sync, ten minutes or more after the first one that missed it,
+  has read its scripts again and not seen it either. A server that lags,
+  or one of the rotation that never heard of the payment, made a single
+  sync announce as dropped a payment that was still coming. A sync that
+  sees the payment again, or a fee bump of it, forgets it; a sync that
+  did not read its scripts says nothing of it; a replacement that cuts
+  the payment down is still said at once. The vault keeps what this
+  needs only while such a payment waits, so a vault written before reads
+  and writes the same.
 - A watched address is never read from a server of another network.
   Testnet, testnet4 and signet spell an address alike, and a server of
   the wrong one answered for it with transactions the wallet's network

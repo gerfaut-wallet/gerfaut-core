@@ -1095,6 +1095,7 @@ impl WalletManager {
                 Ok(synced) => {
                     let mut state = self.state.lock().await;
                     state.orders.extend(synced.orders);
+                    let vanishing = crate::live::news::vanishing(&state.payload, &meta.id);
                     if let Some(height) = synced.drop_above {
                         drop_blocks_above(&mut state, &meta.id, height)?;
                     }
@@ -1110,19 +1111,26 @@ impl WalletManager {
                     let tip_height = views::tip_height(engine);
                     let tx_count_after = engine.transactions().count() as u32;
                     let moves = views::moves(engine, &known);
+                    let read = match &reach {
+                        Reach::Scripts(scripts) => Some(scripts.iter().cloned().collect()),
+                        _ => None,
+                    };
+                    let recheck = views::recheck(engine, &vanishing, read.as_ref());
                     let (new_txs, confirmed_txs) = moves.lines();
                     let staged = engine.take_staged();
 
                     if let Some(staged) = staged {
                         merge_changeset(&mut state, &meta.id, staged)?;
                     }
+                    let now = now_secs();
                     crate::live::news::record(
                         &mut state.payload,
                         &meta.id,
                         meta.last_sync.is_none(),
                         &moves,
-                        now_secs(),
+                        now,
                     );
+                    crate::live::news::settle(&mut state.payload, &meta.id, &recheck, now);
                     let report = SyncReport {
                         wallet_id: meta.id.clone(),
                         new_tx_count: new_txs.len() as u32,
@@ -1177,6 +1185,10 @@ impl WalletManager {
                             .as_ref(),
                         &watch,
                     );
+                    let recheck = views::address_recheck(
+                        &crate::live::news::vanishing(&state.payload, &meta.id),
+                        &watch,
+                    );
                     let (new_txs, confirmed_txs) = moves.lines();
                     // A sync fetches the newest round only. Keep the older
                     // rounds the user already loaded, otherwise every sync
@@ -1188,13 +1200,15 @@ impl WalletManager {
                         keep_older_history(&mut watch, previous);
                     }
                     let tx_count_after = watch.txs.len() as u32;
+                    let now = now_secs();
                     crate::live::news::record(
                         &mut state.payload,
                         &meta.id,
                         meta.last_sync.is_none(),
                         &moves,
-                        now_secs(),
+                        now,
                     );
+                    crate::live::news::settle(&mut state.payload, &meta.id, &recheck, now);
                     let report = SyncReport {
                         wallet_id: meta.id.clone(),
                         new_tx_count: new_txs.len() as u32,
