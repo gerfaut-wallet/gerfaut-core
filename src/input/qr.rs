@@ -161,24 +161,27 @@ fn assemble_ur(frames: &[&str]) -> CoreResult<QrProgress> {
             "this QR code announces an impossible number of parts",
         ));
     }
-    let progress =
-        |received: u32, total: u32, message: Option<Vec<u8>>| -> CoreResult<QrProgress> {
-            let text = message
-                .map(|bytes| ur_message_to_text(&ur_type, &bytes))
-                .transpose()?;
-            Ok(QrProgress {
-                format: QrFormat::Ur,
-                received,
-                total,
-                complete: text.is_some(),
-                text,
-            })
-        };
+    let progress = |ur_type: &str,
+                    received: u32,
+                    total: u32,
+                    message: Option<Vec<u8>>|
+     -> CoreResult<QrProgress> {
+        let text = message
+            .map(|bytes| ur_message_to_text(ur_type, &bytes))
+            .transpose()?;
+        Ok(QrProgress {
+            format: QrFormat::Ur,
+            received,
+            total,
+            complete: text.is_some(),
+            text,
+        })
+    };
 
     let Some(total) = total else {
         let (_, bytes) =
             ur::ur::decode(frames[0]).map_err(|e| qr_error(format!("invalid UR: {e}")))?;
-        return progress(1, 1, Some(bytes));
+        return progress(&ur_type, 1, 1, Some(bytes));
     };
 
     let mut decoder = ur::ur::Decoder::default();
@@ -202,7 +205,10 @@ fn assemble_ur(frames: &[&str]) -> CoreResult<QrProgress> {
     } else {
         None
     };
-    progress(received.min(total), total, message)
+    // The type the parts carried, not the first frame's: that one may
+    // be a damaged frame of another code, skipped above.
+    let ur_type = decoder.ur_type().unwrap_or(&ur_type);
+    progress(ur_type, received.min(total), total, message)
 }
 
 /// Turns the CBOR payload of a UR into classifier text.
@@ -308,8 +314,14 @@ fn key_expression(value: &Value) -> CoreResult<String> {
             if map_get(inner, 2).and_then(as_bool) == Some(true) {
                 return Err(CoreError::PrivateMaterialRejected);
             }
+            // A public key is 33 bytes, or 65 uncompressed; 32 is the
+            // length of a private key in this format, flag or not.
             match map_get(inner, 3) {
-                Some(Value::Bytes(data)) => Ok(hex(data)),
+                Some(Value::Bytes(data)) if matches!(data.len(), 33 | 65) => Ok(hex(data)),
+                Some(Value::Bytes(data)) if data.len() == 32 => {
+                    Err(CoreError::PrivateMaterialRejected)
+                }
+                Some(Value::Bytes(_)) => Err(qr_error("EC key of a length no public key has")),
                 _ => Err(qr_error("EC key without data")),
             }
         }
@@ -342,13 +354,14 @@ fn hdkey_expression(map: &Value) -> CoreResult<String> {
         .map_err(|_| qr_error("chain code must be 32 bytes"))?;
 
     // Network from use-info (2: network, 0 mainnet / 1 testnet); mainnet
-    // when absent, as the spec says.
-    let network = match map_get(map, 5)
-        .and_then(|info| map_get(tagged(info), 2))
-        .and_then(as_u64)
-    {
-        Some(1) => NetworkKind::Test,
-        _ => NetworkKind::Main,
+    // when absent, as the spec says. Any other value is no network.
+    let network = match map_get(map, 5).and_then(|info| map_get(tagged(info), 2)) {
+        None => NetworkKind::Main,
+        Some(code) => match as_u64(code) {
+            Some(0) => NetworkKind::Main,
+            Some(1) => NetworkKind::Test,
+            _ => return Err(qr_error("hdkey for a network this format does not name")),
+        },
     };
 
     let origin = map_get(map, 6).map(tagged);
@@ -356,12 +369,16 @@ fn hdkey_expression(map: &Value) -> CoreResult<String> {
         .and_then(|o| map_get(o, 1))
         .map(keypath_components)
         .transpose()?;
-    let source_fingerprint = origin.and_then(|o| map_get(o, 2)).and_then(as_u64);
-    let depth = origin
-        .and_then(|o| map_get(o, 3))
-        .and_then(as_u64)
-        .or_else(|| components.as_ref().map(|c| c.len() as u64))
-        .unwrap_or(0);
+    let source_fingerprint = origin
+        .and_then(|o| map_get(o, 2))
+        .map(fingerprint)
+        .transpose()?;
+    let depth = match origin.and_then(|o| map_get(o, 3)) {
+        Some(depth) => as_u64(depth),
+        None => Some(components.as_ref().map_or(0, |c| c.len() as u64)),
+    }
+    .and_then(|depth| u8::try_from(depth).ok())
+    .ok_or_else(|| qr_error("hdkey deeper than a key can be"))?;
     let child_number = match components.as_deref().and_then(|c| c.last()) {
         Some(Component::Index {
             index,
@@ -375,13 +392,14 @@ fn hdkey_expression(map: &Value) -> CoreResult<String> {
     }
     .map_err(|e| qr_error(format!("invalid child number: {e}")))?;
     let parent_fingerprint = map_get(map, 8)
-        .and_then(as_u64)
-        .map(|fp| Fingerprint::from((fp as u32).to_be_bytes()))
+        .map(fingerprint)
+        .transpose()?
+        .map(|fp| Fingerprint::from(fp.to_be_bytes()))
         .unwrap_or_default();
 
     let xpub = Xpub {
         network,
-        depth: depth as u8,
+        depth,
         parent_fingerprint,
         child_number,
         public_key,
@@ -390,9 +408,9 @@ fn hdkey_expression(map: &Value) -> CoreResult<String> {
 
     let origin_text = match (source_fingerprint, &components) {
         (Some(fp), Some(components)) if !components.is_empty() => {
-            format!("[{:08x}/{}]", fp as u32, render_components(components))
+            format!("[{fp:08x}/{}]", render_components(components))
         }
-        (Some(fp), _) => format!("[{:08x}]", fp as u32),
+        (Some(fp), _) => format!("[{fp:08x}]"),
         (None, _) => String::new(),
     };
     let children = match map_get(map, 7).map(tagged).and_then(|c| map_get(c, 1)) {
@@ -427,16 +445,17 @@ fn keypath_components(value: &Value) -> CoreResult<Vec<Component>> {
         let [item, hardened] = pair else {
             return Err(qr_error("key path with a dangling component"));
         };
-        let hardened = as_bool(hardened).unwrap_or(false);
+        let hardened =
+            as_bool(hardened).ok_or_else(|| qr_error("key path step without its hardened flag"))?;
         let component = match item {
             Value::Integer(_) => Component::Index {
-                index: as_u64(item).unwrap_or(0) as u32,
+                index: child_index(item)?,
                 hardened,
             },
             Value::Array(inner) if inner.is_empty() => Component::Wildcard { hardened },
             Value::Array(inner) if inner.len() == 2 => Component::Pair {
-                low: as_u64(&inner[0]).unwrap_or(0) as u32,
-                high: as_u64(&inner[1]).unwrap_or(0) as u32,
+                low: child_index(&inner[0])?,
+                high: child_index(&inner[1])?,
                 hardened,
             },
             _ => return Err(qr_error("unsupported key path component")),
@@ -444,6 +463,23 @@ fn keypath_components(value: &Value) -> CoreResult<Vec<Component>> {
         components.push(component);
     }
     Ok(components)
+}
+
+/// A step of a key path: an index below 2³¹, the hardened flag beside
+/// it. Anything else, negative, larger or not a number, is refused
+/// rather than read as another step.
+fn child_index(value: &Value) -> CoreResult<u32> {
+    as_u64(value)
+        .and_then(|index| u32::try_from(index).ok())
+        .filter(|index| *index < 1 << 31)
+        .ok_or_else(|| qr_error("key path step out of range"))
+}
+
+/// A key fingerprint, four bytes as one integer.
+fn fingerprint(value: &Value) -> CoreResult<u32> {
+    as_u64(value)
+        .and_then(|fp| u32::try_from(fp).ok())
+        .ok_or_else(|| qr_error("key fingerprint out of range"))
 }
 
 fn render_components(components: &[Component]) -> String {
@@ -564,7 +600,17 @@ fn assemble_bbqr(frames: &[&str]) -> CoreResult<QrProgress> {
         {
             continue;
         }
-        parts[header.index as usize] = Some(payload);
+        // Two codes in front of the camera at once, the same kind and
+        // length: their parts would be glued together into a text
+        // neither holds.
+        match &mut parts[header.index as usize] {
+            Some(seen) if *seen != payload => {
+                return Err(qr_error(
+                    "two different QR codes were scanned together: scan one at a time",
+                ));
+            }
+            slot => *slot = Some(payload),
+        }
     }
     let received = parts.iter().filter(|p| p.is_some()).count() as u32;
     if received < total {
@@ -865,6 +911,118 @@ mod tests {
         panic!("the fountain never completed");
     }
 
+    /// [`hdkey`] with one entry of its map set to `value`.
+    fn hdkey_with(key: u64, value: Value) -> Value {
+        let Value::Tag(_, inner) = hdkey(None) else {
+            unreachable!()
+        };
+        let Value::Map(mut entries) = *inner else {
+            unreachable!()
+        };
+        entries.retain(|(k, _)| as_u64(k) != Some(key));
+        entries.push((Value::Integer(key.into()), value));
+        tag(TAG_HDKEY, Value::Map(entries))
+    }
+
+    /// An account origin of three hardened steps, the first one given.
+    fn origin_from(first: Value, hardened: Value, depth: u64, fingerprint: u64) -> Value {
+        tag(
+            304,
+            map(vec![
+                (
+                    1,
+                    Value::Array(vec![
+                        first,
+                        hardened,
+                        Value::Integer(1.into()),
+                        Value::Bool(true),
+                        Value::Integer(0.into()),
+                        Value::Bool(true),
+                    ]),
+                ),
+                (2, Value::Integer(fingerprint.into())),
+                (3, Value::Integer(depth.into())),
+            ]),
+        )
+    }
+
+    /// What the format cannot say is refused, not read as something
+    /// else: a step out of range or without its hardened flag, a
+    /// network it does not name, a depth or a fingerprint that does not
+    /// fit. Each used to come out as another key, without a word.
+    #[test]
+    fn a_malformed_hdkey_is_refused_not_guessed() {
+        let index = |i: i64| Value::Integer(i.into());
+        let hardened = Value::Bool(true);
+        let fp = 0x9a6a_2580;
+        let malformed = [
+            hdkey_with(6, origin_from(index(1 << 31), hardened.clone(), 3, fp)),
+            hdkey_with(6, origin_from(index(-1), hardened.clone(), 3, fp)),
+            hdkey_with(6, origin_from(index(84), Value::Integer(1.into()), 3, fp)),
+            hdkey_with(6, origin_from(index(84), hardened.clone(), 300, fp)),
+            hdkey_with(6, origin_from(index(84), hardened.clone(), 3, 1 << 32)),
+            hdkey_with(8, Value::Integer((1u64 << 32).into())),
+            hdkey_with(5, tag(305, map(vec![(1, index(0)), (2, index(2))]))),
+        ];
+        for key in malformed {
+            let frame = encode_ur("crypto-output", &tag(TAG_WPKH, key));
+            let refused = assemble(&[frame]).unwrap_err();
+            assert!(
+                matches!(refused, CoreError::InvalidInput { kind: "qr", .. }),
+                "{refused}"
+            );
+        }
+        // The same origin, well formed, still opens.
+        let key = hdkey_with(6, origin_from(index(84), hardened, 3, fp));
+        let text = assemble(&[encode_ur("crypto-output", &tag(TAG_WPKH, key))])
+            .unwrap()
+            .text
+            .unwrap();
+        assert!(text.starts_with("wpkh([9a6a2580/84'/1'/0']"), "{text}");
+    }
+
+    /// A bare key is a public key of 33 bytes, or 65; 32 is a private
+    /// key in this format, with or without the flag that says so.
+    #[test]
+    fn an_ec_key_of_a_private_length_is_refused_as_one() {
+        let eckey = |data: Vec<u8>| tag(TAG_PK, tag(TAG_ECKEY, map(vec![(3, Value::Bytes(data))])));
+        assert!(matches!(
+            assemble(&[encode_ur("crypto-output", &eckey(vec![7; 32]))]),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
+        assert!(matches!(
+            assemble(&[encode_ur("crypto-output", &eckey(vec![2; 20]))]),
+            Err(CoreError::InvalidInput { kind: "qr", .. })
+        ));
+        let xpub: Xpub = TPUB.parse().unwrap();
+        let public = xpub.public_key.serialize().to_vec();
+        let text = assemble(&[encode_ur("crypto-output", &eckey(public.clone()))])
+            .unwrap()
+            .text
+            .unwrap();
+        assert_eq!(text, format!("pk({})", hex(&public)));
+    }
+
+    /// A damaged frame of another code seen first does not decide what
+    /// the parts that follow are.
+    #[test]
+    fn a_ur_is_read_by_the_type_its_parts_carry() {
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&tag(TAG_WPKH, hdkey(None)), &mut bytes).unwrap();
+        let mut encoder = ur::ur::Encoder::new(&bytes, 40, "crypto-output").unwrap();
+        let mut frames = vec!["ur:crypto-psbt/1-3/lpadaxcfaxhl".to_owned()];
+        for _ in 0..60 {
+            frames.push(encoder.next_part().unwrap());
+            let progress = assemble(&frames).unwrap();
+            if progress.complete {
+                let text = progress.text.unwrap();
+                assert!(text.starts_with("wpkh([9a6a2580"), "{text}");
+                return;
+            }
+        }
+        panic!("the fountain never completed");
+    }
+
     #[test]
     fn private_hdkey_is_rejected() {
         let Value::Tag(_, inner) = hdkey(None) else {
@@ -935,6 +1093,19 @@ mod tests {
         let full = assemble(&[frames[2].clone(), frames[0].clone(), frames[1].clone()]).unwrap();
         assert!(full.complete);
         assert_eq!(full.text.unwrap(), descriptor);
+    }
+
+    /// Two codes of the same kind and length in front of the camera:
+    /// their parts are not glued into a text neither holds. The same
+    /// frame seen twice is only the camera seeing it again.
+    #[test]
+    fn two_bbqr_codes_scanned_together_are_refused() {
+        let one = bbqr_frames(&format!("wpkh({TPUB}/<0;1>/*)"), 2);
+        let other = bbqr_frames(&format!("pkh({TPUB}/<0;1>/*)"), 2);
+        let refused = assemble(&[one[0].clone(), other[0].clone(), one[1].clone()]).unwrap_err();
+        assert!(refused.to_string().contains("one at a time"), "{refused}");
+        let again = assemble(&[one[0].clone(), one[0].clone(), one[1].clone()]).unwrap();
+        assert!(again.complete);
     }
 
     /// A frame is whatever a camera decoded or a person typed. Two
