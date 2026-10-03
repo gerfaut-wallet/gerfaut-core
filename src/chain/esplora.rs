@@ -435,9 +435,13 @@ pub(crate) fn client(url: &str, proxy: Option<&str>) -> Result<Client, String> {
 /// different waits, and a host that is down must not get the budget of
 /// a host that is slow.
 fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, String> {
+    // An Esplora API does not redirect. One that does would send the
+    // scripts of the wallet where the route was never checked: in the
+    // clear, or an onion name to the system's resolver.
     let mut builder = reqwest::Client::builder()
         .connect_timeout(budget.connect)
-        .timeout(budget.total);
+        .timeout(budget.total)
+        .redirect(reqwest::redirect::Policy::none());
     if crate::chain::is_onion(url) {
         let proxy = proxy.ok_or_else(|| crate::chain::tor::no_route(url))?;
         // socks5h: the proxy resolves the name; .onion never touches DNS.
@@ -1384,6 +1388,39 @@ mod error_tests {
         assert_eq!(arrived, fetch(Vec::new()).await);
         assert_eq!(arrived.txs.len(), 61);
         assert_eq!(arrived.txs[0].height, None);
+    }
+
+    /// A server that redirects is not followed: an Esplora instance
+    /// anywhere, and a fixed service elsewhere than its own host over
+    /// HTTPS. The redirection fails the request, and nothing reaches the
+    /// address it named.
+    #[tokio::test]
+    async fn a_redirection_is_not_followed() {
+        let (elsewhere, reached) = answering(vec![
+            "HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\n812345".to_owned(),
+        ])
+        .await;
+        let (redirecting, _) = answering(vec![format!(
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: http://{elsewhere}/blocks/tip/height\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n"
+        )])
+        .await;
+        let client = build(&format!("http://{redirecting}"), None, PATIENT).unwrap();
+        assert_eq!(
+            client.height().await.unwrap_err(),
+            "HTTP 301: unexpected status"
+        );
+        let service = reqwest::Client::builder()
+            .redirect(crate::chain::redirects())
+            .build()
+            .unwrap();
+        let answer = service
+            .get(format!("http://{redirecting}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(answer.status().as_u16(), 301);
+        assert_eq!(*reached.lock().unwrap(), 0);
     }
 
     /// A gzipped answer of a sensible size reads as it always did.

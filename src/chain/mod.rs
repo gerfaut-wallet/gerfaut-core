@@ -148,6 +148,25 @@ pub(crate) const TIP_LAG_MAX: u32 = 144;
 /// have reached is refused with.
 pub(crate) const IMPOSSIBLE_TIP: &str = "the server claims a block height no chain has reached";
 
+/// The redirections an HTTP client of the core follows, to fixed public
+/// services: to the same host, port and scheme, over HTTPS, five at
+/// most. One anywhere else ends there, as an answer that is no success:
+/// it would carry the request where its route was never checked, in the
+/// clear, or an onion name to the system's resolver.
+pub(crate) fn redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin());
+        if same && attempt.url().scheme() == "https" && attempt.previous().len() <= 5 {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 /// What one sync may keep of the transactions it reads, those the wallet
 /// lacks: what it stores then. A wallet paid dozens of the largest
 /// inscriptions there are fits; a server that invents transactions to

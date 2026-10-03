@@ -294,6 +294,11 @@ The first release: the library both Gerfaut apps are built on.
   could list transactions of hundreds of thousands of inputs until the
   phone ran out of memory. Over Electrum, a connection of that sync also
   reads 256 MiB at most, every answer together.
+- The HTTP clients of the core no longer follow a redirection anywhere:
+  an Esplora server's not at all, and the price and update services'
+  only to their own host, over HTTPS. A redirection carried the request,
+  the scripts of a wallet among them, where its route was never checked:
+  in the clear, or an onion name to the system's resolver.
 - An incoming payment announced as pending is said dropped only once a
   second sync, ten minutes or more after the first one that missed it,
   has read its scripts again and not seen it either. A server that lags,
