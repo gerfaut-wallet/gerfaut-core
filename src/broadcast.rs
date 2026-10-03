@@ -906,7 +906,7 @@ mod tests {
     /// break this test rather than fall silently into a tone. Red is a
     /// budget — it has to stay spendable the day it matters.
     #[test]
-    fn every_caution_has_a_tone_and_only_five_are_red() {
+    fn every_caution_has_a_tone_and_only_six_are_red() {
         use TxWarningKind::*;
         let table = [
             (Unsigned, TxSeverity::Alert),
