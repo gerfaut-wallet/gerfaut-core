@@ -25,6 +25,27 @@ fn confirmations(height: u32, tip: u32) -> u32 {
     tip.saturating_sub(height).saturating_add(1)
 }
 
+/// A transaction as a list shows it, its confirmations counted against
+/// `tip`.
+fn summary(
+    txid: String,
+    net_sats: i64,
+    fee_sats: Option<u64>,
+    status: TxStatus,
+    tip: u32,
+) -> TxSummary {
+    TxSummary {
+        txid,
+        net_sats,
+        fee_sats,
+        confirmations: match status {
+            TxStatus::Confirmed { height, .. } => confirmations(height, tip),
+            TxStatus::Pending => 0,
+        },
+        status,
+    }
+}
+
 fn address_of(script: &Script, network: Network) -> Option<String> {
     Address::from_script(script, network.to_bitcoin())
         .ok()
@@ -84,20 +105,16 @@ pub(crate) fn tx_summaries(wallet: &bdk_wallet::Wallet) -> Vec<TxSummary> {
     let mut txs: Vec<TxSummary> = wallet
         .transactions()
         .map(|wtx| {
-            let status = status_of(&wtx.chain_position);
-            TxSummary {
-                txid: wtx.tx_node.txid.to_string(),
-                net_sats: net_of(wallet, &wtx.tx_node.tx),
-                fee_sats: wallet
+            summary(
+                wtx.tx_node.txid.to_string(),
+                net_of(wallet, &wtx.tx_node.tx),
+                wallet
                     .calculate_fee(&wtx.tx_node.tx)
                     .ok()
                     .map(|f| f.to_sat()),
-                confirmations: match status {
-                    TxStatus::Confirmed { height, .. } => confirmations(height, tip),
-                    TxStatus::Pending => 0,
-                },
-                status,
-            }
+                status_of(&wtx.chain_position),
+                tip,
+            )
         })
         .collect();
     sort_summaries(&mut txs);
@@ -830,16 +847,13 @@ pub(crate) fn tx_detail(
         wallet.tx_graph().get_txout(*outpoint).cloned()
     });
     Ok(TxDetail {
-        summary: TxSummary {
-            txid: txid.to_string(),
-            net_sats: received.to_sat() as i64 - sent.to_sat() as i64,
+        summary: summary(
+            txid.to_string(),
+            received.to_sat() as i64 - sent.to_sat() as i64,
             fee_sats,
-            confirmations: match status {
-                TxStatus::Confirmed { height, .. } => confirmations(height, tip),
-                TxStatus::Pending => 0,
-            },
             status,
-        },
+            tip,
+        ),
         inputs,
         outputs,
         vsize,
@@ -1065,17 +1079,13 @@ pub(crate) fn address_tx_summaries(state: &AddressWatchState) -> Vec<TxSummary> 
         .txs
         .iter()
         .map(|tx| {
-            let status = address_tx_status(tx);
-            TxSummary {
-                txid: tx.txid.clone(),
-                net_sats: tx.net_sats,
-                fee_sats: tx.fee_sats,
-                confirmations: match status {
-                    TxStatus::Confirmed { height, .. } => confirmations(height, state.tip_height),
-                    TxStatus::Pending => 0,
-                },
-                status,
-            }
+            summary(
+                tx.txid.clone(),
+                tx.net_sats,
+                tx.fee_sats,
+                address_tx_status(tx),
+                state.tip_height,
+            )
         })
         .collect();
     sort_summaries(&mut txs);
@@ -1087,18 +1097,14 @@ pub(crate) fn address_tx_detail(state: &AddressWatchState, txid: &str) -> CoreRe
         state.txs.iter().find(|t| t.txid == txid).ok_or_else(|| {
             CoreError::WalletNotFound(format!("transaction {txid} not in wallet"))
         })?;
-    let status = address_tx_status(tx);
     Ok(TxDetail {
-        summary: TxSummary {
-            txid: tx.txid.clone(),
-            net_sats: tx.net_sats,
-            fee_sats: tx.fee_sats,
-            confirmations: match status {
-                TxStatus::Confirmed { height, .. } => confirmations(height, state.tip_height),
-                TxStatus::Pending => 0,
-            },
-            status,
-        },
+        summary: summary(
+            tx.txid.clone(),
+            tx.net_sats,
+            tx.fee_sats,
+            address_tx_status(tx),
+            state.tip_height,
+        ),
         inputs: tx.inputs.clone(),
         outputs: tx.outputs.clone(),
         vsize: tx.vsize,
