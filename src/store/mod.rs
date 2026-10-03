@@ -23,7 +23,7 @@ use crate::premium::PremiumState;
 use crate::wallet::AddressWatchState;
 use crate::wallet::meta::WalletMeta;
 
-pub use cipher::{VaultKdf, VaultKey};
+pub use cipher::VaultKey;
 
 /// Current payload schema version. A build refuses a vault of a later
 /// version rather than read it without the fields it does not know and
