@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::format::{civil_date, format_btc};
 use crate::wallet::snapshot::{TxStatus, TxSummary};
 
 /// Keep only one direction of transactions.
@@ -127,26 +128,14 @@ fn passes(tx: &TxSummary, options: &ExportOptions) -> bool {
 /// `-123` sats -> `-0.00000123`, plain 8 decimals, no unit, no grouping.
 fn format_btc_signed_plain(sats: i64) -> String {
     let sign = if sats < 0 { "-" } else { "" };
-    let abs = sats.unsigned_abs();
-    format!("{sign}{}.{:08}", abs / 100_000_000, abs % 100_000_000)
+    format!("{sign}{}", format_btc(sats.unsigned_abs()))
 }
 
-/// Unix seconds -> `2026-08-25 19:41:07` UTC, no external dependency
-/// (days-to-civil per Howard Hinnant's algorithm).
+/// Unix seconds -> `2026-08-25 19:41:07` UTC.
 fn format_utc(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
+    let (year, month, day) = civil_date(secs);
     let rem = secs % 86_400;
     let (hour, minute, second) = (rem / 3_600, (rem / 60) % 60, rem % 60);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { year + 1 } else { year };
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
 }
 

@@ -36,9 +36,10 @@ const HEADER_LEN: usize = 8 + 1 + 1 + SALT_LEN + NONCE_LEN;
 /// each profile for good: a dependency bump changing library defaults
 /// must never lock existing files out.
 const KDF_RAW: u8 = 0;
-/// Argon2id, the OWASP profile: m=19456 KiB, t=2, p=1. Every vault
-/// sealed under a password, and every backup written before the
-/// heavier profile existed.
+/// Argon2id, the OWASP profile: m=19456 KiB, t=2, p=1. Every backup
+/// written before the heavier profile existed, and a vault sealed under
+/// a password, which no app does: the apps seal theirs under the
+/// platform key.
 const KDF_ARGON2ID: u8 = 1;
 /// Argon2id, the RFC 9106 profile: m=65536 KiB, t=3, p=1. What a backup
 /// is sealed under now. A backup is a file that travels and can be
@@ -46,6 +47,23 @@ const KDF_ARGON2ID: u8 = 1;
 /// the profile that costs a guess five times more; the vault, opened
 /// and saved at every change, keeps the lighter one.
 const KDF_ARGON2ID_64M: u8 = 2;
+
+/// Memory in KiB and passes of the OWASP profile, `KDF_ARGON2ID`. The
+/// app lock hashes its secret under it too, and stores no profile
+/// beside the hash: like every profile here, it is fixed for good.
+pub(crate) const OWASP_COST: (u32, u32) = (19_456, 2);
+/// Memory in KiB and passes of the RFC 9106 profile, `KDF_ARGON2ID_64M`.
+const RFC_9106_COST: (u32, u32) = (65_536, 3);
+
+/// Argon2id at a profile's cost, one lane, 32 bytes out.
+pub(crate) fn argon2id((m_cost, t_cost): (u32, u32)) -> Result<Argon2<'static>, argon2::Error> {
+    let params = argon2::Params::new(m_cost, t_cost, 1, Some(32))?;
+    Ok(Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        params,
+    ))
+}
 
 /// Key material for the vault. Zeroized on drop.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -75,14 +93,11 @@ impl VaultKey {
         match self {
             VaultKey::Raw(key) => Ok(Zeroizing::new(*key)),
             VaultKey::Password(password) => {
-                let (m_cost, t_cost) = match kdf {
-                    KDF_ARGON2ID_64M => (65_536, 3),
-                    _ => (19_456, 2),
+                let cost = match kdf {
+                    KDF_ARGON2ID_64M => RFC_9106_COST,
+                    _ => OWASP_COST,
                 };
-                let params = argon2::Params::new(m_cost, t_cost, 1, Some(32))
-                    .map_err(|e| VaultError::Kdf(e.to_string()))?;
-                let argon =
-                    Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+                let argon = argon2id(cost).map_err(|e| VaultError::Kdf(e.to_string()))?;
                 let mut out = Zeroizing::new([0u8; 32]);
                 argon
                     .hash_password_into(password.as_bytes(), salt, &mut out[..])
@@ -154,13 +169,13 @@ pub fn unseal_with(magic: &[u8; 8], file: &[u8], key: &VaultKey) -> Result<Vec<u
     if version != 1 && version != VERSION {
         return Err(VaultError::UnsupportedVersion(version));
     }
-    // The KDF byte names the profile a password is derived under, and
-    // lets an app prompt for the right credential kind. Decryption still
-    // trusts the provided key: the byte is bound as associated data, so
-    // rewriting it to a lighter profile fails authentication rather than
-    // yielding a key to guess at. A profile this build does not know is
-    // one a newer build added: the file is refused as such, before any
-    // key is derived, never reported as a wrong key.
+    // The KDF byte names the profile a password is derived under.
+    // Decryption still trusts the provided key: the byte is bound as
+    // associated data, so rewriting it to a lighter profile fails
+    // authentication rather than yielding a key to guess at. A profile
+    // this build does not know is one a newer build added: the file is
+    // refused as such, before any key is derived, never reported as a
+    // wrong key.
     let kdf = file[9];
     if !matches!(kdf, KDF_RAW | KDF_ARGON2ID | KDF_ARGON2ID_64M) {
         return Err(VaultError::UnsupportedKdf(kdf));
@@ -183,26 +198,6 @@ pub fn unseal_with(magic: &[u8; 8], file: &[u8], key: &VaultKey) -> Result<Vec<u
     cipher
         .decrypt(XNonce::from_slice(nonce), payload)
         .map_err(|_| VaultError::WrongKeyOrCorrupted)
-}
-
-/// Reads the KDF kind of a vault file, so the app knows whether to ask
-/// for a password or fetch the platform key.
-pub fn kdf_kind(file: &[u8]) -> Result<VaultKdf, VaultError> {
-    if file.len() < HEADER_LEN || &file[..8] != MAGIC {
-        return Err(VaultError::NotAVault);
-    }
-    match file[9] {
-        KDF_RAW => Ok(VaultKdf::PlatformKey),
-        KDF_ARGON2ID | KDF_ARGON2ID_64M => Ok(VaultKdf::Password),
-        other => Err(VaultError::UnsupportedKdf(other)),
-    }
-}
-
-/// Credential kind a vault file expects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VaultKdf {
-    PlatformKey,
-    Password,
 }
 
 #[cfg(test)]
@@ -329,7 +324,6 @@ mod tests {
         let vault = seal(b"payload", &key).unwrap();
         assert_eq!(vault[9], KDF_ARGON2ID);
         assert_eq!(unseal(&vault, &key).unwrap(), b"payload");
-        assert_eq!(kdf_kind(&vault).unwrap(), VaultKdf::Password);
         // The platform key derives nothing, under either magic.
         assert_eq!(
             seal_with(BACKUP_MAGIC, b"p", &raw_key(7)).unwrap()[9],
@@ -352,7 +346,6 @@ mod tests {
         // be, reads under it as well: the byte decides, not the magic.
         let heavier = sealed_under(MAGIC, KDF_ARGON2ID_64M, &key, b"heavier vault");
         assert_eq!(unseal(&heavier, &key).unwrap(), b"heavier vault");
-        assert_eq!(kdf_kind(&heavier).unwrap(), VaultKdf::Password);
     }
 
     /// The byte is bound as associated data: rewriting a backup to the
@@ -376,7 +369,7 @@ mod tests {
         let mut vault = seal(b"payload", &key).unwrap();
         vault[9] = 9;
         assert!(matches!(
-            kdf_kind(&vault),
+            unseal(&vault, &key),
             Err(VaultError::UnsupportedKdf(9))
         ));
     }
@@ -424,20 +417,11 @@ mod tests {
             b"payload"
         );
         assert!(matches!(unseal(&backup, &key), Err(VaultError::NotAVault)));
-        assert!(matches!(kdf_kind(&backup), Err(VaultError::NotAVault)));
 
         let vault = seal(b"payload", &key).unwrap();
         assert!(matches!(
             unseal_with(BACKUP_MAGIC, &vault, &key),
             Err(VaultError::NotAVault)
         ));
-    }
-
-    #[test]
-    fn kdf_kind_is_readable_without_key() {
-        let sealed = seal(b"p", &raw_key(7)).unwrap();
-        assert_eq!(kdf_kind(&sealed).unwrap(), VaultKdf::PlatformKey);
-        let sealed = seal(b"p", &VaultKey::Password("x".to_owned())).unwrap();
-        assert_eq!(kdf_kind(&sealed).unwrap(), VaultKdf::Password);
     }
 }

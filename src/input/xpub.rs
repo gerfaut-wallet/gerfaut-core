@@ -19,8 +19,6 @@ use crate::input::ScriptKind;
 /// Outcome of decoding a SLIP-132 or standard extended public key.
 #[derive(Debug, Clone)]
 pub struct DecodedXpub {
-    /// The key, normalized to standard version bytes.
-    pub xpub: Xpub,
     /// Standard-encoded string (`xpub...` / `tpub...`).
     pub normalized: String,
     /// Mainnet or test key.
@@ -46,101 +44,148 @@ pub(crate) struct Slip132Hint {
     pub multisig_only: bool,
 }
 
-/// Version bytes: (prefix bytes, mainnet?, script hint, multisig-only).
-const PUBLIC_VERSIONS: &[([u8; 4], bool, Option<ScriptKind>, bool)] = &[
-    // Standard BIP32. No script hint: a bare xpub does not say how it is used.
-    ([0x04, 0x88, 0xB2, 0x1E], true, None, false), // xpub
-    ([0x04, 0x35, 0x87, 0xCF], false, None, false), // tpub
-    // SLIP-132 single-sig.
-    (
-        [0x04, 0x9D, 0x7C, 0xB2],
+/// One encoding of an extended key: how its public and private forms
+/// are spelled and the version bytes behind each spelling, and what the
+/// encoding says of the key. Each fact once: the classifier refuses a
+/// private key by its spelling before anything decodes it, and by its
+/// version bytes once decoded, and both read this table.
+struct Encoding {
+    public: &'static str,
+    public_version: [u8; 4],
+    private: &'static str,
+    private_version: [u8; 4],
+    mainnet: bool,
+    /// The script the encoding was made for. `None` for the standard
+    /// ones: a bare xpub does not say how it is used.
+    script: Option<ScriptKind>,
+    /// A multisig encoding (`Ypub`, `Zpub`, `Upub`, `Vpub`): a single
+    /// such key cannot form a wallet on its own.
+    multisig_only: bool,
+}
+
+const fn encoding(
+    (public, public_version): (&'static str, [u8; 4]),
+    (private, private_version): (&'static str, [u8; 4]),
+    mainnet: bool,
+    script: Option<ScriptKind>,
+    multisig_only: bool,
+) -> Encoding {
+    Encoding {
+        public,
+        public_version,
+        private,
+        private_version,
+        mainnet,
+        script,
+        multisig_only,
+    }
+}
+
+/// Every encoding read: standard BIP32 first, then SLIP-132.
+const ENCODINGS: &[Encoding] = &[
+    encoding(
+        ("xpub", [0x04, 0x88, 0xB2, 0x1E]),
+        ("xprv", [0x04, 0x88, 0xAD, 0xE4]),
+        true,
+        None,
+        false,
+    ),
+    encoding(
+        ("tpub", [0x04, 0x35, 0x87, 0xCF]),
+        ("tprv", [0x04, 0x35, 0x83, 0x94]),
+        false,
+        None,
+        false,
+    ),
+    encoding(
+        ("ypub", [0x04, 0x9D, 0x7C, 0xB2]),
+        ("yprv", [0x04, 0x9D, 0x78, 0x78]),
         true,
         Some(ScriptKind::NestedSegwit),
         false,
-    ), // ypub
-    (
-        [0x04, 0xB2, 0x47, 0x46],
+    ),
+    encoding(
+        ("zpub", [0x04, 0xB2, 0x47, 0x46]),
+        ("zprv", [0x04, 0xB2, 0x43, 0x0C]),
         true,
         Some(ScriptKind::Segwit),
         false,
-    ), // zpub
-    (
-        [0x04, 0x4A, 0x52, 0x62],
+    ),
+    encoding(
+        ("upub", [0x04, 0x4A, 0x52, 0x62]),
+        ("uprv", [0x04, 0x4A, 0x4E, 0x28]),
         false,
         Some(ScriptKind::NestedSegwit),
         false,
-    ), // upub
-    (
-        [0x04, 0x5F, 0x1C, 0xF6],
+    ),
+    encoding(
+        ("vpub", [0x04, 0x5F, 0x1C, 0xF6]),
+        ("vprv", [0x04, 0x5F, 0x18, 0xBC]),
         false,
         Some(ScriptKind::Segwit),
         false,
-    ), // vpub
-    // SLIP-132 multisig.
-    (
-        [0x02, 0x95, 0xB4, 0x3F],
+    ),
+    encoding(
+        ("Ypub", [0x02, 0x95, 0xB4, 0x3F]),
+        ("Yprv", [0x02, 0x95, 0xB0, 0x05]),
         true,
         Some(ScriptKind::NestedSegwit),
         true,
-    ), // Ypub
-    (
-        [0x02, 0xAA, 0x7E, 0xD3],
+    ),
+    encoding(
+        ("Zpub", [0x02, 0xAA, 0x7E, 0xD3]),
+        ("Zprv", [0x02, 0xAA, 0x7A, 0x99]),
         true,
         Some(ScriptKind::Segwit),
         true,
-    ), // Zpub
-    (
-        [0x02, 0x42, 0x89, 0xEF],
+    ),
+    encoding(
+        ("Upub", [0x02, 0x42, 0x89, 0xEF]),
+        ("Uprv", [0x02, 0x42, 0x85, 0xB5]),
         false,
         Some(ScriptKind::NestedSegwit),
         true,
-    ), // Upub
-    (
-        [0x02, 0x57, 0x54, 0x83],
+    ),
+    encoding(
+        ("Vpub", [0x02, 0x57, 0x54, 0x83]),
+        ("Vprv", [0x02, 0x57, 0x50, 0x48]),
         false,
         Some(ScriptKind::Segwit),
         true,
-    ), // Vpub
+    ),
 ];
 
-/// All known private version bytes, standard and SLIP-132. Any match is
-/// an immediate, unconditional rejection.
-const PRIVATE_VERSIONS: &[[u8; 4]] = &[
-    [0x04, 0x88, 0xAD, 0xE4], // xprv
-    [0x04, 0x35, 0x83, 0x94], // tprv
-    [0x04, 0x9D, 0x78, 0x78], // yprv
-    [0x04, 0xB2, 0x43, 0x0C], // zprv
-    [0x04, 0x4A, 0x4E, 0x28], // uprv
-    [0x04, 0x5F, 0x18, 0xBC], // vprv
-    [0x02, 0x95, 0xB0, 0x05], // Yprv
-    [0x02, 0xAA, 0x7A, 0x99], // Zprv
-    [0x02, 0x42, 0x85, 0xB5], // Uprv
-    [0x02, 0x57, 0x50, 0x48], // Vprv
-];
+/// The standard encoding of a network, `xpub` or `tpub`: the one with
+/// no script, and all a descriptor parser reads.
+fn standard(mainnet: bool) -> &'static Encoding {
+    ENCODINGS
+        .iter()
+        .find(|e| e.mainnet == mainnet && e.script.is_none())
+        .expect("both standard encodings are in the table")
+}
 
-const STANDARD_PUBLIC_MAINNET: [u8; 4] = [0x04, 0x88, 0xB2, 0x1E];
-const STANDARD_PUBLIC_TESTNET: [u8; 4] = [0x04, 0x35, 0x87, 0xCF];
+/// Whether a token is spelled as an extended private key, standard or
+/// SLIP-132. Any such token is refused unread.
+pub(crate) fn has_private_prefix(token: &str) -> bool {
+    ENCODINGS.iter().any(|e| token.starts_with(e.private))
+}
 
-/// Textual prefixes of the SLIP-132 public keys: the spellings a
+/// The SLIP-132 public spelling a token starts with, the one a
 /// descriptor parser does not read.
-const SLIP132_PUBLIC_PREFIXES: &[&str] = &[
-    "ypub", "zpub", "Ypub", "Zpub", "upub", "vpub", "Upub", "Vpub",
-];
-
-/// Textual prefixes of every extended private key, standard and
-/// SLIP-132. Any token starting with one is refused unread.
-pub(crate) const PRIVATE_PREFIXES: &[&str] = &[
-    "xprv", "yprv", "zprv", "Yprv", "Zprv", "tprv", "uprv", "vprv", "Uprv", "Vprv",
-];
+fn slip132_public_prefix(token: &str) -> Option<&'static str> {
+    ENCODINGS
+        .iter()
+        .filter(|e| e.script.is_some())
+        .map(|e| e.public)
+        .find(|p| token.starts_with(p))
+}
 
 /// Textual prefixes that make a token look like an extended key at all.
 /// Used by the classifier to decide whether to attempt a decode.
 pub(crate) fn looks_like_extended_key(token: &str) -> bool {
-    ["xpub", "tpub"]
+    ENCODINGS
         .iter()
-        .chain(SLIP132_PUBLIC_PREFIXES)
-        .chain(PRIVATE_PREFIXES)
-        .any(|p| token.starts_with(p))
+        .any(|e| token.starts_with(e.public) || token.starts_with(e.private))
 }
 
 /// Base58 alphabet, which delimits a key inside a descriptor: nothing
@@ -211,13 +256,10 @@ pub(crate) fn normalize_descriptor_keys(
 /// does not decode is left as it is: the descriptor parser names what
 /// is wrong with it.
 fn standard_form(token: &str) -> CoreResult<Option<(String, Slip132Hint)>> {
-    if PRIVATE_PREFIXES.iter().any(|p| token.starts_with(p)) {
+    if has_private_prefix(token) {
         return Err(CoreError::PrivateMaterialRejected);
     }
-    let Some(&prefix) = SLIP132_PUBLIC_PREFIXES
-        .iter()
-        .find(|p| token.starts_with(**p))
-    else {
+    let Some(prefix) = slip132_public_prefix(token) else {
         return Ok(None);
     };
     match decode_extended_key(token) {
@@ -253,47 +295,38 @@ pub fn decode_extended_key(token: &str) -> CoreResult<DecodedXpub> {
     }
     let version: [u8; 4] = data[..4].try_into().expect("length checked above");
 
-    if PRIVATE_VERSIONS.contains(&version) {
+    if ENCODINGS.iter().any(|e| e.private_version == version) {
         return Err(CoreError::PrivateMaterialRejected);
     }
 
-    let Some((_, mainnet, script_hint, multisig_only)) = PUBLIC_VERSIONS
-        .iter()
-        .find(|(bytes, ..)| *bytes == version)
-        .copied()
-    else {
+    let Some(encoding) = ENCODINGS.iter().find(|e| e.public_version == version) else {
         return Err(CoreError::InvalidInput {
             kind: "extended key",
             detail: "unknown version bytes".to_owned(),
         });
     };
-
-    let standard = if mainnet {
-        STANDARD_PUBLIC_MAINNET
-    } else {
-        STANDARD_PUBLIC_TESTNET
-    };
+    let mainnet = encoding.mainnet;
+    let standard = standard(mainnet).public_version;
     let converted = version != standard;
     let mut normalized_bytes = data;
     normalized_bytes[..4].copy_from_slice(&standard);
     let normalized = base58::encode_check(&normalized_bytes);
 
-    let xpub = Xpub::decode(&normalized_bytes).map_err(|e| CoreError::InvalidInput {
+    Xpub::decode(&normalized_bytes).map_err(|e| CoreError::InvalidInput {
         kind: "extended key",
         detail: format!("invalid BIP32 payload: {e}"),
     })?;
 
     Ok(DecodedXpub {
-        xpub,
         normalized,
         network_kind: if mainnet {
             NetworkKind::Main
         } else {
             NetworkKind::Test
         },
-        script_hint,
+        script_hint: encoding.script,
         converted,
-        multisig_only,
+        multisig_only: encoding.multisig_only,
     })
 }
 
@@ -357,9 +390,29 @@ mod tests {
         assert!(decoded.multisig_only);
     }
 
+    /// Each spelling in the table is what its version bytes encode to,
+    /// whatever the key: the text filter and the decoder agree on every
+    /// encoding, one added later included.
+    #[test]
+    fn every_spelling_matches_its_version_bytes() {
+        for encoding in ENCODINGS {
+            for fill in [0x00, 0xFF] {
+                for (text, version) in [
+                    (encoding.public, encoding.public_version),
+                    (encoding.private, encoding.private_version),
+                ] {
+                    let mut data = vec![fill; 78];
+                    data[..4].copy_from_slice(&version);
+                    let key = base58::encode_check(&data);
+                    assert!(key.starts_with(text), "{text}: {key}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn every_private_version_is_rejected() {
-        for version in PRIVATE_VERSIONS {
+        for version in ENCODINGS.iter().map(|e| &e.private_version) {
             let key = with_version(*version);
             assert!(
                 matches!(
@@ -449,7 +502,7 @@ mod tests {
 
     #[test]
     fn a_private_key_inside_a_descriptor_is_refused_unread() {
-        for version in PRIVATE_VERSIONS {
+        for version in ENCODINGS.iter().map(|e| &e.private_version) {
             let key = with_version(*version);
             let descriptor = format!("wpkh({key}/0/*)");
             assert!(

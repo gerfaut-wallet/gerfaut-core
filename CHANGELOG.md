@@ -128,9 +128,15 @@ The first release: the library both Gerfaut apps are built on.
 - On a phone, the built-in Tor client uses reduced channel padding, so a
   connection held open for hours lets the radio sleep between cells. A
   desktop keeps the normal level.
-- Encrypted local storage: XChaCha20-Poly1305 under an Argon2id key, an app
-  lock that slows repeated attempts and survives a restart, and an encrypted
-  backup file that doubles as the sync format between two devices.
+- Encrypted local storage: XChaCha20-Poly1305 under a key the platform
+  keeps, an app lock hashed with Argon2id that slows repeated attempts and
+  survives a restart, and an encrypted backup file, sealed under a password
+  with Argon2id, that also carries the wallets from one device to another.
+- The channels of a Premium account say when each one last delivered a
+  message, and since when it fails: `last_sent_at`, `failing_since` and
+  `last_failure` on `Channel`, all `null` from a server that predates them.
+  A channel that has failed for an hour or more, behind a blocked bot or an
+  expired webhook domain, delivers nothing, and nothing else showed it.
 
 ### Changed
 
@@ -248,6 +254,11 @@ The first release: the library both Gerfaut apps are built on.
   a build older than this one cannot open the files it writes. A backup
   from a newer Gerfaut is now refused by name, with a message that says to
   update, instead of being reported as a wrong password.
+- `PremiumClient::with_http` is no longer public: a client built elsewhere
+  skipped the refusal of an onion without a proxy and could follow
+  redirects. These are gone, since nothing called them: `store::VaultKdf`,
+  `cipher::kdf_kind`, `format_btc_signed`, `truncate_middle`,
+  `truncate_address` and `PremiumClient::set_key`.
 
 ### Fixed
 
@@ -425,9 +436,11 @@ The first release: the library both Gerfaut apps are built on.
   parsed input the app handed back altered, went straight to the wallet
   engine, which took the key and stored it in the vault. Every wallet is
   now checked again as it is created.
-- A multi-part UR that announces more than 100,000 parts is refused. One
+- A multi-part UR that announces more than 5,000 parts is refused. One
   frame announcing about four billion, pasted or scanned, made the decoder
-  ask for tens of gigabytes and ended the app on the spot.
+  ask for tens of gigabytes and ended the app on the spot, and a frame of a
+  few bytes that mixed half of 100,000 parts cost seconds of work, paid
+  again for every frame scanned after it.
 - An Electrum address whose host still holds a port, such as
   `ssl://[x.onion:50001]:50002` or `x.onion:50001:50002`, is refused. The
   Tor check did not see the onion in it, and the certificate check, which
@@ -515,3 +528,70 @@ The first release: the library both Gerfaut apps are built on.
   unconfirmed transactions no longer announces a payment as dropped for
   missing from that page. Anyone could push it off by sending the
   address enough dust.
+- The policy page reads the internal key of a Liana taproot vault for what
+  it is. Liana writes that unspendable key as an extended key built on the
+  BIP 341 point, and the page took it for a key of its own: on every vault
+  with several keys on its main path, it showed a "Key A" that could spend
+  at once, alone.
+- A threshold that counts one key twice says so, "Any 2 of 3 keys, Key A
+  counted twice". A coordinator holding two places in a 2-of-3 used to read
+  as three keys.
+- When a branch needs two locks together, a date and a delay, both are
+  marked as required, where they read as optional, and the branch is no
+  longer called primary as if it could spend now.
+- A 1-of-n beside a timed path stays one way to spend, "Any of n keys",
+  instead of n primary branches.
+- A pair of descriptors is held together: the change descriptor must have
+  the receive descriptor's script type, keys and conditions, on other
+  paths. The policy page reads the receive one, and change goes to the
+  other: a pair that disagreed, a 2-of-3 for payments and a single key for
+  change, was imported without a word.
+- A QR code that holds another QR code is refused. Each level opened cost a
+  frame of the stack, and a pasted text, or a file dropped on the broadcast
+  page, could hold enough of them to end the app.
+- "Forget this key" first tells the Premium server about the wallets
+  removed from this device, and the removals it could not send stay queued
+  for the same key, entered again. They used to be dropped, and the server
+  went on watching wallets the app no longer had.
+- A Premium connection the vault failed to record stays on the server and
+  is sent again. It used to be revoked, and the retry made a new device
+  that waited ten days for an approval, the account's first one included.
+- A Coldcard export is read under its master fingerprint, the one a signer
+  knows the wallet by, not the account's. A descriptor copied to a
+  coordinator gave PSBTs the Coldcard would not sign.
+- A copy of the Premium state handed back after a wallet was removed no
+  longer brings its consent back, nor cancels its removal.
+- A private key written with JSON escapes inside an export is refused like
+  any other, and never quoted in the error.
+- The Premium server's sentence is kept to one line of 200 characters,
+  control and direction characters dropped, on screen and in the vault.
+- A 4xx from the Premium server without its own error body settles
+  nothing: a connection or a key change under way is sent again as it was.
+  A proxy's page during a deployment used to drop the only copy of a new
+  key.
+- A Premium certificate replaces only an older one, so a slow refresh
+  answered after a key change no longer brings the old paid time back.
+- The balance of a watched address in the address list, and the date a coin
+  unlocks on the policy page, saturate instead of wrapping around when a
+  server sends values no coin can hold.
+- A QR code is refused rather than guessed at: a key path step out of
+  range, a network its format does not name, a 32-byte key, which is a
+  private key in that format, or two animated BBQr codes scanned at once,
+  whose parts used to be glued together.
+- More imports work: a key scanned alone as `ur:crypto-hdkey`, the
+  descriptor file Sparrow exports, a payment URI (`bitcoin:…?amount=…`)
+  scanned from another wallet's receive screen, a BSMS record inside a QR
+  envelope, and a BSMS record for regtest. A BSMS record with more than
+  four lines is refused.
+- A `ypub` or a `zpub` keeps the script its prefix names: picking another
+  one no longer builds a wallet of addresses the exporting wallet never
+  shows, and the confirmation screen no longer offers another. A key under
+  a BIP-48 or BIP-45 origin is refused as a multisig cosigner's key, as its
+  SLIP-132 prefix already was.
+- A vault is written back at payload version 2, so a build older than this
+  one refuses to open it rather than rewrite it without the fields it does
+  not know, the Premium device token and a key change under way among
+  them.
+- The app lock's delay now starts when the answer comes back. It used to
+  start at the guess, so the time Argon2 took to check it came off the
+  delay.

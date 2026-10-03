@@ -64,9 +64,15 @@ pub struct BackupWallet {
     pub name: String,
     pub network: Network,
     pub kind: WalletKind,
+    /// The gap limit when the backup was written. Kept for the format:
+    /// every build so far requires it. A restore ignores it, since the
+    /// gap limit is one setting shared by every wallet: the backup's
+    /// when its settings are applied, this device's otherwise.
     pub gap_limit: u32,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// When the wallet was added, unix seconds. Kept for the format, as
+    /// above: a restored wallet is dated by its restore.
     pub created_at: u64,
     /// Watched live before any other wallet: see
     /// [`WalletMeta::live_pinned`]. Left out while off, so a backup

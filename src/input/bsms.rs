@@ -46,7 +46,7 @@ pub fn parse_bsms(text: &str) -> CoreResult<BsmsRecord> {
     if lines.first().copied() != Some(HEADER) {
         return Err(bsms_error("not a BSMS 1.0 record"));
     }
-    let [_, template, restrictions, first_address, ..] = lines[..] else {
+    let [_, template, restrictions, first_address] = lines[..] else {
         if lines.len() == 2 && is_encrypted(lines[1]) {
             return Err(bsms_error(
                 "this BSMS file is encrypted; export the plain descriptor record from the \
@@ -158,6 +158,9 @@ mod tests {
     #[test]
     fn short_or_foreign_records_are_refused() {
         assert!(parse_bsms("BSMS 1.0\nwsh(...)\n").is_err());
+        // A line past the four is no part of any record.
+        let longer = format!("{}bc1qanother\n", record("/0/*,/1/*", "tb1qfirst"));
+        assert!(parse_bsms(&longer).is_err());
         assert!(parse_bsms("BSMS 2.0\nx\ny\nz").is_err());
         assert!(!is_bsms("wpkh(tpub.../0/*)"));
         assert!(is_bsms("  BSMS 1.0\n"));

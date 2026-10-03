@@ -129,7 +129,7 @@ pub enum PremiumError {
 
     /// The server does not know this key (HTTP 401 on the connection
     /// of a device, said in the server's own error body; a bare 401 is
-    /// a refusal instead).
+    /// an unexpected answer instead).
     #[error("the premium server does not know this key")]
     UnknownKey,
 
@@ -166,8 +166,8 @@ pub enum PremiumError {
 
     /// The key exists but has no paid time left, and the route changes
     /// what is watched (HTTP 403, said in the server's own error body
-    /// with no code of a device refusal; a bare 403 is a refusal
-    /// instead).
+    /// with no code of a device refusal; a bare 403 is an unexpected
+    /// answer instead).
     #[error("this key has no paid time left")]
     NoPaidTime,
 
@@ -175,8 +175,8 @@ pub enum PremiumError {
     /// 404 and 410, said in the server's own error body): a wallet or
     /// a channel already gone from it. For a route that removes
     /// something, the state that was wanted. A bare 404, the answer of
-    /// a captive portal or a proxy without a route, is a refusal
-    /// instead.
+    /// a captive portal or a proxy without a route, is an unexpected
+    /// answer instead.
     #[error("the server has nothing under that id")]
     NotFound,
 
@@ -200,7 +200,8 @@ pub enum PremiumError {
     Unreachable(String),
 
     /// The server answered, with something other than what the route
-    /// promises.
+    /// promises: a body it cannot read, or a 4xx with no word of the
+    /// server's, which settles nothing.
     #[error("unexpected answer from the premium server: {0}")]
     UnexpectedResponse(String),
 

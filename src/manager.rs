@@ -5,6 +5,10 @@
 //! engines in memory, and coordinates syncs so that network I/O never
 //! blocks reads: requests are built under the lock, executed outside it,
 //! and applied back under the lock.
+//!
+//! The facade spans three files: this one, `manager/devices.rs` for the
+//! Premium devices (connecting, logging out, changing the key), and
+//! `live.rs` for the live watch and the alerts it hands out.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -92,6 +96,12 @@ impl ManagerState {
     /// it was: the error the caller reports is then the whole truth, and
     /// no later save, made for something else, quietly commits a change
     /// nobody was told about.
+    ///
+    /// What the user decides goes through here. Chain state does not:
+    /// a sync, more history, an address revealed are written in place,
+    /// engine and payload alike, and saved after. That state is a cache
+    /// of the chain, which the next sync reads again, so a save that
+    /// fails there keeps it in memory, and a later save writes it.
     pub(crate) fn commit<T>(
         &mut self,
         change: impl FnOnce(&mut VaultPayload) -> CoreResult<T>,
@@ -868,12 +878,7 @@ impl WalletManager {
                 let (used, balance_sats) = record
                     .address_state
                     .as_ref()
-                    .map(|s| {
-                        (
-                            !s.txs.is_empty(),
-                            s.utxos.iter().map(|u| u.value_sats).sum(),
-                        )
-                    })
+                    .map(|s| (!s.txs.is_empty(), views::address_balance(s).total))
                     .unwrap_or((false, 0));
                 Ok(AddressList {
                     external: vec![crate::wallet::snapshot::AddressRow {
@@ -1722,11 +1727,12 @@ impl WalletManager {
 
     /// Hashes and compares under the attempts lock, so guesses are
     /// serialized and the delay cannot be raced. The vault lock is not
-    /// held meanwhile: an unlock never waits on a sync.
+    /// held meanwhile: an unlock never waits on a sync. A delay runs
+    /// from the verdict, not from the guess: Argon2 takes its time, and
+    /// more on a busy device, and that time came off the delay.
     async fn check_secret(&self, existing: &AppLock, secret: &str) -> LockVerdict {
         let mut attempts = self.attempts.lock().await;
-        let now = Instant::now();
-        let wait = attempts.retry_after(now);
+        let wait = attempts.retry_after(Instant::now());
         if wait > 0 {
             return LockVerdict {
                 unlocked: false,
@@ -1736,7 +1742,7 @@ impl WalletManager {
         }
         match &existing.secret {
             Some(stored) if lock::verify_secret(secret, stored) => attempts.succeed(),
-            _ => attempts.fail(now),
+            _ => attempts.fail(Instant::now()),
         }
     }
 
@@ -2092,8 +2098,21 @@ impl WalletManager {
     /// saved. See [`Self::premium_set_key_saved`],
     /// [`Self::premium_hide_checklist`] and
     /// [`Self::premium_mark_announced`].
-    pub async fn set_premium_state(&self, premium: PremiumState) -> CoreResult<()> {
+    ///
+    /// A new yes for a wallet no longer on this device is dropped: a
+    /// copy read before [`Self::remove_wallet`] would otherwise bring
+    /// back the consent the removal took, and cancel the removal queued
+    /// for the server.
+    pub async fn set_premium_state(&self, mut premium: PremiumState) -> CoreResult<()> {
         self.state.lock().await.commit(|payload| {
+            let stored = &payload.settings.premium;
+            premium.watched.retain(|consent| {
+                stored.is_consented(&consent.wallet_id)
+                    || payload
+                        .wallets
+                        .iter()
+                        .any(|record| record.meta.id == consent.wallet_id)
+            });
             payload.settings.premium = payload.settings.premium.with_app_part_of(premium);
             Ok(())
         })
@@ -3345,6 +3364,36 @@ mod tests {
         ));
     }
 
+    /// Coins no one can hold, as a hostile server may list them for a
+    /// watched address, show in its row at the largest balance there
+    /// is, as in its snapshot, instead of wrapping around.
+    #[tokio::test]
+    async fn an_address_row_never_overflows() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx").unwrap();
+        let meta = manager
+            .add_wallet("Watched address", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        let coin = |txid: &str| crate::wallet::AddressUtxo {
+            txid: txid.into(),
+            vout: 0,
+            value_sats: u64::MAX,
+            height: Some(1),
+            timestamp: None,
+        };
+        find_record_mut(&mut manager.state.lock().await.payload, &meta.id)
+            .unwrap()
+            .address_state = Some(crate::wallet::AddressWatchState {
+            utxos: vec![coin("aa"), coin("bb")],
+            ..Default::default()
+        });
+
+        let list = manager.address_list(&meta.id).await.unwrap();
+        assert_eq!(list.external[0].balance_sats, u64::MAX);
+    }
+
     /// A descriptor with a private key is refused however it arrives:
     /// from a backup file written by hand, or from a parsed input the
     /// app hands back altered. Nothing reaches the vault.
@@ -3668,6 +3717,41 @@ mod tests {
         drop(manager);
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         assert_eq!(manager.premium_state().await.pending_unwatch, vec![meta.id]);
+    }
+
+    /// An app reads the premium state, the wallet goes meanwhile, and
+    /// the copy comes back to dismiss a banner: its yes for the wallet
+    /// is stale, and the removal queued for the server stays.
+    #[tokio::test]
+    async fn a_stale_copy_cannot_take_back_a_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input(MULTIPATH).unwrap();
+        let meta = manager
+            .add_wallet("Signet cold", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        store_premium(
+            &manager,
+            PremiumState {
+                key: Some("abcdefghijkmnpqr".to_owned()),
+                ..PremiumState::default()
+            },
+        )
+        .await;
+        let mut premium = manager.premium_state().await;
+        premium.consent(&meta.id, 100);
+        manager.set_premium_state(premium).await.unwrap();
+
+        let mut stale = manager.premium_state().await;
+        assert!(stale.is_consented(&meta.id));
+        manager.remove_wallet(&meta.id).await.unwrap();
+        stale.acknowledged_offline_until = Some(5);
+        manager.set_premium_state(stale).await.unwrap();
+        let premium = manager.premium_state().await;
+        assert!(!premium.is_consented(&meta.id));
+        assert_eq!(premium.pending_unwatch, vec![meta.id]);
+        assert_eq!(premium.acknowledged_offline_until, Some(5));
     }
 
     /// A premium server that gives these answers in order, one
@@ -5317,7 +5401,7 @@ mod tests {
         let (base_url, _) = premium_answering(401, "<html>Sign in to continue</html>").await;
         let error = kept.premium_delete_account(&base_url).await.unwrap_err();
         assert!(
-            matches!(&error, CoreError::Premium(PremiumError::Rejected(words)) if words == "HTTP 401"),
+            matches!(&error, CoreError::Premium(PremiumError::UnexpectedResponse(words)) if words == "HTTP 401"),
             "{error}"
         );
         assert_eq!(stored_premium(&kept).await, premium_account());

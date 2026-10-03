@@ -1,10 +1,9 @@
-//! Formatting helpers shared by every platform.
+//! Formatting helpers shared by the apps and the core's own texts.
 //!
-//! A single implementation so mobile, desktop, and server render amounts
-//! and identifiers exactly the same way. Two hard rules from the design
-//! system apply here: amounts are never silently rounded (8 decimals in
-//! BTC, or explicit sats), and addresses are only ever truncated in the
-//! middle, never at the ends.
+//! One implementation, so an amount reads the same in a notification, a
+//! screen and a CSV export, and a date the same in an export and on the
+//! policy page. The design system's rule applies here: amounts are never
+//! silently rounded (8 decimals in BTC, or explicit sats).
 
 /// One bitcoin, in satoshis.
 pub const SATS_PER_BTC: u64 = 100_000_000;
@@ -16,11 +15,25 @@ pub fn format_btc(sats: u64) -> String {
     format!("{}.{:08}", sats / SATS_PER_BTC, sats % SATS_PER_BTC)
 }
 
-/// Formats a signed satoshi delta as BTC, with an explicit sign for
-/// non-negative values (`+0.00010000` / `-0.00010000`).
-pub fn format_btc_signed(sats: i64) -> String {
-    let sign = if sats < 0 { "-" } else { "+" };
-    format!("{sign}{}", format_btc(sats.unsigned_abs()))
+/// A unix time as its civil date in UTC, `(year, month, day)`, by Howard
+/// Hinnant's `civil_from_days`: no calendar dependency.
+pub(crate) fn civil_date(unix: u64) -> (i64, u32, u32) {
+    let days = i64::try_from(unix / 86_400).unwrap_or(i64::MAX / 2);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month as u32, day as u32)
 }
 
 /// Groups the integer digits of a numeric string by thousands using
@@ -50,29 +63,6 @@ pub fn group_thousands(value: &str) -> String {
     grouped
 }
 
-/// Truncates an identifier (address, txid, descriptor) in the middle,
-/// keeping `head` characters at the start and `tail` at the end.
-///
-/// Both ends are what a user compares to detect a substitution by
-/// malware, so the ends are always preserved. Returns the input unchanged
-/// when truncation would not actually shorten it.
-pub fn truncate_middle(value: &str, head: usize, tail: usize) -> String {
-    const ELLIPSIS: &str = "...";
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() <= head + tail + ELLIPSIS.len() {
-        return value.to_owned();
-    }
-    let start: String = chars[..head].iter().collect();
-    let end: String = chars[chars.len() - tail..].iter().collect();
-    format!("{start}{ELLIPSIS}{end}")
-}
-
-/// Middle truncation with the design-system defaults for addresses
-/// (`bc1qxy...k9fz`).
-pub fn truncate_address(address: &str) -> String {
-    truncate_middle(address, 6, 4)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,11 +81,14 @@ mod tests {
     }
 
     #[test]
-    fn btc_signed() {
-        assert_eq!(format_btc_signed(-123_456), "-0.00123456");
-        assert_eq!(format_btc_signed(123_456), "+0.00123456");
-        assert_eq!(format_btc_signed(0), "+0.00000000");
-        assert_eq!(format_btc_signed(i64::MIN), "-92233720368.54775808");
+    fn civil_dates() {
+        assert_eq!(civil_date(0), (1970, 1, 1));
+        assert_eq!(civil_date(951_782_400), (2000, 2, 29));
+        assert_eq!(civil_date(1_756_150_867), (2025, 8, 25));
+        assert_eq!(civil_date(4_107_542_399), (2100, 2, 28));
+        // Past any clock: a date all the same, never a panic.
+        let (year, _, _) = civil_date(u64::MAX);
+        assert!(year > 9_999);
     }
 
     #[test]
@@ -108,18 +101,5 @@ mod tests {
             "1\u{202F}234\u{202F}567.00123456"
         );
         assert_eq!(group_thousands("-1234567"), "-1\u{202F}234\u{202F}567");
-    }
-
-    #[test]
-    fn truncation_keeps_both_ends() {
-        let address = "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh";
-        assert_eq!(truncate_address(address), "bc1qxy...0wlh");
-    }
-
-    #[test]
-    fn truncation_never_lengthens() {
-        assert_eq!(truncate_middle("short", 6, 4), "short");
-        assert_eq!(truncate_middle("exactlength13", 6, 4), "exactlength13");
-        assert_eq!(truncate_middle("", 6, 4), "");
     }
 }

@@ -95,6 +95,9 @@ pub struct WalletMeta {
     pub recognized_as: RecognizedKind,
     /// Unix timestamp, seconds.
     pub created_at: u64,
+    /// The gap limit of the settings, which every wallet shares: written
+    /// over from them whenever the wallet is read or synced, and kept
+    /// here for the vaults and the apps that read it.
     pub gap_limit: u32,
     /// Gap limit the last full scan actually used. When the setting is
     /// raised above it, the next sync is a full scan again: incremental

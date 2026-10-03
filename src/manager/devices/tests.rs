@@ -46,9 +46,11 @@ async fn scripted(answers: Vec<String>) -> (String, UnboundedReceiver<String>) {
 }
 
 /// A premium server that takes one request, hands it to the test, and
-/// gives `answer` only once the test lets it go.
+/// gives `answer` only once the test lets it go; then `after`, in
+/// order, one connection each, like [`scripted`].
 async fn held(
     answer: String,
+    after: Vec<String>,
 ) -> (
     String,
     UnboundedReceiver<String>,
@@ -66,6 +68,12 @@ async fn held(
         let _ = released.await;
         let _ = stream.write_all(answer.as_bytes()).await;
         let _ = stream.shutdown().await;
+        for answer in after {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = sender.send(read_request(&mut stream).await);
+            let _ = stream.write_all(answer.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
     });
     (format!("http://{address}"), seen, release)
 }
@@ -730,6 +738,96 @@ async fn logging_out_clears_the_account_even_when_the_server_is_away() {
     assert_eq!(reopened.premium_flush_logouts(&base_url).await.unwrap(), 0);
 }
 
+/// Logging out first tells the account about the wallets removed from
+/// this device, with the token they are owed under. What the server
+/// could not hear of, this device still waiting, stays queued past the
+/// log out: the same key entered again sends it with its new token,
+/// and another key drops it.
+#[tokio::test]
+async fn logging_out_keeps_the_removals_the_account_never_heard_of() {
+    let waiting = r#"{"error":"this device is waiting for approval: approve it on another of your devices, or wait until it gets full access","code":"device_pending","pending_until":1790864000}"#;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    let mut account = connected(PremiumState {
+        key: Some(KEY.to_owned()),
+        ..PremiumState::default()
+    });
+    account.queue_unwatch("w1");
+
+    let (base_url, mut seen) =
+        scripted(vec![answer("200 OK", "{}"), deleted_answer(THIS_DEVICE)]).await;
+    store_premium(&manager, account.clone()).await;
+    manager.premium_log_out(&base_url).await.unwrap();
+    let removal = seen.recv().await.unwrap();
+    assert!(
+        removal.starts_with("DELETE /v1/wallets/w1 HTTP/1.1"),
+        "{removal}"
+    );
+    assert_eq!(bearer(&removal), Some(TOKEN));
+    assert!(
+        seen.recv()
+            .await
+            .unwrap()
+            .starts_with("DELETE /v1/devices/me HTTP/1.1")
+    );
+    let stored = stored_premium(&manager).await;
+    assert!(stored.pending_unwatch.is_empty());
+    assert!(stored.pending_unwatch_account.is_none());
+
+    // The device still waits: the removal stays, past the log out.
+    let (base_url, mut seen) = scripted(vec![
+        answer("403 Forbidden", waiting),
+        deleted_answer(THIS_DEVICE),
+        connected_answer("full"),
+        licence_answer(fixtures::VALID_CERTIFICATE),
+    ])
+    .await;
+    store_premium(&manager, account.clone()).await;
+    manager.premium_log_out(&base_url).await.unwrap();
+    let stored = stored_premium(&manager).await;
+    assert_eq!(stored.key, None);
+    assert_eq!(stored.pending_unwatch, ["w1"]);
+    assert!(!format!("{:?}", stored.pending_unwatch_account).contains(KEY));
+    assert_eq!(manager.premium_state().await.pending_unwatch_account, None);
+
+    // The same key, entered again: the removal is still owed, and goes
+    // with the token the key earned this time.
+    manager
+        .premium_connect(&base_url, KEY, DevicePlatform::Linux)
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        seen.recv().await.unwrap();
+    }
+    assert_eq!(stored_premium(&manager).await.pending_unwatch, ["w1"]);
+    let (flushing, mut heard) = scripted(vec![answer("200 OK", "{}")]).await;
+    assert_eq!(manager.premium_flush_unwatch(&flushing).await.unwrap(), 0);
+    let removal = heard.recv().await.unwrap();
+    assert!(
+        removal.starts_with("DELETE /v1/wallets/w1 HTTP/1.1"),
+        "{removal}"
+    );
+    assert_eq!(bearer(&removal), Some(NEW_TOKEN));
+
+    // Another key: the removal is not that account's to hear.
+    let (base_url, _seen) = scripted(vec![
+        answer("403 Forbidden", waiting),
+        deleted_answer(THIS_DEVICE),
+        connected_answer("full"),
+        licence_answer(fixtures::VALID_CERTIFICATE),
+    ])
+    .await;
+    store_premium(&manager, account).await;
+    manager.premium_log_out(&base_url).await.unwrap();
+    manager
+        .premium_connect(&base_url, OTHER_KEY, DevicePlatform::Linux)
+        .await
+        .unwrap();
+    let stored = stored_premium(&manager).await;
+    assert!(stored.pending_unwatch.is_empty());
+    assert!(stored.pending_unwatch_account.is_none());
+}
+
 /// Tokens the server could not be told about leave one by one: a
 /// refusal keeps its token and goes on, a server gone stops the round.
 #[tokio::test]
@@ -1287,6 +1385,54 @@ async fn a_lost_connection_is_sent_again_as_it_was() {
     assert!(stored.has_device());
 }
 
+/// The server made the device, and the vault could not record it: the
+/// device stays, under the token the connection under way still holds,
+/// and nothing tells the server to drop it. Sent again once the vault
+/// writes, the same request finds the same device, the account's first
+/// one with its full access, rather than a new one that waits.
+#[tokio::test]
+async fn a_device_the_vault_could_not_record_is_kept_for_the_next_try() {
+    let (base_url, mut seen, release) = held(
+        connected_answer("full"),
+        vec![
+            connected_answer("full"),
+            licence_answer(fixtures::VALID_CERTIFICATE),
+        ],
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+
+    let connect = manager.premium_connect(&base_url, KEY, DevicePlatform::Linux);
+    tokio::pin!(connect);
+    let request = tokio::select! {
+        request = seen.recv() => request.unwrap(),
+        outcome = &mut connect => panic!("the connection ended before its answer: {outcome:?}"),
+    };
+    let (_, token) = connect_body(&request);
+    manager.state.lock().await.vault.fail_saves(true);
+    release.send(()).unwrap();
+    let failed = connect.await.unwrap_err();
+    assert!(matches!(failed, CoreError::Vault(_)), "{failed}");
+    assert!(seen.try_recv().is_err(), "the server was told nothing more");
+    let stored = stored_premium(&manager).await;
+    assert!(stored.connect_pending() && !stored.has_device());
+
+    manager.state.lock().await.vault.fail_saves(false);
+    let device = manager
+        .premium_ensure_device(&base_url, DevicePlatform::Linux)
+        .await
+        .unwrap()
+        .expect("connected");
+    assert_eq!(device.access, DeviceAccess::Full);
+    let replayed = seen.recv().await.unwrap();
+    assert_eq!(connect_body(&replayed).1, token);
+    seen.recv().await.unwrap();
+    let stored = stored_premium(&manager).await;
+    assert!(stored.has_device() && !stored.connect_pending());
+    assert!(stored.pending_logouts.is_empty());
+}
+
 /// A connection under way for one key is over when another key is
 /// entered: its token, which the server may have made a device of,
 /// waits to be dropped there, and the new key gets a token of its own.
@@ -1753,8 +1899,8 @@ async fn switching_accounts_tells_the_old_one_about_its_removals_first() {
 /// The removals queued for the server are the core's. A copy of the
 /// state read before this device moved to another account, handed back
 /// after, brings back none of the old account's: they would go to the
-/// new one, with its token. A yes a copy says for a wallet still drops
-/// that wallet's removal, since the server is to watch it again.
+/// new one, with its token. Nor does a yes the copy says for a wallet
+/// no longer on this device take back that wallet's removal.
 #[tokio::test]
 async fn a_stale_copy_cannot_bring_back_the_old_account_removals() {
     let (base_url, mut seen) = scripted(vec![
@@ -1799,8 +1945,10 @@ async fn a_stale_copy_cannot_bring_back_the_old_account_removals() {
     copy.queue_unwatch("w4");
     manager.set_premium_state(copy).await.unwrap();
     let stored = stored_premium(&manager).await;
-    assert_eq!(stored.pending_unwatch, ["w3"]);
-    assert_eq!(stored.consented_at("w2"), Some(200));
+    // A yes for a wallet gone from this device is a stale one: its
+    // removal stays.
+    assert_eq!(stored.pending_unwatch, ["w2", "w3"]);
+    assert_eq!(stored.consented_at("w2"), None);
 }
 
 /// A flush of removals answers for the account it spoke to. When this
@@ -1809,7 +1957,7 @@ async fn a_stale_copy_cannot_bring_back_the_old_account_removals() {
 /// among them: the old account's answer told the new one nothing.
 #[tokio::test]
 async fn a_flush_answers_for_the_account_it_spoke_to() {
-    let (base_url, mut seen, release) = held(answer("200 OK", "{}")).await;
+    let (base_url, mut seen, release) = held(answer("200 OK", "{}"), Vec::new()).await;
     let dir = tempfile::tempdir().unwrap();
     let manager = premium_manager(dir.path());
     let mut account = connected(PremiumState {
@@ -1849,14 +1997,13 @@ async fn a_flush_answers_for_the_account_it_spoke_to() {
 
 /// Whatever the server refuses a stored key with, and would refuse
 /// again, leaves the device disconnected, with the server's words when
-/// it gave some: a server from before devices, with no route for them,
-/// a request it will not take, a key it will not connect. The key is
-/// not sent again behind the user's back, with a new token each time.
+/// it gave some: a request it will not take, a key it will not connect.
+/// The key is not sent again behind the user's back, with a new token
+/// each time.
 #[tokio::test]
 async fn a_stored_key_refused_for_good_is_not_sent_again() {
     let platforms = "platform must be android, ios, windows, macos or linux";
     let (base_url, mut seen) = scripted(vec![
-        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
         answer("400 Bad Request", &format!(r#"{{"error":"{platforms}"}}"#)),
         answer(
             "403 Forbidden",
@@ -1868,10 +2015,6 @@ async fn a_stored_key_refused_for_good_is_not_sent_again() {
     let manager = premium_manager(dir.path());
 
     for (refusal, reason) in [
-        (
-            PremiumError::Rejected("HTTP 404".to_owned()),
-            Some("HTTP 404"),
-        ),
         (
             PremiumError::Rejected(platforms.to_owned()),
             Some(platforms),
@@ -1901,4 +2044,102 @@ async fn a_stored_key_refused_for_good_is_not_sent_again() {
         );
     }
     assert!(seen.try_recv().is_err(), "sent once each");
+}
+
+/// A 4xx with no word of the server's is what a proxy or a captive
+/// portal answers, and settles nothing: a connection under way and a
+/// key change under way are both kept, to be sent again as they were.
+#[tokio::test]
+async fn a_bare_status_settles_no_connection_and_no_key_change() {
+    const BARE: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let (base_url, mut seen) = scripted(vec![BARE.to_owned(), BARE.to_owned()]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    store_premium(&manager, old_vault()).await;
+
+    let refused = manager
+        .premium_ensure_device(&base_url, DevicePlatform::Linux)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        premium_error(refused),
+        PremiumError::UnexpectedResponse("HTTP 404".to_owned())
+    );
+    let (_, token) = connect_body(&seen.recv().await.unwrap());
+    let stored = stored_premium(&manager).await;
+    assert!(stored.connect_pending() && !stored.disconnected);
+    assert_eq!(stored.disconnected_reason, None);
+    assert!(
+        manager
+            .premium_ensure_device(&base_url, DevicePlatform::Linux)
+            .await
+            .is_err()
+    );
+    assert_eq!(connect_body(&seen.recv().await.unwrap()).1, token);
+
+    let (base_url, mut seen) = scripted(vec![BARE.to_owned()]).await;
+    store_premium(
+        &manager,
+        connected(PremiumState {
+            key: Some(KEY.to_owned()),
+            ..PremiumState::default()
+        }),
+    )
+    .await;
+    assert!(manager.premium_change_key(&base_url).await.is_err());
+    seen.recv().await.unwrap();
+    let stored = stored_premium(&manager).await;
+    assert!(stored.key_change_pending(), "the new key is kept");
+    assert_eq!(stored.key.as_deref(), Some(KEY));
+}
+
+/// A certificate is kept only over one issued before it: a refresh that
+/// answers late, after the one a key change made, brings back neither
+/// the old account nor its paid time.
+#[tokio::test]
+async fn a_late_certificate_does_not_replace_a_newer_one() {
+    let (base_url, _) = scripted(vec![
+        licence_answer(fixtures::VALID_CERTIFICATE),
+        licence_answer(fixtures::ACCOUNT_CERTIFICATE),
+        licence_answer(fixtures::ACCOUNT_CERTIFICATE),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    store_premium(
+        &manager,
+        connected(PremiumState {
+            key: Some(KEY.to_owned()),
+            certificate: Some(fixtures::ACCOUNT_CERTIFICATE.to_owned()),
+            ..PremiumState::default()
+        }),
+    )
+    .await;
+
+    // Issued a minute before the stored one: the stored one stays, and
+    // is what the caller gets.
+    let kept = manager.premium_refresh_licence(&base_url).await.unwrap();
+    assert_eq!(kept.certificate, fixtures::ACCOUNT_CERTIFICATE);
+    assert_eq!(
+        stored_premium(&manager).await.certificate.as_deref(),
+        Some(fixtures::ACCOUNT_CERTIFICATE)
+    );
+
+    // The same one again, and one over a certificate older than it.
+    manager.premium_refresh_licence(&base_url).await.unwrap();
+    store_premium(
+        &manager,
+        connected(PremiumState {
+            key: Some(KEY.to_owned()),
+            certificate: Some(fixtures::VALID_CERTIFICATE.to_owned()),
+            ..PremiumState::default()
+        }),
+    )
+    .await;
+    let fresh = manager.premium_refresh_licence(&base_url).await.unwrap();
+    assert_eq!(fresh.certificate, fixtures::ACCOUNT_CERTIFICATE);
+    assert_eq!(
+        stored_premium(&manager).await.certificate.as_deref(),
+        Some(fixtures::ACCOUNT_CERTIFICATE)
+    );
 }
