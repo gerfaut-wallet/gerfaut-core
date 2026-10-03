@@ -1088,9 +1088,7 @@ impl WalletManager {
                 (plan, views::known(engine), reach)
             };
 
-            let response = chain::sync_engine(endpoint, plan, proxy)
-                .await
-                .and_then(|synced| chain::check_amounts(&synced.update).map(|()| synced));
+            let response = chain::sync_engine(endpoint, plan, proxy).await;
             match response {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(synced) => {

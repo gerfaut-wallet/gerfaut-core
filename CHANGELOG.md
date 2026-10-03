@@ -307,9 +307,13 @@ The first release: the library both Gerfaut apps are built on.
 - A sync that brings a transaction worth more than 21 million bitcoin,
   which only a lying server can send for one still out of a block, is
   refused like a failed server, and the next one is tried. Stored, such a
-  transaction made every later look at the wallet crash the app. The
-  balance of a watched address saturates instead of wrapping around when
-  a server lists coins no one can hold.
+  transaction made every later look at the wallet crash the app. So is
+  one that spends the same coin twice, and an answer whose amounts,
+  added to what the wallet already holds, pass what the wallet's sums
+  can hold: thousands of invented unconfirmed payments, each within the
+  21 million, crashed the app the same way once added up into a balance.
+  The balance of a watched address saturates instead of wrapping around
+  when a server lists coins no one can hold.
 - The transaction preview reads the signature hash type of every
   signature it finds, and a signature made with `SIGHASH_NONE` or
   `SIGHASH_SINGLE` gets a warning of its own, `uncommitted_outputs`,

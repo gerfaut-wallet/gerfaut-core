@@ -437,6 +437,13 @@ pub(crate) fn held(
             .collect(),
         ..Held::default()
     };
+    held.sats = held
+        .txs
+        .values()
+        .flat_map(|tx| &tx.output)
+        .map(|out| out.value.to_sat())
+        .chain(graph.floating_txouts().map(|(_, out)| out.value.to_sat()))
+        .fold(0, u64::saturating_add);
     for wtx in wallet.transactions() {
         if let ChainPosition::Confirmed {
             anchor,

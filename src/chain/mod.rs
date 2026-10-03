@@ -392,6 +392,9 @@ pub(crate) struct Held {
     /// What the wallet holds for each script it revealed, and each
     /// script of the plan.
     pub scripts: HashMap<ScriptBuf, ScriptFacts>,
+    /// Every output of the graph's transactions and every coin it holds
+    /// alone, added up: see [`check_amounts`].
+    pub sats: u64,
 }
 
 impl Held {
@@ -444,36 +447,62 @@ pub(crate) struct Synced {
     pub orders: Vec<(ScriptBuf, Vec<(Txid, i32)>)>,
 }
 
-/// Refuses an update that holds an amount no transaction can carry: an
-/// output, or the outputs of one transaction together, above the 21
-/// million bitcoin there will ever be. Nothing in a block can, but an
+/// The most the transactions of one wallet may carry, every output of
+/// each of them and every coin of another they spend added up: past
+/// whatever a wallet ever sees, by millions of times, and short of what
+/// the sums the wallet engine makes, and the signed figures shown from
+/// them, can hold.
+const HELD_MAX_SATS: u64 = i64::MAX as u64;
+
+/// Refuses an update holding amounts no chain can carry: an output, or
+/// the outputs of one transaction together, above the 21 million bitcoin
+/// there will ever be; a transaction that spends one coin twice; or,
+/// with what the wallet holds (`held_sats`, see [`Held::sats`]), more
+/// than [`HELD_MAX_SATS`] in all. Nothing in a block can, but an
 /// unconfirmed transaction is only the server's word, and the wallet
-/// engine adds amounts up with a panic on overflow: once stored, such a
-/// transaction brought down every later look at the wallet.
-pub(crate) fn check_amounts(update: &bdk_wallet::Update) -> Result<(), String> {
+/// engine adds amounts up with a panic on overflow, across transactions
+/// for a balance and across the coins one spends: once stored, such an
+/// update brought down every later look at the wallet. Each amount it
+/// can add is one of those counted here, once, so none of its sums can
+/// pass the bound.
+pub(crate) fn check_amounts(update: &bdk_wallet::Update, held_sats: u64) -> Result<(), String> {
     let refused = || "the server sent a transaction worth more than every bitcoin".to_owned();
+    let max_money = bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat();
+    let mut total = held_sats;
     for tx in &update.tx_update.txs {
-        tx.output
+        let paid = tx
+            .output
             .iter()
             .try_fold(0u64, |sum, out| sum.checked_add(out.value.to_sat()))
-            .filter(|&total| total <= bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat())
+            .filter(|&paid| paid <= max_money)
             .ok_or_else(refused)?;
+        let mut spent = HashSet::with_capacity(tx.input.len());
+        if !tx
+            .input
+            .iter()
+            .all(|input| spent.insert(input.previous_output))
+        {
+            return Err("the server sent a transaction that spends one coin twice".to_owned());
+        }
+        total = total.saturating_add(paid);
     }
-    if update
-        .tx_update
-        .txouts
-        .values()
-        .any(|out| out.value > bdk_wallet::bitcoin::Amount::MAX_MONEY)
-    {
-        return Err(refused());
+    for out in update.tx_update.txouts.values() {
+        if out.value.to_sat() > max_money {
+            return Err(refused());
+        }
+        total = total.saturating_add(out.value.to_sat());
+    }
+    if total > HELD_MAX_SATS {
+        return Err("the server sent more bitcoin than a wallet can hold".to_owned());
     }
     Ok(())
 }
 
 /// Runs one sync attempt against one endpoint, within the deadline of
-/// a scan. The error is a plain string: the caller owns retry logic and
-/// error wrapping. Dropping the future abandons the attempt, an
-/// Electrum connection included.
+/// a scan, and refuses an answer whose amounts no chain can carry (see
+/// [`check_amounts`]). The error is a plain string: the caller owns
+/// retry logic and error wrapping. Dropping the future abandons the
+/// attempt, an Electrum connection included.
 ///
 /// `proxy`, here and below, is the Tor SOCKS proxy the caller resolved
 /// for this operation; `None` when no endpoint of the list is an onion.
@@ -483,7 +512,8 @@ pub(crate) async fn sync_engine(
     proxy: Option<&str>,
 ) -> Result<Synced, String> {
     let deadline = scan_deadline(endpoint);
-    match endpoint {
+    let held_sats = plan.held.sats;
+    let synced = match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client_for_run(url, proxy)?;
             within(deadline, esplora::sync::run(&client, plan))
@@ -494,7 +524,9 @@ pub(crate) async fn sync_engine(
                 })
         }
         Endpoint::Electrum(target) => electrum::sync(target, plan, proxy, deadline).await,
-    }
+    }?;
+    check_amounts(&synced.update, held_sats)?;
+    Ok(synced)
 }
 
 /// Fetches the state of a single watched address from one endpoint,
@@ -1092,14 +1124,81 @@ mod tests {
         let max = Amount::MAX_MONEY.to_sat();
         use bdk_wallet::bitcoin::hashes::Hash;
 
-        assert!(check_amounts(&full(vec![tx(&[max])], vec![max])).is_ok());
+        assert!(check_amounts(&full(vec![tx(&[max])], vec![max]), 0).is_ok());
         for update in [
             full(vec![tx(&[1 << 63, 1 << 63])], Vec::new()),
             full(vec![tx(&[max, 1])], Vec::new()),
             full(Vec::new(), vec![max + 1]),
         ] {
-            assert!(check_amounts(&update).is_err());
+            assert!(check_amounts(&update, 0).is_err());
         }
+    }
+
+    /// Each transaction within the bound, and thousands of them paying
+    /// every bitcoin there is, all unconfirmed: the wallet engine would
+    /// add them up into a balance and panic. Refused, whether the excess
+    /// comes from the answer alone or from the answer and what the wallet
+    /// holds already; so is a transaction spending one coin twice, whose
+    /// spent amount the engine adds up as many times.
+    #[test]
+    fn a_response_whose_sums_overflow_is_refused() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::{Amount, Sequence, TxIn, Witness, absolute, transaction};
+        use std::sync::Arc;
+        let max = Amount::MAX_MONEY;
+        let paying = |n: u32, inputs: Vec<OutPoint>| {
+            Arc::new(Transaction {
+                version: transaction::Version::TWO,
+                lock_time: absolute::LockTime::from_consensus(n),
+                input: inputs
+                    .into_iter()
+                    .map(|previous_output| TxIn {
+                        previous_output,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                        witness: Witness::new(),
+                    })
+                    .collect(),
+                output: vec![TxOut {
+                    value: max,
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            })
+        };
+        let flood = |count: u32| {
+            let mut update = bdk_wallet::Update::default();
+            update.tx_update.txs = (0..count).map(|n| paying(n, Vec::new())).collect();
+            update
+        };
+        assert!(check_amounts(&flood(9_000), 0).is_err());
+        assert!(check_amounts(&flood(10), 0).is_ok());
+        // Within the bound alone, past it with what the wallet holds.
+        assert!(check_amounts(&flood(10), HELD_MAX_SATS - max.to_sat()).is_err());
+        assert!(check_amounts(&flood(1), HELD_MAX_SATS - max.to_sat()).is_ok());
+        // The coins of others an answer brings count too.
+        let mut coins = bdk_wallet::Update::default();
+        coins.tx_update.txouts = (0..9_000u32)
+            .map(|vout| {
+                (
+                    OutPoint::new(Txid::from_byte_array([7; 32]), vout),
+                    TxOut {
+                        value: max,
+                        script_pubkey: ScriptBuf::new(),
+                    },
+                )
+            })
+            .collect();
+        assert!(check_amounts(&coins, 0).is_err());
+
+        let coin = OutPoint::new(Txid::from_byte_array([8; 32]), 0);
+        let mut twice = bdk_wallet::Update::default();
+        twice.tx_update.txs = vec![paying(0, vec![coin, coin])];
+        assert_eq!(
+            check_amounts(&twice, 0).unwrap_err(),
+            "the server sent a transaction that spends one coin twice"
+        );
+        twice.tx_update.txs = vec![paying(0, vec![coin, OutPoint { vout: 1, ..coin }])];
+        assert!(check_amounts(&twice, 0).is_ok());
     }
 
     /// A previous transaction is read only if it is the one asked for:
