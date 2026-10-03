@@ -229,9 +229,10 @@ The first release: the library both Gerfaut apps are built on.
   for its genesis block first, over Electrum and Esplora, and is refused
   by one of another network.
 - An OP_RETURN payload that holds a character changing the direction of
-  the text, a bidirectional mark, embedding, override or isolate, is no
-  longer read as text: shown as text, it could make an amount or an
-  address beside it read backwards. Its bytes are shown in hex instead.
+  the text, a bidirectional mark, embedding, override or isolate, or a
+  line or paragraph separator, is no longer read as text: shown as text,
+  it could make an amount or an address beside it read backwards, or push
+  it onto a line of its own. Its bytes are shown in hex instead.
 - A 401, 403, 404 or 410 from the premium server counts as its answer only
   when it comes in the server's own error body. The bare status is what a
   captive portal or a proxy answers, and it no longer makes the app forget
