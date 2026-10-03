@@ -48,6 +48,23 @@ const KDF_ARGON2ID: u8 = 1;
 /// and saved at every change, keeps the lighter one.
 const KDF_ARGON2ID_64M: u8 = 2;
 
+/// Memory in KiB and passes of the OWASP profile, `KDF_ARGON2ID`. The
+/// app lock hashes its secret under it too, and stores no profile
+/// beside the hash: like every profile here, it is fixed for good.
+pub(crate) const OWASP_COST: (u32, u32) = (19_456, 2);
+/// Memory in KiB and passes of the RFC 9106 profile, `KDF_ARGON2ID_64M`.
+const RFC_9106_COST: (u32, u32) = (65_536, 3);
+
+/// Argon2id at a profile's cost, one lane, 32 bytes out.
+pub(crate) fn argon2id((m_cost, t_cost): (u32, u32)) -> Result<Argon2<'static>, argon2::Error> {
+    let params = argon2::Params::new(m_cost, t_cost, 1, Some(32))?;
+    Ok(Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        params,
+    ))
+}
+
 /// Key material for the vault. Zeroized on drop.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub enum VaultKey {
@@ -76,14 +93,11 @@ impl VaultKey {
         match self {
             VaultKey::Raw(key) => Ok(Zeroizing::new(*key)),
             VaultKey::Password(password) => {
-                let (m_cost, t_cost) = match kdf {
-                    KDF_ARGON2ID_64M => (65_536, 3),
-                    _ => (19_456, 2),
+                let cost = match kdf {
+                    KDF_ARGON2ID_64M => RFC_9106_COST,
+                    _ => OWASP_COST,
                 };
-                let params = argon2::Params::new(m_cost, t_cost, 1, Some(32))
-                    .map_err(|e| VaultError::Kdf(e.to_string()))?;
-                let argon =
-                    Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+                let argon = argon2id(cost).map_err(|e| VaultError::Kdf(e.to_string()))?;
                 let mut out = Zeroizing::new([0u8; 32]);
                 argon
                     .hash_password_into(password.as_bytes(), salt, &mut out[..])

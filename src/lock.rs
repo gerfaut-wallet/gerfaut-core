@@ -14,13 +14,13 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use argon2::Argon2;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
 use crate::error::{CoreError, CoreResult};
+use crate::store::cipher;
 
 /// What kind of secret unlocks the app. Kept next to the hash so the
 /// unlock screen knows which keyboard to show.
@@ -315,9 +315,8 @@ pub fn verify_secret(secret: &str, stored: &LockSecret) -> bool {
 }
 
 fn derive(secret: &str, salt: &[u8]) -> CoreResult<[u8; 32]> {
-    let params = argon2::Params::new(19_456, 2, 1, Some(32))
+    let argon = cipher::argon2id(cipher::OWASP_COST)
         .map_err(|e| CoreError::Internal(format!("argon2 parameters: {e}")))?;
-    let argon = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut out = [0u8; 32];
     argon
         .hash_password_into(secret.as_bytes(), salt, &mut out)
@@ -349,6 +348,19 @@ mod tests {
         assert!(verify_secret("123456", &stored));
         assert!(!verify_secret("123457", &stored));
         assert!(!verify_secret("", &stored));
+    }
+
+    /// A stored hash names no profile: the one it was made under must
+    /// never move, whatever the vault's profiles do.
+    #[test]
+    fn a_stored_hash_keeps_matching() {
+        let stored = LockSecret {
+            salt: "00112233445566778899aabbccddeeff".to_owned(),
+            hash: "c13a995629afb54a46a6463d6d828616abf2229ce42a7972afcef4235c4d310b".to_owned(),
+        };
+        let derived = derive("1234", &unhex(&stored.salt).unwrap()).unwrap();
+        assert_eq!(hex(&derived), stored.hash);
+        assert!(verify_secret("1234", &stored));
     }
 
     #[test]
