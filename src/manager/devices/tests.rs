@@ -730,6 +730,96 @@ async fn logging_out_clears_the_account_even_when_the_server_is_away() {
     assert_eq!(reopened.premium_flush_logouts(&base_url).await.unwrap(), 0);
 }
 
+/// Logging out first tells the account about the wallets removed from
+/// this device, with the token they are owed under. What the server
+/// could not hear of, this device still waiting, stays queued past the
+/// log out: the same key entered again sends it with its new token,
+/// and another key drops it.
+#[tokio::test]
+async fn logging_out_keeps_the_removals_the_account_never_heard_of() {
+    let waiting = r#"{"error":"this device is waiting for approval: approve it on another of your devices, or wait until it gets full access","code":"device_pending","pending_until":1790864000}"#;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = premium_manager(dir.path());
+    let mut account = connected(PremiumState {
+        key: Some(KEY.to_owned()),
+        ..PremiumState::default()
+    });
+    account.queue_unwatch("w1");
+
+    let (base_url, mut seen) =
+        scripted(vec![answer("200 OK", "{}"), deleted_answer(THIS_DEVICE)]).await;
+    store_premium(&manager, account.clone()).await;
+    manager.premium_log_out(&base_url).await.unwrap();
+    let removal = seen.recv().await.unwrap();
+    assert!(
+        removal.starts_with("DELETE /v1/wallets/w1 HTTP/1.1"),
+        "{removal}"
+    );
+    assert_eq!(bearer(&removal), Some(TOKEN));
+    assert!(
+        seen.recv()
+            .await
+            .unwrap()
+            .starts_with("DELETE /v1/devices/me HTTP/1.1")
+    );
+    let stored = stored_premium(&manager).await;
+    assert!(stored.pending_unwatch.is_empty());
+    assert!(stored.pending_unwatch_account.is_none());
+
+    // The device still waits: the removal stays, past the log out.
+    let (base_url, mut seen) = scripted(vec![
+        answer("403 Forbidden", waiting),
+        deleted_answer(THIS_DEVICE),
+        connected_answer("full"),
+        licence_answer(fixtures::VALID_CERTIFICATE),
+    ])
+    .await;
+    store_premium(&manager, account.clone()).await;
+    manager.premium_log_out(&base_url).await.unwrap();
+    let stored = stored_premium(&manager).await;
+    assert_eq!(stored.key, None);
+    assert_eq!(stored.pending_unwatch, ["w1"]);
+    assert!(!format!("{:?}", stored.pending_unwatch_account).contains(KEY));
+    assert_eq!(manager.premium_state().await.pending_unwatch_account, None);
+
+    // The same key, entered again: the removal is still owed, and goes
+    // with the token the key earned this time.
+    manager
+        .premium_connect(&base_url, KEY, DevicePlatform::Linux)
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        seen.recv().await.unwrap();
+    }
+    assert_eq!(stored_premium(&manager).await.pending_unwatch, ["w1"]);
+    let (flushing, mut heard) = scripted(vec![answer("200 OK", "{}")]).await;
+    assert_eq!(manager.premium_flush_unwatch(&flushing).await.unwrap(), 0);
+    let removal = heard.recv().await.unwrap();
+    assert!(
+        removal.starts_with("DELETE /v1/wallets/w1 HTTP/1.1"),
+        "{removal}"
+    );
+    assert_eq!(bearer(&removal), Some(NEW_TOKEN));
+
+    // Another key: the removal is not that account's to hear.
+    let (base_url, _seen) = scripted(vec![
+        answer("403 Forbidden", waiting),
+        deleted_answer(THIS_DEVICE),
+        connected_answer("full"),
+        licence_answer(fixtures::VALID_CERTIFICATE),
+    ])
+    .await;
+    store_premium(&manager, account).await;
+    manager.premium_log_out(&base_url).await.unwrap();
+    manager
+        .premium_connect(&base_url, OTHER_KEY, DevicePlatform::Linux)
+        .await
+        .unwrap();
+    let stored = stored_premium(&manager).await;
+    assert!(stored.pending_unwatch.is_empty());
+    assert!(stored.pending_unwatch_account.is_none());
+}
+
 /// Tokens the server could not be told about leave one by one: a
 /// refusal keeps its token and goes on, a server gone stops the round.
 #[tokio::test]

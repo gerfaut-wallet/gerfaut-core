@@ -190,20 +190,36 @@ impl WalletManager {
     /// waits, never shown, for [`Self::premium_flush_logouts`]. What
     /// "Forget this key" did, and the server now hears of it.
     ///
+    /// The wallets removed from this device go first, with the token
+    /// they are owed under, as when moving to another account. Those
+    /// the server could not hear of, out of reach or this device still
+    /// waiting, stay queued: the same key entered again sends them.
+    ///
     /// A key change that did not finish is refused,
     /// [`PremiumError::KeyChangePending`], while this device could still
     /// finish it: the new key may already be the account's, and this
     /// vault would be the last place that holds it.
     pub async fn premium_log_out(&self, base_url: &str) -> CoreResult<()> {
         let _change = self.premium_changes.lock().await;
-        let token = {
+        let (token, owes_removals) = {
             let state = self.state.lock().await;
             let premium = &state.payload.settings.premium;
             if premium.key_change_pending() && premium.has_device() {
                 return Err(PremiumError::KeyChangePending.into());
             }
-            premium.device.as_ref().map(|d| d.token().to_owned())
+            (
+                premium.device.as_ref().map(|d| d.token().to_owned()),
+                !premium.pending_unwatch.is_empty(),
+            )
         };
+        if token.is_some()
+            && owes_removals
+            && let Err(error) = self.premium_flush_unwatch(base_url).await
+        {
+            log::warn!(
+                "the premium account could not be told about every removed wallet before logging out: {error}"
+            );
+        }
         let told = match &token {
             Some(token) => self.revoke(base_url, token).await.is_ok(),
             None => true,
@@ -513,9 +529,13 @@ impl WalletManager {
             let premium = &mut payload.settings.premium;
             let mut dropped = 0;
             if !same_key(premium.key.as_deref(), Some(&key)) {
-                // Another account: nothing this device knew of the last
-                // one holds for this one.
-                dropped = std::mem::take(&mut premium.pending_unwatch).len();
+                // Another account than the stored one: its certificate,
+                // its checklist and what was announced of its devices
+                // do not hold for this one, nor do its removals, unless
+                // a log out left them owed to this very key.
+                if !premium.unwatch_owed_to(&key) {
+                    dropped = std::mem::take(&mut premium.pending_unwatch).len();
+                }
                 premium.certificate = None;
                 premium.key_saved = false;
                 premium.checklist_hidden = false;
@@ -538,6 +558,7 @@ impl WalletManager {
                 premium.pending_connect = None;
             }
             premium.key = Some(key.clone());
+            premium.pending_unwatch_account = None;
             premium.disconnected = false;
             premium.disconnected_reason = None;
             premium.acknowledged_offline_until = None;

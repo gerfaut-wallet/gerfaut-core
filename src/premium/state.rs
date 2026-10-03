@@ -60,6 +60,13 @@ pub struct PremiumState {
     /// them drops its removal.
     #[serde(default)]
     pub pending_unwatch: Vec<String>,
+    /// The account the removals above are owed to, once its key left
+    /// the vault with a log out: a SHA-256 digest of the key, never the
+    /// key itself. Entered again, the same key takes them back up;
+    /// another key drops them. Blanked in the copy the apps get. The
+    /// core alone writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_unwatch_account: Option<String>,
     /// This device's connection to the account: its id, its token, when
     /// it connected. `None` until the key connects it, and again once
     /// the server disowned it. The core alone writes it.
@@ -215,12 +222,19 @@ impl PremiumState {
     /// This device leaves the account: the key, its connection, its
     /// certificate and what the screens remembered about it go. The
     /// consents stay, so the same key entered again asks nothing twice,
-    /// and so do the removals the server has yet to hear of. The token
-    /// of a connection sent and not answered joins the ones the server
-    /// is still to be told about: it may have made a device of it.
+    /// and so do the removals the server has yet to hear of, marked
+    /// with the account they are owed to: the same key entered again
+    /// sends them, another drops them. The token of a connection sent
+    /// and not answered joins the ones the server is still to be told
+    /// about: it may have made a device of it.
     pub(crate) fn forget_account(&mut self) {
         if let Some(pending) = self.pending_connect.take() {
             self.queue_logout(pending.token());
+        }
+        if self.pending_unwatch.is_empty() {
+            self.pending_unwatch_account = None;
+        } else if let Some(key) = &self.key {
+            self.pending_unwatch_account = Some(account_digest(key));
         }
         self.key = None;
         self.certificate = None;
@@ -232,6 +246,13 @@ impl PremiumState {
         self.checklist_hidden = false;
         self.announced_devices.clear();
         self.pending_key = None;
+    }
+
+    /// Whether the removals queued after a log out are owed to the
+    /// account of `key`, now entered again.
+    pub(crate) fn unwatch_owed_to(&self, key: &str) -> bool {
+        self.key.is_none()
+            && self.pending_unwatch_account.as_deref() == Some(account_digest(key).as_str())
     }
 
     /// Records the waiting devices a notification has announced.
@@ -262,6 +283,7 @@ impl PremiumState {
         self.pending_connect = self.pending_connect.as_ref().map(PendingConnect::redacted);
         self.pending_key = self.pending_key.as_ref().map(Secret::redacted);
         self.pending_logouts = self.pending_logouts.iter().map(Secret::redacted).collect();
+        self.pending_unwatch_account = None;
     }
 
     /// `offered` as an app hands it back, with what the core alone
@@ -286,6 +308,19 @@ impl PremiumState {
         pending_unwatch.retain(|id| !watched.iter().any(|w| &w.wallet_id == id));
         taken
     }
+}
+
+/// What names an account whose key left the vault: SHA-256 of the key,
+/// normalized, under a label of its own. A key is eighty random bits,
+/// out of reach of a guess, and the digest is good for nothing else.
+fn account_digest(key: &str) -> String {
+    let mut message = b"gerfaut premium account ".to_vec();
+    message.extend_from_slice(super::licence::normalize_key(key).as_bytes());
+    ring::digest::digest(&ring::digest::SHA256, &message)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -357,10 +392,26 @@ mod tests {
         state.consent("w1", 100);
         state.queue_unwatch("w2");
         state.forget_account();
-        let mut expected = PremiumState::default();
+        let mut expected = PremiumState {
+            pending_unwatch_account: state.pending_unwatch_account.clone(),
+            ..PremiumState::default()
+        };
         expected.consent("w1", 100);
         expected.queue_unwatch("w2");
         assert_eq!(state, expected);
+
+        // The removals are owed to the key they were queued under, which
+        // left the vault: entered again, that key takes them back up.
+        let digest = state.pending_unwatch_account.as_deref().unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(!digest.contains("abcdefghijkmnpqr"));
+        assert!(state.unwatch_owed_to("ABCD-EFGH-IJKM-NPQR"));
+        assert!(!state.unwatch_owed_to("wxyz23456789abcd"));
+
+        // Nothing queued, nothing owed.
+        let mut empty = connected();
+        empty.forget_account();
+        assert_eq!(empty, PremiumState::default());
     }
 
     #[test]
@@ -456,6 +507,7 @@ mod tests {
             }],
             acknowledged_offline_until: Some(500),
             pending_unwatch: Vec::new(),
+            pending_unwatch_account: None,
             device: Some(DeviceCredential::new("d1".to_owned(), TOKEN.to_owned(), 7)),
             disconnected: false,
             disconnected_reason: None,
