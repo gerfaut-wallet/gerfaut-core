@@ -299,9 +299,9 @@ pub struct Channel {
 }
 
 /// A sentence of the server's that the screen shows as it came, held to
-/// what [`shown_words`] keeps.
+/// what [`crate::chain::server_words`] keeps.
 fn one_line<'de, D: serde::Deserializer<'de>>(words: D) -> Result<Option<String>, D::Error> {
-    Ok(Option::<String>::deserialize(words)?.map(|words| shown_words(&words)))
+    Ok(Option::<String>::deserialize(words)?.map(|words| crate::chain::server_words(&words)))
 }
 
 /// What happened to a watched wallet. A kind this build does not know
@@ -371,7 +371,10 @@ impl ErrorBody {
     fn read(body: &[u8]) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_slice(body).ok()?;
         Some(ErrorBody {
-            error: shown_words(value.get("error")?.as_str()?),
+            // One short line, as any server's words: the body may run to
+            // `MAX_BODY`, and a refusal of the connection is kept in the
+            // vault, which is rewritten whole at every save.
+            error: crate::chain::server_words(value.get("error")?.as_str()?),
             code: value
                 .get("code")
                 .and_then(serde_json::Value::as_str)
@@ -381,26 +384,6 @@ impl ErrorBody {
                 .and_then(serde_json::Value::as_i64),
         })
     }
-}
-
-/// Most characters of the server's sentence kept, as for the words of
-/// a node: one short line on screen.
-const WORDS_MAX: usize = 200;
-
-/// The server's sentence as the screen shows it and the vault keeps it
-/// (a refusal of the connection is stored to say why): its first 200
-/// characters, an ellipsis after, control characters and those that
-/// turn the text around dropped. The body it comes in may run to
-/// [`MAX_BODY`], and the vault is rewritten whole at every save.
-fn shown_words(text: &str) -> String {
-    let mut kept = text
-        .chars()
-        .filter(|c| !c.is_control() && !crate::wallet::tx_extras::is_bidi_control(*c));
-    let mut words: String = kept.by_ref().take(WORDS_MAX).collect();
-    if kept.next().is_some() {
-        words.push('\u{2026}');
-    }
-    words
 }
 
 #[derive(Deserialize)]
@@ -1807,7 +1790,7 @@ mod tests {
         assert_eq!(channels[2].last_sent_at, None);
         let reason = channels[2].last_failure.as_deref().unwrap();
         assert!(reason.starts_with("the channel answered 403x"), "{reason}");
-        assert_eq!(reason.chars().count(), WORDS_MAX + 1);
+        assert_eq!(reason.chars().count(), crate::chain::SERVER_WORDS_MAX + 1);
 
         // The apps get the same names, `null` for what is not there.
         let view = serde_json::to_value(&channels[1]).unwrap();
@@ -2563,7 +2546,7 @@ mod tests {
         else {
             panic!("a refusal in the server's words");
         };
-        assert_eq!(words.chars().count(), WORDS_MAX + 1);
+        assert_eq!(words.chars().count(), crate::chain::SERVER_WORDS_MAX + 1);
         assert!(words.starts_with("firstline reversed x"), "{words}");
         assert!(words.ends_with('\u{2026}'));
         assert_eq!(

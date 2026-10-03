@@ -159,7 +159,7 @@ pub(crate) fn net_sats(received: u64, spent: u64) -> i64 {
 }
 
 /// The longest a server's words are shown, in characters.
-const SERVER_WORDS_MAX: usize = 200;
+pub(crate) const SERVER_WORDS_MAX: usize = 200;
 
 /// What a server wrote, a refusal or an error, kept to what a screen may
 /// show it as: one line of 200 characters at most, an ellipsis past them,
