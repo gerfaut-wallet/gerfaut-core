@@ -577,6 +577,22 @@ pub(crate) fn recheck(
     Recheck { held, reread }
 }
 
+/// The scripts of the wallet the transactions `txids` touch, in hex:
+/// what a sync reads to look for them again.
+pub(crate) fn scripts_touched_by(wallet: &bdk_wallet::Wallet, txids: &[String]) -> Vec<String> {
+    let mut scripts = std::collections::BTreeSet::new();
+    for txid in txids {
+        if let Some(tx) = txid
+            .parse::<Txid>()
+            .ok()
+            .and_then(|txid| wallet.tx_graph().get_tx(txid))
+        {
+            scripts.extend(touched(wallet, &tx).map(|script| script.to_hex_string()));
+        }
+    }
+    scripts.into_iter().collect()
+}
+
 /// The same for a watched address, from the state a sync read. A sync
 /// reads its one script whole, unless the page of its unconfirmed
 /// transactions came back full: see [`address_moves`].

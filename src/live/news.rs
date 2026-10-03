@@ -486,6 +486,18 @@ pub(crate) fn vanishing(payload: &VaultPayload, wallet_id: &str) -> Vec<String> 
         .collect()
 }
 
+/// Those whose second look is due at `now`: [`DROPPED_AFTER`] or more
+/// since a sync first missed them.
+pub(crate) fn vanishing_due(payload: &VaultPayload, wallet_id: &str, now: u64) -> Vec<String> {
+    payload
+        .vanishing
+        .iter()
+        .filter(|entry| entry.wallet_id == wallet_id)
+        .filter(|entry| now >= entry.missed_at.saturating_add(DROPPED_AFTER))
+        .map(|entry| entry.txid.clone())
+        .collect()
+}
+
 /// What a sync of a wallet found of the payments earlier syncs saw
 /// vanish, by txid: the ones the wallet holds again, and the ones whose
 /// scripts it read again without seeing them.

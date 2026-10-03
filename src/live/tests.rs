@@ -1233,6 +1233,27 @@ async fn a_payment_one_sync_misses_is_not_announced_as_dropped() {
     assert!(sync_and_claim(&manager, &wallet).await.is_empty());
 }
 
+/// While the watch runs, a payment a sync saw vanish is looked at again
+/// ten minutes on, and said dropped then: nothing moves on its scripts
+/// after it left, and the next sync that reads them may be a day away.
+#[tokio::test]
+async fn the_watch_looks_again_at_a_payment_that_vanished() {
+    let server = FakeMempool::start(false, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = paid(&server, dir.path()).await;
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    assert!(caught_up(&mut events, &wallet).await.is_empty());
+    server.state.lock().unwrap().address_txs = Vec::new();
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    ten_minutes_on(&manager).await;
+    let dropped = next_announcement(&mut events).await;
+    assert_eq!(
+        (dropped.txid.as_str(), dropped.stage),
+        (txid(0x11).as_str(), TxStage::Dropped)
+    );
+    manager.live_stop().await;
+}
+
 /// The sender replaces the payment with one that leaves the address a
 /// single sat: no fee bump. The replacement is announced for what it
 /// pays, and the payment announced first as dropped.
@@ -1370,6 +1391,11 @@ fn a_descriptor_wallet_tells_replacements_and_vanished_payments() {
         engine.apply_evicted_txs([(second.compute_txid(), 500)]);
     });
     assert!(claimed.is_empty(), "one sync says nothing yet");
+    // What the watch reads to look for it again: the script it paid.
+    assert_eq!(
+        views::scripts_touched_by(&engine, &[second.compute_txid().to_string()]),
+        [ours.as_str()]
+    );
     // Ten minutes on, a sync that read other scripts says nothing either;
     // one that read the payment's says it dropped.
     let later = NOW + news::DROPPED_AFTER;

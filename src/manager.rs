@@ -2576,6 +2576,27 @@ pub(crate) fn watched_wallet(
     })
 }
 
+/// The scripts a sync reads to look again for the payments of a wallet
+/// earlier syncs saw vanish, those whose second look is due at `now`:
+/// `None` when none is, empty for a watched address, whose sync reads
+/// its one script whatever it is asked.
+pub(crate) fn vanished_scripts(
+    state: &mut ManagerState,
+    id: &str,
+    now: u64,
+) -> Option<Vec<String>> {
+    let due = crate::live::news::vanishing_due(&state.payload, id, now);
+    if due.is_empty() {
+        return None;
+    }
+    let record = find_record(&state.payload, id).ok()?;
+    if matches!(record.meta.kind, WalletKind::SingleAddress { .. }) {
+        return Some(Vec::new());
+    }
+    let engine = ensure_engine(state, id).ok()?;
+    Some(views::scripts_touched_by(engine, &due)).filter(|scripts| !scripts.is_empty())
+}
+
 fn find_record<'a>(payload: &'a VaultPayload, id: &str) -> CoreResult<&'a WalletRecord> {
     payload
         .wallets

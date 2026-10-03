@@ -281,7 +281,9 @@ The first release: the library both Gerfaut apps are built on.
   did not read its scripts says nothing of it; a replacement that cuts
   the payment down is still said at once. The vault keeps what this
   needs only while such a payment waits, so a vault written before reads
-  and writes the same.
+  and writes the same. While the live watch runs, it reads the scripts
+  of such a payment again itself ten minutes on, nothing moving on them
+  once it left.
 - A watched address is never read from a server of another network.
   Testnet, testnet4 and signet spell an address alike, and a server of
   the wrong one answered for it with transactions the wallet's network
