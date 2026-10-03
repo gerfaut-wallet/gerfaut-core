@@ -62,6 +62,8 @@ fn wallet(id: &str, scripts: &[u8], lookahead: &[u8], has_pending: bool) -> Watc
             })
             .collect(),
         has_pending,
+        pinned: false,
+        holds_coins: false,
     }
 }
 
@@ -786,6 +788,8 @@ fn wallets_the_whole_list_cut_short_are_caught_up_whole() {
                 })
                 .collect(),
             has_pending: false,
+            pinned: false,
+            holds_coins: false,
         })
         .collect();
     wallets.insert(0, wallet("small", &[1, 2, 3], &[], false));
@@ -836,7 +840,106 @@ fn numbered(id: &str, first: u32, count: u32) -> WatchedWallet {
             })
             .collect(),
         has_pending: false,
+        pinned: false,
+        holds_coins: false,
     }
+}
+
+/// The same, pinned or holding coins as said.
+fn flagged(id: &str, first: u32, count: u32, pinned: bool, holds_coins: bool) -> WatchedWallet {
+    WatchedWallet {
+        pinned,
+        holds_coins,
+        ..numbered(id, first, count)
+    }
+}
+
+/// The wallet of each script of the list, in its order: the first that
+/// lists it.
+fn first_owners(watched: &Watched) -> Vec<usize> {
+    watched
+        .entries
+        .iter()
+        .map(|entry| entry.owners[0])
+        .collect()
+}
+
+/// The wallets the user pinned come first, rank by rank among
+/// themselves and up to what a watch takes of one wallet, whatever the
+/// others hold. Pinned past the cap on the whole list, they leave the
+/// others nothing.
+#[test]
+fn pinned_wallets_are_watched_first() {
+    let wallets = || {
+        vec![
+            flagged("funded", 0, 10, false, true),
+            flagged("pinned", 100, 10, true, false),
+            flagged("also pinned", 200, 10, true, false),
+        ]
+    };
+    let roomy = WatchLimits {
+        per_wallet: 20,
+        total: 25,
+    };
+    let watched = Watched::new(wallets(), roomy);
+    let owners = first_owners(&watched);
+    assert_eq!(owners[..4], [1, 2, 1, 2]);
+    assert!(owners[..20].iter().all(|&owner| owner != 0));
+    assert_eq!(owners[20..], [0; 5]);
+    assert_eq!(watched.capped, vec!["funded".to_owned()]);
+
+    let tight = WatchLimits {
+        per_wallet: 20,
+        total: 15,
+    };
+    let watched = Watched::new(wallets(), tight);
+    let owners = first_owners(&watched);
+    assert_eq!(owners.len(), 15);
+    assert!(!owners.contains(&0));
+    assert_eq!(watched.capped.len(), 3);
+}
+
+/// Among the wallets nobody pinned, at each rank one that holds coins
+/// goes first, and the order of the list holds otherwise: when the cap
+/// cuts a rank short, an empty wallet loses its script before a funded
+/// one does.
+#[test]
+fn wallets_holding_coins_go_first_at_each_rank() {
+    let wallets = vec![
+        flagged("empty", 0, 10, false, false),
+        flagged("funded", 100, 10, false, true),
+        flagged("also empty", 200, 10, false, false),
+    ];
+    let limits = WatchLimits {
+        per_wallet: 20,
+        total: 25,
+    };
+    let watched = Watched::new(wallets, limits);
+    let owners = first_owners(&watched);
+    assert_eq!(owners[..6], [1, 0, 2, 1, 0, 2]);
+    let kept = |owner| owners.iter().filter(|&&listed| listed == owner).count();
+    assert_eq!((kept(0), kept(1), kept(2)), (8, 9, 8));
+}
+
+/// A script two wallets list is one subscription heard for both, the
+/// pinned one and the other, even once the list is full.
+#[test]
+fn a_shared_script_is_heard_for_every_wallet_that_lists_it() {
+    let shared = numbered("", 3, 1).scripts.remove(0);
+    let own = numbered("", 600, 1).scripts.remove(0);
+    let other = WatchedWallet {
+        scripts: vec![shared.clone(), own.clone()],
+        ..flagged("other", 0, 0, false, true)
+    };
+    let limits = WatchLimits {
+        per_wallet: 20,
+        total: 10,
+    };
+    let watched = Watched::new(vec![other, flagged("pinned", 0, 10, true, false)], limits);
+    assert_eq!(watched.entries.len(), 10);
+    assert_eq!(watched.by_hex(&shared.script).unwrap().owners, [1, 0]);
+    assert!(watched.by_hex(&own.script).is_none());
+    assert_eq!(watched.capped, vec!["other".to_owned()]);
 }
 
 /// On the user's own node a watch takes ten times as many scripts in
@@ -1038,6 +1141,8 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
                 counts: None,
             }],
             has_pending: false,
+            pinned: false,
+            holds_coins: false,
         }]
     );
     manager.sync_wallet(&wallet.id).await.unwrap();
@@ -1366,6 +1471,8 @@ async fn live_the_three_transports_see_signet_move() {
             })
             .collect(),
         has_pending: true,
+        pinned: false,
+        holds_coins: false,
     }];
     // The Electrum server may sign its own certificate: accepted here
     // the way the settings screen does it, by its fingerprint.

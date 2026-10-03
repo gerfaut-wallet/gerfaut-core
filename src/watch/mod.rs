@@ -199,6 +199,15 @@ pub struct WatchedWallet {
     /// The wallet holds an unconfirmed transaction, so a new block is
     /// worth a sync on a transport that does not push confirmations.
     pub has_pending: bool,
+    /// The user asked for this wallet to be watched before any other:
+    /// its scripts come first, up to what a watch takes of one wallet.
+    #[serde(default)]
+    pub pinned: bool,
+    /// The wallet holds a coin, confirmed or not. When the scripts are
+    /// shared out, its script of each rank goes before an empty
+    /// wallet's.
+    #[serde(default)]
+    pub holds_coins: bool,
 }
 
 /// Why a wallet is reported. Reasons heard together are kept as the
@@ -518,9 +527,16 @@ pub(crate) struct Entry {
     pub counts: Vec<Option<poll::Fingerprint>>,
 }
 
-/// The list in the order transports cover it: the first script of
-/// every wallet, then the second of each, and so on, so that a
-/// transport that covers ten scripts covers the head of every wallet.
+/// The list in the order transports cover it, a transport that covers
+/// ten scripts covering its head. The scripts are taken rank by rank:
+/// the first script of every wallet, then the second of each, and so
+/// on, so the head of every wallet comes before the tail of any. The
+/// wallets the user pinned come first, rank by rank among themselves,
+/// up to what a watch takes of one wallet. The others follow, and at
+/// each rank a wallet that holds coins goes before an empty one, in the
+/// order of the list otherwise. Past the cap on the whole list, a script
+/// is left out, pinned or not, unless a wallet already in the list
+/// shares it: then it is heard for both.
 #[derive(Debug, Default)]
 pub(crate) struct Watched {
     pub wallets: Vec<(String, bool)>,
@@ -545,58 +561,66 @@ impl Watched {
         };
         // How many scripts of each wallet made it into the list.
         let mut kept = vec![0usize; wallets.len()];
-        let longest = wallets
-            .iter()
-            .map(|wallet| wallet.scripts.len().min(limits.per_wallet))
-            .max()
-            .unwrap_or(0);
-        'ranks: for rank in 0..longest {
-            for (owner, wallet) in wallets.iter().enumerate() {
-                let Some(listed) = wallet.scripts.get(rank) else {
-                    continue;
-                };
-                if listed.script.len() > 2 * MAX_SCRIPT_BYTES || listed.script.is_empty() {
-                    continue;
-                }
-                let Ok(script) = ScriptBuf::from_hex(&listed.script) else {
-                    continue;
-                };
-                let hex = listed.script.to_ascii_lowercase();
-                let status = listed
-                    .status
-                    .as_deref()
-                    .map(|status| status.chars().take(64).collect::<String>());
-                if let Some(&index) = watched.by_hex.get(&hex) {
-                    let entry = &mut watched.entries[index];
-                    if !entry.owners.contains(&owner) {
-                        entry.owners.push(owner);
-                        entry.statuses.push(status);
-                        entry.counts.push(listed.counts);
+        let (pinned, mut others): (Vec<usize>, Vec<usize>) =
+            (0..wallets.len()).partition(|&owner| wallets[owner].pinned);
+        // A stable sort: the list keeps its order within each side.
+        others.sort_by_key(|&owner| !wallets[owner].holds_coins);
+        for group in [pinned, others] {
+            let longest = group
+                .iter()
+                .map(|&owner| wallets[owner].scripts.len().min(limits.per_wallet))
+                .max()
+                .unwrap_or(0);
+            for rank in 0..longest {
+                for &owner in &group {
+                    let Some(listed) = wallets[owner].scripts.get(rank) else {
+                        continue;
+                    };
+                    if listed.script.len() > 2 * MAX_SCRIPT_BYTES || listed.script.is_empty() {
+                        continue;
                     }
-                    entry.lookahead &= listed.lookahead;
+                    let hex = listed.script.to_ascii_lowercase();
+                    let status = || {
+                        listed
+                            .status
+                            .as_deref()
+                            .map(|status| status.chars().take(64).collect::<String>())
+                    };
+                    if let Some(&index) = watched.by_hex.get(&hex) {
+                        let entry = &mut watched.entries[index];
+                        if !entry.owners.contains(&owner) {
+                            entry.owners.push(owner);
+                            entry.statuses.push(status());
+                            entry.counts.push(listed.counts);
+                        }
+                        entry.lookahead &= listed.lookahead;
+                        kept[owner] += 1;
+                        continue;
+                    }
+                    if watched.entries.len() >= limits.total {
+                        continue;
+                    }
+                    let Ok(script) = ScriptBuf::from_hex(&listed.script) else {
+                        continue;
+                    };
                     kept[owner] += 1;
-                    continue;
+                    let mut digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
+                    digest.reverse();
+                    let scripthash = digest.to_lower_hex_string();
+                    watched.by_hex.insert(hex.clone(), watched.entries.len());
+                    watched
+                        .by_scripthash
+                        .insert(scripthash.clone(), watched.entries.len());
+                    watched.entries.push(Entry {
+                        script,
+                        hex,
+                        scripthash,
+                        lookahead: listed.lookahead,
+                        owners: vec![owner],
+                        statuses: vec![status()],
+                        counts: vec![listed.counts],
+                    });
                 }
-                if watched.entries.len() >= limits.total {
-                    break 'ranks;
-                }
-                kept[owner] += 1;
-                let mut digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
-                digest.reverse();
-                let scripthash = digest.to_lower_hex_string();
-                watched.by_hex.insert(hex.clone(), watched.entries.len());
-                watched
-                    .by_scripthash
-                    .insert(scripthash.clone(), watched.entries.len());
-                watched.entries.push(Entry {
-                    script,
-                    hex,
-                    scripthash,
-                    lookahead: listed.lookahead,
-                    owners: vec![owner],
-                    statuses: vec![status],
-                    counts: vec![listed.counts],
-                });
             }
         }
         // A wallet listed with as many scripts as a watch takes of one,

@@ -252,6 +252,12 @@ pub(crate) fn watch_scripts(
         .collect()
 }
 
+/// Whether the wallet holds a coin, confirmed or not: what puts it
+/// ahead of an empty wallet when the live watch shares out its scripts.
+pub(crate) fn holds_coins(wallet: &bdk_wallet::Wallet) -> bool {
+    wallet.list_unspent().next().is_some()
+}
+
 /// The order an Electrum server listed the history of each script in,
 /// the last time a sync read it there: txids and heights, 0 or -1 for
 /// the mempool.

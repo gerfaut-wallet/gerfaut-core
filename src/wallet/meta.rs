@@ -114,6 +114,12 @@ pub struct WalletMeta {
     pub complete_at: Option<u64>,
     #[serde(default)]
     pub cached: CachedTotals,
+    /// The user asked for this wallet to be watched live before any
+    /// other: an advanced setting, off unless set, and left out of the
+    /// stored form while off. See
+    /// [`crate::WalletManager::set_wallet_live_pinned`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live_pinned: bool,
 }
 
 /// Wallets stored before scan tracking existed were scanned with the
@@ -125,6 +131,28 @@ fn default_scan_gap() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wallet stored before pinning existed reads as not pinned and
+    /// is stored back as it was; a pinned one says so.
+    #[test]
+    fn a_wallet_is_stored_pinned_only_when_pinned() {
+        let stored = r#"{"id":"w","name":"Cold","icon":"wallet","network":"signet","kind":{"type":"single_address","address":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"},"recognized_as":"address","created_at":1,"gap_limit":20,"scan_gap":20,"labels":{},"last_sync":null,"cached":{"balance":{"confirmed":0,"trusted_pending":0,"untrusted_pending":0,"immature":0,"total":0},"tx_count":0}}"#;
+        let meta: WalletMeta = serde_json::from_str(stored).unwrap();
+        assert!(!meta.live_pinned);
+        let written = serde_json::to_string(&meta).unwrap();
+        assert!(!written.contains("live_pinned"), "{written}");
+        let pinned = WalletMeta {
+            live_pinned: true,
+            ..meta
+        };
+        let written = serde_json::to_string(&pinned).unwrap();
+        assert!(written.contains(r#""live_pinned":true"#), "{written}");
+        assert!(
+            serde_json::from_str::<WalletMeta>(&written)
+                .unwrap()
+                .live_pinned
+        );
+    }
 
     #[test]
     fn icon_reads_snake_case_and_forgives_the_unknown() {

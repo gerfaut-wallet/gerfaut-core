@@ -624,6 +624,20 @@ impl WalletManager {
         })
     }
 
+    /// Pins a wallet to the live watch, or unpins it. The scripts of the
+    /// pinned wallets are watched before any other wallet's, up to what
+    /// a watch takes of one wallet; the others share what is left, the
+    /// wallets holding coins first. An advanced setting, off unless set,
+    /// kept in the vault and carried by a backup.
+    pub async fn set_wallet_live_pinned(&self, id: &str, pinned: bool) -> CoreResult<()> {
+        let result = self.state.lock().await.commit(|payload| {
+            find_record_mut(payload, id)?.meta.live_pinned = pinned;
+            Ok(())
+        });
+        self.live_refresh().await;
+        result
+    }
+
     /// Puts the named wallets in the given order. Only the slots those
     /// wallets occupy are rearranged: a list shown for one network can
     /// be reordered without moving the wallets of another. Every id must
@@ -1742,6 +1756,7 @@ impl WalletManager {
                     gap_limit: settings.gap_limit,
                     labels: record.meta.labels.clone(),
                     created_at: record.meta.created_at,
+                    live_pinned: record.meta.live_pinned,
                 })
                 .collect();
             BackupPayload {
@@ -1889,6 +1904,7 @@ impl WalletManager {
                     gap_limit,
                 );
                 meta.labels = wallet.labels.clone();
+                meta.live_pinned = wallet.live_pinned;
                 pending.push(build_record(meta)?);
             }
 
@@ -2459,9 +2475,9 @@ fn keep_older_history(watch: &mut AddressWatchState, previous: &AddressWatchStat
 }
 
 /// One wallet as the live watch takes it: its scripts in the order a
-/// transport should cover them, `per_wallet` at most, and whether it
-/// waits for a block. `None` for a wallet that cannot be read, which is
-/// then not watched.
+/// transport should cover them, `per_wallet` at most, whether it waits
+/// for a block, whether the user pinned it and whether it holds coins.
+/// `None` for a wallet that cannot be read, which is then not watched.
 pub(crate) fn watched_wallet(
     state: &mut ManagerState,
     id: &str,
@@ -2469,7 +2485,8 @@ pub(crate) fn watched_wallet(
     per_wallet: usize,
 ) -> Option<crate::watch::WatchedWallet> {
     let record = find_record(&state.payload, id).ok()?;
-    let (scripts, has_pending) = match &record.meta.kind {
+    let pinned = record.meta.live_pinned;
+    let (scripts, has_pending, holds_coins) = match &record.meta.kind {
         WalletKind::SingleAddress { address } => {
             let script = Address::from_str(address)
                 .ok()?
@@ -2480,6 +2497,10 @@ pub(crate) fn watched_wallet(
                 .address_state
                 .as_ref()
                 .is_some_and(|watch| watch.txs.iter().any(|tx| tx.height.is_none()));
+            let holds_coins = record
+                .address_state
+                .as_ref()
+                .is_some_and(|watch| !watch.utxos.is_empty());
             let scripts = vec![crate::watch::WatchedScript {
                 script: script.to_hex_string(),
                 lookahead: false,
@@ -2491,7 +2512,7 @@ pub(crate) fn watched_wallet(
                 // counters with.
                 counts: None,
             }];
-            (scripts, has_pending)
+            (scripts, has_pending, holds_coins)
         }
         WalletKind::Descriptors { .. } => {
             let orders = std::mem::take(&mut state.orders);
@@ -2499,6 +2520,7 @@ pub(crate) fn watched_wallet(
                 (
                     views::watch_scripts(engine, gap_limit, &orders, per_wallet),
                     views::has_pending(engine),
+                    views::holds_coins(engine),
                 )
             });
             state.orders = orders;
@@ -2528,6 +2550,8 @@ pub(crate) fn watched_wallet(
         wallet_id: id.to_owned(),
         scripts,
         has_pending,
+        pinned,
+        holds_coins,
     })
 }
 
@@ -2618,6 +2642,7 @@ fn fresh_meta(
         last_sync: None,
         complete_at: None,
         cached: CachedTotals::default(),
+        live_pinned: false,
     }
 }
 
@@ -3255,6 +3280,7 @@ mod tests {
                     gap_limit: 20,
                     labels: Default::default(),
                     created_at: 1_755_000_000,
+                    live_pinned: false,
                 }],
                 backends: None,
                 electrum_certs: None,
@@ -4062,6 +4088,7 @@ mod tests {
             gap_limit: 20,
             labels: Default::default(),
             created_at: 1_755_000_000,
+            live_pinned: false,
         };
         let with_settings = BackupPayload {
             version: BACKUP_VERSION,
@@ -4431,6 +4458,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(target.settings().await.backend_for(Network::Signet), own);
+    }
+
+    /// A pin is kept in the vault and carried by a backup, and the live
+    /// watch reads it with whether each wallet holds coins.
+    #[tokio::test]
+    async fn a_pinned_wallet_stays_pinned_and_travels_in_a_backup() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let (source, cold, watch) = seeded(source_dir.path()).await;
+        assert!(matches!(
+            source.set_wallet_live_pinned("nope", true).await,
+            Err(CoreError::WalletNotFound(_))
+        ));
+        source
+            .set_wallet_live_pinned(&watch.id, true)
+            .await
+            .unwrap();
+        let flags = async |manager: &WalletManager| {
+            manager
+                .watch_list(Network::Signet)
+                .await
+                .into_iter()
+                .map(|wallet| (wallet.pinned, wallet.holds_coins))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(flags(&source).await, [(false, false), (true, false)]);
+
+        // A coin on each: one the cold wallet's engine holds, one in the
+        // state of the watched address.
+        {
+            let mut state = source.state.lock().await;
+            let engine = ensure_engine(&mut state, &cold.id).unwrap();
+            let ours = engine
+                .reveal_next_address(bdk_wallet::KeychainKind::External)
+                .script_pubkey()
+                .to_hex_string();
+            engine.apply_unconfirmed_txs([(
+                crate::testkit::transaction(
+                    &[crate::testkit::nowhere(1, 0)],
+                    &[(ours.as_str(), 50_000)],
+                ),
+                1_700_000_000,
+            )]);
+            find_record_mut(&mut state.payload, &watch.id)
+                .unwrap()
+                .address_state = Some(AddressWatchState {
+                utxos: vec![crate::wallet::AddressUtxo {
+                    txid: "aa".repeat(32),
+                    vout: 0,
+                    value_sats: 1_000,
+                    height: Some(10),
+                    timestamp: None,
+                }],
+                ..Default::default()
+            });
+        }
+        assert_eq!(flags(&source).await, [(false, true), (true, true)]);
+
+        // Kept on disk.
+        drop(source);
+        let source = WalletManager::open(source_dir.path(), key()).unwrap();
+        let pinned = |wallets: Vec<WalletMeta>| {
+            wallets
+                .into_iter()
+                .map(|meta| (meta.name, meta.live_pinned))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![("Cold".to_owned(), false), ("Watch".to_owned(), true)];
+        assert_eq!(pinned(source.list_wallets(None).await), expected);
+
+        let options = BackupOptions {
+            wallet_ids: None,
+            include_settings: false,
+        };
+        let bundle = source
+            .export_backup(&options, BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = manager(target_dir.path()).await;
+        target
+            .import_backup(&bundle.data, BACKUP_PASSWORD, &ImportChoices::default())
+            .await
+            .unwrap();
+        assert_eq!(pinned(target.list_wallets(None).await), expected);
+
+        source
+            .set_wallet_live_pinned(&watch.id, false)
+            .await
+            .unwrap();
+        assert!(
+            source
+                .list_wallets(None)
+                .await
+                .iter()
+                .all(|meta| !meta.live_pinned)
+        );
     }
 
     #[tokio::test]

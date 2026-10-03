@@ -489,6 +489,7 @@ mod tests {
             last_sync: None,
             complete_at: None,
             cached: CachedTotals::default(),
+            live_pinned: false,
         }
     }
 
