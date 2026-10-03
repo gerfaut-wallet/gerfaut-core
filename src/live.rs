@@ -69,8 +69,8 @@ use crate::network::Network;
 use crate::store::TxStage;
 use crate::wallet::snapshot::SyncReport;
 use crate::watch::{
-    ChangeReason, LiveWatch, Timings, WatchConfig, WatchEvent, WatchEvents, WatchStatus,
-    WatchedWallet,
+    ChangeReason, LiveWatch, Timings, WatchConfig, WatchEvent, WatchEvents, WatchLimits,
+    WatchStatus, WatchedWallet,
 };
 
 pub(crate) mod news;
@@ -315,9 +315,11 @@ fn config_of(state: &ManagerState) -> WatchConfig {
     }
 }
 
-/// The wallets of a network as the watcher takes them.
+/// The wallets of a network as the watcher takes them, each listed up
+/// to what a watch under the network's backend takes of one wallet.
 fn list_of(state: &mut ManagerState, network: Network) -> Vec<WatchedWallet> {
     let gap_limit = state.payload.settings.gap_limit;
+    let limits = WatchLimits::of(&state.payload.settings.backend_for(network));
     let ids: Vec<String> = state
         .payload
         .wallets
@@ -326,7 +328,7 @@ fn list_of(state: &mut ManagerState, network: Network) -> Vec<WatchedWallet> {
         .map(|record| record.meta.id.clone())
         .collect();
     ids.into_iter()
-        .filter_map(|id| crate::manager::watched_wallet(state, &id, gap_limit))
+        .filter_map(|id| crate::manager::watched_wallet(state, &id, gap_limit, limits.per_wallet))
         .collect()
 }
 

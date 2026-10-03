@@ -368,6 +368,7 @@ mod tests {
                 Network::Signet,
                 BackendConfig::CustomEsplora {
                     url: "https://esplora.example.org/api".to_owned(),
+                    own_node: false,
                 },
             )])),
             electrum_certs: Some(BTreeMap::from([(

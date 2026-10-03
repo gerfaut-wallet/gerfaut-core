@@ -493,6 +493,7 @@ async fn a_sync_reads_only_what_the_wallet_lacks() {
         dir.path(),
         BackendConfig::CustomElectrum {
             url: format!("tcp://{electrum}"),
+            own_node: false,
         },
     )
     .await;
@@ -586,6 +587,7 @@ async fn a_sync_reads_only_what_the_wallet_lacks() {
         dir.path(),
         BackendConfig::CustomEsplora {
             url: format!("http://{esplora}"),
+            own_node: false,
         },
     )
     .await;
@@ -916,6 +918,7 @@ async fn a_live_wallet_stays_true_to_the_chain() {
         dir.path(),
         BackendConfig::CustomElectrum {
             url: format!("tcp://{electrum}"),
+            own_node: false,
         },
     )
     .await;
@@ -1073,6 +1076,7 @@ async fn a_payment_a_reorganisation_replaced_costs_nothing_after() {
         esplora_dir.path(),
         BackendConfig::CustomEsplora {
             url: format!("http://{esplora}"),
+            own_node: false,
         },
     )
     .await;
@@ -1083,6 +1087,7 @@ async fn a_payment_a_reorganisation_replaced_costs_nothing_after() {
         electrum_dir.path(),
         BackendConfig::CustomElectrum {
             url: format!("tcp://{electrum}"),
+            own_node: false,
         },
     )
     .await;

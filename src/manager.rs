@@ -2322,8 +2322,8 @@ impl WalletManager {
                 // which no sync will connect to: if it so much as names
                 // an onion, its owner meant Tor.
                 Err(_) => match config {
-                    BackendConfig::CustomEsplora { url }
-                    | BackendConfig::CustomElectrum { url } => {
+                    BackendConfig::CustomEsplora { url, .. }
+                    | BackendConfig::CustomElectrum { url, .. } => {
                         url.to_ascii_lowercase().contains(".onion")
                     }
                     BackendConfig::Public { .. } => false,
@@ -2459,12 +2459,14 @@ fn keep_older_history(watch: &mut AddressWatchState, previous: &AddressWatchStat
 }
 
 /// One wallet as the live watch takes it: its scripts in the order a
-/// transport should cover them, and whether it waits for a block.
-/// `None` for a wallet that cannot be read, which is then not watched.
+/// transport should cover them, `per_wallet` at most, and whether it
+/// waits for a block. `None` for a wallet that cannot be read, which is
+/// then not watched.
 pub(crate) fn watched_wallet(
     state: &mut ManagerState,
     id: &str,
     gap_limit: u32,
+    per_wallet: usize,
 ) -> Option<crate::watch::WatchedWallet> {
     let record = find_record(&state.payload, id).ok()?;
     let (scripts, has_pending) = match &record.meta.kind {
@@ -2495,7 +2497,7 @@ pub(crate) fn watched_wallet(
             let orders = std::mem::take(&mut state.orders);
             let listed = ensure_engine(state, id).ok().map(|engine| {
                 (
-                    views::watch_scripts(engine, gap_limit, &orders),
+                    views::watch_scripts(engine, gap_limit, &orders, per_wallet),
                     views::has_pending(engine),
                 )
             });
@@ -3390,6 +3392,7 @@ mod tests {
                 Network::Signet,
                 BackendConfig::CustomEsplora {
                     url: "https://esplora.example.org/api".to_owned(),
+                    own_node: false,
                 },
             )
             .await
@@ -3406,7 +3409,8 @@ mod tests {
         assert_eq!(
             settings.backend_for(Network::Signet),
             BackendConfig::CustomEsplora {
-                url: "https://esplora.example.org/api".to_owned()
+                url: "https://esplora.example.org/api".to_owned(),
+                own_node: false,
             }
         );
         assert_eq!(settings.app_prefs.get("theme").unwrap(), "dark");
@@ -3422,9 +3426,11 @@ mod tests {
         let manager = manager(dir.path()).await;
         let electrum = |url: &str| BackendConfig::CustomElectrum {
             url: url.to_owned(),
+            own_node: false,
         };
         let esplora = |url: &str| BackendConfig::CustomEsplora {
             url: url.to_owned(),
+            own_node: false,
         };
 
         manager
@@ -4067,12 +4073,14 @@ mod tests {
                         Network::Signet,
                         BackendConfig::CustomElectrum {
                             url: "ssl://127.0.0.1:1".to_owned(),
+                            own_node: false,
                         },
                     ),
                     (
                         Network::Mainnet,
                         BackendConfig::CustomEsplora {
                             url: "https://user:pass@node.example.org:3002/api".to_owned(),
+                            own_node: false,
                         },
                     ),
                 ]
@@ -4160,12 +4168,14 @@ mod tests {
                         Network::Mainnet,
                         BackendConfig::CustomEsplora {
                             url: "HTTPS://Esplora.Example.ORG./api/".to_owned(),
+                            own_node: false,
                         },
                     ),
                     (
                         Network::Signet,
                         BackendConfig::CustomElectrum {
                             url: "tcp://x.onion:50001:extra".to_owned(),
+                            own_node: false,
                         },
                     ),
                     (
@@ -4185,6 +4195,7 @@ mod tests {
         let manager = manager(dir.path()).await;
         let kept = BackendConfig::CustomElectrum {
             url: "ssl://node.example.org:50002".to_owned(),
+            own_node: false,
         };
         manager
             .set_backend(Network::Signet, kept.clone())
@@ -4223,6 +4234,7 @@ mod tests {
             settings.backend_for(Network::Mainnet),
             BackendConfig::CustomEsplora {
                 url: "https://esplora.example.org/api".to_owned(),
+                own_node: false,
             }
         );
         assert_eq!(settings.backend_for(Network::Signet), kept);
@@ -4241,6 +4253,7 @@ mod tests {
         source.set_gap_limit(50).await.unwrap();
         let esplora = BackendConfig::CustomEsplora {
             url: "https://esplora.example.org/api".to_owned(),
+            own_node: false,
         };
         source
             .set_backend(Network::Signet, esplora.clone())
@@ -4352,6 +4365,72 @@ mod tests {
         let target = WalletManager::open(target_dir.path(), key()).unwrap();
         assert_eq!(target.list_wallets(None).await.len(), 2);
         assert_eq!(target.settings().await.gap_limit, 50);
+    }
+
+    /// "This is my node" is stored with the backend, in its canonical
+    /// form, lifts what the live watch lists of a wallet, and travels in
+    /// a backup with the rest of the node settings.
+    #[tokio::test]
+    async fn the_own_node_switch_lifts_the_list_and_travels_in_a_backup() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let (source, cold, _) = seeded(source_dir.path()).await;
+        {
+            let mut state = source.state.lock().await;
+            let engine = ensure_engine(&mut state, &cold.id).unwrap();
+            let _ = engine
+                .reveal_addresses_to(bdk_wallet::KeychainKind::External, 999)
+                .count();
+        }
+        let listed = async |manager: &WalletManager| {
+            manager
+                .watch_list(Network::Signet)
+                .await
+                .into_iter()
+                .find(|wallet| wallet.wallet_id == cold.id)
+                .unwrap()
+                .scripts
+                .len()
+        };
+        assert_eq!(listed(&source).await, crate::watch::MAX_SCRIPTS_PER_WALLET);
+
+        source
+            .set_backend(
+                Network::Signet,
+                BackendConfig::CustomElectrum {
+                    url: "Node.Example.ORG.:50002".to_owned(),
+                    own_node: true,
+                },
+            )
+            .await
+            .unwrap();
+        let own = BackendConfig::CustomElectrum {
+            url: "ssl://node.example.org:50002".to_owned(),
+            own_node: true,
+        };
+        assert_eq!(source.settings().await.backend_for(Network::Signet), own);
+        // Every revealed receive address, and a gap limit past the last
+        // one on each keychain.
+        assert_eq!(listed(&source).await, 1_000 + 2 * 20);
+
+        let options = BackupOptions {
+            wallet_ids: None,
+            include_settings: true,
+        };
+        let bundle = source
+            .export_backup(&options, BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = manager(target_dir.path()).await;
+        let choices = ImportChoices {
+            indexes: None,
+            apply_settings: true,
+        };
+        target
+            .import_backup(&bundle.data, BACKUP_PASSWORD, &choices)
+            .await
+            .unwrap();
+        assert_eq!(target.settings().await.backend_for(Network::Signet), own);
     }
 
     #[tokio::test]
@@ -4734,6 +4813,7 @@ mod tests {
                 BackendConfig::CustomEsplora {
                     url: "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/signet/api"
                         .to_owned(),
+                    own_node: false,
                 },
             )
             .await
@@ -4783,6 +4863,7 @@ mod tests {
                 BackendConfig::CustomEsplora {
                     url: "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/signet/api"
                         .to_owned(),
+                    own_node: false,
                 },
             )
             .await
@@ -5162,6 +5243,7 @@ mod tests {
                 Network::Regtest,
                 BackendConfig::CustomEsplora {
                     url: esplora_knowing(funding, Unknown::NotFound).await,
+                    own_node: false,
                 },
             )
             .await
@@ -5277,6 +5359,7 @@ mod tests {
                 Network::Regtest,
                 BackendConfig::CustomEsplora {
                     url: esplora_knowing(answered, Unknown::NoAnswer).await,
+                    own_node: false,
                 },
             )
             .await

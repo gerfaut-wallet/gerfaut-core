@@ -433,6 +433,7 @@ impl FakeElectrum {
     pub(crate) fn backend(&self) -> BackendConfig {
         BackendConfig::CustomElectrum {
             url: format!("tcp://{}", self.address),
+            own_node: false,
         }
     }
 
@@ -639,6 +640,7 @@ impl FakeMempool {
     pub(crate) fn backend(&self) -> BackendConfig {
         BackendConfig::CustomEsplora {
             url: format!("http://{}/api", self.address),
+            own_node: false,
         }
     }
 

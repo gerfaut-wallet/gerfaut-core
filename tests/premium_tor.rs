@@ -91,6 +91,7 @@ async fn onion_backend(manager: &WalletManager) {
             network,
             BackendConfig::CustomEsplora {
                 url: ONION.to_owned(),
+                own_node: false,
             },
         )
         .await

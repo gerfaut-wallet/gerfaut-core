@@ -43,10 +43,20 @@ pub enum BackendConfig {
         server: Option<String>,
     },
     /// The user's own Esplora-compatible HTTP endpoint.
-    CustomEsplora { url: String },
+    CustomEsplora {
+        url: String,
+        /// See [`BackendConfig::is_own_node`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        own_node: bool,
+    },
     /// The user's own Electrum server, `ssl://host:port` or
     /// `tcp://host:port`.
-    CustomElectrum { url: String },
+    CustomElectrum {
+        url: String,
+        /// See [`BackendConfig::is_own_node`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        own_node: bool,
+    },
 }
 
 impl Default for BackendConfig {
@@ -71,9 +81,27 @@ impl BackendConfig {
                         .and_then(|url| host_of(url))
                 })
                 .unwrap_or_else(|| "public esplora".to_owned()),
-            BackendConfig::CustomEsplora { url } | BackendConfig::CustomElectrum { url } => {
+            BackendConfig::CustomEsplora { url, .. }
+            | BackendConfig::CustomElectrum { url, .. } => {
                 host_of(url).unwrap_or_else(|| "custom backend".to_owned())
             }
+        }
+    }
+
+    /// Whether the user said this server is their own node. Nothing
+    /// checks it: the app cannot tell a node at home from a public
+    /// server typed in by hand. What it changes is how much the live
+    /// watch asks of the server ([`crate::watch::WatchLimits`]): a
+    /// public server charges every subscription to the session and
+    /// refuses them past a limit of its own, a node of one's own serves
+    /// all it is asked. The public backend never is one. Off unless
+    /// set, and left out of the stored form while off, so a vault or a
+    /// backup written before it existed reads and writes back the same.
+    pub fn is_own_node(&self) -> bool {
+        match self {
+            BackendConfig::Public { .. } => false,
+            BackendConfig::CustomEsplora { own_node, .. }
+            | BackendConfig::CustomElectrum { own_node, .. } => *own_node,
         }
     }
 
@@ -89,11 +117,13 @@ impl BackendConfig {
     pub fn canonical(self) -> CoreResult<Self> {
         use connect::ScannedBackendKind::{Electrum, Esplora};
         Ok(match self {
-            BackendConfig::CustomEsplora { url } => BackendConfig::CustomEsplora {
+            BackendConfig::CustomEsplora { url, own_node } => BackendConfig::CustomEsplora {
                 url: connect::stored_form(Esplora, &url)?,
+                own_node,
             },
-            BackendConfig::CustomElectrum { url } => BackendConfig::CustomElectrum {
+            BackendConfig::CustomElectrum { url, own_node } => BackendConfig::CustomElectrum {
                 url: connect::stored_form(Electrum, &url)?,
+                own_node,
             },
             public @ BackendConfig::Public { .. } => public,
         })
@@ -248,8 +278,8 @@ pub(crate) fn endpoints(
             None => automatic_endpoints(network),
         },
         BackendConfig::Public { server: None } => automatic_endpoints(network),
-        BackendConfig::CustomEsplora { url } => Ok(vec![Endpoint::Esplora(url.clone())]),
-        BackendConfig::CustomElectrum { url } => Ok(vec![Endpoint::Electrum(
+        BackendConfig::CustomEsplora { url, .. } => Ok(vec![Endpoint::Esplora(url.clone())]),
+        BackendConfig::CustomElectrum { url, .. } => Ok(vec![Endpoint::Electrum(
             electrum::Target::new(url.clone(), pin_for(certs, url)),
         )]),
     }
@@ -788,14 +818,16 @@ mod tests {
         );
         assert_eq!(
             BackendConfig::CustomEsplora {
-                url: "https://user:pass@node.example.org:3002/api".to_owned()
+                url: "https://user:pass@node.example.org:3002/api".to_owned(),
+                own_node: false,
             }
             .label(Network::Mainnet),
             "node.example.org"
         );
         assert_eq!(
             BackendConfig::CustomElectrum {
-                url: "ssl://fulcrum.example.org:50002".to_owned()
+                url: "ssl://fulcrum.example.org:50002".to_owned(),
+                own_node: false,
             }
             .label(Network::Signet),
             "fulcrum.example.org"
@@ -834,6 +866,43 @@ mod tests {
             .unwrap(),
             chosen
         );
+    }
+
+    /// A custom backend stored before the switch existed reads as a
+    /// server that is not the user's node, and writes back byte for
+    /// byte; the switch shows in the stored form only once turned on,
+    /// and the canonical form keeps it.
+    #[test]
+    fn the_own_node_switch_is_stored_only_when_on() {
+        for stored in [
+            r#"{"type":"custom_electrum","url":"ssl://node.example.org:50002"}"#,
+            r#"{"type":"custom_esplora","url":"https://node.example.org/api"}"#,
+        ] {
+            let config: BackendConfig = serde_json::from_str(stored).unwrap();
+            assert!(!config.is_own_node());
+            assert_eq!(serde_json::to_string(&config).unwrap(), stored);
+        }
+        let own = BackendConfig::CustomElectrum {
+            url: "Node.Example.ORG.:50002".to_owned(),
+            own_node: true,
+        };
+        assert!(own.is_own_node());
+        let canonical = own.canonical().unwrap();
+        assert_eq!(
+            serde_json::to_string(&canonical).unwrap(),
+            r#"{"type":"custom_electrum","url":"ssl://node.example.org:50002","own_node":true}"#
+        );
+        let esplora: BackendConfig = serde_json::from_str(
+            r#"{"type":"custom_esplora","url":"https://node.example.org/api","own_node":true}"#,
+        )
+        .unwrap();
+        assert!(esplora.is_own_node());
+        // The public backend has no such switch, whatever a stored form
+        // says.
+        let public: BackendConfig =
+            serde_json::from_str(r#"{"type":"public_esplora","own_node":true}"#).unwrap();
+        assert_eq!(public, BackendConfig::default());
+        assert!(!public.is_own_node());
     }
 
     #[test]
@@ -883,6 +952,7 @@ mod tests {
         );
         let own = BackendConfig::CustomElectrum {
             url: "blackie.c3-soft.com:57010".to_owned(),
+            own_node: false,
         };
         // Read in the form the settings store, the fingerprint with it.
         assert_eq!(
@@ -895,6 +965,7 @@ mod tests {
         // A server with nothing accepted for it carries no fingerprint.
         let other = BackendConfig::CustomElectrum {
             url: "ssl://elsewhere.example:50002".to_owned(),
+            own_node: false,
         };
         assert_eq!(
             endpoints(&other, Network::Testnet4, &certs).unwrap(),
@@ -915,6 +986,7 @@ mod tests {
         let none = TrustedCerts::new();
         let electrum = BackendConfig::CustomElectrum {
             url: "Node.Example.ORG.:50002".to_owned(),
+            own_node: false,
         };
         assert_eq!(
             endpoints(&electrum, Network::Signet, &none).unwrap(),
@@ -925,6 +997,7 @@ mod tests {
         );
         let esplora = BackendConfig::CustomEsplora {
             url: "HTTPS://Esplora.Example.ORG./api/".to_owned(),
+            own_node: false,
         };
         assert_eq!(
             endpoints(&esplora, Network::Signet, &none).unwrap(),
@@ -935,9 +1008,11 @@ mod tests {
         for unreadable in [
             BackendConfig::CustomElectrum {
                 url: "tcp://x.onion:50001:extra".to_owned(),
+                own_node: false,
             },
             BackendConfig::CustomEsplora {
                 url: "x.onion/api".to_owned(),
+                own_node: false,
             },
         ] {
             assert!(

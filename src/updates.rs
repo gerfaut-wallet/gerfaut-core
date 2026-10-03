@@ -261,6 +261,7 @@ mod tests {
                 Network::Mainnet,
                 BackendConfig::CustomElectrum {
                     url: ONION.to_owned(),
+                    own_node: false,
                 },
             )
             .await
@@ -307,6 +308,7 @@ mod tests {
                 Network::Mainnet,
                 BackendConfig::CustomElectrum {
                     url: ONION.to_owned(),
+                    own_node: false,
                 },
             )
             .await

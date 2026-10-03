@@ -159,23 +159,23 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
 /// [`electrum_statuses`] computes it, and the counters an Esplora server
 /// would keep for that history.
 ///
-/// The list stops at [`crate::watch::MAX_SCRIPTS_PER_WALLET`], all a
-/// watch takes of one wallet.
+/// The list stops at `cap`, all a watch takes of one wallet (see
+/// [`crate::watch::WatchLimits`]).
 ///
 /// This runs under the lock of the vault after every sync, for every
-/// wallet of the network, so nothing past that is looked at, and every
-/// script the wallet revealed is read from its index, where revealing
-/// it stored it, instead of being derived again: a derivation costs
-/// tens of microseconds, a key or two per address and more for a
-/// multisig, where a lookup costs a fraction of one. Only the scripts
+/// wallet of the network, so nothing past the cap is looked at, and
+/// every script the wallet revealed is read from its index, where
+/// revealing it stored it, instead of being derived again: measured, a
+/// derivation costs a hundred microseconds or more, and more again for
+/// a multisig, where a lookup costs a fraction of one. Only the scripts
 /// past what the index looks ahead are derived, a gap limit's worth at
 /// most.
 pub(crate) fn watch_scripts(
     wallet: &bdk_wallet::Wallet,
     gap_limit: u32,
     orders: &HistoryOrders,
+    cap: usize,
 ) -> Vec<crate::watch::WatchedScript> {
-    let cap = crate::watch::MAX_SCRIPTS_PER_WALLET;
     let index = wallet.spk_index();
     let mut seen = std::collections::HashSet::new();
     let mut listed: Vec<(bdk_wallet::bitcoin::ScriptBuf, bool)> = Vec::new();
@@ -1188,7 +1188,12 @@ mod tests {
         let _ = wallet
             .reveal_addresses_to(KeychainKind::External, 1_000)
             .count();
-        let scripts = watch_scripts(&wallet, 20, &HistoryOrders::new());
+        let scripts = watch_scripts(
+            &wallet,
+            20,
+            &HistoryOrders::new(),
+            crate::watch::MAX_SCRIPTS_PER_WALLET,
+        );
         assert_eq!(scripts.len(), crate::watch::MAX_SCRIPTS_PER_WALLET);
         assert_eq!(
             scripts[0].script,
@@ -1233,7 +1238,7 @@ mod tests {
         // Past the 25 scripts the index derives ahead of the last one
         // revealed.
         let gap = 40;
-        let scripts = watch_scripts(&wallet, gap, &HistoryOrders::new());
+        let scripts = watch_scripts(&wallet, gap, &HistoryOrders::new(), usize::MAX);
         let mut expected: Vec<(String, bool)> = Vec::new();
         for index in [0, 1, 2, 4, 5, 6, 7, 8, 9] {
             expected.push((derived(&wallet, KeychainKind::External, index), false));

@@ -456,9 +456,11 @@ async fn an_onion_backend_without_tor_never_connects_in_the_clear() {
     for backend in [
         BackendConfig::CustomElectrum {
             url: format!("tcp://{onion}:50001"),
+            own_node: false,
         },
         BackendConfig::CustomEsplora {
             url: format!("http://{onion}/api"),
+            own_node: false,
         },
     ] {
         let mut config = config(backend);
@@ -787,7 +789,7 @@ fn wallets_the_whole_list_cut_short_are_caught_up_whole() {
         })
         .collect();
     wallets.insert(0, wallet("small", &[1, 2, 3], &[], false));
-    let watched = Watched::new(wallets);
+    let watched = Watched::new(wallets, WatchLimits::DEFAULT);
     assert_eq!(watched.entries.len(), MAX_SCRIPTS);
     let expected: Vec<String> = (0..15).map(|w| format!("w{w}")).collect();
     assert_eq!(watched.capped, expected);
@@ -804,7 +806,7 @@ fn a_list_is_cut_to_what_can_be_watched() {
         counts: None,
     });
     wallets.push(wallet("b", &[1, 1, 250], &[1], false));
-    let watched = Watched::new(wallets);
+    let watched = Watched::new(wallets, WatchLimits::DEFAULT);
     assert_eq!(watched.entries.len(), MAX_SCRIPTS_PER_WALLET + 1);
     // Cut, so a start reports it whole.
     assert_eq!(watched.capped, vec!["a".to_owned()]);
@@ -819,6 +821,61 @@ fn a_list_is_cut_to_what_can_be_watched() {
             .hex,
         script(250)
     );
+}
+
+/// A wallet of `count` distinct scripts, numbered from `first`.
+fn numbered(id: &str, first: u32, count: u32) -> WatchedWallet {
+    WatchedWallet {
+        wallet_id: id.to_owned(),
+        scripts: (first..first + count)
+            .map(|n| WatchedScript {
+                script: format!("0014{n:040x}"),
+                lookahead: false,
+                status: None,
+                counts: None,
+            })
+            .collect(),
+        has_pending: false,
+    }
+}
+
+/// On the user's own node a watch takes ten times as many scripts in
+/// all, and a wallet may take all of them; anywhere else, what it took
+/// before. The two wallets that share the whole of it share it evenly.
+#[test]
+fn the_users_own_node_lifts_what_a_watch_takes() {
+    let own = |own_node| BackendConfig::CustomElectrum {
+        url: "ssl://node.example.org:50002".to_owned(),
+        own_node,
+    };
+    assert_eq!(
+        WatchLimits::of(&BackendConfig::default()),
+        WatchLimits::DEFAULT
+    );
+    assert_eq!(WatchLimits::of(&own(false)), WatchLimits::DEFAULT);
+    assert_eq!(WatchLimits::of(&own(true)), WatchLimits::OWN_NODE);
+    assert_eq!(WatchLimits::OWN_NODE.total, 20_000);
+
+    let large = || vec![numbered("large", 0, 5_000)];
+    let anywhere = Watched::new(large(), WatchLimits::DEFAULT);
+    assert_eq!(anywhere.entries.len(), MAX_SCRIPTS_PER_WALLET);
+    assert_eq!(anywhere.capped, vec!["large".to_owned()]);
+    let at_home = Watched::new(large(), WatchLimits::OWN_NODE);
+    assert_eq!(at_home.entries.len(), 5_000);
+    assert!(at_home.capped.is_empty());
+
+    let two = vec![numbered("a", 0, 15_000), numbered("b", 100_000, 15_000)];
+    let shared = Watched::new(two, WatchLimits::OWN_NODE);
+    assert_eq!(shared.entries.len(), OWN_NODE_MAX_SCRIPTS);
+    let owned_by = |owner: usize| {
+        shared
+            .entries
+            .iter()
+            .filter(|entry| entry.owners == [owner])
+            .count()
+    };
+    assert_eq!((owned_by(0), owned_by(1)), (10_000, 10_000));
+    assert_eq!(shared.capped, vec!["a".to_owned(), "b".to_owned()]);
 }
 
 /// A block marked in the burst of a reconnection that cannot say what
@@ -1314,6 +1371,7 @@ async fn live_the_three_transports_see_signet_move() {
     // the way the settings screen does it, by its fingerprint.
     let mut electrum = config(BackendConfig::CustomElectrum {
         url: SIGNET_ELECTRUM.to_owned(),
+        own_node: false,
     });
     let inspected = crate::chain::electrum::inspect(&crate::chain::electrum::Target::new(
         SIGNET_ELECTRUM,

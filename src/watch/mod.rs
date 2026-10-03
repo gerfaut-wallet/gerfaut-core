@@ -96,11 +96,59 @@ use crate::network::Network;
 pub const MAX_SCRIPTS_PER_WALLET: usize = 200;
 /// Scripts watched in all.
 pub const MAX_SCRIPTS: usize = 2_000;
+/// Scripts watched in all on the user's own node. Every one is a
+/// subscription the server keeps for the session: Fulcrum takes 75,000
+/// from one address by default, ElectrumX 50,000 per session, electrs
+/// sets no limit. A public server would refuse what passes its own
+/// limit, which is why this is for a node the user runs.
+pub const OWN_NODE_MAX_SCRIPTS: usize = 20_000;
+/// Scripts watched for one wallet on the user's own node: as many as
+/// in all, so that one large wallet may take the whole of it. They are
+/// shared out between wallets rank by rank, so a large one never
+/// crowds out the head of a small one. What a longer list costs is the
+/// list itself, built under the lock of the vault after every sync,
+/// from scripts the wallet's index already holds: measured on a wallet
+/// that revealed 150,000 addresses, 20,000 of them take some tens of
+/// milliseconds where deriving them took seconds, and on a wallet of
+/// 30,000 transactions most of the time goes to reading its history,
+/// which a list of 200 reads all the same.
+pub const OWN_NODE_MAX_SCRIPTS_PER_WALLET: usize = OWN_NODE_MAX_SCRIPTS;
 /// The longest script read from a list, in bytes: the consensus limit.
 const MAX_SCRIPT_BYTES: usize = 10_000;
 /// Events held for a consumer that lags. They coalesce, so a full
 /// queue delays an event and never loses a wallet.
 const EVENT_QUEUE: usize = 64;
+
+/// How many scripts a watch takes of one wallet, and of all of them.
+/// What it leaves out is heard at the next regular sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchLimits {
+    pub per_wallet: usize,
+    pub total: usize,
+}
+
+impl WatchLimits {
+    /// What a watch asks of any server.
+    pub const DEFAULT: WatchLimits = WatchLimits {
+        per_wallet: MAX_SCRIPTS_PER_WALLET,
+        total: MAX_SCRIPTS,
+    };
+    /// What it asks of the user's own node.
+    pub const OWN_NODE: WatchLimits = WatchLimits {
+        per_wallet: OWN_NODE_MAX_SCRIPTS_PER_WALLET,
+        total: OWN_NODE_MAX_SCRIPTS,
+    };
+
+    /// The limits under a backend: higher when the user said it is their
+    /// own node ([`BackendConfig::is_own_node`]).
+    pub fn of(backend: &BackendConfig) -> WatchLimits {
+        if backend.is_own_node() {
+            WatchLimits::OWN_NODE
+        } else {
+            WatchLimits::DEFAULT
+        }
+    }
+}
 
 /// Everything the watcher needs to reach the backend, and nothing of
 /// the vault: a copy of four settings and the data directory, where
@@ -381,7 +429,7 @@ impl LiveWatch {
             last_alive: SystemTime::now(),
             fixed_timings,
         };
-        hub.watched = Watched::new(wallets);
+        hub.watched = Watched::new(wallets, WatchLimits::of(&hub.config.backend));
         let (halt, halted) = watch::channel(false);
         tokio::spawn(watcher(hub, halted));
         (
@@ -485,8 +533,9 @@ pub(crate) struct Watched {
 }
 
 impl Watched {
-    fn new(wallets: Vec<WatchedWallet>) -> Self {
+    fn new(wallets: Vec<WatchedWallet>, limits: WatchLimits) -> Self {
         use bdk_wallet::bitcoin::hashes::{Hash, sha256};
+        use bdk_wallet::bitcoin::hex::DisplayHex;
         let mut watched = Watched {
             wallets: wallets
                 .iter()
@@ -498,14 +547,11 @@ impl Watched {
         let mut kept = vec![0usize; wallets.len()];
         let longest = wallets
             .iter()
-            .map(|wallet| wallet.scripts.len().min(MAX_SCRIPTS_PER_WALLET))
+            .map(|wallet| wallet.scripts.len().min(limits.per_wallet))
             .max()
             .unwrap_or(0);
         'ranks: for rank in 0..longest {
             for (owner, wallet) in wallets.iter().enumerate() {
-                if rank >= MAX_SCRIPTS_PER_WALLET {
-                    break 'ranks;
-                }
                 let Some(listed) = wallet.scripts.get(rank) else {
                     continue;
                 };
@@ -531,13 +577,13 @@ impl Watched {
                     kept[owner] += 1;
                     continue;
                 }
-                if watched.entries.len() >= MAX_SCRIPTS {
+                if watched.entries.len() >= limits.total {
                     break 'ranks;
                 }
                 kept[owner] += 1;
                 let mut digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
                 digest.reverse();
-                let scripthash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                let scripthash = digest.to_lower_hex_string();
                 watched.by_hex.insert(hex.clone(), watched.entries.len());
                 watched
                     .by_scripthash
@@ -560,7 +606,7 @@ impl Watched {
             .iter()
             .zip(kept)
             .filter(|(wallet, kept)| {
-                wallet.scripts.len() >= MAX_SCRIPTS_PER_WALLET || *kept < wallet.scripts.len()
+                wallet.scripts.len() >= limits.per_wallet || *kept < wallet.scripts.len()
             })
             .map(|(wallet, _)| wallet.wallet_id.clone())
             .collect();
@@ -904,7 +950,7 @@ impl Hub {
                         self.timings = Timings::of(&config);
                     }
                     self.config = *config;
-                    self.watched = Watched::new(wallets);
+                    self.watched = Watched::new(wallets, WatchLimits::of(&self.config.backend));
                     self.forget_baselines();
                     // The server of the old configuration, its certificate
                     // and its route with it, is no longer one to sync on.
@@ -912,7 +958,7 @@ impl Hub {
                     Wake::Reconfigured
                 }
                 Some(Command::Wallets(wallets)) => {
-                    self.watched = Watched::new(wallets);
+                    self.watched = Watched::new(wallets, WatchLimits::of(&self.config.backend));
                     let kept: HashSet<&String> =
                         self.watched.wallets.iter().map(|(id, _)| id).collect();
                     self.debounce.pending.retain(|id, _| kept.contains(id));
