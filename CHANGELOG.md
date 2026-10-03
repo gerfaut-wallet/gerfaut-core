@@ -251,6 +251,14 @@ The first release: the library both Gerfaut apps are built on.
   the list or refused by the server. The confirmation comes as news on
   the scripts of the transaction, and on a script nobody pushes it used
   to wait for the next regular sync.
+- An Esplora server that limits the rate of requests (HTTP 429) is asked
+  again once, after the wait its `Retry-After` names, five seconds at
+  least, instead of three times within two seconds; past a minute the
+  request fails at once and says how long the server asked for.
+  mempool.space bans a client that keeps coming back too soon. Polling
+  a server that limits it waits twice as long between rounds each time,
+  up to ten minutes, and back to a minute half an hour after the last
+  limit; a round turned away no longer counts as a server lost.
 - A watched address is never read from a server of another network.
   Testnet, testnet4 and signet spell an address alike, and a server of
   the wrong one answered for it with transactions the wallet's network

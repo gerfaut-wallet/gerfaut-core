@@ -34,9 +34,17 @@ const JSON_MAX: usize = 64 << 20;
 const KEEP_MAX: usize = 256 << 20;
 /// Chunks of an answer read ahead of its parsing.
 const CHUNKS_AHEAD: usize = 8;
-/// Tries of a request a server turned away for being busy: a public
-/// instance answers a burst with 429, and a moment later with the data.
+/// Tries of a request a server failed with an error of its own, which a
+/// moment later it may not.
 const TRIES: u32 = 4;
+/// The shortest wait after a server limited the rate of requests (429),
+/// whatever it named: mempool.space bans a client that keeps coming
+/// back too soon.
+const RATE_WAIT_MIN: Duration = Duration::from_secs(5);
+/// The longest wait a request sits through before it is asked again, a
+/// single time; past it the request fails at once, saying how long the
+/// server asked for.
+const RATE_WAIT_MAX: Duration = Duration::from_secs(60);
 /// The longest refusal read from a broadcast: the node's reason is one
 /// line, and a page of text is cut to its first 200 characters anyway.
 const REFUSAL_MAX: usize = 64 << 10;
@@ -85,16 +93,24 @@ pub(crate) struct Client {
     /// much it may.
     kept: std::sync::atomic::AtomicUsize,
     keep_max: usize,
+    /// The longest wait the server asked for since it was last read:
+    /// see [`Client::take_rate_limit`].
+    rate_limit: std::sync::Mutex<Option<Duration>>,
 }
 
 impl Client {
     /// The answer to `path` under the instance's address, its body not
-    /// read yet; `None` when the server has nothing there (404). A busy
-    /// server is asked again a few times, a little later each time.
+    /// read yet; `None` when the server has nothing there (404). A server
+    /// that fails with an error of its own is asked again a few times, a
+    /// little later each time. One that limits the rate of requests is
+    /// asked again once, after the wait it named, five seconds at least
+    /// and a little more so that clients do not come back together, when
+    /// that wait is a minute at most.
     async fn open(&self, path: &str) -> Result<Option<reqwest::Response>, String> {
         let url = format!("{}{path}", self.base);
         let mut wait = Duration::from_millis(250);
         let mut tries = 1;
+        let mut limited = false;
         let response = loop {
             let response = self
                 .http
@@ -103,7 +119,18 @@ impl Client {
                 .await
                 .map_err(|e| describe_request(&e, self.budget))?;
             let status = response.status().as_u16();
-            if tries < TRIES && matches!(status, 429 | 500 | 502 | 503 | 504) {
+            if status == 429 {
+                let named = retry_after(response.headers()).unwrap_or_default();
+                let pause = named.max(RATE_WAIT_MIN);
+                self.limited(pause);
+                if limited || pause > RATE_WAIT_MAX {
+                    return Err(rate_limited(pause));
+                }
+                limited = true;
+                tokio::time::sleep(pause.mul_f64(1.0 + 0.2 * rand::random::<f64>())).await;
+                continue;
+            }
+            if tries < TRIES && matches!(status, 500 | 502 | 503 | 504) {
                 tokio::time::sleep(wait).await;
                 wait *= 2;
                 tries += 1;
@@ -178,6 +205,26 @@ impl Client {
         parsed
             .map(Some)
             .map_err(|_| "unexpected response".to_owned())
+    }
+
+    /// Notes that the server asked for `pause` before the next request.
+    fn limited(&self, pause: Duration) {
+        let mut asked = self
+            .rate_limit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *asked = (*asked).max(Some(pause));
+    }
+
+    /// The longest wait the server asked for since this was last called,
+    /// if it limited the rate of requests meanwhile, a request that went
+    /// through on its second try included: whoever asks it at a pace
+    /// learns it is too fast.
+    pub(crate) fn take_rate_limit(&self) -> Option<Duration> {
+        self.rate_limit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
     /// Counts `bytes` of transactions against what one sync may keep.
@@ -423,6 +470,7 @@ fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, Strin
         budget,
         kept: std::sync::atomic::AtomicUsize::new(0),
         keep_max: usize::MAX,
+        rate_limit: std::sync::Mutex::new(None),
     })
 }
 
@@ -475,6 +523,28 @@ impl<B: AsRef<[u8]>> std::io::Read for ChunkReader<B> {
 }
 
 // --- errors ---------------------------------------------------------------
+
+/// The wait a `Retry-After` header names in seconds, a day at most. The
+/// date form reads as none: the shortest wait applies.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let seconds: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds.min(24 * 60 * 60)))
+}
+
+/// A server that limited the rate of requests, and the wait it asked for.
+fn rate_limited(pause: Duration) -> String {
+    format!(
+        "{}, try again in {} s",
+        describe_status(429),
+        pause.as_secs()
+    )
+}
 
 fn describe_status(status: u16) -> String {
     let reason = match status {
@@ -1106,6 +1176,76 @@ mod error_tests {
             broadcast(&client, &tx).await.unwrap_err(),
             "the server sent an answer longer than 64 KiB"
         );
+    }
+
+    /// A server that answers each request with the next of `answers`,
+    /// whole HTTP answers, and the last one past them; and how many
+    /// requests it had.
+    async fn answering(
+        answers: Vec<String>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<usize>>,
+    ) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let counted = asked.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = vec![0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let answer = {
+                    let mut asked = counted.lock().unwrap();
+                    *asked += 1;
+                    answers[(*asked - 1).min(answers.len() - 1)].clone()
+                };
+                let _ = stream.write_all(answer.as_bytes()).await;
+            }
+        });
+        (address, asked)
+    }
+
+    /// A server that limits the rate of requests is asked again once,
+    /// after the wait it named, five seconds at least, and never at once;
+    /// past a minute, the request fails at once and says how long the
+    /// server asked for. Whoever asks at a pace learns of it either way.
+    #[tokio::test]
+    async fn a_rate_limit_is_waited_out_once() {
+        let limited = |named: &str| {
+            format!(
+                "HTTP/1.1 429 Too Many Requests\r\n{named}content-length: 0\r\n\
+                 connection: close\r\n\r\n"
+            )
+        };
+        let height = "HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\n812345";
+
+        let (long, asked) = answering(vec![limited("retry-after: 120\r\n")]).await;
+        let client = build(&format!("http://{long}"), None, PATIENT).unwrap();
+        assert_eq!(
+            client.height().await.unwrap_err(),
+            "HTTP 429: rate limited, try again in 120 s"
+        );
+        assert_eq!(*asked.lock().unwrap(), 1);
+        assert_eq!(client.take_rate_limit(), Some(Duration::from_secs(120)));
+        assert_eq!(client.take_rate_limit(), None);
+
+        let (short, asked_short) =
+            answering(vec![limited("retry-after: 1\r\n"), height.to_owned()]).await;
+        let (again, asked_again) = answering(vec![limited("")]).await;
+        let short = build(&format!("http://{short}"), None, PATIENT).unwrap();
+        let again = build(&format!("http://{again}"), None, PATIENT).unwrap();
+        let started = std::time::Instant::now();
+        let (read, refused) = tokio::join!(short.height(), again.height());
+        assert!(started.elapsed() >= RATE_WAIT_MIN);
+        assert_eq!(read.unwrap(), 812_345);
+        assert_eq!(
+            refused.unwrap_err(),
+            "HTTP 429: rate limited, try again in 5 s"
+        );
+        assert_eq!(*asked_short.lock().unwrap(), 2);
+        assert_eq!(*asked_again.lock().unwrap(), 2);
+        assert_eq!(short.take_rate_limit(), Some(RATE_WAIT_MIN));
     }
 
     /// A gzipped answer of a sensible size reads as it always did.

@@ -3,13 +3,20 @@
 //!
 //! A round is the tip hash and at most [`ROUND_BUDGET`] script
 //! lookups, one after the other, about once a minute: some 240 requests
-//! an hour, whatever the size of the wallets. blockstream.info, the
-//! public server this is for, allows an address 700 an hour, and the
-//! syncs need their share of that. The first [`HOT`] scripts of the
-//! list, the head of every wallet, are looked up every round; the
+//! an hour, whatever the size of the wallets, and the syncs need their
+//! share of what a public server allows. The first [`HOT`] scripts of
+//! the list, the head of every wallet, are looked up every round; the
 //! rest take turns. A lookup reads the counters of
 //! `/scripthash/:hash`, which move when a transaction enters the
 //! mempool and again when it confirms.
+//!
+//! No public server says how many requests it allows: mempool.space
+//! bans a client that keeps going past its limit, blockstream.info has
+//! limited its free access since April 2026. One that limits the rate
+//! (HTTP 429) is asked less often ([`Pace`]): each time it does, the
+//! wait between rounds doubles, up to ten minutes, never shorter than
+//! the wait it named, and comes back to a minute half an hour after the
+//! last time. A round it turned away is no failure of the server.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +36,51 @@ pub(super) const HOT: usize = 2;
 const FAILED_ROUNDS: u32 = 3;
 /// What a whole round may take.
 const ROUND_TIMEOUT: Duration = Duration::from_secs(45);
+/// The longest wait between two rounds, however often the server limited
+/// the rate of requests.
+const SLOWEST: Duration = Duration::from_secs(10 * 60);
+/// How long after the last limit the server set the rounds stay slowed.
+const SLOWED_FOR: Duration = Duration::from_secs(30 * 60);
+
+/// How often rounds come: see the module documentation.
+#[derive(Debug, Default)]
+pub(super) struct Pace {
+    /// Times the wait doubled.
+    slowed: u32,
+    /// When the server last limited the rate of requests.
+    limited_at: Option<Instant>,
+    /// No round before this: the wait the server named.
+    not_before: Option<Instant>,
+}
+
+impl Pace {
+    /// The server limited the rate of requests, and asked for `pause`.
+    pub(super) fn limited(&mut self, pause: Duration, now: Instant) {
+        self.slowed = self.slowed.saturating_add(1).min(16);
+        self.limited_at = Some(now);
+        self.not_before = Some(now + pause);
+    }
+
+    /// The wait before the next round, `every` being the usual one, a
+    /// little more or less so that clients do not fall in step.
+    pub(super) fn wait(&mut self, every: Duration, now: Instant) -> Duration {
+        if self
+            .limited_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= SLOWED_FOR)
+        {
+            self.slowed = 0;
+            self.limited_at = None;
+        }
+        let slowed = every
+            .saturating_mul(1 << self.slowed)
+            .min(SLOWEST.max(every));
+        let wait = slowed.mul_f64(0.85 + 0.3 * rand::random::<f64>());
+        let named = self
+            .not_before
+            .map_or(Duration::ZERO, |until| until.saturating_duration_since(now));
+        wait.max(named)
+    }
+}
 
 /// The counters of a script: transactions in the chain and in the
 /// mempool, and the coins they moved. Any difference is a change.
@@ -53,6 +105,12 @@ impl Poller {
             client: Arc::new(esplora::client(base, proxy)?),
             cursor: 0,
         })
+    }
+
+    /// The longest wait the server asked for since this was last called,
+    /// if it limited the rate of requests meanwhile.
+    pub(super) fn take_rate_limit(&self) -> Option<Duration> {
+        self.client.take_rate_limit()
     }
 
     /// The scripts of the next round, among those past the first
@@ -153,6 +211,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
     }
     let mut tip: Option<String> = None;
     let mut failed = 0u32;
+    let mut pace = Pace::default();
     let started = Instant::now();
     loop {
         // One round: the tip, then the scripts.
@@ -168,7 +227,12 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
             };
             Ok::<_, String>((hash, height, plan.check().await?))
         };
-        match hub.during(round).await {
+        let outcome = hub.during(round).await;
+        let limited = poller.take_rate_limit();
+        if let Some(pause) = limited {
+            pace.limited(pause, Instant::now());
+        }
+        match outcome {
             Err(exit) => return exit,
             Ok(Ok((hash, height, found))) => {
                 failed = 0;
@@ -194,6 +258,11 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
                     status.pushed_scripts = 0;
                 });
             }
+            // Turned away for asking too often: the server is there, and
+            // the next round comes later.
+            Ok(Err(detail)) if limited.is_some() => {
+                hub.set_status(|status| status.detail = Some(detail));
+            }
             Ok(Err(detail)) => {
                 failed += 1;
                 if tip.is_none() {
@@ -207,10 +276,10 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         if started.elapsed() >= hub.timings.reprobe {
             return Exit::Reprobe;
         }
-        // The next round, a little early or late so that clients do not
-        // fall in step; a tick from the host runs it now.
-        let wait = hub.timings.poll.mul_f64(0.85 + 0.3 * rand::random::<f64>());
+        // The next round; a tick from the host runs it now if it is due.
+        let wait = pace.wait(hub.timings.poll, Instant::now());
         let until = Instant::now() + wait;
+        let waiting = std::time::SystemTime::now();
         loop {
             tokio::select! {
                 wake = hub.wake() => match wake {
@@ -218,7 +287,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
                     Wake::Reconfigured => return Exit::Reconfigured,
                     // Timers stopped with the device: the round is due
                     // by the wall clock.
-                    Wake::Tick { idle } if idle >= hub.timings.poll => break,
+                    Wake::Tick { .. } if waiting.elapsed().unwrap_or_default() >= wait => break,
                     Wake::Wallets if hub.watched.entries.is_empty() => return Exit::Reprobe,
                     Wake::Tick { .. } | Wake::Wallets | Wake::Flushed => {}
                 },

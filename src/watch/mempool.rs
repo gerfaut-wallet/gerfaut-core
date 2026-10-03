@@ -164,7 +164,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         Instant::now() + hub.timings.keepalive,
         hub.timings.keepalive,
     );
-    let mut round = tokio::time::interval_at(Instant::now() + hub.timings.poll, hub.timings.poll);
+    // The REST rounds keep the pace polling keeps: see [`poll::Pace`].
+    let mut pace = poll::Pace::default();
+    let mut next_round = Instant::now() + hub.timings.poll;
     let mut pong_by: Option<Instant> = None;
     loop {
         let outcome: Result<(), String> = tokio::select! {
@@ -217,7 +219,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
                 pong_by.get_or_insert(Instant::now() + hub.pong_budget(endpoint));
                 say(&mut socket, &json!({ "action": "ping" })).await
             }
-            _ = round.tick() => {
+            () = tokio::time::sleep_until(next_round) => {
                 // The scripts the server does not push, and only those.
                 let plan = poller.plan(&hub.watched, tracked.len(), 0);
                 match hub.during(plan.check()).await {
@@ -227,6 +229,10 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
                     Ok(Err(_)) => {}
                     Err(exit) => return exit,
                 }
+                if let Some(pause) = poller.take_rate_limit() {
+                    pace.limited(pause, Instant::now());
+                }
+                next_round = Instant::now() + pace.wait(hub.timings.poll, Instant::now());
                 Ok(())
             }
             () = super::sleep_until(pong_by), if pong_by.is_some() => {

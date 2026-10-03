@@ -1554,6 +1554,40 @@ fn a_backoff_doubles_up_to_its_cap() {
     assert!(backoff.delay(&timings) <= timings.backoff_first);
 }
 
+/// A server that limits the rate of requests is polled half as often
+/// each time it does, ten minutes apart at most, never sooner than the
+/// wait it named, and as usual half an hour after it last did.
+#[test]
+fn a_server_that_limits_the_rate_is_polled_less_often() {
+    let every = Duration::from_secs(60);
+    let around = |wait: Duration, pace: Duration| {
+        assert!(
+            wait >= pace.mul_f64(0.85) && wait <= pace.mul_f64(1.15),
+            "{wait:?} {pace:?}"
+        );
+    };
+    let now = Instant::now();
+    let mut pace = poll::Pace::default();
+    around(pace.wait(every, now), every);
+    pace.limited(Duration::from_secs(5), now);
+    around(pace.wait(every, now), every * 2);
+    pace.limited(Duration::from_secs(5), now);
+    around(pace.wait(every, now), every * 4);
+    for _ in 0..20 {
+        pace.limited(Duration::from_secs(5), now);
+    }
+    around(pace.wait(every, now), Duration::from_secs(600));
+    // A wait the server named longer than that is waited out.
+    pace.limited(Duration::from_secs(3_600), now);
+    assert!(pace.wait(every, now) >= Duration::from_secs(3_600));
+    // Half an hour after the last limit, the usual pace, the wait the
+    // server named still kept to.
+    let later = now + Duration::from_secs(30 * 60);
+    assert!(pace.wait(every, later) >= Duration::from_secs(30 * 60));
+    let past = now + Duration::from_secs(3_600);
+    around(pace.wait(every, past), every);
+}
+
 // --- the manager ---------------------------------------------------------------
 
 fn payment(confirmed: bool) -> Value {
