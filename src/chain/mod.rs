@@ -148,6 +148,66 @@ pub(crate) const TIP_LAG_MAX: u32 = 144;
 /// have reached is refused with.
 pub(crate) const IMPOSSIBLE_TIP: &str = "the server claims a block height no chain has reached";
 
+/// What one sync may keep of the transactions it reads, those the wallet
+/// lacks: what it stores then. A wallet paid dozens of the largest
+/// inscriptions there are fits; a server that invents transactions to
+/// fill memory does not.
+pub(crate) const KEEP_MAX: usize = 256 << 20;
+
+/// What a sync kept so far of the transactions it read, held to a cap.
+#[derive(Debug)]
+pub(crate) struct Kept {
+    bytes: std::sync::atomic::AtomicUsize,
+    max: usize,
+}
+
+impl Kept {
+    pub(crate) fn up_to(max: usize) -> Self {
+        Kept {
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            max,
+        }
+    }
+
+    /// Counts `bytes` of transactions against the cap.
+    pub(crate) fn add(&self, bytes: usize) -> Result<(), String> {
+        let kept = self
+            .bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(bytes);
+        if kept > self.max {
+            return Err(format!(
+                "the server sent more than {} MiB of transactions for one sync",
+                self.max >> 20
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// About what a transaction of a watched address holds in memory, all of
+/// which its sync keeps and stores: its raw bytes in hex, and each of its
+/// inputs and outputs, however many a server lists.
+pub(crate) fn held_by(tx: &crate::wallet::AddressTx) -> usize {
+    use crate::wallet::snapshot::TxIo;
+    let text = |text: &Option<String>| text.as_ref().map_or(0, String::len);
+    let side = |io: &TxIo| {
+        std::mem::size_of::<TxIo>()
+            + text(&io.address)
+            + text(&io.prev_txid)
+            + io.op_return.as_ref().map_or(0, |data| {
+                data.hex.len() + text(&data.text) + text(&data.label)
+            })
+    };
+    let extras = tx.extras.as_ref().map_or(0, |extras| {
+        extras.raw_hex.len() + text(&extras.coinbase_pool) + text(&extras.coinbase_tag)
+    });
+    std::mem::size_of::<crate::wallet::AddressTx>()
+        + tx.txid.len()
+        + extras
+        + tx.inputs.iter().chain(&tx.outputs).map(side).sum::<usize>()
+}
+
 /// The fastest a chain is taken to have grown since its genesis block,
 /// in seconds per block: ten times the pace of every network there is.
 const FASTEST_BLOCK_SECS: u64 = 60;

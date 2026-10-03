@@ -27,11 +27,6 @@ const MAX_BODY: usize = 32 << 20;
 /// witness, costs nothing: this only stops a server that never ends.
 /// Four of the largest inscriptions there are fit in one page.
 const JSON_MAX: usize = 64 << 20;
-/// What one sync may keep of the transactions it reads, those the
-/// wallet lacks: what it stores then. A wallet paid dozens of the
-/// largest inscriptions there are fits; a server that invents
-/// transactions to fill memory does not.
-const KEEP_MAX: usize = 256 << 20;
 /// Chunks of an answer read ahead of its parsing.
 const CHUNKS_AHEAD: usize = 8;
 /// Tries of a request a server failed with an error of its own, which a
@@ -91,8 +86,7 @@ pub(crate) struct Client {
     budget: Budget,
     /// What a sync kept so far of the transactions it read, and how
     /// much it may.
-    kept: std::sync::atomic::AtomicUsize,
-    keep_max: usize,
+    kept: crate::chain::Kept,
     /// The longest wait the server asked for since it was last read:
     /// see [`Client::take_rate_limit`].
     rate_limit: std::sync::Mutex<Option<Duration>>,
@@ -229,17 +223,7 @@ impl Client {
 
     /// Counts `bytes` of transactions against what one sync may keep.
     pub(crate) fn keep(&self, bytes: usize) -> Result<(), String> {
-        let kept = self
-            .kept
-            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(bytes);
-        if kept > self.keep_max {
-            return Err(format!(
-                "the server sent more than {} MiB of transactions for one sync",
-                self.keep_max >> 20
-            ));
-        }
-        Ok(())
+        self.kept.add(bytes)
     }
 
     /// The body of an answer, read a chunk at a time, decompressed, and
@@ -468,17 +452,16 @@ fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, Strin
         http,
         base: url.trim_end_matches('/').to_owned(),
         budget,
-        kept: std::sync::atomic::AtomicUsize::new(0),
-        keep_max: usize::MAX,
+        kept: crate::chain::Kept::up_to(usize::MAX),
         rate_limit: std::sync::Mutex::new(None),
     })
 }
 
 /// A client for one sync: the same, and what it keeps of the
-/// transactions it reads held to [`KEEP_MAX`].
+/// transactions it reads held to [`crate::chain::KEEP_MAX`].
 pub(crate) fn client_for_run(url: &str, proxy: Option<&str>) -> Result<Client, String> {
     let mut client = client(url, proxy)?;
-    client.keep_max = KEEP_MAX;
+    client.kept = crate::chain::Kept::up_to(crate::chain::KEEP_MAX);
     Ok(client)
 }
 
@@ -744,6 +727,8 @@ async fn history_round(
 ) -> Result<HistoryRound, String> {
     // Each page is read into what the app shows as soon as it arrives,
     // and dropped: forty pages are never held as the server spelled them.
+    // What is kept of them, every input and output of each transaction,
+    // counts against what one sync may keep.
     let mut txs: Vec<AddressTx> = Vec::new();
     let mut confirmed = 0usize;
     let mut last_seen: Option<Txid> = None;
@@ -753,11 +738,14 @@ async fn history_round(
                 confirmed += 1;
                 last_seen = Some(tx.txid);
             }
-            txs.push(to_address_tx(tx, our_script, network));
+            let tx = to_address_tx(tx, our_script, network);
+            client.keep(crate::chain::held_by(&tx))?;
+            txs.push(tx);
         }
-        (confirmed, last_seen)
+        Ok::<_, String>((confirmed, last_seen))
     };
-    let (mut confirmed_so_far, mut last) = read(client.address_txs(address, from).await?, &mut txs);
+    let (mut confirmed_so_far, mut last) =
+        read(client.address_txs(address, from).await?, &mut txs)?;
     let mut cursor: Option<String> = None;
     let mut pages = 1usize;
     loop {
@@ -780,7 +768,7 @@ async fn history_round(
         if page.is_empty() {
             break;
         }
-        (confirmed_so_far, last) = read(page, &mut txs);
+        (confirmed_so_far, last) = read(page, &mut txs)?;
     }
     Ok(HistoryRound { txs, cursor })
 }
@@ -1248,6 +1236,36 @@ mod error_tests {
         assert_eq!(short.take_rate_limit(), Some(RATE_WAIT_MIN));
     }
 
+    /// What a sync of an address keeps of each transaction, its raw
+    /// bytes and every input and output, counts against what one sync
+    /// may keep: a server that lists enough of them fails the sync
+    /// instead of filling memory.
+    #[tokio::test]
+    async fn an_address_keeps_so_much_and_no_more() {
+        use crate::testkit::{ADDRESS, FakeMempool, esplora_payment};
+        let server = FakeMempool::start(false, 0).await;
+        server.state.lock().unwrap().address_txs = (1..=3u8)
+            .map(|n| esplora_payment(n, n + 10, 50_000, true))
+            .collect();
+        let base = format!("http://{}/api", server.address);
+        let client = client_for_run(&base, None).unwrap();
+        let state = fetch_address_state(&client, ADDRESS, Network::Signet)
+            .await
+            .unwrap();
+        assert_eq!(state.txs.len(), 3);
+        let one = crate::chain::held_by(&state.txs[0]);
+        assert!(one > state.txs[0].extras.as_ref().unwrap().raw_hex.len());
+        let mut tight = client_for_run(&base, None).unwrap();
+        tight.kept = crate::chain::Kept::up_to(one * 5 / 2);
+        let refused = fetch_address_state(&tight, ADDRESS, Network::Signet)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.starts_with("the server sent more than"),
+            "{refused}"
+        );
+    }
+
     /// A gzipped answer of a sensible size reads as it always did.
     #[tokio::test]
     async fn a_gzipped_answer_is_read() {
@@ -1276,14 +1294,14 @@ mod error_tests {
     #[test]
     fn a_sync_keeps_so_much_and_no_more() {
         let one_sync = client_for_run("http://127.0.0.1:9", None).unwrap();
-        one_sync.keep(KEEP_MAX - 1).unwrap();
+        one_sync.keep(crate::chain::KEEP_MAX - 1).unwrap();
         assert_eq!(
             one_sync.keep(2).unwrap_err(),
             "the server sent more than 256 MiB of transactions for one sync"
         );
         let watching = client("http://127.0.0.1:9", None).unwrap();
-        watching.keep(KEEP_MAX).unwrap();
-        watching.keep(KEEP_MAX).unwrap();
+        watching.keep(crate::chain::KEEP_MAX).unwrap();
+        watching.keep(crate::chain::KEEP_MAX).unwrap();
     }
 
     /// A history page listing an inscription of the largest kind: a

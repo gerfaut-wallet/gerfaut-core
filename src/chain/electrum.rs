@@ -258,7 +258,7 @@ pub(crate) struct Guarded {
 
 /// The most one connection reads, every answer together: far past the
 /// full scan of any wallet a phone holds.
-const MAX_READ: usize = 256 << 20;
+pub(crate) const MAX_READ: usize = 256 << 20;
 
 impl Guarded {
     fn new(inner: Box<dyn Stream>, cancel: Arc<Cancel>, limit: usize) -> Self {

@@ -266,6 +266,12 @@ The first release: the library both Gerfaut apps are built on.
   a server that limits it waits twice as long between rounds each time,
   up to ten minutes, and back to a minute half an hour after the last
   limit; a round turned away no longer counts as a server lost.
+- A sync of a watched address keeps 256 MiB at most of the transactions
+  it reads, as a sync of a descriptor wallet already did: each one is
+  kept whole, its raw bytes and every input and output, and a server
+  could list transactions of hundreds of thousands of inputs until the
+  phone ran out of memory. Over Electrum, a connection of that sync also
+  reads 256 MiB at most, every answer together.
 - A watched address is never read from a server of another network.
   Testnet, testnet4 and signet spell an address alike, and a server of
   the wrong one answered for it with transactions the wallet's network

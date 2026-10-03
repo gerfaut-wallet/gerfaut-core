@@ -11,7 +11,8 @@
 //! facts and the sigops of a transaction are read from them. A round is
 //! read a few transactions at a time, each turned into what the wallet
 //! keeps before the next ones come: what a round holds in memory is its
-//! result, not its transactions.
+//! result, not its transactions, and that result counts against what one
+//! sync may keep ([`crate::chain::KEEP_MAX`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -25,6 +26,7 @@ use serde_json::json;
 use super::rpc::{CallError, Connection};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
+use crate::chain::{KEEP_MAX, Kept};
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
 use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
@@ -115,7 +117,8 @@ async fn state_in_rounds_of(
         .call("blockchain.scripthash.listunspent", json!([hash]))
         .await?;
     let (round, cursor) = round_of(&history, None, per_round)?;
-    let mut txs = read(&mut connection, &round, &ours, network).await?;
+    let kept = Kept::up_to(KEEP_MAX);
+    let mut txs = read(&mut connection, &round, &ours, network, &kept).await?;
 
     let heights = txs
         .iter()
@@ -170,7 +173,8 @@ async fn history_in_rounds_of(
     check_network(&mut connection, network).await?;
     let history = history(&mut connection, &scripthash(&ours)).await?;
     let (round, cursor) = round_of(&history, Some(from), per_round)?;
-    let mut txs = read(&mut connection, &round, &ours, network).await?;
+    let kept = Kept::up_to(KEEP_MAX);
+    let mut txs = read(&mut connection, &round, &ours, network, &kept).await?;
     let heights: Vec<u32> = txs.iter().filter_map(|tx| tx.height).collect();
     let times = block_times(&mut connection, heights).await?;
     for tx in &mut txs {
@@ -299,12 +303,14 @@ fn decode(hex: &str, expected: Txid) -> Result<Transaction, CallError> {
     Ok(tx)
 }
 
-/// The transactions of a round, as the wallet keeps them.
+/// The transactions of a round, as the wallet keeps them, each counted
+/// in `kept`.
 async fn read(
     connection: &mut Connection,
     round: &[Picked],
     ours: &ScriptBuf,
     network: Network,
+    kept: &Kept,
 ) -> Result<Vec<AddressTx>, String> {
     // Outputs paying the address, from the transactions read so far:
     // what a spend from it takes as input, no fetch needed.
@@ -342,7 +348,9 @@ async fn read(
         }
         fetch_outputs(connection, wanted, &mut prevouts).await?;
         for (tx, (_, height)) in txs.iter().zip(chunk) {
-            read.push(to_address_tx(tx, *height, &prevouts, ours, network));
+            let tx = to_address_tx(tx, *height, &prevouts, ours, network);
+            kept.add(crate::chain::held_by(&tx))?;
+            read.push(tx);
         }
     }
     Ok(read)
@@ -570,6 +578,38 @@ mod tests {
             &[(&script(8), 30_000), (OURS, 19_500)],
         );
         (parent, payment, spend)
+    }
+
+    /// What a round keeps of each transaction, its raw bytes and every
+    /// input and output, counts against what one sync may keep: a server
+    /// that sends enough of them fails the sync instead of filling
+    /// memory.
+    #[tokio::test]
+    async fn a_round_keeps_so_much_and_no_more() {
+        let server = FakeElectrum::start().await;
+        let (parent, payment, spend) = story();
+        for tx in [&parent, &payment, &spend] {
+            server.add_tx(tx);
+        }
+        let round: Vec<Picked> = vec![
+            (spend.compute_txid(), None),
+            (payment.compute_txid(), Some(90)),
+        ];
+        let ours = ScriptBuf::from_hex(OURS).unwrap();
+        let mut connection = Connection::open(&target(&server), None).await.unwrap();
+        let unbound = Kept::up_to(usize::MAX);
+        let all = read(&mut connection, &round, &ours, Network::Signet, &unbound)
+            .await
+            .unwrap();
+        let first = crate::chain::held_by(&all[0]);
+        let tight = Kept::up_to(first);
+        let refused = read(&mut connection, &round, &ours, Network::Signet, &tight)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.starts_with("the server sent more than"),
+            "{refused}"
+        );
     }
 
     #[tokio::test]
