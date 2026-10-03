@@ -2068,8 +2068,21 @@ impl WalletManager {
     /// saved. See [`Self::premium_set_key_saved`],
     /// [`Self::premium_hide_checklist`] and
     /// [`Self::premium_mark_announced`].
-    pub async fn set_premium_state(&self, premium: PremiumState) -> CoreResult<()> {
+    ///
+    /// A new yes for a wallet no longer on this device is dropped: a
+    /// copy read before [`Self::remove_wallet`] would otherwise bring
+    /// back the consent the removal took, and cancel the removal queued
+    /// for the server.
+    pub async fn set_premium_state(&self, mut premium: PremiumState) -> CoreResult<()> {
         self.state.lock().await.commit(|payload| {
+            let stored = &payload.settings.premium;
+            premium.watched.retain(|consent| {
+                stored.is_consented(&consent.wallet_id)
+                    || payload
+                        .wallets
+                        .iter()
+                        .any(|record| record.meta.id == consent.wallet_id)
+            });
             payload.settings.premium = payload.settings.premium.with_app_part_of(premium);
             Ok(())
         })
@@ -3563,6 +3576,41 @@ mod tests {
         drop(manager);
         let manager = WalletManager::open(dir.path(), key()).unwrap();
         assert_eq!(manager.premium_state().await.pending_unwatch, vec![meta.id]);
+    }
+
+    /// An app reads the premium state, the wallet goes meanwhile, and
+    /// the copy comes back to dismiss a banner: its yes for the wallet
+    /// is stale, and the removal queued for the server stays.
+    #[tokio::test]
+    async fn a_stale_copy_cannot_take_back_a_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input(MULTIPATH).unwrap();
+        let meta = manager
+            .add_wallet("Signet cold", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        store_premium(
+            &manager,
+            PremiumState {
+                key: Some("abcdefghijkmnpqr".to_owned()),
+                ..PremiumState::default()
+            },
+        )
+        .await;
+        let mut premium = manager.premium_state().await;
+        premium.consent(&meta.id, 100);
+        manager.set_premium_state(premium).await.unwrap();
+
+        let mut stale = manager.premium_state().await;
+        assert!(stale.is_consented(&meta.id));
+        manager.remove_wallet(&meta.id).await.unwrap();
+        stale.acknowledged_offline_until = Some(5);
+        manager.set_premium_state(stale).await.unwrap();
+        let premium = manager.premium_state().await;
+        assert!(!premium.is_consented(&meta.id));
+        assert_eq!(premium.pending_unwatch, vec![meta.id]);
+        assert_eq!(premium.acknowledged_offline_until, Some(5));
     }
 
     /// A premium server that gives these answers in order, one

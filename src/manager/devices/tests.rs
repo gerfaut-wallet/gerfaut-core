@@ -1899,8 +1899,8 @@ async fn switching_accounts_tells_the_old_one_about_its_removals_first() {
 /// The removals queued for the server are the core's. A copy of the
 /// state read before this device moved to another account, handed back
 /// after, brings back none of the old account's: they would go to the
-/// new one, with its token. A yes a copy says for a wallet still drops
-/// that wallet's removal, since the server is to watch it again.
+/// new one, with its token. Nor does a yes the copy says for a wallet
+/// no longer on this device take back that wallet's removal.
 #[tokio::test]
 async fn a_stale_copy_cannot_bring_back_the_old_account_removals() {
     let (base_url, mut seen) = scripted(vec![
@@ -1945,8 +1945,10 @@ async fn a_stale_copy_cannot_bring_back_the_old_account_removals() {
     copy.queue_unwatch("w4");
     manager.set_premium_state(copy).await.unwrap();
     let stored = stored_premium(&manager).await;
-    assert_eq!(stored.pending_unwatch, ["w3"]);
-    assert_eq!(stored.consented_at("w2"), Some(200));
+    // A yes for a wallet gone from this device is a stale one: its
+    // removal stays.
+    assert_eq!(stored.pending_unwatch, ["w2", "w3"]);
+    assert_eq!(stored.consented_at("w2"), None);
 }
 
 /// A flush of removals answers for the account it spoke to. When this
