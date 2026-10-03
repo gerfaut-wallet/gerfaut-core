@@ -239,6 +239,13 @@ The first release: the library both Gerfaut apps are built on.
   left to the regular syncs. The status counts those scripts out, so
   `WatchStatus.wallets` and `left_out_scripts` say what the server really
   took, on the user's own node as on a public server.
+- An Electrum server that cuts the live watch for what it costs, an
+  ElectrumX past its budget, is left alone for a quarter of an hour, as
+  one of another network is, and asked for half as many scripts when the
+  watch comes back to it. ElectrumX keeps that cost against the address
+  for a while, and the watch used to come back within two minutes with
+  the same burst. Subscriptions go out ten at a time instead of 25, as
+  many as ElectrumX serves at once before it slows a session down.
 - A watched address is never read from a server of another network.
   Testnet, testnet4 and signet spell an address alike, and a server of
   the wrong one answered for it with transactions the wallet's network

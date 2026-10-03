@@ -450,6 +450,51 @@ async fn electrum_keeps_to_what_a_server_takes() {
     }
 }
 
+/// A server that cuts the watch for what it costs, ElectrumX past its
+/// budget, is left alone a long while, and asked for half as many
+/// scripts when the watch comes back to it.
+#[tokio::test]
+async fn a_server_that_cuts_the_watch_for_its_cost_is_asked_less() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().cost_cut = Some(6);
+    let refused = Duration::from_secs(1);
+    let started = std::time::Instant::now();
+    let all: Vec<u8> = (1..=10).collect();
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            refused,
+            ..timings()
+        }),
+    );
+    let status = until(&watch, "cut", |s| s.state == WatchState::Reconnecting).await;
+    assert_eq!(status.detail.as_deref(), Some("excessive resource usage"));
+    within("connected again", WAIT, || {
+        server.subscriptions().len() == 2
+    })
+    .await;
+    // Left alone four fifths of the wait at least, not the backoff of a
+    // lost connection.
+    assert!(started.elapsed() >= refused.mul_f64(0.8));
+    within("asked for half", WAIT, || {
+        server.subscriptions()[1].len() == 3
+    })
+    .await;
+    let head: Vec<String> = (1..=3).map(|n| scripthash(&script(n))).collect();
+    assert_eq!(server.subscriptions()[1], head);
+    let status = until(&watch, "connected", |s| s.state == WatchState::Connected).await;
+    assert_eq!(
+        status.wallets[0],
+        WalletCoverage {
+            wallet_id: "a".to_owned(),
+            coverage: Coverage::Partial,
+            watched_scripts: 3,
+            left_out_scripts: 7,
+        }
+    );
+}
+
 /// A server that says it takes no more subscriptions is at its limit,
 /// and the scripts still waiting their turn are not asked for. Nothing
 /// watches them from then on, and nothing says what they did while

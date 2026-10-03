@@ -81,6 +81,8 @@ pub(crate) fn scripthash(script_hex: &str) -> String {
 /// How the fake answers one request.
 enum Answer {
     Line(Value),
+    /// The last answer, after which the connection is closed.
+    Last(Value),
     /// The start of an answer, and nothing more.
     Stall,
     /// Bytes without a line end.
@@ -160,6 +162,10 @@ pub(crate) struct ElectrumState {
     /// The most subscriptions one connection holds, and the words that
     /// refuse the next ones.
     pub subscription_limit: Option<(usize, &'static str)>,
+    /// Subscriptions past which a connection costs the server too much:
+    /// the next one is refused the way ElectrumX does, and the
+    /// connection closed.
+    pub cost_cut: Option<usize>,
     /// A method whose answer starts and never ends: the connection
     /// answers nothing more after it.
     pub stall: Option<&'static str>,
@@ -298,6 +304,10 @@ impl FakeElectrum {
                     }
                     let bytes = match answer {
                         Answer::Line(answer) => format!("{answer}\n").into_bytes(),
+                        Answer::Last(answer) => {
+                            let _ = writer.write_all(format!("{answer}\n").as_bytes()).await;
+                            return;
+                        }
                         Answer::Stall => {
                             stalled = true;
                             format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":", request["id"]).into_bytes()
@@ -344,6 +354,15 @@ impl FakeElectrum {
             && state.connections[index].0.len() >= limit
         {
             return refusal(words);
+        }
+        if let Some(cut) = state.cost_cut
+            && method == "blockchain.scripthash.subscribe"
+            && state.connections[index].0.len() >= cut
+        {
+            return Answer::Last(json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": { "code": -101, "message": "excessive resource usage" },
+            }));
         }
         let param = request["params"][0].clone();
         let scripthash = param.as_str().unwrap_or_default().to_owned();

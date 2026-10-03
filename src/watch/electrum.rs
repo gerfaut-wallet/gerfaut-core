@@ -32,8 +32,14 @@ use crate::chain::{ANOTHER_NETWORK, Endpoint, is_genesis_of};
 /// The longest line read. A status is 64 characters and a header 160;
 /// a server sending more than this is not speaking the protocol.
 const MAX_LINE: usize = 64 * 1024;
-/// Subscriptions awaiting their answer at any time.
-const WINDOW: usize = 25;
+/// Subscriptions awaiting their answer at any time: as many as ElectrumX
+/// serves at once before it slows a session down. More go no faster, and
+/// are already sent when the server starts refusing.
+const WINDOW: usize = 10;
+/// The codes aiorpcx, under ElectrumX, refuses a request with when the
+/// session costs the server too much, before it closes it: excessive
+/// resource usage, and server busy.
+const COSTLY: [i64; 2] = [-101, -102];
 /// Subscriptions refused in a row, in words that do not say why, before
 /// the server is taken to be at its limit and the rest of the queue is
 /// given up: a server at its limit refuses them all, and asking on only
@@ -69,6 +75,8 @@ struct Session {
     refused_run: Vec<String>,
     /// The server takes no more on this connection.
     at_limit: bool,
+    /// The server cut the session for what it costs, in these words.
+    overloaded: Option<String>,
     can_unsubscribe: bool,
     /// When the ping in flight, if any, is given up on.
     pong_by: Option<Instant>,
@@ -161,6 +169,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         acknowledged: 0,
         refused_run: Vec::new(),
         at_limit: false,
+        overloaded: None,
         can_unsubscribe: at_least_1_4_2(&negotiated),
         pong_by: None,
         opening: HashSet::new(),
@@ -200,6 +209,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                     hub.alive();
                     session.pong_by = None;
                     session.handle(hub, &line);
+                    if let Some(detail) = session.overloaded.take() {
+                        return Exit::Refused(detail);
+                    }
                     session.check_ready(hub);
                     session.pump().await
                 }
@@ -332,7 +344,14 @@ impl Session {
             let Some(request) = self.in_flight.remove(&id) else {
                 return;
             };
-            let refused = message.get("error").is_some_and(|error| !error.is_null());
+            let error = message.get("error").filter(|error| !error.is_null());
+            if let Some(error) = error
+                && costs_too_much(error)
+            {
+                self.cut(hub, words(error));
+                return;
+            }
+            let refused = error.is_some();
             match request {
                 Request::Headers if !refused => {
                     if let Some(height) = height_of(&message["result"]) {
@@ -426,6 +445,21 @@ impl Session {
         }
     }
 
+    /// The server refused a request for what the session costs it,
+    /// ElectrumX past its budget, and is closing the connection. It
+    /// keeps that cost against the address for a while, and coming back
+    /// at once with the same burst would only be cut again: the session
+    /// ends, the server is left alone ([`Exit::Refused`]), and the next
+    /// session there asks for half as many scripts as this one took.
+    fn cut(&mut self, hub: &mut Hub, detail: String) {
+        let half = self.acknowledged as usize / 2;
+        if half > 0 {
+            let limit = &mut hub.refusals.entry(self.endpoint.clone()).or_default().limit;
+            *limit = Some(limit.map_or(half, |limit| limit.min(half)));
+        }
+        self.overloaded = Some(detail);
+    }
+
     /// A status arrived for a script, as the answer to a subscription
     /// (`answer`) or as a notification. It is news when it differs from
     /// the status of what the wallet holds for the script; a
@@ -513,6 +547,17 @@ fn height_of(header: &Value) -> Option<u32> {
         .get("height")
         .and_then(Value::as_u64)
         .and_then(|height| u32::try_from(height).ok())
+}
+
+/// Whether an error is a server cutting the session for what it costs:
+/// see [`COSTLY`].
+fn costs_too_much(error: &Value) -> bool {
+    let coded = error
+        .get("code")
+        .and_then(Value::as_i64)
+        .is_some_and(|code| COSTLY.contains(&code));
+    let words = words(error).to_lowercase();
+    coded || words.contains("excessive resource usage") || words.contains("server busy")
 }
 
 /// Whether a refusal says the server takes no more subscriptions on the

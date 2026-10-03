@@ -73,7 +73,8 @@
 //! - A server is asked for its genesis block before it hears of any
 //!   script. One of another network is refused, and left alone for a
 //!   quarter of an hour ([`Exit::Refused`]) while the next one is
-//!   tried.
+//!   tried. So is an Electrum server that cuts the watch for what it
+//!   costs; back there, the watch asks it for half as many scripts.
 //! - Timers stop while a phone sleeps. [`LiveWatch::tick`] is the
 //!   entry point a host alarm calls: it measures the pause on the wall
 //!   clock, pings at once, and cuts a backoff short.
@@ -904,8 +905,9 @@ pub(crate) enum Exit {
     /// The server is there and offers no push (a WebSocket upgrade
     /// answered with an HTTP refusal).
     NoPush(String),
-    /// The server will not do: one of another network. It is left alone
-    /// for [`Timings::refused`], whatever else is tried meanwhile, so that
+    /// The server will not do: one of another network, or one that cut
+    /// the watch for what it costs. It is left alone for
+    /// [`Timings::refused`], whatever else is tried meanwhile, so that
     /// coming back does not cost it, or the watch, what it just did.
     Refused(String),
 }
