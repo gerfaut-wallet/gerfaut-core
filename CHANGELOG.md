@@ -214,6 +214,12 @@ The first release: the library both Gerfaut apps are built on.
   types of what a server answers, which it now reads itself. Nor on
   `bdk_electrum`, kept only to reach `electrum-client`, on which it now
   depends directly, at the same version and with the same features.
+- On the WebSocket of a mempool instance, the live watch asks for as
+  many scripts as one message carries, some six hundred, instead of a
+  hundred: the public instances of signet and the testnets track 1,337
+  on one connection, and the rest were polled three a minute. The
+  message stays under the 50,000 bytes past which such an instance cuts
+  the connection.
 - The keepalive ping of the live watch comes at random between seven
   tenths of its wait and all of it, never later: a ping every four
   minutes on the dot marked the connection even through Tor.

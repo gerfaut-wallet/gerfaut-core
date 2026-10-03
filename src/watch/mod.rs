@@ -23,8 +23,10 @@
 //! 2. **The WebSocket of a mempool instance** (`/api/v1/ws`), for an
 //!    Esplora backend that is one. It pushes every block, and
 //!    transactions for as many scripts as the server allows on one
-//!    connection: ten on the public instances, one by default. The
-//!    scripts past that number are covered by polling.
+//!    connection and one message carries: ten on the public instances
+//!    of mainnet, some six hundred on those of signet and the
+//!    testnets, one by default. The scripts past that number are
+//!    covered by polling.
 //! 3. **Short polling** of any other Esplora: once a minute, the tip
 //!    hash and at most three script lookups, the head of the list every
 //!    round and the rest in rotation. About 240 requests an hour; with
