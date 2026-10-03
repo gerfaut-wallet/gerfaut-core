@@ -6,7 +6,7 @@
 //! blocks reads: requests are built under the lock, executed outside it,
 //! and applied back under the lock.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -284,6 +284,7 @@ fn plan_for(engine: &bdk_wallet::Wallet, reach: &Reach, gap_limit: u32) -> (chai
         views::held(engine, &all)
     };
     let plan = chain::Plan {
+        network: Network::from_bitcoin(engine.network()),
         tip: engine.latest_checkpoint(),
         start_time: now_secs(),
         scripts,
@@ -1094,6 +1095,9 @@ impl WalletManager {
                 Ok(synced) => {
                     let mut state = self.state.lock().await;
                     state.orders.extend(synced.orders);
+                    if let Some(height) = synced.drop_above {
+                        drop_blocks_above(&mut state, &meta.id, height)?;
+                    }
                     let engine = ensure_engine(&mut state, &meta.id)?;
                     engine
                         .apply_update(synced.update)
@@ -2738,6 +2742,66 @@ fn merge_changeset(
         None => staged,
     });
     Ok(())
+}
+
+/// Takes every block above `height` out of a wallet's chain: blocks a
+/// lying server put there, which no update can take out, since none
+/// will ever hold a block at their height (see
+/// [`chain::Synced::drop_above`]). The engine is loaded again from its
+/// stored change set, what it staged merged in first, with those
+/// heights removed.
+fn drop_blocks_above(state: &mut ManagerState, id: &str, height: u32) -> CoreResult<()> {
+    let engine = ensure_engine(state, id)?;
+    let above: BTreeMap<u32, Option<bdk_wallet::bitcoin::BlockHash>> = engine
+        .checkpoints()
+        .map(|checkpoint| checkpoint.height())
+        .take_while(|at| *at > height)
+        .map(|at| (at, None))
+        .collect();
+    if above.is_empty() {
+        return Ok(());
+    }
+    if let Some(staged) = engine.take_staged() {
+        merge_changeset(state, id, staged)?;
+    }
+    let mut dropped = bdk_wallet::ChangeSet::default();
+    dropped.local_chain.blocks = above;
+    merge_changeset(state, id, dropped)?;
+    state.engines.remove(id);
+    ensure_engine(state, id).map(|_| ())
+}
+
+/// Puts a block in a wallet's stored chain, the way a sync that took it
+/// from a lying server stored it before such blocks were refused.
+#[cfg(test)]
+pub(crate) fn store_block(
+    state: &mut ManagerState,
+    id: &str,
+    block: bdk_wallet::chain::BlockId,
+) -> CoreResult<()> {
+    let engine = ensure_engine(state, id)?;
+    let tip = engine
+        .latest_checkpoint()
+        .push(block)
+        .map_err(|_| CoreError::Internal("a block below the tip".to_owned()))?;
+    engine
+        .apply_update(bdk_wallet::Update {
+            chain: Some(tip),
+            ..Default::default()
+        })
+        .map_err(|e| CoreError::Internal(e.to_string()))?;
+    if let Some(staged) = engine.take_staged() {
+        merge_changeset(state, id, staged)?;
+    }
+    state.engines.remove(id);
+    Ok(())
+}
+
+/// The height of a wallet's tip, as its stored change set gives it.
+#[cfg(test)]
+pub(crate) fn stored_tip(state: &mut ManagerState, id: &str) -> CoreResult<u32> {
+    state.engines.remove(id);
+    Ok(ensure_engine(state, id)?.latest_checkpoint().height())
 }
 
 /// Updates cached totals and the sync stamp, then persists the vault.

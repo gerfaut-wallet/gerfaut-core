@@ -97,7 +97,7 @@ pub(crate) fn header_at(height: u32) -> String {
         version: Version::TWO,
         prev_blockhash: BlockHash::all_zeros(),
         merkle_root: TxMerkleNode::all_zeros(),
-        time: 1_700_000_000 + height,
+        time: 1_700_000_000_u32.wrapping_add(height),
         bits: CompactTarget::from_consensus(0x207f_ffff),
         nonce: 0,
     })
@@ -174,33 +174,48 @@ pub(crate) struct ElectrumState {
     pub closed: usize,
 }
 
+/// Heights past which the fake Electrum server makes a header up on the
+/// spot, its parent all zeroes, instead of chaining it to the genesis
+/// block: a height no chain of the tests reaches, which a client is to
+/// refuse before it asks for the blocks under it.
+const CHAINED_UP_TO: u32 = 100_000;
+
 impl ElectrumState {
-    /// The header at `height`, in hex: the signet genesis block at 0,
-    /// so a descriptor wallet's chain meets the server's there, and above
-    /// it the header of [`header_at`], whose merkle root is the txid of
-    /// the transaction a history puts at that height, if any: the one
-    /// transaction of its block.
+    /// The header at `height`, in hex: see [`Self::header_of`].
     fn header(&self, height: u32) -> String {
+        serialize_hex(&self.header_of(height))
+    }
+
+    /// The header at `height`: the signet genesis block at 0, so a
+    /// descriptor wallet's chain meets the server's there, and above it
+    /// the header of [`header_at`] with the one below as its parent,
+    /// whose merkle root is the txid of the transaction a history puts at
+    /// that height, if any: the one transaction of its block.
+    fn header_of(&self, height: u32) -> bdk_wallet::bitcoin::block::Header {
         use bdk_wallet::bitcoin::TxMerkleNode;
         use bdk_wallet::bitcoin::block::Header;
         use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
         use bdk_wallet::bitcoin::hashes::Hash;
-        if height == 0 {
-            let genesis = bdk_wallet::bitcoin::constants::genesis_block(
-                self.genesis.unwrap_or(bdk_wallet::bitcoin::Network::Signet),
-            );
-            return serialize_hex(&genesis.header);
+        let mut header = bdk_wallet::bitcoin::constants::genesis_block(
+            self.genesis.unwrap_or(bdk_wallet::bitcoin::Network::Signet),
+        )
+        .header;
+        if height > CHAINED_UP_TO {
+            return deserialize_hex(&header_at(height)).unwrap();
         }
-        let mut header: Header = deserialize_hex(&header_at(height)).unwrap();
-        if let Some((txid, _)) = self
-            .histories
-            .values()
-            .flatten()
-            .find(|(_, mined)| *mined == i64::from(height))
-        {
-            header.merkle_root = TxMerkleNode::from_byte_array(txid.to_byte_array());
+        let mut mined: HashMap<i64, Txid> = HashMap::new();
+        for (txid, at) in self.histories.values().flatten() {
+            mined.entry(*at).or_insert(*txid);
         }
-        serialize_hex(&header)
+        for at in 1..=height {
+            let mut next: Header = deserialize_hex(&header_at(at)).unwrap();
+            next.prev_blockhash = header.block_hash();
+            if let Some(txid) = mined.get(&i64::from(at)) {
+                next.merkle_root = TxMerkleNode::from_byte_array(txid.to_byte_array());
+            }
+            header = next;
+        }
+        header
     }
 }
 
@@ -493,6 +508,21 @@ pub(crate) struct MempoolState {
     pub genesis: Option<bdk_wallet::bitcoin::Network>,
 }
 
+impl MempoolState {
+    /// The id of the block at `height`: the genesis block of the network
+    /// at 0, signet unless set, and the height in hex above it, as the
+    /// tip's hash is read.
+    fn block_id(&self, height: u32) -> String {
+        if height == 0 {
+            let network = self.genesis.unwrap_or(bdk_wallet::bitcoin::Network::Signet);
+            return bdk_wallet::bitcoin::constants::genesis_block(network)
+                .block_hash()
+                .to_string();
+        }
+        format!("{height:064x}")
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct FakeMempool {
     pub address: SocketAddr,
@@ -591,12 +621,28 @@ impl FakeMempool {
                 ("200 OK", format!("{:064x}", state.tip))
             } else if path.ends_with("/blocks/tip/height") {
                 ("200 OK", state.tip.to_string())
-            } else if path.ends_with("/block-height/0") {
-                let network = state
-                    .genesis
-                    .unwrap_or(bdk_wallet::bitcoin::Network::Signet);
-                let genesis = bdk_wallet::bitcoin::constants::genesis_block(network);
-                ("200 OK", genesis.block_hash().to_string())
+            } else if path.ends_with("/blocks") {
+                let tip = state.tip;
+                let blocks: Vec<Value> = (tip.saturating_sub(9)..=tip)
+                    .rev()
+                    .map(|height| {
+                        json!({
+                            "id": state.block_id(height),
+                            "height": height,
+                            "previousblockhash": height.checked_sub(1).map(|below| state.block_id(below)),
+                        })
+                    })
+                    .collect();
+                ("200 OK", Value::Array(blocks).to_string())
+            } else if let Some(height) = path
+                .rsplit_once("/block-height/")
+                .and_then(|(_, height)| height.parse::<u32>().ok())
+            {
+                if height <= state.tip {
+                    ("200 OK", state.block_id(height))
+                } else {
+                    ("404 Not Found", "Block not found".to_owned())
+                }
             } else if path.ends_with("/utxo") || path.contains("/txs/chain/") {
                 ("200 OK", "[]".to_owned())
             } else if path.ends_with("/txs") {

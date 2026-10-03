@@ -357,6 +357,19 @@ The first release: the library both Gerfaut apps are built on.
 - A live watch that read an impossible tip height, from a lying server or
   a slip, no longer ignores every block after it: a height more than a
   day of blocks below the one kept becomes the baseline again.
+- A server can no longer put made-up blocks into a wallet's chain for
+  good. Its tip is refused past any height a chain can have reached (one
+  block a minute since the genesis block, with a clock set back read as
+  the day this release was written), and its latest blocks are taken
+  only as a chain: one per height, each the parent of the next, and over
+  Electrum the last one the tip it announced, with the work mainnet and
+  testnet4 ask for. A wallet that already holds such blocks, far above
+  the tip of the server it syncs with next, drops them: a single answer
+  with a height of four billion used to give every transaction billions
+  of confirmations, every timelock of the policy as expired, and every
+  later Esplora sync a failure, even on an honest server. An Esplora
+  server a little behind the wallet now leaves its chain as it is, as an
+  Electrum server already did, instead of failing the sync.
 - The update check keeps the page it links to only when it is one of the
   repository's release pages on GitHub, and falls back to the latest
   release page otherwise. A tag longer than 32 characters, or with

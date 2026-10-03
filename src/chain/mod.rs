@@ -139,6 +139,60 @@ pub(crate) fn is_genesis_of(network: Network, hash: bdk_wallet::bitcoin::BlockHa
     bdk_wallet::bitcoin::constants::genesis_block(network.to_bitcoin()).block_hash() == hash
 }
 
+/// How far below the height a wallet or a watch holds a server's tip may
+/// read and still be a server that lags: past a day of blocks, the
+/// height held was never a real one.
+pub(crate) const TIP_LAG_MAX: u32 = 144;
+
+/// What a server whose tip is higher than any chain of its network can
+/// have reached is refused with.
+pub(crate) const IMPOSSIBLE_TIP: &str = "the server claims a block height no chain has reached";
+
+/// The fastest a chain is taken to have grown since its genesis block,
+/// in seconds per block: ten times the pace of every network there is.
+const FASTEST_BLOCK_SECS: u64 = 60;
+/// A time this code was written after, 1 October 2026: a device clock
+/// that reads earlier is wrong, and is not believed over it.
+const WRITTEN_AFTER: u64 = 1_790_812_800;
+
+/// The highest block a chain of `network` can have reached at `now`, in
+/// unix seconds: one block a minute since its genesis block, ten times
+/// any pace there is, with a clock set back read as the day this was
+/// written. Loose on purpose, since a clock may be wrong, and enough to
+/// refuse a tip of four billion, which a lying server once had only to
+/// send for it to stay in the wallet's chain for good. A regtest chain
+/// is made at will, and has none.
+pub(crate) fn height_limit(network: Network, now: u64) -> u32 {
+    if network == Network::Regtest {
+        return u32::MAX;
+    }
+    let genesis = bdk_wallet::bitcoin::constants::genesis_block(network.to_bitcoin());
+    let elapsed = now
+        .max(WRITTEN_AFTER)
+        .saturating_sub(u64::from(genesis.header.time));
+    u32::try_from(elapsed / FASTEST_BLOCK_SECS).unwrap_or(u32::MAX)
+}
+
+/// Whether a header carries the proof of work its target asks for, and
+/// that target is one the network allows. Signet blocks are made valid
+/// by a signature, not by work, and regtest blocks by nobody, so only
+/// mainnet and testnet4 are held to it. It does not prove the work the
+/// chain asks for at that height, which takes every header since the
+/// last retarget: a server that mines a header at the easiest target
+/// passes. What it refuses is a header no one mined at all.
+pub(crate) fn has_proof_of_work(
+    network: Network,
+    header: &bdk_wallet::bitcoin::block::Header,
+) -> bool {
+    if !matches!(network, Network::Mainnet | Network::Testnet4) {
+        return true;
+    }
+    let easiest =
+        bdk_wallet::bitcoin::params::Params::new(network.to_bitcoin()).max_attainable_target;
+    let target = header.target();
+    target <= easiest && target.is_met_by(header.block_hash())
+}
+
 /// Whether a backend URL points at a Tor hidden service. Onion hosts
 /// are routed through the Tor proxy [`tor`] resolves, never looked up.
 ///
@@ -341,6 +395,8 @@ async fn within<T>(
 /// already holds: built under the lock of the vault, consumed by one
 /// attempt against one endpoint.
 pub(crate) struct Plan {
+    /// The network of the wallet, whose chain the server's must be.
+    pub network: Network,
     /// The wallet's chain, which the answer extends.
     pub tip: CheckPoint,
     /// The time a transaction seen in the mempool is stamped with.
@@ -442,6 +498,14 @@ pub(crate) struct ScriptFacts {
 /// What one sync attempt brought back.
 pub(crate) struct Synced {
     pub update: bdk_wallet::Update,
+    /// Set when the wallet's chain holds blocks above the server's tip
+    /// that no server will ever have: far above that tip, or above any
+    /// height a chain can have reached ([`TIP_LAG_MAX`],
+    /// [`height_limit`]). A lying server put them there, once, and an
+    /// update cannot take them out. The blocks above this height are to
+    /// be dropped before the update is applied, which was built as if
+    /// they were gone.
+    pub drop_above: Option<u32>,
     /// The histories an Electrum server listed, in its order, by script:
     /// the order its statuses hash them in.
     pub orders: Vec<(ScriptBuf, Vec<(Txid, i32)>)>,
@@ -516,12 +580,7 @@ pub(crate) async fn sync_engine(
     let synced = match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client_for_run(url, proxy)?;
-            within(deadline, esplora::sync::run(&client, plan))
-                .await
-                .map(|update| Synced {
-                    update,
-                    orders: Vec::new(),
-                })
+            within(deadline, esplora::sync::run(&client, plan)).await
         }
         Endpoint::Electrum(target) => electrum::sync(target, plan, proxy, deadline).await,
     }?;
@@ -1199,6 +1258,127 @@ mod tests {
         );
         twice.tx_update.txs = vec![paying(0, vec![coin, OutPoint { vout: 1, ..coin }])];
         assert!(check_amounts(&twice, 0).is_ok());
+    }
+
+    /// The highest tip a chain can have is far past the real one, with
+    /// room for a clock that is wrong, and far short of four billion.
+    #[test]
+    fn a_tip_is_bounded_by_the_clock() {
+        let now = 1_790_812_800 + 365 * 24 * 3600;
+        for network in [Network::Mainnet, Network::Signet, Network::Testnet4] {
+            let limit = height_limit(network, now);
+            assert!(limit > 1_000_000, "{network}: {limit}");
+            assert!(limit < 20_000_000, "{network}: {limit}");
+            // A clock set back to 1970 is not believed over the code.
+            assert!(height_limit(network, 0) > 1_000_000, "{network}");
+        }
+        assert_eq!(height_limit(Network::Regtest, now), u32::MAX);
+    }
+
+    /// A mainnet header is held to the work its target asks for; a signet
+    /// one, made valid by a signature, is not.
+    #[test]
+    fn a_header_no_one_mined_has_no_work() {
+        use bdk_wallet::bitcoin::constants::genesis_block;
+        let genesis = genesis_block(bdk_wallet::bitcoin::Network::Bitcoin).header;
+        assert!(has_proof_of_work(Network::Mainnet, &genesis));
+        let unmined = bdk_wallet::bitcoin::block::Header {
+            nonce: genesis.nonce.wrapping_add(1),
+            ..genesis
+        };
+        assert!(!has_proof_of_work(Network::Mainnet, &unmined));
+        // The easiest target there is, on a network that asks for more.
+        let easy = bdk_wallet::bitcoin::block::Header {
+            bits: bdk_wallet::bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+            ..genesis
+        };
+        assert!(!has_proof_of_work(Network::Testnet4, &easy));
+        assert!(has_proof_of_work(Network::Signet, &unmined));
+    }
+
+    /// A descriptor wallet on signet whose backend is `backend`, synced
+    /// once.
+    async fn synced_wallet(
+        dir: &std::path::Path,
+        backend: BackendConfig,
+    ) -> (crate::WalletManager, String) {
+        const WALLET: &str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)";
+        let manager =
+            crate::WalletManager::open(dir, crate::store::VaultKey::Raw([7; 32])).unwrap();
+        manager.set_backend(Network::Signet, backend).await.unwrap();
+        let parsed = crate::input::parse_input(WALLET).unwrap();
+        let wallet = manager
+            .add_wallet("Watched", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        manager.sync_wallet(&wallet.id).await.unwrap();
+        (manager, wallet.id)
+    }
+
+    /// A tip of four billion, from either kind of server, is refused,
+    /// and the wallet syncs as before once the server stops lying.
+    #[tokio::test]
+    async fn a_tip_no_chain_has_reached_is_refused() {
+        let electrum = crate::testkit::FakeElectrum::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, wallet) = synced_wallet(dir.path(), electrum.backend()).await;
+        electrum.state.lock().unwrap().height = 4_000_000_000;
+        let refused = manager.sync_wallet(&wallet).await.unwrap_err().to_string();
+        assert!(refused.contains(IMPOSSIBLE_TIP), "{refused}");
+        electrum.state.lock().unwrap().height = 100;
+        assert_eq!(manager.sync_wallet(&wallet).await.unwrap().tip_height, 100);
+
+        let esplora = crate::testkit::FakeMempool::start(false, 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, wallet) = synced_wallet(dir.path(), esplora.backend()).await;
+        esplora.state.lock().unwrap().tip = 4_000_000_000;
+        let refused = manager.sync_wallet(&wallet).await.unwrap_err().to_string();
+        assert!(refused.contains(IMPOSSIBLE_TIP), "{refused}");
+        esplora.state.lock().unwrap().tip = 500;
+        assert_eq!(manager.sync_wallet(&wallet).await.unwrap().tip_height, 500);
+    }
+
+    /// A block a lying server once put in a wallet's chain, far above
+    /// any real tip, is stored with it. No update can take it out, and
+    /// every Esplora sync failed on it for good. The next sync, on an
+    /// honest server of either kind, drops it, and the wallet's chain
+    /// is back on the server's, in the vault too.
+    #[tokio::test]
+    async fn a_block_a_lying_server_left_is_dropped() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        let forged = bdk_wallet::chain::BlockId {
+            height: 4_000_000_000,
+            hash: bdk_wallet::bitcoin::BlockHash::from_byte_array([0xee; 32]),
+        };
+        let electrum = crate::testkit::FakeElectrum::start().await;
+        let esplora = crate::testkit::FakeMempool::start(false, 0).await;
+        for (backend, honest) in [(electrum.backend(), 100), (esplora.backend(), 500)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (manager, wallet) = synced_wallet(dir.path(), backend.clone()).await;
+            {
+                let mut state = manager.state.lock().await;
+                crate::manager::store_block(&mut state, &wallet, forged).unwrap();
+                assert_eq!(
+                    crate::manager::stored_tip(&mut state, &wallet).unwrap(),
+                    forged.height
+                );
+            }
+            let report = manager.sync_wallet(&wallet).await.unwrap();
+            assert_eq!(report.tip_height, honest, "{backend:?}");
+            drop(manager);
+            let manager =
+                crate::WalletManager::open(dir.path(), crate::store::VaultKey::Raw([7; 32]))
+                    .unwrap();
+            assert_eq!(
+                crate::manager::stored_tip(&mut *manager.state.lock().await, &wallet).unwrap(),
+                honest,
+                "{backend:?}"
+            );
+            assert_eq!(
+                manager.sync_wallet(&wallet).await.unwrap().tip_height,
+                honest
+            );
+        }
     }
 
     /// A previous transaction is read only if it is the one asked for:
