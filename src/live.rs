@@ -36,6 +36,15 @@
 //! - [`WalletManager::live_tick`] is for a host whose timers stop
 //!   while it sleeps: call it from an alarm every few minutes, and
 //!   when the network comes back.
+//! - The status ([`WalletManager::live_status`], [`LiveEvent::Status`])
+//!   says how much of each wallet the watch hears, and what it leaves
+//!   to the regular syncs: the scripts past what it takes of one
+//!   wallet, or of all of them ([`crate::watch::WatchLimits`]). A
+//!   payment to one of those shows at the next sync. The user's own
+//!   node lifts both limits ([`crate::chain::BackendConfig::is_own_node`]);
+//!   pinned wallets come first
+//!   ([`WalletManager::set_wallet_live_pinned`]), then those holding
+//!   coins.
 //! - Stop the watch before the vault locks.
 //!
 //! # At exit
@@ -410,7 +419,8 @@ impl WalletManager {
         }
     }
 
-    /// Where the watch stands; off when none runs.
+    /// Where the watch stands, and how much of each wallet it hears;
+    /// off, and nothing heard, when none runs.
     pub async fn live_status(&self) -> WatchStatus {
         match self.live_slot().as_ref() {
             Some(running) => running.watch.status(),

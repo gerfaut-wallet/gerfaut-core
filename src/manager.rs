@@ -2501,17 +2501,20 @@ pub(crate) fn watched_wallet(
                 .address_state
                 .as_ref()
                 .is_some_and(|watch| !watch.utxos.is_empty());
-            let scripts = vec![crate::watch::WatchedScript {
-                script: script.to_hex_string(),
-                lookahead: false,
-                status: record
-                    .address_state
-                    .as_ref()
-                    .and_then(views::address_status),
-                // Its history may be cut short: nothing to compare
-                // counters with.
-                counts: None,
-            }];
+            let scripts = (
+                vec![crate::watch::WatchedScript {
+                    script: script.to_hex_string(),
+                    lookahead: false,
+                    status: record
+                        .address_state
+                        .as_ref()
+                        .and_then(views::address_status),
+                    // Its history may be cut short: nothing to compare
+                    // counters with.
+                    counts: None,
+                }],
+                0,
+            );
             (scripts, has_pending, holds_coins)
         }
         WalletKind::Descriptors { .. } => {
@@ -2535,6 +2538,7 @@ pub(crate) fn watched_wallet(
         .meta
         .last_sync
         .is_none();
+    let (scripts, unlisted) = scripts;
     let scripts = scripts
         .into_iter()
         .map(|script| crate::watch::WatchedScript {
@@ -2552,6 +2556,7 @@ pub(crate) fn watched_wallet(
         has_pending,
         pinned,
         holds_coins,
+        unlisted,
     })
 }
 
@@ -4414,11 +4419,13 @@ mod tests {
                 .await
                 .into_iter()
                 .find(|wallet| wallet.wallet_id == cold.id)
+                .map(|wallet| (wallet.scripts.len(), wallet.unlisted))
                 .unwrap()
-                .scripts
-                .len()
         };
-        assert_eq!(listed(&source).await, crate::watch::MAX_SCRIPTS_PER_WALLET);
+        assert_eq!(
+            listed(&source).await,
+            (crate::watch::MAX_SCRIPTS_PER_WALLET, 840)
+        );
 
         source
             .set_backend(
@@ -4437,7 +4444,7 @@ mod tests {
         assert_eq!(source.settings().await.backend_for(Network::Signet), own);
         // Every revealed receive address, and a gap limit past the last
         // one on each keychain.
-        assert_eq!(listed(&source).await, 1_000 + 2 * 20);
+        assert_eq!(listed(&source).await, (1_000 + 2 * 20, 0));
 
         let options = BackupOptions {
             wallet_ids: None,

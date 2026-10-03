@@ -64,6 +64,7 @@ fn wallet(id: &str, scripts: &[u8], lookahead: &[u8], has_pending: bool) -> Watc
         has_pending,
         pinned: false,
         holds_coins: false,
+        unlisted: 0,
     }
 }
 
@@ -790,6 +791,7 @@ fn wallets_the_whole_list_cut_short_are_caught_up_whole() {
             has_pending: false,
             pinned: false,
             holds_coins: false,
+            unlisted: 0,
         })
         .collect();
     wallets.insert(0, wallet("small", &[1, 2, 3], &[], false));
@@ -842,6 +844,7 @@ fn numbered(id: &str, first: u32, count: u32) -> WatchedWallet {
         has_pending: false,
         pinned: false,
         holds_coins: false,
+        unlisted: 0,
     }
 }
 
@@ -940,6 +943,149 @@ fn a_shared_script_is_heard_for_every_wallet_that_lists_it() {
     assert_eq!(watched.by_hex(&shared.script).unwrap().owners, [1, 0]);
     assert!(watched.by_hex(&own.script).is_none());
     assert_eq!(watched.capped, vec!["other".to_owned()]);
+}
+
+/// What the watch hears of each wallet: all of it, its head, or
+/// nothing, with what it leaves out counted, the scripts a list stopped
+/// short of included.
+#[test]
+fn each_wallet_is_live_in_part_or_left_to_the_syncs() {
+    fn coverage(watched: &Watched) -> Vec<(&str, Coverage, u32, u32)> {
+        watched
+            .coverage
+            .iter()
+            .map(|wallet| {
+                (
+                    wallet.wallet_id.as_str(),
+                    wallet.coverage,
+                    wallet.watched_scripts,
+                    wallet.left_out_scripts,
+                )
+            })
+            .collect::<Vec<_>>()
+    }
+    let cut_short = WatchedWallet {
+        unlisted: 7,
+        ..numbered("cut short", 100, 10)
+    };
+    let limits = WatchLimits {
+        per_wallet: 20,
+        total: 30,
+    };
+    let watched = Watched::new(
+        vec![
+            numbered("small", 0, 5),
+            numbered("large", 200, 30),
+            cut_short,
+        ],
+        limits,
+    );
+    assert_eq!(
+        coverage(&watched),
+        [
+            ("small", Coverage::Live, 5, 0),
+            ("large", Coverage::Partial, 15, 15),
+            ("cut short", Coverage::Partial, 10, 7),
+        ]
+    );
+    assert_eq!(
+        watched.capped,
+        vec!["large".to_owned(), "cut short".to_owned()]
+    );
+
+    // Pinned wallets that take it all leave nothing to the others.
+    let limits = WatchLimits {
+        per_wallet: 20,
+        total: 2,
+    };
+    let watched = Watched::new(
+        vec![
+            numbered("other", 10, 1),
+            flagged("pinned", 0, 2, true, false),
+        ],
+        limits,
+    );
+    assert_eq!(
+        coverage(&watched),
+        [
+            ("other", Coverage::SyncOnly, 0, 1),
+            ("pinned", Coverage::Live, 2, 0),
+        ]
+    );
+}
+
+/// The status a screen reads says how much of each wallet the watch
+/// hears and what it leaves to the syncs, and says it again when the
+/// backend becomes the user's own node, which takes the whole list.
+#[tokio::test]
+async fn the_status_says_how_much_of_each_wallet_is_live() {
+    let server = FakeElectrum::start().await;
+    let wallets = || vec![numbered("large", 0, 250), numbered("small", 1_000, 3)];
+    let (watch, _events) =
+        LiveWatch::start_with(config(server.backend()), wallets(), Some(timings()));
+    let status = until(&watch, "subscribed", |s| s.pushed_scripts == 203).await;
+    assert_eq!((status.left_out_wallets, status.left_out_scripts), (1, 50));
+    assert_eq!(
+        status.wallets,
+        vec![
+            WalletCoverage {
+                wallet_id: "large".to_owned(),
+                coverage: Coverage::Partial,
+                watched_scripts: 200,
+                left_out_scripts: 50,
+            },
+            WalletCoverage {
+                wallet_id: "small".to_owned(),
+                coverage: Coverage::Live,
+                watched_scripts: 3,
+                left_out_scripts: 0,
+            },
+        ]
+    );
+
+    let BackendConfig::CustomElectrum { url, .. } = server.backend() else {
+        unreachable!("the fake server is an Electrum one");
+    };
+    let own = BackendConfig::CustomElectrum {
+        url,
+        own_node: true,
+    };
+    watch.reconfigure(config(own), wallets());
+    let status = until(&watch, "subscribed whole", |s| s.pushed_scripts == 253).await;
+    assert_eq!((status.left_out_wallets, status.left_out_scripts), (0, 0));
+    assert!(
+        status
+            .wallets
+            .iter()
+            .all(|wallet| wallet.coverage == Coverage::Live)
+    );
+}
+
+/// A status, or a wallet list, written before coverage and pinning
+/// existed still reads, with nothing left out and nothing pinned.
+#[test]
+fn a_status_and_a_list_from_before_coverage_still_read() {
+    let status: WatchStatus = serde_json::from_str(
+        r#"{"state":"connected","transport":"electrum","server":"node.example.org","detail":null,"watched_scripts":3,"pushed_scripts":3}"#,
+    )
+    .unwrap();
+    assert_eq!((status.left_out_scripts, status.left_out_wallets), (0, 0));
+    assert!(status.wallets.is_empty());
+    let wallet: WatchedWallet =
+        serde_json::from_str(r#"{"wallet_id":"w","scripts":[],"has_pending":false}"#).unwrap();
+    assert!(!wallet.pinned && !wallet.holds_coins);
+    assert_eq!(wallet.unlisted, 0);
+    let json = serde_json::to_string(&WalletCoverage {
+        wallet_id: "w".to_owned(),
+        coverage: Coverage::SyncOnly,
+        watched_scripts: 0,
+        left_out_scripts: 4,
+    })
+    .unwrap();
+    assert_eq!(
+        json,
+        r#"{"wallet_id":"w","coverage":"sync_only","watched_scripts":0,"left_out_scripts":4}"#
+    );
 }
 
 /// On the user's own node a watch takes ten times as many scripts in
@@ -1143,6 +1289,7 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
             has_pending: false,
             pinned: false,
             holds_coins: false,
+            unlisted: 0,
         }]
     );
     manager.sync_wallet(&wallet.id).await.unwrap();
@@ -1473,6 +1620,7 @@ async fn live_the_three_transports_see_signet_move() {
         has_pending: true,
         pinned: false,
         holds_coins: false,
+        unlisted: 0,
     }];
     // The Electrum server may sign its own certificate: accepted here
     // the way the settings screen does it, by its fingerprint.

@@ -208,6 +208,12 @@ pub struct WatchedWallet {
     /// wallet's.
     #[serde(default)]
     pub holds_coins: bool,
+    /// Scripts worth watching past the end of `scripts`, which the list
+    /// stopped short of at what a watch takes of one wallet: zero when
+    /// it is whole. Counted in what the watch leaves out of the wallet
+    /// ([`WalletCoverage`]).
+    #[serde(default)]
+    pub unlisted: u32,
 }
 
 /// Why a wallet is reported. Reasons heard together are kept as the
@@ -292,6 +298,63 @@ pub struct WatchStatus {
     pub watched_scripts: u32,
     /// Scripts the server pushes changes for; the rest are polled.
     pub pushed_scripts: u32,
+    /// Scripts worth watching that the watch leaves to the regular
+    /// syncs, past what it takes of one wallet or of all of them: a
+    /// payment to one of them shows at the next sync, not at once.
+    #[serde(default)]
+    pub left_out_scripts: u32,
+    /// The wallets those scripts belong to.
+    #[serde(default)]
+    pub left_out_wallets: u32,
+    /// How much of each wallet of the list the watch hears, in the
+    /// order of the list.
+    #[serde(default)]
+    pub wallets: Vec<WalletCoverage>,
+}
+
+/// How much of one wallet the live watch hears.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletCoverage {
+    pub wallet_id: String,
+    pub coverage: Coverage,
+    /// Scripts of the wallet the watch hears, one it shares with
+    /// another wallet included.
+    pub watched_scripts: u32,
+    /// Scripts of the wallet worth watching that it leaves to the
+    /// regular syncs.
+    pub left_out_scripts: u32,
+}
+
+/// Whether a wallet is watched whole, in part, or only synced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coverage {
+    /// Every script worth watching is: a payment shows at once.
+    Live,
+    /// The head of the wallet is: the unused addresses first, then the
+    /// coins, then the addresses ahead. A payment to the rest shows at
+    /// the next sync.
+    Partial,
+    /// None is: every payment shows at the next sync.
+    SyncOnly,
+}
+
+impl WalletCoverage {
+    fn of(wallet_id: String, watched_scripts: u32, left_out_scripts: u32) -> WalletCoverage {
+        let coverage = if watched_scripts == 0 {
+            Coverage::SyncOnly
+        } else if left_out_scripts == 0 {
+            Coverage::Live
+        } else {
+            Coverage::Partial
+        };
+        WalletCoverage {
+            wallet_id,
+            coverage,
+            watched_scripts,
+            left_out_scripts,
+        }
+    }
 }
 
 /// Durations of the watcher, in one place so tests can shorten them.
@@ -543,6 +606,9 @@ pub(crate) struct Watched {
     /// Wallets with scripts left out of the list: past what a watch
     /// takes of one wallet, or of all of them.
     pub capped: Vec<String>,
+    /// How much of each wallet the list holds, in the order of the
+    /// wallets.
+    pub coverage: Vec<WalletCoverage>,
     pub entries: Vec<Entry>,
     by_hex: HashMap<String, usize>,
     by_scripthash: HashMap<String, usize>,
@@ -623,16 +689,25 @@ impl Watched {
                 }
             }
         }
-        // A wallet listed with as many scripts as a watch takes of one,
-        // or whose tail the cap on the whole list cut off: what the
-        // scripts left out do is never heard.
-        watched.capped = wallets
+        // What is left out of each wallet: the scripts listed past what a
+        // watch takes of one wallet, or whose rank the cap on the whole
+        // list cut off, and those the list itself stopped short of. What
+        // they do is never heard.
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        watched.coverage = wallets
             .iter()
             .zip(kept)
-            .filter(|(wallet, kept)| {
-                wallet.scripts.len() >= limits.per_wallet || *kept < wallet.scripts.len()
+            .map(|(wallet, kept)| {
+                let left_out = count(wallet.scripts.len().saturating_sub(kept))
+                    .saturating_add(wallet.unlisted);
+                WalletCoverage::of(wallet.wallet_id.clone(), count(kept), left_out)
             })
-            .map(|(wallet, _)| wallet.wallet_id.clone())
+            .collect();
+        watched.capped = watched
+            .coverage
+            .iter()
+            .filter(|wallet| wallet.left_out_scripts > 0)
+            .map(|wallet| wallet.wallet_id.clone())
             .collect();
         watched
     }
@@ -820,6 +895,15 @@ impl Hub {
         let mut next = self.status.borrow().clone();
         change(&mut next);
         next.watched_scripts = self.watched.entries.len() as u32;
+        let coverage = &self.watched.coverage;
+        next.left_out_scripts = coverage.iter().fold(0u32, |sum, wallet| {
+            sum.saturating_add(wallet.left_out_scripts)
+        });
+        next.left_out_wallets = coverage
+            .iter()
+            .filter(|wallet| wallet.left_out_scripts > 0)
+            .count() as u32;
+        next.wallets.clone_from(coverage);
         if *self.status.borrow() == next {
             return;
         }

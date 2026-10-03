@@ -160,7 +160,9 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
 /// would keep for that history.
 ///
 /// The list stops at `cap`, all a watch takes of one wallet (see
-/// [`crate::watch::WatchLimits`]).
+/// [`crate::watch::WatchLimits`]), and comes back with the number of
+/// scripts it left out past that, counted and not derived: none when it
+/// is whole.
 ///
 /// This runs under the lock of the vault after every sync, for every
 /// wallet of the network, so nothing past the cap is looked at, and
@@ -175,7 +177,7 @@ pub(crate) fn watch_scripts(
     gap_limit: u32,
     orders: &HistoryOrders,
     cap: usize,
-) -> Vec<crate::watch::WatchedScript> {
+) -> (Vec<crate::watch::WatchedScript>, u32) {
     let index = wallet.spk_index();
     let mut seen = std::collections::HashSet::new();
     let mut listed: Vec<(bdk_wallet::bitcoin::ScriptBuf, bool)> = Vec::new();
@@ -197,47 +199,69 @@ pub(crate) fn watch_scripts(
                 .unwrap_or_else(|| wallet.peek_address(keychain, at).script_pubkey())
         })
     };
-    'full: {
+    let cut = 'full: {
         for (_, script) in index.unused_keychain_spks(KeychainKind::External) {
             if push(script, false) {
-                break 'full;
+                break 'full true;
             }
         }
         for coin in wallet.list_unspent() {
             if push(coin.txout.script_pubkey, false) {
-                break 'full;
+                break 'full true;
             }
         }
         for script in ahead(KeychainKind::External) {
             if push(script, true) {
-                break 'full;
+                break 'full true;
             }
         }
         if keychains.contains(&KeychainKind::Internal) {
             for (_, script) in index.unused_keychain_spks(KeychainKind::Internal) {
                 if push(script, false) {
-                    break 'full;
+                    break 'full true;
                 }
             }
             for script in ahead(KeychainKind::Internal) {
                 if push(script, true) {
-                    break 'full;
+                    break 'full true;
                 }
             }
         }
         for &keychain in &keychains {
             for (_, script) in index.revealed_keychain_spks(keychain).rev() {
                 if push(script, false) {
-                    break 'full;
+                    break 'full true;
                 }
             }
         }
-    }
+        false
+    };
+    // What the list holds whole: the scripts each keychain revealed and
+    // a gap limit past them, or the one script of a descriptor without
+    // a wildcard.
+    let unlisted = if cut {
+        let whole: u64 = wallet
+            .keychains()
+            .map(|(keychain, descriptor)| {
+                if descriptor.has_wildcard() {
+                    wallet
+                        .derivation_index(keychain)
+                        .map_or(0, |last| u64::from(last) + 1)
+                        + u64::from(gap_limit)
+                } else {
+                    1
+                }
+            })
+            .sum();
+        u32::try_from(whole.saturating_sub(listed.len() as u64)).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
     let scripts: Vec<bdk_wallet::bitcoin::ScriptBuf> =
         listed.iter().map(|(script, _)| script.clone()).collect();
     let statuses = electrum_statuses(wallet, &scripts, orders);
     let facts = script_facts(wallet, &scripts);
-    listed
+    let listed = listed
         .into_iter()
         .zip(statuses)
         .zip(facts)
@@ -249,7 +273,8 @@ pub(crate) fn watch_scripts(
                 counts: Some(facts.counts),
             },
         )
-        .collect()
+        .collect();
+    (listed, unlisted)
 }
 
 /// Whether the wallet holds a coin, confirmed or not: what puts it
@@ -1194,13 +1219,19 @@ mod tests {
         let _ = wallet
             .reveal_addresses_to(KeychainKind::External, 1_000)
             .count();
-        let scripts = watch_scripts(
+        let (scripts, unlisted) = watch_scripts(
             &wallet,
             20,
             &HistoryOrders::new(),
             crate::watch::MAX_SCRIPTS_PER_WALLET,
         );
         assert_eq!(scripts.len(), crate::watch::MAX_SCRIPTS_PER_WALLET);
+        // The 1,001 receive addresses revealed and a gap limit past
+        // them, and a gap limit of change addresses: counted, not
+        // listed.
+        assert_eq!(unlisted, 1_001 + 20 + 20 - 200);
+        let (whole, unlisted) = watch_scripts(&wallet, 20, &HistoryOrders::new(), 5_000);
+        assert_eq!((whole.len(), unlisted), (1_041, 0));
         assert_eq!(
             scripts[0].script,
             wallet
@@ -1244,7 +1275,8 @@ mod tests {
         // Past the 25 scripts the index derives ahead of the last one
         // revealed.
         let gap = 40;
-        let scripts = watch_scripts(&wallet, gap, &HistoryOrders::new(), usize::MAX);
+        let (scripts, unlisted) = watch_scripts(&wallet, gap, &HistoryOrders::new(), usize::MAX);
+        assert_eq!(unlisted, 0);
         let mut expected: Vec<(String, bool)> = Vec::new();
         for index in [0, 1, 2, 4, 5, 6, 7, 8, 9] {
             expected.push((derived(&wallet, KeychainKind::External, index), false));
