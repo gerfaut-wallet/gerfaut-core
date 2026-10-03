@@ -235,10 +235,14 @@ fn ur_message_to_text(ur_type: &str, bytes: &[u8]) -> CoreResult<String> {
                 .map_err(|e| qr_error(format!("invalid crypto-output: {e}")))?;
             crypto_output_to_descriptor(&value)
         }
+        // A key alone is an account key, as pasted: `[origin]xpub`, the
+        // branches left to the confirmation screen, which reads the
+        // script from the origin. With its children path glued on, the
+        // classifier took the whole for one key and refused it.
         "crypto-hdkey" => {
             let value: Value = ciborium::from_reader(bytes)
                 .map_err(|e| qr_error(format!("invalid crypto-hdkey: {e}")))?;
-            hdkey_expression(&value)
+            hdkey_parts(&value).map(|(key, _)| key)
         }
         // A PSBT rides as a CBOR byte string (BCR-2020-006). It comes
         // out as base64, the text every other PSBT path accepts.
@@ -309,7 +313,9 @@ fn crypto_output_to_descriptor(value: &Value) -> CoreResult<String> {
 /// a bare EC public key.
 fn key_expression(value: &Value) -> CoreResult<String> {
     match value {
-        Value::Tag(TAG_HDKEY, inner) => hdkey_expression(inner),
+        Value::Tag(TAG_HDKEY, inner) => {
+            hdkey_parts(inner).map(|(key, children)| format!("{key}{children}"))
+        }
         Value::Tag(TAG_ECKEY, inner) => {
             if map_get(inner, 2).and_then(as_bool) == Some(true) {
                 return Err(CoreError::PrivateMaterialRejected);
@@ -329,12 +335,13 @@ fn key_expression(value: &Value) -> CoreResult<String> {
     }
 }
 
-/// `[fingerprint/origin]xpub/children` from a `crypto-hdkey` map.
+/// `[fingerprint/origin]xpub` and `/children` from a `crypto-hdkey`
+/// map.
 ///
 /// Without a children path, both branches are watched (`/<0;1>/*`):
 /// coordinators that omit it mean the whole account, and a lone
 /// receive branch would silently miss change.
-fn hdkey_expression(map: &Value) -> CoreResult<String> {
+fn hdkey_parts(map: &Value) -> CoreResult<(String, String)> {
     if map_get(map, 2).and_then(as_bool) == Some(true) {
         return Err(CoreError::PrivateMaterialRejected);
     }
@@ -424,7 +431,7 @@ fn hdkey_expression(map: &Value) -> CoreResult<String> {
         }
         None => "/<0;1>/*".to_owned(),
     };
-    Ok(format!("{origin_text}{xpub}{children}"))
+    Ok((format!("{origin_text}{xpub}"), children))
 }
 
 /// One step of a BCR-2020-007 key path.
@@ -909,6 +916,33 @@ mod tests {
             }
         }
         panic!("the fountain never completed");
+    }
+
+    /// A key scanned alone opens as the account key a person would
+    /// paste, and the classifier takes it, script read from its origin.
+    #[test]
+    fn a_lone_hdkey_opens_as_an_account_key() {
+        let Value::Tag(_, map) = hdkey(None) else {
+            unreachable!()
+        };
+        let text = assemble(&[encode_ur("crypto-hdkey", &map)])
+            .unwrap()
+            .text
+            .unwrap();
+        assert_eq!(text, format!("[9a6a2580/84'/1'/0']{TPUB}"));
+        let parsed = crate::input::parse_input(&text).unwrap();
+        assert_eq!(parsed.kind, crate::input::RecognizedKind::ExtendedKey);
+        let crate::input::ParsedPayload::Descriptors {
+            external, internal, ..
+        } = parsed.payload
+        else {
+            panic!("an extended key makes descriptors");
+        };
+        assert!(
+            external.starts_with(&format!("wpkh([9a6a2580/84'/1'/0']{TPUB}/0/*)")),
+            "{external}"
+        );
+        assert!(internal.is_some());
     }
 
     /// [`hdkey`] with one entry of its map set to `value`.
