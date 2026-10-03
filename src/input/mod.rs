@@ -7,8 +7,9 @@
 //! confirmation. Detection is never silent.
 //!
 //! Anything that carries private key material — extended private keys,
-//! WIF keys, seed phrases — is rejected before any other processing and
-//! is never stored or logged.
+//! WIF keys, seed phrases — is rejected before it is read as wallet
+//! material, the strings of a JSON export once more after decoding,
+//! and is never stored or logged.
 
 pub mod bsms;
 pub mod qr;
@@ -978,6 +979,10 @@ fn parse_json_export(input: &str) -> CoreResult<ParsedInput> {
             kind: "json",
             detail: e.to_string(),
         })?;
+    // Checked once more as decoded: a key written with JSON escapes,
+    // `5Hue…`, reads as nothing private in the raw text, and a
+    // parser that refused it later would quote it in its error.
+    reject_private_in_json(&value)?;
 
     // Generic: { "descriptor": "...", "change_descriptor": "..."? }
     if let Some(descriptor) = value.get("descriptor").and_then(|v| v.as_str()) {
@@ -1041,6 +1046,22 @@ fn parse_json_export(input: &str) -> CoreResult<ParsedInput> {
     Err(CoreError::UnrecognizedInput(
         "JSON file is not a recognized wallet export".to_owned(),
     ))
+}
+
+/// [`reject_private_material`] over every string of a JSON document,
+/// names and values alike.
+fn reject_private_in_json(value: &serde_json::Value) -> CoreResult<()> {
+    match value {
+        serde_json::Value::String(text) => reject_private_material(text),
+        serde_json::Value::Array(items) => items.iter().try_for_each(reject_private_in_json),
+        serde_json::Value::Object(fields) => fields.iter().try_for_each(|(name, value)| {
+            reject_private_material(name)?;
+            reject_private_in_json(value)
+        }),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            Ok(())
+        }
+    }
 }
 
 /// An account of a Coldcard-style export without a descriptor of its
@@ -1769,6 +1790,24 @@ mod tests {
                       abandon abandon abandon abandon abandon about";
         assert!(matches!(
             parse_input(phrase),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
+    }
+
+    /// A private key written with JSON escapes reads as nothing in the
+    /// raw text: it is caught once the text is decoded, before anything
+    /// could quote it back in an error.
+    #[test]
+    fn an_escaped_private_key_in_json_is_rejected() {
+        let escaped =
+            r#"{"descriptor": "wpkh(5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ)"}"#;
+        assert!(matches!(
+            parse_input(escaped),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
+        let named = r#"{"bip84": {"5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ": 1}}"#;
+        assert!(matches!(
+            parse_input(named),
             Err(CoreError::PrivateMaterialRejected)
         ));
     }
