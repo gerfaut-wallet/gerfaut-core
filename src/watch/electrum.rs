@@ -197,10 +197,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         return Exit::Lost(detail);
     }
 
-    let mut keepalive = tokio::time::interval_at(
-        Instant::now() + hub.timings.keepalive,
-        hub.timings.keepalive,
-    );
+    let mut next_ping = Instant::now() + hub.timings.keepalive_wait();
     loop {
         let pong_by = session.pong_by;
         let outcome: Result<(), String> = tokio::select! {
@@ -238,7 +235,10 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                 }
                 Wake::Flushed => Ok(()),
             },
-            _ = keepalive.tick() => session.ping(hub.pong_budget(endpoint)).await,
+            () = tokio::time::sleep_until(next_ping) => {
+                next_ping = Instant::now() + hub.timings.keepalive_wait();
+                session.ping(hub.pong_budget(endpoint)).await
+            }
             () = super::sleep_until(pong_by), if pong_by.is_some() => {
                 Err("the server stopped answering".to_owned())
             }

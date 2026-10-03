@@ -161,10 +161,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
     // and after a loss, every wallet is worth one sync.
     hub.ready(false);
 
-    let mut keepalive = tokio::time::interval_at(
-        Instant::now() + hub.timings.keepalive,
-        hub.timings.keepalive,
-    );
+    let mut next_ping = Instant::now() + hub.timings.keepalive_wait();
     // The REST rounds keep the pace polling keeps: see [`poll::Pace`].
     let mut pace = poll::Pace::default();
     let mut next_round = Instant::now() + hub.timings.poll;
@@ -216,7 +213,8 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
                 }
                 Wake::Flushed => Ok(()),
             },
-            _ = keepalive.tick() => {
+            () = tokio::time::sleep_until(next_ping) => {
+                next_ping = Instant::now() + hub.timings.keepalive_wait();
                 pong_by.get_or_insert(Instant::now() + hub.pong_budget(endpoint));
                 say(&mut socket, &json!({ "action": "ping" })).await
             }

@@ -214,6 +214,9 @@ The first release: the library both Gerfaut apps are built on.
   types of what a server answers, which it now reads itself. Nor on
   `bdk_electrum`, kept only to reach `electrum-client`, on which it now
   depends directly, at the same version and with the same features.
+- The keepalive ping of the live watch comes at random between seven
+  tenths of its wait and all of it, never later: a ping every four
+  minutes on the dot marked the connection even through Tor.
 - On the user's own node, polling reads thirty scripts a minute, four at
   a time, instead of three. Polling reads the head of the list every
   round and the rest in turn, so with N scripts past what a server

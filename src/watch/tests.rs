@@ -1554,6 +1554,24 @@ fn a_backoff_doubles_up_to_its_cap() {
     assert!(backoff.delay(&timings) <= timings.backoff_first);
 }
 
+/// A keepalive ping comes at the latest when it is due, and at random
+/// before: never on the dot, never past what a server waits for.
+#[test]
+fn a_keepalive_comes_at_random_within_its_wait() {
+    let timings = Timings {
+        keepalive: Duration::from_secs(240),
+        ..timings()
+    };
+    let waits: Vec<Duration> = (0..200).map(|_| timings.keepalive_wait()).collect();
+    assert!(
+        waits
+            .iter()
+            .all(|wait| { *wait >= Duration::from_secs(168) && *wait <= Duration::from_secs(240) })
+    );
+    let first = waits[0];
+    assert!(waits.iter().any(|wait| *wait != first), "drawn, not fixed");
+}
+
 /// A server that limits the rate of requests is polled half as often
 /// each time it does, ten minutes apart at most, never sooner than the
 /// wait it named, and as usual half an hour after it last did.

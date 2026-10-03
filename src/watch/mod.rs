@@ -172,9 +172,11 @@ pub struct WatchConfig {
     pub electrum_certs: TrustedCerts,
     pub tor: TorSettings,
     pub data_dir: PathBuf,
-    /// Seconds between two keepalive pings; `None` is 240. Electrum
-    /// servers drop a session idle for about ten minutes. Held between
-    /// 30 and 540.
+    /// Seconds between two keepalive pings at most; `None` is 240. Each
+    /// wait is drawn between seven tenths of it and all of it: a ping on
+    /// the dot every four minutes marks the connection even through Tor.
+    /// Electrum servers drop a session idle for about ten minutes. Held
+    /// between 30 and 540.
     #[serde(default)]
     pub keepalive_secs: Option<u32>,
 }
@@ -388,6 +390,8 @@ pub(crate) struct Timings {
     /// is held down further on, where the syncs run: one at a time per
     /// wallet, and less and less often when they find nothing.
     pub gap: Duration,
+    /// The longest wait between two keepalive pings: see
+    /// [`Timings::keepalive_wait`].
     pub keepalive: Duration,
     /// How long a ping may go unanswered.
     pub pong: Duration,
@@ -420,6 +424,13 @@ pub(crate) struct Timings {
 }
 
 impl Timings {
+    /// The wait before the next keepalive ping, drawn between seven
+    /// tenths of [`Self::keepalive`] and all of it, never more: a server
+    /// drops a session idle for ten minutes.
+    pub(crate) fn keepalive_wait(&self) -> Duration {
+        self.keepalive.mul_f64(0.7 + 0.3 * rand::random::<f64>())
+    }
+
     pub(crate) fn of(config: &WatchConfig) -> Self {
         let keepalive = config.keepalive_secs.unwrap_or(240).clamp(30, 540);
         Timings {
