@@ -498,15 +498,30 @@ fn write_then_swap(tmp: &Path, bytes: &[u8], target: &Path) -> std::io::Result<(
 fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        let mut delay = std::time::Duration::from_millis(10);
-        for _ in 0..5 {
-            match std::fs::rename(from, to) {
-                Err(e) if held_by_another(&e) => {
-                    std::thread::sleep(delay);
-                    delay *= 2;
-                }
-                other => return other,
+        rename_waiting(from, to, std::thread::sleep)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+}
+
+/// [`rename_over`] on Windows, `wait` taking each pause between two
+/// tries.
+#[cfg(windows)]
+fn rename_waiting(
+    from: &Path,
+    to: &Path,
+    mut wait: impl FnMut(std::time::Duration),
+) -> std::io::Result<()> {
+    let mut delay = std::time::Duration::from_millis(10);
+    for _ in 0..5 {
+        match std::fs::rename(from, to) {
+            Err(e) if held_by_another(&e) => {
+                wait(delay);
+                delay *= 2;
             }
+            other => return other,
         }
     }
     std::fs::rename(from, to)
@@ -855,7 +870,10 @@ mod tests {
     }
 
     /// A scanner that holds the file just written, or the vault, for a
-    /// moment does not fail the save: the rename waits it out.
+    /// moment does not fail the save: the rename waits it out. Here the
+    /// holder lets go during the first pause, however long the machine
+    /// takes to get there; one the system itself adds, a scanner reading
+    /// the new file, is waited out as a save would.
     #[cfg(windows)]
     #[test]
     fn a_rename_waits_for_a_brief_holder_of_either_file() {
@@ -867,17 +885,22 @@ mod tests {
         for held in ["source", "target"] {
             let source = dir.path().join("gerfaut.vault.1.tmp");
             std::fs::write(&source, held).unwrap();
-            let handle = std::fs::OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ)
-                .open(if held == "source" { &source } else { &target })
-                .unwrap();
-            let release = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                drop(handle);
-            });
-            rename_over(&source, &target).unwrap();
-            release.join().unwrap();
+            let mut handle = Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ)
+                    .open(if held == "source" { &source } else { &target })
+                    .unwrap(),
+            );
+            let mut pauses = 0;
+            rename_waiting(&source, &target, |delay| {
+                pauses += 1;
+                if handle.take().is_none() {
+                    std::thread::sleep(delay);
+                }
+            })
+            .unwrap();
+            assert!(pauses >= 1, "the {held} was renamed while held");
             assert_eq!(std::fs::read(&target).unwrap(), held.as_bytes());
         }
     }
