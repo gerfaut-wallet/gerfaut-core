@@ -1693,11 +1693,12 @@ impl WalletManager {
 
     /// Hashes and compares under the attempts lock, so guesses are
     /// serialized and the delay cannot be raced. The vault lock is not
-    /// held meanwhile: an unlock never waits on a sync.
+    /// held meanwhile: an unlock never waits on a sync. A delay runs
+    /// from the verdict, not from the guess: Argon2 takes its time, and
+    /// more on a busy device, and that time came off the delay.
     async fn check_secret(&self, existing: &AppLock, secret: &str) -> LockVerdict {
         let mut attempts = self.attempts.lock().await;
-        let now = Instant::now();
-        let wait = attempts.retry_after(now);
+        let wait = attempts.retry_after(Instant::now());
         if wait > 0 {
             return LockVerdict {
                 unlocked: false,
@@ -1707,7 +1708,7 @@ impl WalletManager {
         }
         match &existing.secret {
             Some(stored) if lock::verify_secret(secret, stored) => attempts.succeed(),
-            _ => attempts.fail(now),
+            _ => attempts.fail(Instant::now()),
         }
     }
 
