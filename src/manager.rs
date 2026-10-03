@@ -96,6 +96,12 @@ impl ManagerState {
     /// it was: the error the caller reports is then the whole truth, and
     /// no later save, made for something else, quietly commits a change
     /// nobody was told about.
+    ///
+    /// What the user decides goes through here. Chain state does not:
+    /// a sync, more history, an address revealed are written in place,
+    /// engine and payload alike, and saved after. That state is a cache
+    /// of the chain, which the next sync reads again, so a save that
+    /// fails there keeps it in memory, and a later save writes it.
     pub(crate) fn commit<T>(
         &mut self,
         change: impl FnOnce(&mut VaultPayload) -> CoreResult<T>,
