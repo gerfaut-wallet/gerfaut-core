@@ -27,7 +27,9 @@
 //!    scripts past that number are covered by polling.
 //! 3. **Short polling** of any other Esplora: once a minute, the tip
 //!    hash and at most three script lookups, the head of the list every
-//!    round and the rest in rotation. About 240 requests an hour.
+//!    round and the rest in rotation. About 240 requests an hour; with
+//!    N scripts past the head, each is read about every N/3 minutes.
+//!    On the user's own node, thirty lookups a round.
 //!
 //! With the automatic public backend, an Electrum server of the
 //! catalogue run by an operator that mode already rotates through is

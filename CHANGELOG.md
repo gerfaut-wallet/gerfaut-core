@@ -192,6 +192,13 @@ The first release: the library both Gerfaut apps are built on.
   addresses, that is milliseconds instead of seconds. While an Electrum
   server takes the subscriptions, the count the status gives moves in
   steps of a hundred, not one event per script.
+- On the user's own node, polling reads thirty scripts a minute, four at
+  a time, instead of three. Polling reads the head of the list every
+  round and the rest in turn, so with N scripts past what a server
+  pushes, each is read about every N/3 minutes on any server, and every
+  N/30 minutes on one's own node; all of them at the next regular sync.
+  Every minute for each would be N requests a minute, which no public
+  server would take from every client.
 - The live watch keeps each wallet complete on its own. At each block,
   and every ten minutes, it reruns any sync that failed, and reads every
   script of any wallet that has gone a day without a complete sync. A

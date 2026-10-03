@@ -6,7 +6,8 @@
 //! default, ten on the public instances. The server names it when it
 //! refuses a longer list, and the list is cut to it: the head of every
 //! wallet is pushed, and the scripts past it are polled over the REST
-//! API of the same server, three a minute.
+//! API of the same server, three a minute, thirty on the user's own
+//! node.
 //!
 //! Any Esplora address is tried. A server that is not a mempool
 //! instance answers the upgrade with an HTTP status, which is how the
@@ -77,7 +78,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         Err(Exit::Lost(detail)) => return Exit::Unreachable(detail),
         Err(exit) => return exit,
     };
-    let mut poller = match Poller::new(base, proxy.as_deref()) {
+    let mut poller = match Poller::new(base, proxy.as_deref(), hub.config.backend.is_own_node()) {
         Ok(poller) => poller,
         Err(detail) => return Exit::Unreachable(detail),
     };

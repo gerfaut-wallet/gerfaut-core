@@ -6,9 +6,16 @@
 //! an hour, whatever the size of the wallets, and the syncs need their
 //! share of what a public server allows. The first [`HOT`] scripts of
 //! the list, the head of every wallet, are looked up every round; the
-//! rest take turns. A lookup reads the counters of
+//! rest take turns: with N scripts past the head, each is read about
+//! every N/3 minutes, and every one of them at the next regular sync.
+//! Every minute for each would be N requests a minute, which no public
+//! server would take from every client. A lookup reads the counters of
 //! `/scripthash/:hash`, which move when a transaction enters the
 //! mempool and again when it confirms.
+//!
+//! The user's own node ([`crate::chain::BackendConfig::is_own_node`])
+//! answers nobody else, and a round there looks up
+//! [`OWN_NODE_ROUND_BUDGET`] scripts, a few at a time.
 //!
 //! No public server says how many requests it allows: mempool.space
 //! bans a client that keeps going past its limit, blockstream.info has
@@ -30,6 +37,10 @@ use crate::chain::{ANOTHER_NETWORK, Endpoint};
 
 /// Script lookups in one round.
 pub(super) const ROUND_BUDGET: usize = 3;
+/// Script lookups in one round on the user's own node, and how many go
+/// out at once there: a round over Tor stays well within its time.
+pub(super) const OWN_NODE_ROUND_BUDGET: usize = 30;
+const OWN_NODE_AT_ONCE: usize = 4;
 /// Scripts looked up every round; the rest of the budget rotates.
 pub(super) const HOT: usize = 2;
 /// Rounds that may fail in a row before the server counts as lost.
@@ -90,6 +101,10 @@ pub(crate) type Fingerprint = crate::chain::esplora::Counts;
 pub(super) struct Poller {
     client: Arc<Client>,
     cursor: usize,
+    /// Lookups in a round.
+    budget: usize,
+    /// Lookups that go out at once.
+    at_once: usize,
 }
 
 /// The scripts of one round, owned so the lookups can run while the
@@ -97,13 +112,23 @@ pub(super) struct Poller {
 pub(super) struct Plan {
     client: Arc<Client>,
     scripts: Vec<(String, ScriptBuf)>,
+    at_once: usize,
 }
 
 impl Poller {
-    pub(super) fn new(base: &str, proxy: Option<&str>) -> Result<Self, String> {
+    /// A poller of the server at `base`, which is the user's own node
+    /// when `own_node` is.
+    pub(super) fn new(base: &str, proxy: Option<&str>, own_node: bool) -> Result<Self, String> {
+        let (budget, at_once) = if own_node {
+            (OWN_NODE_ROUND_BUDGET, OWN_NODE_AT_ONCE)
+        } else {
+            (ROUND_BUDGET, 1)
+        };
         Ok(Poller {
             client: Arc::new(esplora::client(base, proxy)?),
             cursor: 0,
+            budget,
+            at_once,
         })
     }
 
@@ -117,10 +142,10 @@ impl Poller {
     /// `skip`, which a push connection already covers.
     pub(super) fn plan(&mut self, watched: &Watched, skip: usize, hot: usize) -> Plan {
         let pool = watched.entries.get(skip..).unwrap_or_default();
-        let hot = hot.min(pool.len()).min(ROUND_BUDGET);
+        let hot = hot.min(pool.len()).min(self.budget);
         let mut picked: Vec<&super::Entry> = pool[..hot].iter().collect();
         let rest = &pool[hot..];
-        let turns = (ROUND_BUDGET - hot).min(rest.len());
+        let turns = (self.budget - hot).min(rest.len());
         for turn in 0..turns {
             picked.push(&rest[(self.cursor + turn) % rest.len()]);
         }
@@ -133,21 +158,31 @@ impl Poller {
                 .into_iter()
                 .map(|entry| (entry.hex.clone(), entry.script.clone()))
                 .collect(),
+            at_once: self.at_once,
         }
     }
 }
 
 impl Plan {
-    /// Looks the scripts up, one after the other.
+    /// Looks the scripts up: one after the other on any server, a few at
+    /// a time on the user's own node.
     pub(super) async fn check(self) -> Result<Vec<(String, Fingerprint)>, String> {
-        let lookups = async {
-            let mut found = Vec::with_capacity(self.scripts.len());
-            for (hex, script) in &self.scripts {
-                let stats = self.client.scripthash_stats(script).await?;
-                found.push((hex.clone(), Fingerprint::of(&stats)));
-            }
-            Ok(found)
-        };
+        use futures_util::{StreamExt, TryStreamExt};
+        let Plan {
+            client,
+            scripts,
+            at_once,
+        } = self;
+        let lookups = futures_util::stream::iter(scripts)
+            .map(move |(hex, script)| {
+                let client = client.clone();
+                async move {
+                    let stats = client.scripthash_stats(&script).await?;
+                    Ok::<_, String>((hex, Fingerprint::of(&stats)))
+                }
+            })
+            .buffered(at_once)
+            .try_collect::<Vec<_>>();
         tokio::time::timeout(ROUND_TIMEOUT, lookups)
             .await
             .unwrap_or_else(|_| Err("timed out".to_owned()))
@@ -202,7 +237,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         Err(Exit::Lost(detail)) => return Exit::Unreachable(detail),
         Err(exit) => return exit,
     };
-    let mut poller = match Poller::new(base, proxy.as_deref()) {
+    let mut poller = match Poller::new(base, proxy.as_deref(), hub.config.backend.is_own_node()) {
         Ok(poller) => poller,
         Err(detail) => return Exit::Unreachable(detail),
     };
@@ -293,6 +328,46 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
                 },
                 () = tokio::time::sleep_until(until) => break,
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::watch::{WatchLimits, WatchedScript, WatchedWallet};
+
+    /// A round reads three scripts on any server, the head of the list
+    /// and one in turn, and thirty on the user's own node, a few at a
+    /// time; past the head, every script is read in its turn.
+    #[test]
+    fn a_round_reads_so_many_scripts() {
+        let wallet = WatchedWallet {
+            wallet_id: "w".to_owned(),
+            scripts: (0..100u32)
+                .map(|n| WatchedScript {
+                    script: format!("0014{n:040x}"),
+                    lookahead: false,
+                    status: None,
+                    counts: None,
+                })
+                .collect(),
+            has_pending: false,
+            pinned: false,
+            holds_coins: false,
+            unlisted: 0,
+        };
+        let watched = Watched::new(vec![wallet], WatchLimits::DEFAULT);
+        for (own_node, budget) in [(false, ROUND_BUDGET), (true, OWN_NODE_ROUND_BUDGET)] {
+            let mut poller = Poller::new("http://127.0.0.1:9/api", None, own_node).unwrap();
+            assert_eq!(poller.at_once, if own_node { OWN_NODE_AT_ONCE } else { 1 });
+            let mut read = std::collections::HashSet::new();
+            for _ in 0..(100 - HOT).div_ceil(budget - HOT) {
+                let plan = poller.plan(&watched, 0, HOT);
+                assert_eq!(plan.scripts.len(), budget);
+                read.extend(plan.scripts.into_iter().map(|(hex, _)| hex));
+            }
+            assert_eq!(read.len(), 100, "own node: {own_node}");
         }
     }
 }
