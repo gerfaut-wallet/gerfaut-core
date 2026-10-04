@@ -1247,6 +1247,20 @@ async fn a_payment_one_sync_misses_is_not_announced_as_dropped() {
     assert!(sync_and_claim(&manager, &wallet).await.is_empty());
 }
 
+/// A wallet removed takes with it the payments its syncs saw vanish:
+/// kept, they stayed in the vault for days, a removed wallet's.
+#[tokio::test]
+async fn a_removed_wallet_leaves_no_vanished_payment_behind() {
+    let server = FakeMempool::start(false, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = paid(&server, dir.path()).await;
+    server.state.lock().unwrap().address_txs = Vec::new();
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    assert_eq!(manager.state.lock().await.payload.vanishing.len(), 1);
+    manager.remove_wallet(&wallet).await.unwrap();
+    assert!(manager.state.lock().await.payload.vanishing.is_empty());
+}
+
 /// While the watch runs, a payment a sync saw vanish is looked at again
 /// ten minutes on, and said dropped then: nothing moves on its scripts
 /// after it left, and the next sync that reads them may be a day away.

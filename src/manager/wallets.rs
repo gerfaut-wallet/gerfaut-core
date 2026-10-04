@@ -206,6 +206,7 @@ impl WalletManager {
                 }
                 payload.unclaimed.retain(|news| news.wallet_id != id);
                 payload.announced.retain(|told| told.wallet_id != id);
+                payload.vanishing.retain(|missed| missed.wallet_id != id);
                 let premium = &mut payload.settings.premium;
                 let account = premium.has_key() || premium.pending_unwatch_account.is_some();
                 if account && premium.is_consented(id) {
