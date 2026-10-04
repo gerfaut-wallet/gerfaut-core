@@ -20,6 +20,7 @@ use ciborium::Value;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
+use super::InputWarning;
 use crate::backup::BACKUP_PREFIX;
 use crate::error::{CoreError, CoreResult};
 use crate::store::cipher::BACKUP_MAGIC;
@@ -47,6 +48,10 @@ pub struct QrProgress {
     pub complete: bool,
     /// The assembled text, once complete.
     pub text: Option<String>,
+    /// What was assumed reading the envelope, which the text no longer
+    /// shows: show them with the classifier's own warnings for `text`.
+    #[serde(default)]
+    pub warnings: Vec<InputWarning>,
 }
 
 fn qr_error(detail: impl Into<String>) -> CoreError {
@@ -110,6 +115,7 @@ pub fn assemble(frames: &[String]) -> CoreResult<QrProgress> {
             total: 1,
             complete: true,
             text: Some((*first).to_owned()),
+            warnings: Vec::new(),
         })
     }
 }
@@ -166,8 +172,9 @@ fn assemble_ur(frames: &[&str]) -> CoreResult<QrProgress> {
                     total: u32,
                     message: Option<Vec<u8>>|
      -> CoreResult<QrProgress> {
+        let mut warnings = Vec::new();
         let text = message
-            .map(|bytes| ur_message_to_text(ur_type, &bytes))
+            .map(|bytes| ur_message_to_text(ur_type, &bytes, &mut warnings))
             .transpose()?;
         Ok(QrProgress {
             format: QrFormat::Ur,
@@ -175,6 +182,7 @@ fn assemble_ur(frames: &[&str]) -> CoreResult<QrProgress> {
             total,
             complete: text.is_some(),
             text,
+            warnings,
         })
     };
 
@@ -211,8 +219,13 @@ fn assemble_ur(frames: &[&str]) -> CoreResult<QrProgress> {
     progress(ur_type, received.min(total), total, message)
 }
 
-/// Turns the CBOR payload of a UR into classifier text.
-fn ur_message_to_text(ur_type: &str, bytes: &[u8]) -> CoreResult<String> {
+/// Turns the CBOR payload of a UR into classifier text, noting in
+/// `warnings` what it had to assume.
+fn ur_message_to_text(
+    ur_type: &str,
+    bytes: &[u8],
+    warnings: &mut Vec<InputWarning>,
+) -> CoreResult<String> {
     match ur_type {
         "bytes" => {
             let value: Value = ciborium::from_reader(bytes)
@@ -233,7 +246,7 @@ fn ur_message_to_text(ur_type: &str, bytes: &[u8]) -> CoreResult<String> {
         "crypto-output" => {
             let value: Value = ciborium::from_reader(bytes)
                 .map_err(|e| qr_error(format!("invalid crypto-output: {e}")))?;
-            crypto_output_to_descriptor(&value)
+            crypto_output_to_descriptor(&value, warnings)
         }
         // A key alone is an account key, as pasted: `[origin]xpub`, the
         // branches left to the confirmation screen, which reads the
@@ -272,20 +285,26 @@ const TAG_ECKEY: u64 = 306;
 
 /// Renders a `crypto-output` tree as a descriptor string. Checksums are
 /// left to the classifier, which canonicalizes the result.
-fn crypto_output_to_descriptor(value: &Value) -> CoreResult<String> {
+fn crypto_output_to_descriptor(
+    value: &Value,
+    warnings: &mut Vec<InputWarning>,
+) -> CoreResult<String> {
     let Value::Tag(tag, inner) = value else {
         return Err(qr_error("crypto-output must start with a script tag"));
     };
-    let wrap = |name: &str| -> CoreResult<String> {
-        Ok(format!("{name}({})", crypto_output_to_descriptor(inner)?))
+    let mut wrap = |name: &str| -> CoreResult<String> {
+        Ok(format!(
+            "{name}({})",
+            crypto_output_to_descriptor(inner, warnings)?
+        ))
     };
     match *tag {
         TAG_SH => wrap("sh"),
         TAG_WSH => wrap("wsh"),
-        TAG_PK => Ok(format!("pk({})", key_expression(inner)?)),
-        TAG_PKH => Ok(format!("pkh({})", key_expression(inner)?)),
-        TAG_WPKH => Ok(format!("wpkh({})", key_expression(inner)?)),
-        TAG_TR => Ok(format!("tr({})", key_expression(inner)?)),
+        TAG_PK => Ok(format!("pk({})", key_expression(inner, warnings)?)),
+        TAG_PKH => Ok(format!("pkh({})", key_expression(inner, warnings)?)),
+        TAG_WPKH => Ok(format!("wpkh({})", key_expression(inner, warnings)?)),
+        TAG_TR => Ok(format!("tr({})", key_expression(inner, warnings)?)),
         TAG_MULTI | TAG_SORTED_MULTI => {
             let name = if *tag == TAG_MULTI {
                 "multi"
@@ -301,7 +320,7 @@ fn crypto_output_to_descriptor(value: &Value) -> CoreResult<String> {
             };
             let keys = keys
                 .iter()
-                .map(key_expression)
+                .map(|key| key_expression(key, warnings))
                 .collect::<CoreResult<Vec<_>>>()?;
             Ok(format!("{name}({threshold},{})", keys.join(",")))
         }
@@ -311,10 +330,22 @@ fn crypto_output_to_descriptor(value: &Value) -> CoreResult<String> {
 
 /// A key inside a crypto-output: an hdkey (with origin and children) or
 /// a bare EC public key.
-fn key_expression(value: &Value) -> CoreResult<String> {
+///
+/// An hdkey without a children path watches both branches (`/<0;1>/*`):
+/// coordinators that omit it mean the whole account, and a lone receive
+/// branch would silently miss change. The addresses rest on that guess,
+/// so it is said ([`InputWarning::AssumedBranches`]).
+fn key_expression(value: &Value, warnings: &mut Vec<InputWarning>) -> CoreResult<String> {
     match value {
         Value::Tag(TAG_HDKEY, inner) => {
-            hdkey_parts(inner).map(|(key, children)| format!("{key}{children}"))
+            let (key, children) = hdkey_parts(inner)?;
+            let children = children.unwrap_or_else(|| {
+                if !warnings.contains(&InputWarning::AssumedBranches) {
+                    warnings.push(InputWarning::AssumedBranches);
+                }
+                "/<0;1>/*".to_owned()
+            });
+            Ok(format!("{key}{children}"))
         }
         Value::Tag(TAG_ECKEY, inner) => {
             if map_get(inner, 2).and_then(as_bool) == Some(true) {
@@ -336,12 +367,8 @@ fn key_expression(value: &Value) -> CoreResult<String> {
 }
 
 /// `[fingerprint/origin]xpub` and `/children` from a `crypto-hdkey`
-/// map.
-///
-/// Without a children path, both branches are watched (`/<0;1>/*`):
-/// coordinators that omit it mean the whole account, and a lone
-/// receive branch would silently miss change.
-fn hdkey_parts(map: &Value) -> CoreResult<(String, String)> {
+/// map, `None` for the children when the map names no step of them.
+fn hdkey_parts(map: &Value) -> CoreResult<(String, Option<String>)> {
     if map_get(map, 2).and_then(as_bool) == Some(true) {
         return Err(CoreError::PrivateMaterialRejected);
     }
@@ -423,13 +450,9 @@ fn hdkey_parts(map: &Value) -> CoreResult<(String, String)> {
     let children = match map_get(map, 7).map(tagged).and_then(|c| map_get(c, 1)) {
         Some(components) => {
             let components = keypath_components(components)?;
-            if components.is_empty() {
-                "/<0;1>/*".to_owned()
-            } else {
-                format!("/{}", render_components(&components))
-            }
+            (!components.is_empty()).then(|| format!("/{}", render_components(&components)))
         }
-        None => "/<0;1>/*".to_owned(),
+        None => None,
     };
     Ok((format!("{origin_text}{xpub}"), children))
 }
@@ -627,6 +650,7 @@ fn assemble_bbqr(frames: &[&str]) -> CoreResult<QrProgress> {
             total,
             complete: false,
             text: None,
+            warnings: Vec::new(),
         });
     }
 
@@ -673,6 +697,7 @@ fn assemble_bbqr(frames: &[&str]) -> CoreResult<QrProgress> {
         total,
         complete: true,
         text: Some(text.trim().to_owned()),
+        warnings: Vec::new(),
     })
 }
 
@@ -801,6 +826,61 @@ mod tests {
         let ur_text = encode_ur("crypto-output", &tag(TAG_WPKH, hdkey(Some(pair))));
         let text = assemble(&[ur_text]).unwrap().text.unwrap();
         assert!(text.ends_with(&format!("{TPUB}/<0;1>/*)")), "{text}");
+    }
+
+    /// A key without a children path is read as the whole account,
+    /// receive and change, and that guess is said, once however many
+    /// keys share it: the addresses rest on it. A path given, `<0;1>`
+    /// included, is no guess, and neither is a lone key, whose branches
+    /// the confirmation screen shows.
+    #[test]
+    fn an_assumed_children_path_is_said() {
+        let assumed = vec![InputWarning::AssumedBranches];
+        let ur_text = encode_ur("crypto-output", &tag(TAG_WPKH, hdkey(None)));
+        let progress = assemble(std::slice::from_ref(&ur_text)).unwrap();
+        assert_eq!(progress.warnings, assumed);
+
+        let empty = hdkey(Some(Value::Array(vec![])));
+        let progress = assemble(&[encode_ur("crypto-output", &tag(TAG_WPKH, empty))]).unwrap();
+        assert!(progress.text.unwrap().ends_with("/<0;1>/*)"));
+        assert_eq!(progress.warnings, assumed);
+
+        let multi = tag(
+            TAG_WSH,
+            tag(
+                TAG_SORTED_MULTI,
+                map(vec![
+                    (1, Value::Integer(1.into())),
+                    (2, Value::Array(vec![hdkey(None), hdkey(None)])),
+                ]),
+            ),
+        );
+        let progress = assemble(&[encode_ur("crypto-output", &multi)]).unwrap();
+        assert_eq!(progress.warnings, assumed);
+
+        let pair = Value::Array(vec![
+            Value::Array(vec![Value::Integer(0.into()), Value::Integer(1.into())]),
+            Value::Bool(false),
+            Value::Array(vec![]),
+            Value::Bool(false),
+        ]);
+        let given = encode_ur("crypto-output", &tag(TAG_WPKH, hdkey(Some(pair))));
+        let given = assemble(&[given]).unwrap();
+        assert!(given.warnings.is_empty());
+        let Value::Tag(_, lone) = hdkey(None) else {
+            unreachable!()
+        };
+        let lone = assemble(&[encode_ur("crypto-hdkey", &lone)]).unwrap();
+        assert!(lone.warnings.is_empty());
+
+        // Pasted, the code is opened by the classifier, which says it
+        // with its own findings; the descriptor it held, typed, is no
+        // guess.
+        let pasted = crate::input::parse_input(&ur_text).unwrap();
+        assert!(pasted.warnings.contains(&InputWarning::AssumedBranches));
+        let typed = crate::input::parse_input(&given.text.unwrap()).unwrap();
+        assert!(!typed.warnings.contains(&InputWarning::AssumedBranches));
+        assert_eq!(pasted.payload, typed.payload);
     }
 
     #[test]

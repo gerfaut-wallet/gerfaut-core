@@ -88,6 +88,10 @@ pub enum InputWarning {
     /// The branches differ from the BIP32 convention (`0/*` receive,
     /// `1/*` change): a wallet that follows it shows other addresses.
     NonStandardDerivation,
+    /// A key in a QR code (`crypto-output`) named no child path: the
+    /// receive and change branches (`/<0;1>/*`) were assumed. The first
+    /// address is the one to compare with the signer.
+    AssumedBranches,
 }
 
 /// Normalized wallet material produced by the classifier.
@@ -307,21 +311,31 @@ fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
     // A pasted QR payload (UR, BBQr) is opened first; a multi-part one
     // cannot be typed in, it has to be scanned frame by frame.
     if qr::is_envelope(trimmed) {
-        let progress = qr::assemble(&[trimmed.to_owned()])?;
-        return match progress.text {
-            // A BSMS record in an envelope is checked as one pasted bare.
-            Some(text) => match qr::opened_once(text)? {
-                text if bsms::is_bsms(&text) => parse_bsms_record(&text),
-                text => classify(&text, options),
-            },
-            None => Err(CoreError::InvalidInput {
+        let qr::QrProgress {
+            text,
+            total,
+            warnings,
+            ..
+        } = qr::assemble(&[trimmed.to_owned()])?;
+        let Some(text) = text else {
+            return Err(CoreError::InvalidInput {
                 kind: "qr",
                 detail: format!(
-                    "this is part 1 of a {}-part QR code: scan it with the camera",
-                    progress.total
+                    "this is part 1 of a {total}-part QR code: scan it with the camera"
                 ),
-            }),
+            });
         };
+        // A BSMS record in an envelope is checked as one pasted bare.
+        let mut parsed = match qr::opened_once(text)? {
+            text if bsms::is_bsms(&text) => parse_bsms_record(&text),
+            text => classify(&text, options),
+        }?;
+        for warning in warnings {
+            if !parsed.warnings.contains(&warning) {
+                parsed.warnings.push(warning);
+            }
+        }
+        return Ok(parsed);
     }
 
     if trimmed.starts_with('{') {
