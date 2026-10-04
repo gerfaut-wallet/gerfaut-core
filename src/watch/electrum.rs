@@ -13,7 +13,10 @@
 //! again, and past the most it takes on one connection, the next one
 //! asks for the head of the list only. Each is reported once, when it
 //! is refused, and left to the regular syncs after that: a reconnection
-//! does not ask the server, or the syncs, for it again.
+//! does not ask the server, or the syncs, for it again. The most it
+//! takes is asked again a day after it was learned, an hour after when
+//! it took none: the session ends at the next ping, and the next one
+//! asks for the whole list.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -86,6 +89,9 @@ struct Session {
     /// The session picks up after another one under the same
     /// configuration: a script it had no status for is reported.
     resumed: bool,
+    /// Script hashes the server's last limit, which ran out, left out:
+    /// reported then, and not again if the server refuses them anew.
+    left_out: HashSet<String>,
     ready_told: bool,
 }
 
@@ -163,6 +169,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         Ok(Err(exit)) | Err(exit) => return exit,
     };
 
+    let left_out = hub.retry_limit(endpoint);
     let mut session = Session {
         endpoint: endpoint.clone(),
         writer,
@@ -178,6 +185,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         pong_by: None,
         opening: HashSet::new(),
         resumed: hub.caught_up,
+        left_out,
         ready_told: false,
     };
     hub.alive();
@@ -230,6 +238,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                     session.check_ready(hub);
                     relisted
                 }
+                // The limit is checked when the connection is: the
+                // next session asks for the whole list.
+                Wake::Tick { .. } if hub.limit_ran_out(endpoint) => return Exit::Reprobe,
                 Wake::Tick { idle } => {
                     // A deadline set before the device slept says
                     // nothing about the server.
@@ -241,6 +252,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                 Wake::Flushed => Ok(()),
             },
             () = tokio::time::sleep_until(next_ping) => {
+                if hub.limit_ran_out(endpoint) {
+                    return Exit::Reprobe;
+                }
                 next_ping = Instant::now() + hub.timings.keepalive_wait();
                 session.ping(hub.pong_budget(endpoint)).await
             }
@@ -369,9 +383,9 @@ impl Session {
                     if self.at_limit {
                         // Taken after all, answered out of order: the
                         // limit is what the connection holds.
-                        let limit =
-                            &mut hub.refusals.entry(self.endpoint.clone()).or_default().limit;
-                        *limit = (*limit).max(Some(self.acknowledged as usize));
+                        let refusals = hub.refusals.entry(self.endpoint.clone()).or_default();
+                        let held = self.acknowledged as usize;
+                        refusals.learn(refusals.limit.map_or(held, |limit| limit.max(held)));
                     }
                     if self.acknowledged.is_multiple_of(STATUS_STEP) || !self.subscribing() {
                         let acknowledged = self.acknowledged;
@@ -434,7 +448,7 @@ impl Session {
                 // What this connection took, rather than a number the
                 // server's words may give: a limit per address counts
                 // the other connections from it too.
-                refusals.limit = Some(self.acknowledged as usize);
+                refusals.learn(self.acknowledged as usize);
                 given_up.extend(self.queue.drain(..));
             } else {
                 refusals.scripts.insert(scripthash.to_owned());
@@ -443,6 +457,9 @@ impl Session {
         let reason = self.opening_reason();
         for scripthash in given_up {
             self.opening.remove(&scripthash);
+            if self.left_out.contains(&scripthash) {
+                continue;
+            }
             if let Some(entry) = hub.watched.by_scripthash(&scripthash) {
                 let hex = entry.hex.clone();
                 hub.mark_entry(&hex, reason);
@@ -462,16 +479,23 @@ impl Session {
     fn cut(&mut self, hub: &mut Hub, detail: String) {
         let half = self.acknowledged as usize / 2;
         if half > 0 {
-            let heard: Vec<String> = hub
+            let refusals = hub.refusals.get(&self.endpoint);
+            let kept = refusals
+                .and_then(|refusals| refusals.limit)
+                .map_or(half, |limit| limit.min(half));
+            let past: Vec<String> = hub
                 .watched
-                .heard(hub.refusals.get(&self.endpoint))
+                .heard(refusals)
+                .skip(kept)
+                .filter(|entry| !self.left_out.contains(&entry.scripthash))
                 .map(|entry| entry.hex.clone())
                 .collect();
-            let limit = &mut hub.refusals.entry(self.endpoint.clone()).or_default().limit;
-            let kept = limit.map_or(half, |limit| limit.min(half));
-            *limit = Some(kept);
+            hub.refusals
+                .entry(self.endpoint.clone())
+                .or_default()
+                .learn(kept);
             let reason = self.opening_reason();
-            for hex in heard.iter().skip(kept) {
+            for hex in &past {
                 hub.mark_entry(hex, reason);
             }
         }

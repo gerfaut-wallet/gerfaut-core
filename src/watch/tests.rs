@@ -36,6 +36,8 @@ fn timings() -> Timings {
         hold_cap: Duration::from_millis(400),
         due: Duration::from_secs(3600),
         refused: Duration::from_millis(600),
+        limit_kept: Duration::from_secs(3600),
+        zero_limit_kept: Duration::from_secs(3600),
     }
 }
 
@@ -452,6 +454,94 @@ async fn electrum_keeps_to_what_a_server_takes() {
         // The scripts past the limit are not reported again.
         no_event(&mut events, Duration::from_millis(300)).await;
     }
+}
+
+/// The most a server takes is asked again once it ran out, on a new
+/// connection while the one open holds: the next session asks for the
+/// whole list. Refused again past the same point, the scripts that
+/// limit left out are not reported again: the regular syncs have them.
+/// Once the server takes them all, the watch hears the whole list.
+#[tokio::test]
+async fn a_learned_limit_is_asked_again_once_it_ran_out() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().subscription_limit =
+        Some((3, "subscription limit reached (3 max per client)"));
+    let all: Vec<u8> = (1..=10).collect();
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            limit_kept: Duration::from_millis(500),
+            ..timings()
+        }),
+    );
+    let mut reported = BTreeSet::new();
+    while reported.len() < 7 {
+        match next_event(&mut events).await {
+            WatchEvent::WalletChanged { scripts, .. } => reported.extend(scripts),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let past: BTreeSet<String> = (4..=10).map(script).collect();
+    assert_eq!(reported, past);
+    let first = asked(&server, "blockchain.scripthash.subscribe");
+    assert_eq!(first, all.len());
+
+    within("asked for the whole list again", WAIT, || {
+        asked(&server, "blockchain.scripthash.subscribe") >= 2 * all.len()
+    })
+    .await;
+    assert!(server.subscriptions().len() >= 2);
+    no_event(&mut events, Duration::from_millis(300)).await;
+
+    server.state.lock().unwrap().subscription_limit = None;
+    let status = until(&watch, "heard whole", |s| s.pushed_scripts == 10).await;
+    assert_eq!(
+        status.wallets,
+        [WalletCoverage {
+            wallet_id: "a".to_owned(),
+            coverage: Coverage::Live,
+            watched_scripts: 10,
+            left_out_scripts: 0,
+        }]
+    );
+    no_event(&mut events, Duration::from_millis(300)).await;
+}
+
+/// A server that took no subscription at all leaves Live nothing to
+/// push: it is asked again sooner than one that took some.
+#[tokio::test]
+async fn a_server_that_took_none_is_asked_again_sooner() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().subscription_limit =
+        Some((0, "subscription limit reached (0 max per client)"));
+    let all: Vec<u8> = (1..=10).collect();
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            limit_kept: Duration::from_secs(3600),
+            zero_limit_kept: Duration::from_millis(500),
+            ..timings()
+        }),
+    );
+    let mut reported = BTreeSet::new();
+    while reported.len() < all.len() {
+        match next_event(&mut events).await {
+            WatchEvent::WalletChanged { scripts, .. } => reported.extend(scripts),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let status = until(&watch, "refused", |s| {
+        s.pushed_scripts == 0 && s.detail.is_some()
+    })
+    .await;
+    assert_eq!(status.wallets[0].coverage, Coverage::SyncOnly);
+
+    server.state.lock().unwrap().subscription_limit = None;
+    let status = until(&watch, "heard whole", |s| s.pushed_scripts == 10).await;
+    assert_eq!(status.wallets[0].coverage, Coverage::Live);
+    no_event(&mut events, Duration::from_millis(300)).await;
 }
 
 /// A server that cuts the watch for what it costs, ElectrumX past its
@@ -1328,6 +1418,7 @@ fn what_a_server_refused_is_counted_out() {
     let refusals = Refusals {
         limit: Some(2),
         scripts: HashSet::from([scripthash(&script(4))]),
+        ..Refusals::default()
     };
     let heard: Vec<&str> = watched
         .heard(Some(&refusals))
@@ -1355,6 +1446,34 @@ fn what_a_server_refused_is_counted_out() {
     );
     assert!(watched.capped(None).is_empty());
     assert_eq!(watched.heard(None).count(), 5);
+    let past: Vec<&str> = watched
+        .past_limit(&refusals)
+        .map(|entry| entry.hex.as_str())
+        .collect();
+    assert_eq!(past, [script(5), script(3)]);
+}
+
+/// The most a server takes is kept a day, and a limit of none an hour:
+/// past that, the server is asked for the whole list again. A wall
+/// clock set back before the limit was learned asks again too.
+#[test]
+fn a_learned_limit_runs_out() {
+    let timings = Timings::of(&config(BackendConfig::Public { server: None }));
+    let learned = SystemTime::now();
+    let after = |secs: u64| learned + Duration::from_secs(secs);
+    let mut refusals = Refusals {
+        limit: Some(100),
+        learned: Some(learned),
+        ..Refusals::default()
+    };
+    assert!(!refusals.ran_out(&timings, after(23 * 3600 + 59 * 60)));
+    assert!(refusals.ran_out(&timings, after(24 * 3600)));
+    refusals.limit = Some(0);
+    assert!(!refusals.ran_out(&timings, after(59 * 60)));
+    assert!(refusals.ran_out(&timings, after(3600)));
+    assert!(refusals.ran_out(&timings, learned - Duration::from_secs(60)));
+    // Nothing learned, nothing to run out.
+    assert!(!Refusals::default().ran_out(&timings, after(48 * 3600)));
 }
 
 /// The status a screen reads says how much of each wallet the watch

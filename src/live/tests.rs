@@ -240,6 +240,8 @@ fn timings() -> crate::watch::Timings {
         hold_cap: Duration::from_millis(400),
         due: Duration::from_millis(100),
         refused: Duration::from_millis(600),
+        limit_kept: Duration::from_secs(3600),
+        zero_limit_kept: Duration::from_secs(3600),
     }
 }
 

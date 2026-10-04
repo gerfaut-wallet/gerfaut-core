@@ -75,7 +75,10 @@
 //!   some number on one connection, is not asked for them again under
 //!   the configuration: they are reported once, when refused, and left
 //!   to the regular syncs. The status counts them with what the watch
-//!   leaves out ([`WalletCoverage`]).
+//!   leaves out ([`WalletCoverage`]). That number is asked again a day
+//!   after it was learned, an hour after when it is none: the session
+//!   open there ends, the next one asks for the whole list, and what
+//!   the server refuses again is not reported again.
 //! - A server is asked for its genesis block before it hears of any
 //!   script. One of another network is refused, and left alone for a
 //!   quarter of an hour ([`Exit::Refused`]) while the next one is
@@ -432,6 +435,13 @@ pub(crate) struct Timings {
     /// How long a server that refused the watch is left alone: see
     /// [`Exit::Refused`].
     pub refused: Duration,
+    /// How long the most an Electrum server takes on one connection is
+    /// kept before it is asked for the whole list again: see
+    /// [`Refusals::ran_out`].
+    pub limit_kept: Duration,
+    /// The same for a server that took none, which leaves the watch
+    /// nothing to push: kept a shorter while.
+    pub zero_limit_kept: Duration,
 }
 
 impl Timings {
@@ -462,6 +472,8 @@ impl Timings {
             hold_cap: Duration::from_secs(10 * 60),
             due: Duration::from_secs(10 * 60),
             refused: Duration::from_secs(15 * 60),
+            limit_kept: Duration::from_secs(24 * 60 * 60),
+            zero_limit_kept: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -664,12 +676,47 @@ pub(crate) struct Watched {
 /// so or refused several in a row. The next session there asks for the
 /// head of the list up to that many, the scripts it turned down left
 /// out, and leaves the rest to the regular syncs, the way the cap on
-/// the list does.
+/// the list does. That most is only what the server took at one time:
+/// its operator may raise it, and a limit per address counts the other
+/// connections from it, which close. It is asked again once it ran out
+/// ([`Refusals::ran_out`]).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Refusals {
     pub limit: Option<usize>,
+    /// When `limit` was learned, on the wall clock: it keeps running
+    /// while the computer sleeps, as the server's limit does.
+    pub learned: Option<SystemTime>,
     /// Script hashes.
     pub scripts: HashSet<String>,
+}
+
+impl Refusals {
+    /// The server takes `limit` subscriptions on one connection, as of
+    /// now.
+    pub fn learn(&mut self, limit: usize) {
+        self.limit = Some(limit);
+        self.learned = Some(SystemTime::now());
+    }
+
+    /// Whether the limit was kept long enough for the server to be asked
+    /// for the whole list again: [`Timings::limit_kept`] after it was
+    /// learned, [`Timings::zero_limit_kept`] when the server took none.
+    pub fn ran_out(&self, timings: &Timings, now: SystemTime) -> bool {
+        let (Some(limit), Some(learned)) = (self.limit, self.learned) else {
+            return false;
+        };
+        let kept = if limit == 0 {
+            timings.zero_limit_kept
+        } else {
+            timings.limit_kept
+        };
+        match now.duration_since(learned) {
+            Ok(kept_for) => kept_for >= kept,
+            // The clock was set back past the moment it was learned:
+            // how long it was kept is unknown.
+            Err(_) => true,
+        }
+    }
 }
 
 impl Watched {
@@ -772,6 +819,16 @@ impl Watched {
             .iter()
             .filter(move |entry| refusals.is_none_or(|r| !r.scripts.contains(&entry.scripthash)))
             .take(limit)
+    }
+
+    /// The entries the limit of `refusals` keeps from a server: those
+    /// past the head of the list it takes, the ones it turned down
+    /// aside.
+    pub fn past_limit<'a>(&'a self, refusals: &'a Refusals) -> impl Iterator<Item = &'a Entry> {
+        self.entries
+            .iter()
+            .filter(move |entry| !refusals.scripts.contains(&entry.scripthash))
+            .skip(refusals.limit.unwrap_or(usize::MAX))
     }
 
     /// How much of each wallet is heard, in the order of the wallets:
@@ -921,7 +978,9 @@ impl Backoff {
 pub(crate) enum Exit {
     Stop,
     Reconfigured,
-    /// Try the transports again now: polling gives push another chance.
+    /// Try the transports again now: polling gives push another chance,
+    /// and a session whose server's limit ran out asks it for the whole
+    /// list again.
     Reprobe,
     /// A session was open and ended.
     Lost(String),
@@ -1030,6 +1089,36 @@ impl Hub {
         self.heard_by
             .as_ref()
             .and_then(|endpoint| self.refusals.get(endpoint))
+    }
+
+    /// Whether the limit learned of `endpoint` ran out: see
+    /// [`Refusals::ran_out`].
+    pub fn limit_ran_out(&self, endpoint: &Endpoint) -> bool {
+        self.refusals
+            .get(endpoint)
+            .is_some_and(|refusals| refusals.ran_out(&self.timings, SystemTime::now()))
+    }
+
+    /// Forgets the limit learned of `endpoint` once it ran out, so that
+    /// the session about to open asks that server for the whole list
+    /// again. Returns the script hashes that limit left out: reported
+    /// when it was learned and left to the regular syncs since, they are
+    /// not reported again if the server refuses them anew.
+    pub fn retry_limit(&mut self, endpoint: &Endpoint) -> HashSet<String> {
+        if !self.limit_ran_out(endpoint) {
+            return HashSet::new();
+        }
+        let Some(refusals) = self.refusals.get_mut(endpoint) else {
+            return HashSet::new();
+        };
+        let left_out = self
+            .watched
+            .past_limit(refusals)
+            .map(|entry| entry.scripthash.clone())
+            .collect();
+        refusals.limit = None;
+        refusals.learned = None;
+        left_out
     }
 
     /// Notes the server a session is open with, or that none is.
