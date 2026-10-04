@@ -90,9 +90,6 @@ struct Session {
     /// The session picks up after another one under the same
     /// configuration: a script it had no status for is reported.
     resumed: bool,
-    /// Script hashes the server's last limit, which ran out, left out:
-    /// reported then, and not again if the server refuses them anew.
-    left_out: HashSet<String>,
     ready_told: bool,
 }
 
@@ -170,7 +167,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         Ok(Err(exit)) | Err(exit) => return exit,
     };
 
-    let left_out = hub.retry_limit(endpoint);
+    hub.retry_limit(endpoint);
     let mut session = Session {
         endpoint: endpoint.clone(),
         writer,
@@ -186,7 +183,6 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         pong_by: None,
         opening: HashSet::new(),
         resumed: hub.caught_up,
-        left_out,
         ready_told: false,
     };
     hub.alive();
@@ -293,6 +289,12 @@ impl Session {
             return;
         }
         self.ready_told = true;
+        // Every script of the first pass has its answer: what a limit
+        // that ran out had left out is heard now, or was refused again
+        // and not reported twice.
+        if let Some(refusals) = hub.refusals.get_mut(&self.endpoint) {
+            refusals.left_out.clear();
+        }
         hub.ready(true);
     }
 
@@ -456,15 +458,18 @@ impl Session {
             }
         }
         let reason = self.opening_reason();
-        for scripthash in given_up {
-            self.opening.remove(&scripthash);
-            if self.left_out.contains(&scripthash) {
-                continue;
-            }
-            if let Some(entry) = hub.watched.by_scripthash(&scripthash) {
-                let hex = entry.hex.clone();
-                hub.mark_entry(&hex, reason);
-            }
+        for scripthash in &given_up {
+            self.opening.remove(scripthash);
+        }
+        let left_out = hub.refusals.get(&self.endpoint).map(|r| &r.left_out);
+        let report: Vec<String> = given_up
+            .iter()
+            .filter(|scripthash| left_out.is_none_or(|left_out| !left_out.contains(*scripthash)))
+            .filter_map(|scripthash| hub.watched.by_scripthash(scripthash))
+            .map(|entry| entry.hex.clone())
+            .collect();
+        for hex in &report {
+            hub.mark_entry(hex, reason);
         }
     }
 
@@ -488,7 +493,7 @@ impl Session {
                 .watched
                 .heard(refusals)
                 .skip(kept)
-                .filter(|entry| !self.left_out.contains(&entry.scripthash))
+                .filter(|entry| refusals.is_none_or(|r| !r.left_out.contains(&entry.scripthash)))
                 .map(|entry| entry.hex.clone())
                 .collect();
             hub.refusals

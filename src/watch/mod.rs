@@ -693,6 +693,12 @@ pub(crate) struct Refusals {
     pub cut: bool,
     /// Script hashes.
     pub scripts: HashSet<String>,
+    /// Script hashes a limit that ran out had left out: reported when it
+    /// was learned and left to the regular syncs since, they are not
+    /// reported again if the server refuses them anew. Kept until a
+    /// session has had an answer for every script of its first pass, so
+    /// that one lost before the server refused them does not undo it.
+    pub left_out: HashSet<String>,
 }
 
 impl Refusals {
@@ -1118,24 +1124,25 @@ impl Hub {
 
     /// Forgets the limit learned of `endpoint` once it ran out, so that
     /// the session about to open asks that server for the whole list
-    /// again. Returns the script hashes that limit left out: reported
-    /// when it was learned and left to the regular syncs since, they are
-    /// not reported again if the server refuses them anew.
-    pub fn retry_limit(&mut self, endpoint: &Endpoint) -> HashSet<String> {
+    /// again. The script hashes that limit left out go to
+    /// [`Refusals::left_out`]: reported when it was learned and left to
+    /// the regular syncs since, they are not reported again if the
+    /// server refuses them anew.
+    pub fn retry_limit(&mut self, endpoint: &Endpoint) {
         if !self.limit_ran_out(endpoint) {
-            return HashSet::new();
+            return;
         }
         let Some(refusals) = self.refusals.get_mut(endpoint) else {
-            return HashSet::new();
+            return;
         };
-        let left_out = self
+        let left_out: Vec<String> = self
             .watched
             .past_limit(refusals)
             .map(|entry| entry.scripthash.clone())
             .collect();
+        refusals.left_out.extend(left_out);
         refusals.limit = None;
         refusals.learned = None;
-        left_out
     }
 
     /// Notes the server a session is open with, or that none is.

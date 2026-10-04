@@ -508,6 +508,54 @@ async fn a_learned_limit_is_asked_again_once_it_ran_out() {
     no_event(&mut events, Duration::from_millis(300)).await;
 }
 
+/// A session that asks for the whole list again may be lost before the
+/// server refuses anything: the next one, which has no limit to keep
+/// to, still does not report again what the limit had left out.
+#[tokio::test]
+async fn a_retry_lost_before_a_refusal_reports_nothing_again() {
+    const SUBSCRIBE: &str = "blockchain.scripthash.subscribe";
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().subscription_limit =
+        Some((3, "subscription limit reached (3 max per client)"));
+    let all: Vec<u8> = (1..=10).collect();
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            limit_kept: Duration::from_millis(500),
+            ..timings()
+        }),
+    );
+    let mut reported = BTreeSet::new();
+    while reported.len() < 7 {
+        match next_event(&mut events).await {
+            WatchEvent::WalletChanged { scripts, .. } => reported.extend(scripts),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // The retry hears nothing back, and is given up on.
+    server.state.lock().unwrap().stall = Some(SUBSCRIBE);
+    within("the retry asks", WAIT, || {
+        asked(&server, SUBSCRIBE) > all.len()
+    })
+    .await;
+    server.state.lock().unwrap().stall = None;
+
+    within("a third connection refused past three", WAIT, || {
+        server
+            .subscriptions()
+            .get(2)
+            .is_some_and(|taken| taken.len() == 3)
+    })
+    .await;
+    let status = until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 3
+    })
+    .await;
+    assert_eq!(status.wallets[0].left_out_scripts, 7);
+    no_event(&mut events, Duration::from_millis(500)).await;
+}
+
 /// A server that took no subscription at all leaves Live nothing to
 /// push: it is asked again sooner than one that took some.
 #[tokio::test]
