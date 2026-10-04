@@ -390,6 +390,17 @@ The first release: the library both Gerfaut apps are built on.
   configured on any network it goes through the same Tor proxy, and when
   Tor cannot be had it does not go at all, where it used to ask GitHub in
   the clear. It now runs from the wallet manager only.
+- The price now takes the route the syncs take, as the update check
+  already does. When a backend on any network is an onion address, the
+  price goes through the same Tor proxy, and when Tor cannot be reached it
+  does not go out at all. Before, the price source was asked in the clear
+  every minute. The request now runs from the wallet manager only, which
+  refuses a currency or a range the source cannot serve before it resolves
+  any route.
+- The first address shown before a wallet is added is now derived for the
+  network the wallet goes to, given in `ImportOptions::network`. On
+  regtest, a test key showed the `tb1…` address of signet, which no
+  regtest wallet ever gives. It now shows its `bcrt1…` address.
 - A sync of a descriptor wallet also reads its receive addresses past the
   last one it revealed, the way a full scan does: up to the gap limit, and
   further past any that holds a transaction. A payment to an address the
