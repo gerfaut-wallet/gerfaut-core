@@ -75,6 +75,9 @@ pub struct PolicyInput<'a> {
 /// One unspent output, reduced to what a timelock needs to know.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coin {
+    /// The coin, `txid:vout`, and its value. The analysis reads neither:
+    /// it counts coins by their confirmation alone. They say which coin
+    /// it is, to whoever builds the list.
     pub outpoint: String,
     pub value_sats: u64,
     /// Confirmation height; `None` while the coin sits in the mempool.
