@@ -298,16 +298,19 @@ The first release: the library both Gerfaut apps are built on.
   disagrees with the wallet on a block now asks for its genesis block
   too, and says "the server is on another network" at once, instead of
   walking the wallet's chain down to it one request a block.
-- The live watch remembers what an Electrum server refuses, for as long
-  as its configuration holds. A server takes so many subscriptions on one
-  connection, 100 on the Electrum server of mempool.space, and at each
-  reconnection the watch used to ask it for the whole list again, be
-  refused the rest, and sync every script it gave up on. Now a refused
-  script is synced once, when it is refused, and the next connection asks
-  only for the head of the list, up to what the server took; the rest is
-  left to the regular syncs. The status counts those scripts out, so
-  `WatchStatus.wallets` and `left_out_scripts` say what the server really
-  took, on the user's own node as on a public server.
+- The live watch remembers what an Electrum server refuses. A server takes
+  so many subscriptions on one connection, 100 on the Electrum server of
+  mempool.space, and at each reconnection the watch used to ask it for the
+  whole list again, get the rest refused, and sync every script it gave up
+  on. Now a refused script is synced once, when the server refuses it, and
+  the next connection asks only for the head of the list, up to what the
+  server took; the regular syncs cover the rest. The watch keeps that limit
+  for a day, then asks the server for the whole list again. A limit of zero
+  lasts an hour: a server that refused every subscription no longer leaves
+  Live with nothing to push until the configuration changes. A script it
+  refuses again is not synced again. The status counts those scripts out,
+  so `WatchStatus.wallets` and `left_out_scripts` say what the server
+  really took, on the user's own node as on a public server.
 - An Electrum server that cuts the live watch for what it costs, an
   ElectrumX past its budget, is left alone for a quarter of an hour, as
   one of another network is, and asked for half as many scripts when the
@@ -610,6 +613,11 @@ The first release: the library both Gerfaut apps are built on.
   range, a network its format does not name, a 32-byte key, which is a
   private key in that format, or two animated BBQr codes scanned at once,
   whose parts used to be glued together.
+- A `crypto-output` QR code whose key names no child path is still read as
+  the receive and change branches (`/<0;1>/*`), and Gerfaut now says so.
+  `QrProgress.warnings`, and the parse of a pasted code, carry
+  `assumed_branches`, so the app can ask the user to compare the first
+  address with the signer.
 - More imports work: a key scanned alone as `ur:crypto-hdkey`, the
   descriptor file Sparrow exports, a payment URI (`bitcoin:…?amount=…`)
   scanned from another wallet's receive screen, a BSMS record inside a QR
