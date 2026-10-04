@@ -36,8 +36,9 @@ The first release: the library both Gerfaut apps are built on.
   instead of waiting for the next scheduled sync. An Electrum server pushes
   changes on up to 200 scripts per wallet, 2,000 in all, and the regular
   syncs cover the rest. A mempool instance pushes blocks and as many
-  scripts as it allows per connection, ten on the public ones, and the rest
-  are polled. Any other Esplora is polled about once a minute, around 240
+  scripts as it allows per connection, ten on the public mainnet ones and
+  some six hundred on those of signet and the testnets, and the rest are
+  polled. Any other Esplora is polled about once a minute, around 240
   requests an hour. The connection takes the route a sync takes: Tor for
   an onion host, and never around it, with the same certificate checks.
   The server learns what a sync already tells it, plus how long the app
@@ -236,12 +237,14 @@ The first release: the library both Gerfaut apps are built on.
   tenths of its wait and all of it, never later: a ping every four
   minutes on the dot marked the connection even through Tor.
 - On the user's own node, polling reads thirty scripts a minute, four at
-  a time, instead of three. Polling reads the head of the list every
-  round and the rest in turn, so with N scripts past what a server
-  pushes, each is read about every N/3 minutes on any server, and every
-  N/30 minutes on one's own node; all of them at the next regular sync.
-  Every minute for each would be N requests a minute, which no public
-  server would take from every client.
+  a time, instead of three. On a server that pushes nothing, polling
+  reads the first two scripts of the list every round and the rest in
+  turn, so with N scripts past those two, each is read about every N
+  minutes, and every N/28 minutes on one's own node. Past what a mempool
+  instance pushes, every script polled takes its turn: every N/3
+  minutes, or N/30 on one's own node. All of them are read at the next
+  regular sync. Every minute for each would be N requests a minute,
+  which no public server would take from every client.
 - The live watch keeps each wallet complete on its own. At each block,
   and every ten minutes, it reruns any sync that failed, and reads every
   script of any wallet that has gone a day without a complete sync. A
@@ -256,7 +259,15 @@ The first release: the library both Gerfaut apps are built on.
   update, instead of being reported as a wrong password.
 - `PremiumClient::with_http` is no longer public: a client built elsewhere
   skipped the refusal of an onion without a proxy and could follow
-  redirects. These are gone, since nothing called them: `store::VaultKdf`,
+  redirects. Nor are `price::fetch_price` and `price::fetch_price_history`:
+  an app asks the wallet manager, which takes the route of the syncs.
+- A 4xx from the Premium server without its own error body is now
+  `PremiumError::UnexpectedResponse`. It used to be
+  `PremiumError::Rejected`, with the bare status as its words.
+
+### Removed
+
+- Nothing called these, so they are gone: `store::VaultKdf`,
   `cipher::kdf_kind`, `format_btc_signed`, `truncate_middle`,
   `truncate_address`, `PremiumClient::set_key` and `broadcast::sats`. So
   are the `funded_sats` and `spent_sats` fields of `AddressWatchState`,
@@ -310,8 +321,9 @@ The first release: the library both Gerfaut apps are built on.
   the scripts of the transaction, and on a script nobody pushes it used
   to wait for the next regular sync.
 - An Esplora server that limits the rate of requests (HTTP 429) is asked
-  again once, after the wait its `Retry-After` names, five seconds at
-  least, instead of three times within two seconds; past a minute the
+  again once, after the wait its `Retry-After` names, in seconds or as a
+  date, five seconds at least, instead of three times within two
+  seconds; past a minute the
   request fails at once and says how long the server asked for.
   mempool.space bans a client that keeps coming back too soon. Polling
   a server that limits it waits twice as long between rounds each time,
@@ -364,7 +376,8 @@ The first release: the library both Gerfaut apps are built on.
   needs only while such a payment waits, so a vault written before reads
   and writes the same. While the live watch runs, it reads the scripts
   of such a payment again itself ten minutes on, nothing moving on them
-  once it left.
+  once it left. A wallet removed takes such a payment out of the vault
+  with it.
 - A watched address is never read from a server of another network.
   Testnet, testnet4 and signet spell an address alike, and a server of
   the wrong one answered for it with transactions the wallet's network
@@ -519,8 +532,10 @@ The first release: the library both Gerfaut apps are built on.
   block a minute since the genesis block, with a clock set back read as
   the day this release was written), and its latest blocks are taken
   only as a chain: one per height, each the parent of the next, and over
-  Electrum the last one the tip it announced, with the work mainnet and
-  testnet4 ask for. A wallet that already holds such blocks, far above
+  Electrum the last one the tip it announced, each mined on mainnet and
+  testnet4 at a target no easier than the network allows. That stops a
+  header no one mined; it does not prove the work the chain asks for at
+  that height. A wallet that already holds such blocks, far above
   the tip of the server it syncs with next, drops them: a single answer
   with a height of four billion used to give every transaction billions
   of confirmations, every timelock of the policy as expired, and every
@@ -554,7 +569,8 @@ The first release: the library both Gerfaut apps are built on.
   marked as required, where they read as optional, and the branch is no
   longer called primary as if it could spend now.
 - A 1-of-n beside a timed path stays one way to spend, "Any of n keys",
-  instead of n primary branches.
+  instead of n primary branches. So do a taproot key path and a leaf of a
+  single key: "Any of 2 keys", beside the timed leaf.
 - A pair of descriptors is held together: the change descriptor must have
   the receive descriptor's script type, keys and conditions, on other
   paths. The policy page reads the receive one, and change goes to the
@@ -573,7 +589,8 @@ The first release: the library both Gerfaut apps are built on.
   that waited ten days for an approval, the account's first one included.
 - A Coldcard export is read under its master fingerprint, the one a signer
   knows the wallet by, not the account's. A descriptor copied to a
-  coordinator gave PSBTs the Coldcard would not sign.
+  coordinator gave PSBTs the Coldcard would not sign. An account whose
+  `first` address is not the one its key derives is refused.
 - A copy of the Premium state handed back after a wallet was removed no
   longer brings its consent back, nor cancels its removal.
 - A private key written with JSON escapes inside an export is refused like
@@ -597,7 +614,8 @@ The first release: the library both Gerfaut apps are built on.
   descriptor file Sparrow exports, a payment URI (`bitcoin:…?amount=…`)
   scanned from another wallet's receive screen, a BSMS record inside a QR
   envelope, and a BSMS record for regtest. A BSMS record with more than
-  four lines is refused.
+  four lines is refused, and so is a descriptor file whose three
+  descriptors do not describe the same wallet.
 - A `ypub` or a `zpub` keeps the script its prefix names: picking another
   one no longer builds a wallet of addresses the exporting wallet never
   shows, and the confirmation screen no longer offers another. A key under
@@ -606,7 +624,9 @@ The first release: the library both Gerfaut apps are built on.
 - A vault is written back at payload version 2, so a build older than this
   one refuses to open it rather than rewrite it without the fields it does
   not know, the Premium device token and a key change under way among
-  them.
+  them. The version is read first, on its own, so a vault from a later
+  build that gives a field another shape is refused as newer instead of
+  being reported as corrupted.
 - The app lock's delay now starts when the answer comes back. It used to
   start at the guess, so the time Argon2 took to check it came off the
   delay.
