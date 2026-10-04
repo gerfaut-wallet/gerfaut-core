@@ -35,14 +35,11 @@ use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use futures_util::future::try_join_all;
 
 use super::page::PageTx;
-use super::{Client, Counts, PARALLEL_REQUESTS};
+use super::{Client, Counts, PAGE, PARALLEL_REQUESTS};
 use crate::chain::{
     Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX, height_limit,
 };
 use crate::network::Network;
-
-/// Confirmed transactions an Esplora server lists per page.
-const PAGE: usize = 25;
 /// Pages read of one script at most: 10,000 confirmed transactions. A
 /// server that keeps listing new ones past that is refused rather than
 /// read on until the deadline, holding every page in memory.

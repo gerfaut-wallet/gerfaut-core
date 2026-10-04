@@ -884,7 +884,8 @@ fn fill_from_held(
     Ok(Some(filled))
 }
 
-/// Confirmed transactions in a page of an address history.
+/// Confirmed transactions an Esplora server lists in a page of a
+/// history, a script's or an address's.
 const PAGE: usize = 25;
 
 /// One esplora transaction as seen from the watched address.
