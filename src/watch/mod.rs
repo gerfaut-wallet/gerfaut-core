@@ -78,7 +78,8 @@
 //!   leaves out ([`WalletCoverage`]). That number is asked again a day
 //!   after it was learned, an hour after when it is none: the session
 //!   open there ends, the next one asks for the whole list, and what
-//!   the server refuses again is not reported again.
+//!   the server refuses again is not reported again. A number learned
+//!   from a cut for cost is not: the whole list would be cut again.
 //! - A server is asked for its genesis block before it hears of any
 //!   script. One of another network is refused, and left alone for a
 //!   quarter of an hour ([`Exit::Refused`]) while the next one is
@@ -679,13 +680,17 @@ pub(crate) struct Watched {
 /// the list does. That most is only what the server took at one time:
 /// its operator may raise it, and a limit per address counts the other
 /// connections from it, which close. It is asked again once it ran out
-/// ([`Refusals::ran_out`]).
+/// ([`Refusals::ran_out`]), unless it came from a cut for cost.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Refusals {
     pub limit: Option<usize>,
     /// When `limit` was learned, on the wall clock: it keeps running
     /// while the computer sleeps, as the server's limit does.
     pub learned: Option<SystemTime>,
+    /// `limit` is what was left after a cut for cost, ElectrumX past its
+    /// budget: asked again, the whole list would only be cut again, so
+    /// it holds for the configuration.
+    pub cut: bool,
     /// Script hashes.
     pub scripts: HashSet<String>,
 }
@@ -696,15 +701,27 @@ impl Refusals {
     pub fn learn(&mut self, limit: usize) {
         self.limit = Some(limit);
         self.learned = Some(SystemTime::now());
+        self.cut = false;
+    }
+
+    /// The server cut the watch for what it costs, and the next session
+    /// there asks for `limit` scripts: see [`Self::cut`].
+    pub fn learn_cut(&mut self, limit: usize) {
+        self.learn(limit);
+        self.cut = true;
     }
 
     /// Whether the limit was kept long enough for the server to be asked
     /// for the whole list again: [`Timings::limit_kept`] after it was
-    /// learned, [`Timings::zero_limit_kept`] when the server took none.
+    /// learned, [`Timings::zero_limit_kept`] when the server took none,
+    /// and never when it came from a cut for cost.
     pub fn ran_out(&self, timings: &Timings, now: SystemTime) -> bool {
         let (Some(limit), Some(learned)) = (self.limit, self.learned) else {
             return false;
         };
+        if self.cut {
+            return false;
+        }
         let kept = if limit == 0 {
             timings.zero_limit_kept
         } else {

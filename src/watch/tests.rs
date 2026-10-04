@@ -561,6 +561,8 @@ async fn a_server_that_cuts_the_watch_for_its_cost_is_asked_less() {
         vec![wallet("a", &all, &[], false)],
         Some(Timings {
             refused,
+            // What a cut leaves is not asked again, however long it is kept.
+            limit_kept: Duration::from_millis(200),
             ..timings()
         }),
     );
@@ -606,7 +608,8 @@ async fn a_server_that_cuts_the_watch_for_its_cost_is_asked_less() {
             left_out_scripts: 7,
         }
     );
-    no_event(&mut events, Duration::from_millis(300)).await;
+    no_event(&mut events, Duration::from_millis(800)).await;
+    assert_eq!(server.subscriptions().len(), 2);
 }
 
 /// Over Electrum a confirmation comes as the new status of the scripts
@@ -1455,7 +1458,8 @@ fn what_a_server_refused_is_counted_out() {
 
 /// The most a server takes is kept a day, and a limit of none an hour:
 /// past that, the server is asked for the whole list again. A wall
-/// clock set back before the limit was learned asks again too.
+/// clock set back before the limit was learned asks again too. What a
+/// cut for cost left is kept for the configuration.
 #[test]
 fn a_learned_limit_runs_out() {
     let timings = Timings::of(&config(BackendConfig::Public { server: None }));
@@ -1472,6 +1476,11 @@ fn a_learned_limit_runs_out() {
     assert!(!refusals.ran_out(&timings, after(59 * 60)));
     assert!(refusals.ran_out(&timings, after(3600)));
     assert!(refusals.ran_out(&timings, learned - Duration::from_secs(60)));
+    // What a cut for cost left is never asked again.
+    refusals.limit = Some(100);
+    refusals.cut = true;
+    assert!(!refusals.ran_out(&timings, after(48 * 3600)));
+    assert!(!refusals.ran_out(&timings, learned - Duration::from_secs(60)));
     // Nothing learned, nothing to run out.
     assert!(!Refusals::default().ran_out(&timings, after(48 * 3600)));
 }

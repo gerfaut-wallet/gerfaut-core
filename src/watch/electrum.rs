@@ -16,7 +16,8 @@
 //! does not ask the server, or the syncs, for it again. The most it
 //! takes is asked again a day after it was learned, an hour after when
 //! it took none: the session ends at the next ping, and the next one
-//! asks for the whole list.
+//! asks for the whole list. What is left after a cut for cost is not:
+//! the whole list would be cut again.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -493,7 +494,7 @@ impl Session {
             hub.refusals
                 .entry(self.endpoint.clone())
                 .or_default()
-                .learn(kept);
+                .learn_cut(kept);
             let reason = self.opening_reason();
             for hex in &past {
                 hub.mark_entry(hex, reason);
