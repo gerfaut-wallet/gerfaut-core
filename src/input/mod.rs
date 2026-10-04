@@ -130,10 +130,12 @@ pub struct ParsedInput {
     /// new choice to rebuild the descriptors.
     #[serde(default)]
     pub derivation_editable: bool,
-    /// First receive address, derived for the first candidate network,
-    /// so the user can compare it with the wallet they are importing.
-    /// `None` for single addresses and for descriptors that cannot
-    /// derive one.
+    /// First receive address, so the user can compare it with the
+    /// wallet they are importing. Derived for the network chosen in
+    /// [`ImportOptions::network`] when it is one of `networks`, for the
+    /// first candidate otherwise: a test key reads `tb1…` on signet and
+    /// testnet, `bcrt1…` on regtest. `None` for single addresses and
+    /// for descriptors that cannot derive one.
     #[serde(default)]
     pub preview_address: Option<String>,
 }
@@ -179,13 +181,18 @@ impl Default for DerivationChoice {
     }
 }
 
-/// What the user picked on the confirmation screen. Each choice only
-/// applies to inputs that leave it open, which is a lone extended key;
-/// the others fix their own and ignore it.
+/// What the user picked on the confirmation screen. The script and the
+/// derivation only apply to inputs that leave them open, which is a
+/// lone extended key; the others fix their own and ignore them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImportOptions {
     pub script: Option<ScriptKind>,
     pub derivation: Option<DerivationChoice>,
+    /// The network the wallet is about to be added on, which the
+    /// preview address is derived for. Ignored when the input does not
+    /// allow it; `None` means the first candidate.
+    #[serde(default)]
+    pub network: Option<Network>,
 }
 
 /// Classifies raw user input into wallet material.
@@ -208,22 +215,23 @@ pub fn parse_input_with(input: &str, script: Option<ScriptKind>) -> CoreResult<P
         input,
         &ImportOptions {
             script,
-            derivation: None,
+            ..ImportOptions::default()
         },
     )
 }
 
-/// Same as [`parse_input`], with everything the user may pick for a
-/// lone extended key. Inputs that fix their own script type and paths
-/// (`script_options` empty, `derivation_editable` false) ignore the
-/// options.
+/// Same as [`parse_input`], with everything the user may pick: the
+/// script type and paths of a lone extended key, and the network the
+/// preview address is derived for. Inputs that fix their own script
+/// type and paths (`script_options` empty, `derivation_editable` false)
+/// ignore those two.
 pub fn parse_input_with_options(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
     if bsms::is_bsms(input) {
         return parse_bsms_record(input);
     }
     let mut parsed = classify(input, options)?;
     if parsed.preview_address.is_none() {
-        parsed.preview_address = preview_address(&parsed);
+        parsed.preview_address = preview_address(&parsed, options.network);
     }
     Ok(parsed)
 }
@@ -1011,12 +1019,16 @@ fn parse_extended_key(
     })
 }
 
-/// First receive address of a descriptor payload, on the first
-/// candidate network. Best effort: a descriptor that cannot derive
-/// (bare miniscript, no wildcard on a script we cannot address) yields
-/// `None` rather than an error, the import itself is unaffected.
-fn preview_address(parsed: &ParsedInput) -> Option<String> {
-    first_address(&parsed.payload, *parsed.networks.first()?)
+/// First receive address of a descriptor payload, on the network
+/// chosen when the input allows it, on the first candidate otherwise.
+/// Best effort: a descriptor that cannot derive (bare miniscript, no
+/// wildcard on a script we cannot address) yields `None` rather than
+/// an error, the import itself is unaffected.
+fn preview_address(parsed: &ParsedInput, chosen: Option<Network>) -> Option<String> {
+    let network = chosen
+        .filter(|network| parsed.networks.contains(network))
+        .or_else(|| parsed.networks.first().copied())?;
+    first_address(&parsed.payload, network)
 }
 
 /// The first receive address of descriptors on `network`.
@@ -1308,13 +1320,27 @@ mod tests {
 
     fn with_derivation(receive: &str, change: Option<&str>, origin: Option<&str>) -> ImportOptions {
         ImportOptions {
-            script: None,
             derivation: Some(DerivationChoice {
                 receive: receive.to_owned(),
                 change: change.map(str::to_owned),
                 origin: origin.map(str::to_owned),
             }),
+            ..ImportOptions::default()
         }
+    }
+
+    fn on(network: Network) -> ImportOptions {
+        ImportOptions {
+            network: Some(network),
+            ..ImportOptions::default()
+        }
+    }
+
+    /// What a bech32 address carries between its prefix and its
+    /// checksum: the witness program, the same on every network.
+    fn program(address: &str) -> &str {
+        let (_, data) = address.split_once('1').unwrap();
+        &data[..data.len() - 6]
     }
 
     fn descriptors(parsed: &ParsedInput) -> (&str, Option<&str>, ScriptKind) {
@@ -1735,6 +1761,57 @@ mod tests {
         assert_eq!(parsed.script_options, SINGLE_KEY_SCRIPTS.to_vec());
         let preview = parsed.preview_address.as_deref().unwrap();
         assert!(preview.starts_with("tb1q"), "{preview}");
+    }
+
+    /// The first address is the one the wallet shows on the network it
+    /// is added on. Signet and testnet 4 share the `tb1` prefix.
+    #[test]
+    fn the_preview_follows_a_chosen_signet() {
+        let parsed = parse_input_with_options(TPUB, &on(Network::Signet)).unwrap();
+        assert_eq!(parsed.preview_address.as_deref(), Some(DEFAULT_PREVIEW));
+    }
+
+    #[test]
+    fn the_preview_follows_a_chosen_testnet4() {
+        let parsed = parse_input_with_options(TPUB, &on(Network::Testnet4)).unwrap();
+        assert_eq!(parsed.preview_address.as_deref(), Some(DEFAULT_PREVIEW));
+    }
+
+    /// Regtest was shown a `tb1` address, which no regtest wallet ever
+    /// gives: the same key reads `bcrt1` there, on the same program.
+    #[test]
+    fn the_preview_follows_a_chosen_regtest() {
+        let parsed = parse_input_with_options(TPUB, &on(Network::Regtest)).unwrap();
+        let preview = parsed.preview_address.unwrap();
+        assert!(preview.starts_with("bcrt1q"), "{preview}");
+        assert_eq!(program(&preview), program(DEFAULT_PREVIEW));
+
+        // A descriptor follows it too, and so does a script picked again.
+        let parsed = parse_input_with_options(MULTIPATH, &on(Network::Regtest)).unwrap();
+        assert!(parsed.preview_address.unwrap().starts_with("bcrt1q"));
+        let taproot = parse_input_with_options(
+            TPUB,
+            &ImportOptions {
+                script: Some(ScriptKind::Taproot),
+                ..on(Network::Regtest)
+            },
+        )
+        .unwrap();
+        assert!(taproot.preview_address.unwrap().starts_with("bcrt1p"));
+    }
+
+    #[test]
+    fn the_preview_follows_a_chosen_mainnet() {
+        let parsed = parse_input_with_options(XPUB, &on(Network::Mainnet)).unwrap();
+        let preview = parsed.preview_address.unwrap();
+        assert!(preview.starts_with("bc1q"), "{preview}");
+
+        // A network the key does not allow changes nothing: a main key
+        // has no regtest address, and a test key no mainnet one.
+        let parsed = parse_input_with_options(XPUB, &on(Network::Regtest)).unwrap();
+        assert_eq!(parsed.preview_address, Some(preview));
+        let parsed = parse_input_with_options(TPUB, &on(Network::Mainnet)).unwrap();
+        assert_eq!(parsed.preview_address.as_deref(), Some(DEFAULT_PREVIEW));
     }
 
     #[test]
@@ -2305,6 +2382,7 @@ mod tests {
                 origin: Some("[deadbeef/84'/1'/0']".to_owned()),
                 ..DerivationChoice::default()
             }),
+            network: None,
         };
         let parsed = parse_input_with_options(TPUB, &options).unwrap();
         let (external, _, script) = descriptors(&parsed);
