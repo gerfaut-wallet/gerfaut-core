@@ -543,7 +543,10 @@ fn http_date(text: &str) -> Option<u64> {
     };
     let day: u32 = day.parse().ok().filter(|day| (1..=31).contains(day))?;
     let month = MONTHS.iter().position(|name| *name == month)? as u32 + 1;
-    let year: i64 = year.parse().ok()?;
+    let year: i64 = year
+        .parse()
+        .ok()
+        .filter(|year| (1970..=9999).contains(year))?;
     let [hours, minutes, seconds]: [u64; 3] = time
         .split(':')
         .map(|part| part.parse().ok())
@@ -1377,6 +1380,10 @@ mod error_tests {
         assert_eq!(named("Sun, 06 Nov 1994 08:49:37 GMT"), None, "past");
         assert_eq!(named("Sunday, 06-Nov-94 08:49:37 GMT"), None, "obsolete");
         assert_eq!(named("soon"), None);
+        assert_eq!(
+            http_date("Sun, 06 Nov 99999999999999999 08:49:37 GMT"),
+            None
+        );
     }
 
     /// What a sync of an address keeps of each transaction, its raw
