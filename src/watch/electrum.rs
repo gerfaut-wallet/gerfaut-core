@@ -456,11 +456,24 @@ impl Session {
     /// at once with the same burst would only be cut again: the session
     /// ends, the server is left alone ([`Exit::Refused`]), and the next
     /// session there asks for half as many scripts as this one took.
+    /// The scripts that leaves out are not asked for again, so each is
+    /// reported once, as a script given up on a refusal is: what it did
+    /// from the cut on, nothing will tell.
     fn cut(&mut self, hub: &mut Hub, detail: String) {
         let half = self.acknowledged as usize / 2;
         if half > 0 {
+            let heard: Vec<String> = hub
+                .watched
+                .heard(hub.refusals.get(&self.endpoint))
+                .map(|entry| entry.hex.clone())
+                .collect();
             let limit = &mut hub.refusals.entry(self.endpoint.clone()).or_default().limit;
-            *limit = Some(limit.map_or(half, |limit| limit.min(half)));
+            let kept = limit.map_or(half, |limit| limit.min(half));
+            *limit = Some(kept);
+            let reason = self.opening_reason();
+            for hex in heard.iter().skip(kept) {
+                hub.mark_entry(hex, reason);
+            }
         }
         self.overloaded = Some(detail);
     }

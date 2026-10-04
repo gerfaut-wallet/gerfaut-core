@@ -454,7 +454,9 @@ async fn electrum_keeps_to_what_a_server_takes() {
 
 /// A server that cuts the watch for what it costs, ElectrumX past its
 /// budget, is left alone a long while, and asked for half as many
-/// scripts when the watch comes back to it.
+/// scripts when the watch comes back to it. Each script that leaves
+/// out is reported once, for a sync of its own, as one given up on a
+/// refusal is.
 #[tokio::test]
 async fn a_server_that_cuts_the_watch_for_its_cost_is_asked_less() {
     let server = FakeElectrum::start().await;
@@ -462,7 +464,7 @@ async fn a_server_that_cuts_the_watch_for_its_cost_is_asked_less() {
     let refused = Duration::from_secs(1);
     let started = std::time::Instant::now();
     let all: Vec<u8> = (1..=10).collect();
-    let (watch, _events) = LiveWatch::start_with(
+    let (watch, mut events) = LiveWatch::start_with(
         config(server.backend()),
         vec![wallet("a", &all, &[], false)],
         Some(Timings {
@@ -472,6 +474,23 @@ async fn a_server_that_cuts_the_watch_for_its_cost_is_asked_less() {
     );
     let status = until(&watch, "cut", |s| s.state == WatchState::Reconnecting).await;
     assert_eq!(status.detail.as_deref(), Some("excessive resource usage"));
+    let mut reported = BTreeSet::new();
+    while reported.len() < 7 {
+        match next_event(&mut events).await {
+            WatchEvent::WalletChanged {
+                wallet_id,
+                reason,
+                scripts,
+                ..
+            } => {
+                assert_eq!((wallet_id.as_str(), reason), ("a", ChangeReason::Started));
+                reported.extend(scripts);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let past: BTreeSet<String> = (4..=10).map(script).collect();
+    assert_eq!(reported, past);
     within("connected again", WAIT, || {
         server.subscriptions().len() == 2
     })
@@ -495,6 +514,7 @@ async fn a_server_that_cuts_the_watch_for_its_cost_is_asked_less() {
             left_out_scripts: 7,
         }
     );
+    no_event(&mut events, Duration::from_millis(300)).await;
 }
 
 /// Over Electrum a confirmation comes as the new status of the scripts
