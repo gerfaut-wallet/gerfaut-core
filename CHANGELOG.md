@@ -307,17 +307,21 @@ The first release: the library both Gerfaut apps are built on.
   server took; the regular syncs cover the rest. The watch keeps that limit
   for a day, then asks the server for the whole list again. A limit of zero
   lasts an hour: a server that refused every subscription no longer leaves
-  Live with nothing to push until the configuration changes. A script it
-  refuses again is not synced again. The status counts those scripts out,
-  so `WatchStatus.wallets` and `left_out_scripts` say what the server
-  really took, on the user's own node as on a public server.
+  Live with nothing to push until the configuration changes. Scripts the
+  server refuses again are not synced a second time, even if the
+  connection that asks for them again drops before the server refuses
+  them. The status counts those scripts out, so `WatchStatus.wallets` and
+  `left_out_scripts` say what the server really took, on the user's own
+  node as on a public server.
 - An Electrum server that cuts the live watch for what it costs, an
   ElectrumX past its budget, is left alone for a quarter of an hour, as
   one of another network is, and asked for half as many scripts when the
   watch comes back to it. ElectrumX keeps that cost against the address
   for a while, and the watch used to come back within two minutes with
-  the same burst. Subscriptions go out ten at a time instead of 25, as
-  many as ElectrumX serves at once before it slows a session down.
+  the same burst. The watch keeps to that smaller list until the
+  configuration changes: asked for the whole list again, ElectrumX would
+  cut it again. Subscriptions go out ten at a time instead of 25, as many
+  as ElectrumX serves at once before it slows a session down.
 - Over Electrum, a block now syncs a wallet waiting for a confirmation
   when the live watch does not hear all of its scripts, past the caps on
   the list or refused by the server. The confirmation comes as news on
@@ -615,8 +619,8 @@ The first release: the library both Gerfaut apps are built on.
   whose parts used to be glued together.
 - A `crypto-output` QR code whose key names no child path is still read as
   the receive and change branches (`/<0;1>/*`), and Gerfaut now says so.
-  `QrProgress.warnings`, and the parse of a pasted code, carry
-  `assumed_branches`, so the app can ask the user to compare the first
+  `QrProgress.warnings` carries `assumed_branches`, and parsing a pasted
+  code returns it too, so the app can ask the user to compare the first
   address with the signer.
 - More imports work: a key scanned alone as `ur:crypto-hdkey`, the
   descriptor file Sparrow exports, a payment URI (`bitcoin:…?amount=…`)
