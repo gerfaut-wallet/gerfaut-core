@@ -484,8 +484,8 @@ async fn a_learned_limit_is_asked_again_once_it_ran_out() {
     }
     let past: BTreeSet<String> = (4..=10).map(script).collect();
     assert_eq!(reported, past);
-    let first = asked(&server, "blockchain.scripthash.subscribe");
-    assert_eq!(first, all.len());
+    // Read from the first connection: the second may already be open.
+    assert_eq!(server.subscriptions()[0].len(), 3);
 
     within("asked for the whole list again", WAIT, || {
         asked(&server, "blockchain.scripthash.subscribe") >= 2 * all.len()
