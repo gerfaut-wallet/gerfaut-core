@@ -36,6 +36,19 @@ pub(crate) fn civil_date(unix: u64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
+/// The days from 1970-01-01 to a civil date in UTC, by Howard Hinnant's
+/// `days_from_civil`: the inverse of [`civil_date`].
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month = i64::from(month);
+    let day_of_year =
+        (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 /// Groups the integer digits of a numeric string by thousands using
 /// a narrow no-break space, leaving any decimal part untouched.
 ///
@@ -89,6 +102,19 @@ mod tests {
         // Past any clock: a date all the same, never a panic.
         let (year, _, _) = civil_date(u64::MAX);
         assert!(year > 9_999);
+    }
+
+    #[test]
+    fn days_from_civil_dates() {
+        for unix in [0, 951_782_400, 1_756_150_867, 4_107_542_399] {
+            let (year, month, day) = civil_date(unix);
+            assert_eq!(
+                days_from_civil(year, month, day),
+                (unix / 86_400) as i64,
+                "{unix}"
+            );
+        }
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
     }
 
     #[test]

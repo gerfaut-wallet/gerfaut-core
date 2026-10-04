@@ -511,17 +511,51 @@ impl<B: AsRef<[u8]>> std::io::Read for ChunkReader<B> {
 
 // --- errors ---------------------------------------------------------------
 
-/// The wait a `Retry-After` header names in seconds, a day at most. The
-/// date form reads as none: the shortest wait applies.
+/// The wait a `Retry-After` header names, in seconds or as the date to
+/// come back at, a day at most. A date already past, or written in one
+/// of the obsolete forms, reads as none: the shortest wait applies.
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let seconds: u64 = headers
+    let value = headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
         .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+        .trim();
+    let seconds = match value.parse::<u64>() {
+        Ok(seconds) => seconds,
+        Err(_) => http_date(value)?.checked_sub(crate::now_secs())?,
+    };
     Some(Duration::from_secs(seconds.min(24 * 60 * 60)))
+}
+
+/// An HTTP date in the form servers send, `Sun, 06 Nov 1994 08:49:37
+/// GMT`, as unix seconds.
+fn http_date(text: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let parts: [&str; 6] = text
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()?;
+    let [_weekday, day, month, year, time, "GMT"] = parts else {
+        return None;
+    };
+    let day: u32 = day.parse().ok().filter(|day| (1..=31).contains(day))?;
+    let month = MONTHS.iter().position(|name| *name == month)? as u32 + 1;
+    let year: i64 = year.parse().ok()?;
+    let [hours, minutes, seconds]: [u64; 3] = time
+        .split(':')
+        .map(|part| part.parse().ok())
+        .collect::<Option<Vec<u64>>>()?
+        .try_into()
+        .ok()?;
+    if hours > 23 || minutes > 59 || seconds > 60 {
+        return None;
+    }
+    let days = u64::try_from(crate::format::days_from_civil(year, month, day)).ok()?;
+    days.checked_mul(86_400)?
+        .checked_add(hours * 3_600 + minutes * 60 + seconds)
 }
 
 /// A server that limited the rate of requests, and the wait it asked for.
@@ -1306,6 +1340,42 @@ mod error_tests {
         assert_eq!(*asked_short.lock().unwrap(), 2);
         assert_eq!(*asked_again.lock().unwrap(), 2);
         assert_eq!(short.take_rate_limit(), Some(RATE_WAIT_MIN));
+    }
+
+    /// `Retry-After` names a wait in seconds, or the date to come back at.
+    #[test]
+    fn a_retry_after_date_is_a_wait_until_then() {
+        let named = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+            retry_after(&headers)
+        };
+        assert_eq!(named("17"), Some(Duration::from_secs(17)));
+        assert_eq!(
+            http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        let in_two_minutes = crate::now_secs() + 120;
+        let (year, month, day) = crate::format::civil_date(in_two_minutes);
+        let time = in_two_minutes % 86_400;
+        let months = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let date = format!(
+            "Mon, {day:02} {} {year} {:02}:{:02}:{:02} GMT",
+            months[month as usize - 1],
+            time / 3_600,
+            time % 3_600 / 60,
+            time % 60
+        );
+        let wait = named(&date).unwrap();
+        assert!(
+            (Duration::from_secs(115)..=Duration::from_secs(120)).contains(&wait),
+            "{date}: {wait:?}"
+        );
+        assert_eq!(named("Sun, 06 Nov 1994 08:49:37 GMT"), None, "past");
+        assert_eq!(named("Sunday, 06-Nov-94 08:49:37 GMT"), None, "obsolete");
+        assert_eq!(named("soon"), None);
     }
 
     /// What a sync of an address keeps of each transaction, its raw
