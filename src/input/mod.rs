@@ -666,9 +666,11 @@ fn parse_descriptor_file(lines: &[&str]) -> CoreResult<ParsedInput> {
         .filter(|&i| i != whole)
         .map(|i| lines[i])
         .collect();
-    let pair = parse_descriptor_pair(pair[0], pair[1])?;
     let wallet = parsed.swap_remove(whole);
-    if wallet.payload != pair.payload {
+    let describes = |receive: &str, change: &str| -> CoreResult<bool> {
+        Ok(parse_descriptor_pair(receive, change)?.payload == wallet.payload)
+    };
+    if !(describes(pair[0], pair[1])? || describes(pair[1], pair[0])?) {
         return Err(refuse(
             "the descriptors in this file do not describe the same wallet",
         ));
@@ -1924,10 +1926,16 @@ mod tests {
 "
             )
         };
-        let parsed = parse_input(&file(receive, change.unwrap())).unwrap();
+        let change = change.unwrap();
+        let parsed = parse_input(&file(receive, change)).unwrap();
         assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
         assert_eq!(parsed.payload, alone.payload);
         assert_eq!(parsed.preview_address, alone.preview_address);
+        let swapped = parse_input(&file(change, receive)).unwrap();
+        assert_eq!(
+            swapped.payload, alone.payload,
+            "the branches in either order"
+        );
 
         let elsewhere = format!("wpkh([9a6a2580/84'/1'/0']{TPUB}/2/*)");
         let error = parse_input(&file(receive, &elsewhere))
