@@ -448,7 +448,9 @@ async fn electrum_keeps_to_what_a_server_takes() {
             asked(&server, "blockchain.scripthash.subscribe"),
             before + 3
         );
-        assert_eq!(watch.status().pushed_scripts, 3);
+        until(&watch, "subscribed again", |s| s.pushed_scripts == 3).await;
+        // The scripts past the limit are not reported again.
+        no_event(&mut events, Duration::from_millis(300)).await;
     }
 }
 
