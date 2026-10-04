@@ -324,17 +324,22 @@ impl Vault {
         }
     }
 
-    /// Reads and decrypts the whole payload.
+    /// Reads and decrypts the whole payload. Its version is read first,
+    /// alone: a later build may give a field another shape, and its
+    /// vault is one to refuse as newer, not one to call corrupted.
     pub fn load(&self) -> Result<VaultPayload, VaultError> {
+        #[derive(Deserialize)]
+        struct Version {
+            version: u32,
+        }
         let file = std::fs::read(&self.path)?;
         let plaintext = cipher::unseal(&file, &self.key)?;
-        let mut payload: VaultPayload = serde_json::from_slice(&plaintext)
-            .map_err(|e| VaultError::CorruptedPayload(e.to_string()))?;
-        if payload.version > PAYLOAD_VERSION {
-            return Err(VaultError::UnsupportedVersion(
-                payload.version.min(255) as u8
-            ));
+        let corrupted = |e: serde_json::Error| VaultError::CorruptedPayload(e.to_string());
+        let Version { version } = serde_json::from_slice(&plaintext).map_err(corrupted)?;
+        if version > PAYLOAD_VERSION {
+            return Err(VaultError::UnsupportedVersion(version.min(255) as u8));
         }
+        let mut payload: VaultPayload = serde_json::from_slice(&plaintext).map_err(corrupted)?;
         payload.version = PAYLOAD_VERSION;
         Ok(payload)
     }
@@ -619,6 +624,20 @@ mod tests {
         drop(vault);
 
         written_at(PAYLOAD_VERSION + 1);
+        assert!(matches!(
+            Vault::open_or_create(&path, key()),
+            Err(VaultError::UnsupportedVersion(3))
+        ));
+
+        // A later build that gave a field another shape: still a newer
+        // vault, not a corrupted one.
+        let reshaped = serde_json::json!({
+            "version": PAYLOAD_VERSION + 1,
+            "settings": "of another shape",
+            "wallets": {},
+        });
+        let sealed = cipher::seal(&serde_json::to_vec(&reshaped).unwrap(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
         assert!(matches!(
             Vault::open_or_create(&path, key()),
             Err(VaultError::UnsupportedVersion(3))
