@@ -1,4 +1,9 @@
 //! Chain data sources: backend configuration and synchronization.
+//!
+//! And what every request of the core to a server keeps to, the price
+//! and the update check included: what a server's words may show on a
+//! screen (`server_words`), and which redirections a client follows
+//! (`redirects`).
 
 pub mod connect;
 pub(crate) mod electrum;

@@ -60,7 +60,7 @@ Every app goes through `WalletManager`. The rest of `src/` answers one question 
 
 | Module | Question |
 |---|---|
-| `manager/`, `live.rs` | What can an app ask? The facade, one file per question, listed at the top of `manager/mod.rs`: settings and Tor, wallets, syncs, transactions to send, the app lock, backups, the Premium account and its devices. Live alerts are in `live.rs`. |
+| `manager/`, `live.rs` | What can an app ask? The facade, one file per question, listed at the top of `manager/mod.rs`: settings and Tor, wallets, syncs, transactions to send, the price, the app lock, backups, the Premium account and its devices. Live alerts are in `live.rs`. |
 | `input/` | What did the user paste, scan or open? Descriptors, keys, addresses, exports, BSMS records, QR envelopes (`qr`), SLIP-132 prefixes (`xpub`). |
 | `wallet/` | What does a wallet hold, and who can spend it? Metadata, snapshots, the views the screens read, the policy page (`policy`). |
 | `chain/` | How does a sync reach a server? Esplora and Electrum, certificates, the public servers, Tor, and the sockets (`net`) that the live watch opens too. |

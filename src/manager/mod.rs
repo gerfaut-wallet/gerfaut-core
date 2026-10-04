@@ -16,6 +16,8 @@
 //! - `sync.rs`: how far a sync reads, and which caller waits for which.
 //! - `broadcast.rs`: what a transaction does, and where it stands once
 //!   sent.
+//! - `price.rs`: what a bitcoin is worth, asked by the route the syncs
+//!   take.
 //! - `app_lock.rs`: who may open the app.
 //! - `backup.rs`: what a backup carries, and what a restore brings back.
 //! - `premium.rs`: what the premium account holds, and which wallets the
