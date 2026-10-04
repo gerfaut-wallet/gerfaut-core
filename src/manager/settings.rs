@@ -1,7 +1,7 @@
 //! The settings: the backend of each network and the certificates
 //! accepted for it, the gap limit, the app's preferences, and Tor. A
-//! sync, a broadcast, the premium client and the update check ask here
-//! whether they go through Tor, and by which proxy.
+//! sync, a broadcast, the premium client, the update check and the price
+//! ask here whether they go through Tor, and by which proxy.
 
 use std::path::PathBuf;
 
@@ -291,13 +291,21 @@ impl WalletManager {
         repo: &str,
         current_version: &str,
     ) -> CoreResult<crate::updates::UpdateCheck> {
-        let proxy = if self.uses_tor().await {
-            let (settings, data_dir) = self.tor_setup().await;
-            Some(tor::resolve(&settings, &data_dir).await?.proxy())
-        } else {
-            None
-        };
+        let proxy = self.beside_syncs_proxy().await?;
         crate::updates::check_update(api, repo, current_version, proxy.as_deref()).await
+    }
+
+    /// The proxy for a request that is not a sync, the update check and
+    /// the price among them: the Tor route a sync would resolve when
+    /// [`Self::uses_tor`] says so, nothing otherwise. When Tor is
+    /// needed and cannot be had this fails with [`CoreError::Tor`],
+    /// before any request exists.
+    pub(super) async fn beside_syncs_proxy(&self) -> CoreResult<Option<String>> {
+        if !self.uses_tor().await {
+            return Ok(None);
+        }
+        let (settings, data_dir) = self.tor_setup().await;
+        Ok(Some(tor::resolve(&settings, &data_dir).await?.proxy()))
     }
 
     /// Whether the backend of the active network is reached through

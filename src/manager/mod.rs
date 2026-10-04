@@ -53,6 +53,7 @@ mod backup;
 mod broadcast;
 mod devices;
 mod premium;
+mod price;
 mod settings;
 mod sync;
 mod wallets;

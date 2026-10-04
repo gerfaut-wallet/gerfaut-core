@@ -3,6 +3,14 @@
 //! One shared implementation so mobile and desktop show the same figure
 //! from the same source. Quotes are informative display data: failures
 //! degrade the UI to amounts without fiat, never block anything.
+//!
+//! The requests go out through [`crate::WalletManager::fetch_price`]
+//! and [`crate::WalletManager::fetch_price_history`] and nowhere else,
+//! because they have to take the route the syncs take. A price asked
+//! every minute beside the Tor circuits of an onion backend would show
+//! the source this device's address, timed next to them: with an onion
+//! backend configured the request goes through the same Tor proxy, and
+//! when Tor cannot be had it does not go at all.
 
 use serde::{Deserialize, Serialize};
 
@@ -212,14 +220,8 @@ pub(crate) fn client_through(proxy: Option<&str>) -> CoreResult<reqwest::Client>
         .map_err(|e| CoreError::Internal(format!("http client: {e}")))
 }
 
-pub(crate) async fn get_json(url: &str) -> CoreResult<serde_json::Value> {
-    get_json_through(url, None).await
-}
-
-pub(crate) async fn get_json_through(
-    url: &str,
-    proxy: Option<&str>,
-) -> CoreResult<serde_json::Value> {
+/// One GET for a JSON answer, through `proxy` when there is one.
+async fn get_json(url: &str, proxy: Option<&str>) -> CoreResult<serde_json::Value> {
     let mut response = client_through(proxy)?
         .get(url)
         .send()
@@ -255,10 +257,9 @@ fn price_error(detail: String) -> CoreError {
     }
 }
 
-/// Fetches the current BTC price from one source. The source must quote
-/// the currency ([`PriceSource::supports_currency`]); the settings
-/// screens only offer pairs that exist.
-pub async fn fetch_price(source: PriceSource, currency: FiatCurrency) -> CoreResult<PriceQuote> {
+/// Refuses a currency the source does not quote, before anything is
+/// sent or any route resolved.
+pub(crate) fn check_quote(source: PriceSource, currency: FiatCurrency) -> CoreResult<()> {
     if !source.supports_currency(currency) {
         return Err(price_error(format!(
             "{} does not quote {}",
@@ -266,12 +267,44 @@ pub async fn fetch_price(source: PriceSource, currency: FiatCurrency) -> CoreRes
             currency.code()
         )));
     }
+    Ok(())
+}
+
+/// Refuses a range or a currency the source cannot serve, before
+/// anything is sent or any route resolved.
+pub(crate) fn check_history(
+    source: PriceSource,
+    currency: FiatCurrency,
+    range: PriceRange,
+) -> CoreResult<()> {
+    if !source.supports(range) {
+        return Err(price_error(format!(
+            "{} cannot serve this range",
+            source.label()
+        )));
+    }
+    check_quote(source, currency)
+}
+
+/// Fetches the current BTC price from one source, through `proxy` when
+/// the manager resolved one. The source must quote the currency
+/// ([`PriceSource::supports_currency`]); the settings screens only
+/// offer pairs that exist.
+pub(crate) async fn fetch_price(
+    source: PriceSource,
+    currency: FiatCurrency,
+    proxy: Option<&str>,
+) -> CoreResult<PriceQuote> {
+    check_quote(source, currency)?;
     let rate = match source {
         PriceSource::Coingecko => {
             let code = currency.code().to_lowercase();
-            let value = get_json(&format!(
-                "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={code}"
-            ))
+            let value = get_json(
+                &format!(
+                    "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={code}"
+                ),
+                proxy,
+            )
             .await?;
             value["bitcoin"][&code]
                 .as_f64()
@@ -279,9 +312,10 @@ pub async fn fetch_price(source: PriceSource, currency: FiatCurrency) -> CoreRes
         }
         PriceSource::Kraken => {
             let pair = format!("XBT{}", currency.code());
-            let value = get_json(&format!(
-                "https://api.kraken.com/0/public/Ticker?pair={pair}"
-            ))
+            let value = get_json(
+                &format!("https://api.kraken.com/0/public/Ticker?pair={pair}"),
+                proxy,
+            )
             .await?;
             let result = value["result"]
                 .as_object()
@@ -293,7 +327,7 @@ pub async fn fetch_price(source: PriceSource, currency: FiatCurrency) -> CoreRes
                 .ok_or_else(|| price_error("unexpected response shape".to_owned()))?
         }
         PriceSource::MempoolSpace => {
-            let value = get_json("https://mempool.space/api/v1/prices").await?;
+            let value = get_json("https://mempool.space/api/v1/prices", proxy).await?;
             value[currency.code()]
                 .as_f64()
                 .ok_or_else(|| price_error("unexpected response shape".to_owned()))?
@@ -335,26 +369,16 @@ pub struct PriceHistory {
 /// Enough for a chart at any width; series are thinned above this.
 const MAX_POINTS: usize = 480;
 
-/// Fetches a BTC price series from one source. The source must support
-/// the range (`PriceSource::supports`); callers hide unsupported ranges.
-pub async fn fetch_price_history(
+/// Fetches a BTC price series from one source, through `proxy` when
+/// the manager resolved one. The source must support the range
+/// (`PriceSource::supports`); callers hide unsupported ranges.
+pub(crate) async fn fetch_price_history(
     source: PriceSource,
     currency: FiatCurrency,
     range: PriceRange,
+    proxy: Option<&str>,
 ) -> CoreResult<PriceHistory> {
-    if !source.supports(range) {
-        return Err(price_error(format!(
-            "{} cannot serve this range",
-            source.label()
-        )));
-    }
-    if !source.supports_currency(currency) {
-        return Err(price_error(format!(
-            "{} does not quote {}",
-            source.label(),
-            currency.code()
-        )));
-    }
+    check_history(source, currency, range)?;
     let mut points = match source {
         PriceSource::Coingecko => {
             let days = match range {
@@ -364,9 +388,12 @@ pub async fn fetch_price_history(
                 PriceRange::Year | PriceRange::Max => "365",
             };
             let code = currency.code().to_lowercase();
-            let value = get_json(&format!(
-                "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency={code}&days={days}"
-            ))
+            let value = get_json(
+                &format!(
+                    "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency={code}&days={days}"
+                ),
+                proxy,
+            )
             .await?;
             parse_coingecko_history(&value)?
         }
@@ -380,15 +407,16 @@ pub async fn fetch_price_history(
                 PriceRange::Max => 10080,
             };
             let pair = format!("XBT{}", currency.code());
-            let value = get_json(&format!(
-                "https://api.kraken.com/0/public/OHLC?pair={pair}&interval={interval}"
-            ))
+            let value = get_json(
+                &format!("https://api.kraken.com/0/public/OHLC?pair={pair}&interval={interval}"),
+                proxy,
+            )
             .await?;
             parse_kraken_history(&value)?
         }
         PriceSource::MempoolSpace => {
             // One endpoint, the full daily history for every currency.
-            let value = get_json("https://mempool.space/api/v1/historical-price").await?;
+            let value = get_json("https://mempool.space/api/v1/historical-price", proxy).await?;
             parse_mempool_history(&value, currency)?
         }
     };
@@ -552,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn a_source_refuses_a_currency_it_does_not_quote() {
         // Refused before any request goes out.
-        let error = fetch_price(PriceSource::Kraken, FiatCurrency::Inr)
+        let error = fetch_price(PriceSource::Kraken, FiatCurrency::Inr, None)
             .await
             .unwrap_err()
             .to_string();
@@ -561,7 +589,8 @@ mod tests {
             fetch_price_history(
                 PriceSource::MempoolSpace,
                 FiatCurrency::Ngn,
-                PriceRange::Year
+                PriceRange::Year,
+                None
             )
             .await
             .is_err()
@@ -651,7 +680,7 @@ mod tests {
         // reachable at all.
         let mut reachable = 0;
         for source in PriceSource::ALL {
-            match fetch_price(source, FiatCurrency::Eur).await {
+            match fetch_price(source, FiatCurrency::Eur, None).await {
                 Ok(quote) => {
                     reachable += 1;
                     assert!(quote.rate > 1_000.0, "{source:?} gave {}", quote.rate);
@@ -676,10 +705,13 @@ mod tests {
             .iter()
             .map(|c| c.code().to_lowercase())
             .collect();
-        let value = get_json(&format!(
-            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={}",
-            codes.join(",")
-        ))
+        let value = get_json(
+            &format!(
+                "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={}",
+                codes.join(",")
+            ),
+            None,
+        )
         .await
         .expect("CoinGecko unreachable");
         for code in &codes {
@@ -688,7 +720,7 @@ mod tests {
         }
 
         // The seven shared ones, from the other two sources.
-        let mempool = get_json("https://mempool.space/api/v1/prices")
+        let mempool = get_json("https://mempool.space/api/v1/prices", None)
             .await
             .expect("mempool.space unreachable");
         for currency in FiatCurrency::ALL {
@@ -700,7 +732,7 @@ mod tests {
                 "mempool.space misses {}",
                 currency.code()
             );
-            let quote = fetch_price(PriceSource::Kraken, *currency)
+            let quote = fetch_price(PriceSource::Kraken, *currency, None)
                 .await
                 .unwrap_or_else(|e| panic!("Kraken misses {}: {e}", currency.code()));
             assert!(quote.rate > 100.0);
@@ -716,7 +748,7 @@ mod tests {
                 if !source.supports(range) {
                     continue;
                 }
-                match fetch_price_history(source, FiatCurrency::Usd, range).await {
+                match fetch_price_history(source, FiatCurrency::Usd, range, None).await {
                     Ok(history) => {
                         reachable += 1;
                         assert!(history.points.len() >= 2, "{source:?} {range:?} too short");
