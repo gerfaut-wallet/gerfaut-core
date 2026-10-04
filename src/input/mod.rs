@@ -2113,13 +2113,14 @@ mod tests {
     /// could quote it back in an error.
     #[test]
     fn an_escaped_private_key_in_json_is_rejected() {
+        // `\u0035` is the `5` the key starts with.
         let escaped =
-            r#"{"descriptor": "wpkh(5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ)"}"#;
+            r#"{"descriptor": "wpkh(\u0035HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ)"}"#;
         assert!(matches!(
             parse_input(escaped),
             Err(CoreError::PrivateMaterialRejected)
         ));
-        let named = r#"{"bip84": {"5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ": 1}}"#;
+        let named = r#"{"bip84": {"\u0035HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ": 1}}"#;
         assert!(matches!(
             parse_input(named),
             Err(CoreError::PrivateMaterialRejected)
