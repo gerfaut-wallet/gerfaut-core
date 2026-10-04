@@ -1003,6 +1003,30 @@ async fn a_new_configuration_moves_the_watch() {
     until(&watch, "off", |s| s.state == WatchState::Off).await;
 }
 
+/// Off, the watch says it covers nothing, wallets with no script to
+/// watch included: an app shows no coverage while Live does not run.
+#[tokio::test]
+async fn an_idle_watch_covers_no_wallet() {
+    let server = FakeElectrum::start().await;
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &[], &[], false)],
+        Some(timings()),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let status = watch.status();
+    assert_eq!(status.state, WatchState::Off);
+    assert!(status.wallets.is_empty(), "{:?}", status.wallets);
+    assert_eq!(
+        (
+            status.watched_scripts,
+            status.left_out_scripts,
+            status.left_out_wallets
+        ),
+        (0, 0, 0)
+    );
+}
+
 // --- the parts on their own ---------------------------------------------------
 
 #[test]

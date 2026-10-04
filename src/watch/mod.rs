@@ -998,8 +998,18 @@ impl Hub {
     pub fn set_status(&mut self, change: impl FnOnce(&mut WatchStatus)) {
         let mut next = self.status.borrow().clone();
         change(&mut next);
-        next.watched_scripts = self.watched.entries.len() as u32;
-        let coverage = self.watched.coverage(self.heard_refusals());
+        // Off, the watch covers nothing, whatever wallets it was given.
+        let off = next.state == WatchState::Off;
+        next.watched_scripts = if off {
+            0
+        } else {
+            self.watched.entries.len() as u32
+        };
+        let coverage = if off {
+            Vec::new()
+        } else {
+            self.watched.coverage(self.heard_refusals())
+        };
         next.left_out_scripts = coverage.iter().fold(0u32, |sum, wallet| {
             sum.saturating_add(wallet.left_out_scripts)
         });
