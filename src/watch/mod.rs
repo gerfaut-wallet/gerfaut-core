@@ -28,10 +28,12 @@
 //!    testnets, one by default. The scripts past that number are
 //!    covered by polling.
 //! 3. **Short polling** of any other Esplora: once a minute, the tip
-//!    hash and at most three script lookups, the head of the list every
-//!    round and the rest in rotation. About 240 requests an hour; with
-//!    N scripts past the head, each is read about every N/3 minutes.
-//!    On the user's own node, thirty lookups a round.
+//!    hash and at most three script lookups, the first two of the list
+//!    every round and one more in rotation. About 240 requests an hour;
+//!    with N scripts past the first two, each is read about every N
+//!    minutes. On the user's own node, thirty lookups a round, every
+//!    N/28 minutes each. Past what a mempool instance pushes, all
+//!    three, or thirty, take turns: every N/3 minutes, or N/30.
 //!
 //! With the automatic public backend, an Electrum server of the
 //! catalogue run by an operator that mode already rotates through is

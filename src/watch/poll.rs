@@ -5,17 +5,20 @@
 //! lookups, one after the other, about once a minute: some 240 requests
 //! an hour, whatever the size of the wallets, and the syncs need their
 //! share of what a public server allows. The first [`HOT`] scripts of
-//! the list, the head of every wallet, are looked up every round; the
-//! rest take turns: with N scripts past the head, each is read about
-//! every N/3 minutes, and every one of them at the next regular sync.
-//! Every minute for each would be N requests a minute, which no public
-//! server would take from every client. A lookup reads the counters of
-//! `/scripthash/:hash`, which move when a transaction enters the
-//! mempool and again when it confirms.
+//! the list are looked up every round, and the rest take turns with
+//! what the budget leaves: one a round, so that with N scripts past
+//! those two each is read about every N minutes, and every one of them
+//! at the next regular sync. Past what a mempool instance pushes, no
+//! script is looked up every round, and the three take turns: every
+//! N/3 minutes. Every minute for each would be N requests a minute,
+//! which no public server would take from every client. A lookup reads
+//! the counters of `/scripthash/:hash`, which move when a transaction
+//! enters the mempool and again when it confirms.
 //!
 //! The user's own node ([`crate::chain::BackendConfig::is_own_node`])
 //! answers nobody else, and a round there looks up
-//! [`OWN_NODE_ROUND_BUDGET`] scripts, a few at a time.
+//! [`OWN_NODE_ROUND_BUDGET`] scripts, a few at a time: every N/28
+//! minutes each, every N/30 past what a mempool instance pushes.
 //!
 //! No public server says how many requests it allows: mempool.space
 //! bans a client that keeps going past its limit, blockstream.info has
