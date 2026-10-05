@@ -90,38 +90,6 @@ The first release: the library both Gerfaut apps are built on.
   scripts out, an app can name the setting of that server that takes
   more. It is `None` over the other transports, and absent from a
   status written before.
-- The premium client reads a wallet the server refused: `watching` is false
-  and `refusal` says why, in the list and in a `wallet_refused` event. A
-  single address can be registered like a descriptor.
-- Premium devices. The account key now only connects a device: the server
-  hands that device a token of its own, which the vault keeps and which is
-  never shown, logged or handed to the apps, and every later request
-  carries that token instead of the key. A new device sees nothing and
-  changes nothing until another device approves it, or for ten days; the
-  first device an account ever has gets full access at once. The wallet
-  manager connects this device, lists the others, approves and disconnects
-  them, changes the key, logs out, and hands out each waiting device once
-  for a local notification. A vault written before devices, with a key and
-  no token, connects on its own, once. A device the server disowned, or
-  whose key it refuses for good (for example a key that already has every
-  device the server takes), keeps its key and waits for the user to
-  connect it again. A rate limit holds back only the key that hit it,
-  until the wait ends, rather than being met at every poll. A debug build
-  can point the premium client at a local server with
-  `GERFAUT_PREMIUM_URL` and `GERFAUT_PREMIUM_PUBLIC_KEY`; a release build
-  has no code that reads them.
-- A lost answer from the premium server costs neither a key nor a device.
-  The device token and the new key of a key change are drawn on the device
-  and written to the vault before the request leaves, and the same request
-  is sent again until the server answers it; the server takes it as the
-  one it already carried out. While a key change is unanswered the apps
-  say so, and nothing that would lose the new key is allowed. If the
-  server disconnects the device in the meantime, the change was never
-  applied, and the device drops it. A device that logs out while the
-  server is out of reach keeps its token queued, never shown, until the
-  server hears of it. Moving to another account first tells the old one
-  about its removed wallets, with the old token, and none of those
-  removals ever goes to the new account.
 - One sync of a wallet runs at a time. A caller that arrives while one runs
   waits for it, then runs its own, since the running sync may have read
   the wallet before the payment the caller came for arrived. Callers that
@@ -133,11 +101,6 @@ The first release: the library both Gerfaut apps are built on.
   keeps, an app lock hashed with Argon2id that slows repeated attempts and
   survives a restart, and an encrypted backup file, sealed under a password
   with Argon2id, that also carries the wallets from one device to another.
-- The channels of a Premium account say when each one last delivered a
-  message, and since when it fails: `last_sent_at`, `failing_since` and
-  `last_failure` on `Channel`, all `null` from a server that predates them.
-  A channel that has failed for an hour or more, behind a blocked bot or an
-  expired webhook domain, delivers nothing, and nothing else showed it.
 
 ### Changed
 
@@ -257,22 +220,17 @@ The first release: the library both Gerfaut apps are built on.
   a build older than this one cannot open the files it writes. A backup
   from a newer Gerfaut is now refused by name, with a message that says to
   update, instead of being reported as a wrong password.
-- `PremiumClient::with_http` is no longer public: a client built elsewhere
-  skipped the refusal of an onion without a proxy and could follow
-  redirects. Nor are `price::fetch_price` and `price::fetch_price_history`:
-  an app asks the wallet manager, which takes the route of the syncs.
-- A 4xx from the Premium server without its own error body is now
-  `PremiumError::UnexpectedResponse`. It used to be
-  `PremiumError::Rejected`, with the bare status as its words.
+- `price::fetch_price` and `price::fetch_price_history` are no longer
+  public: an app asks the wallet manager, which takes the route of the
+  syncs.
 
 ### Removed
 
 - Nothing called these, so they are gone: `store::VaultKdf`,
   `cipher::kdf_kind`, `format_btc_signed`, `truncate_middle`,
-  `truncate_address`, `PremiumClient::set_key` and `broadcast::sats`. So
-  are the `funded_sats` and `spent_sats` fields of `AddressWatchState`,
-  which nothing read. A vault still writes them as zero, for the older
-  builds that require them.
+  `truncate_address` and `broadcast::sats`. So are the `funded_sats` and
+  `spent_sats` fields of `AddressWatchState`, which nothing read. A vault
+  still writes them as zero, for the older builds that require them.
 
 ### Fixed
 
@@ -288,8 +246,6 @@ The first release: the library both Gerfaut apps are built on.
   goes where the client would take it: through Tor when it is one, in the
   clear when it is not. The host is stored in lower case; the userinfo
   before an `@` keeps its own.
-- The ids the premium server hands out are percent-encoded before they go
-  into a URL path.
 - The live watch asks a server for its genesis block before it hears of
   any script, over Electrum as over Esplora, and refuses one of another
   network: a signet port typed for testnet4 reported changes that never
@@ -397,15 +353,6 @@ The first release: the library both Gerfaut apps are built on.
   line or paragraph separator, is no longer read as text: shown as text,
   it could make an amount or an address beside it read backwards, or push
   it onto a line of its own. Its bytes are shown in hex instead.
-- A 401, 403, 404 or 410 from the premium server counts as its answer only
-  when it comes in the server's own error body. The bare status is what a
-  captive portal or a proxy answers, and it no longer makes the app forget
-  a key or a wallet the server still holds.
-- A 429 from the premium server that names a wait is a rate limit of its
-  own, with the wait it named, a day at most: what the server holds back
-  for the day comes back the next day. Telling the server about
-  removed wallets stops at one and keeps the rest for later, instead of
-  sending every request behind it to be turned away too.
 - The update check takes the route the syncs take. With an onion backend
   configured on any network it goes through the same Tor proxy, and when
   Tor cannot be had it does not go at all, where it used to ask GitHub in
@@ -429,9 +376,6 @@ The first release: the library both Gerfaut apps are built on.
   rescan used to find it. With the default gap limit of 20, that costs a
   sync 21 more requests on Esplora, and 2 more round trips carrying 20
   requests on Electrum, plus the tip and the latest headers.
-- Switching a wallet off on the premium server withdraws the consent kept
-  for it once the server has nothing left under its id, so removing the
-  wallet later has nothing to tell the server.
 - A custom server address is stored the way a scan reads it, the host in
   lower case and an IPv6 literal in brackets, and one the URL parser cannot
   read is refused when saved, with the reason. Stored as typed, an address
@@ -497,21 +441,9 @@ The first release: the library both Gerfaut apps are built on.
   read as an alert. Such a signature leaves some or all of the outputs
   open, so a node that relays the transaction can send that money
   elsewhere, and the outputs the preview showed were only a suggestion.
-- The Telegram link puts the server's code in the link only when Telegram
-  would take it as a start parameter: 1 to 64 letters, digits, `_` and
-  `-`. Any other code, which could have changed what the link says, is
-  left out, and the link only opens the bot.
 - The key derived from a password or a platform key is wiped on every way
   out of a seal or an open, a failure included, and Argon2 now wipes its
   own working hashes as well.
-- The premium client follows no redirect and reads at most 2 MiB of an
-  answer. A redirect used to take the request on to the host it named,
-  body included, and with it the device token or a new key; an answer of
-  any size was held in memory whole.
-- The premium client goes through Tor as soon as a backend of any network
-  is an onion, the way the update check does. It used to look at the
-  network on screen only, so switching to one whose backend is in the
-  clear showed this device's address to the premium server.
 - A previous transaction fetched for the transaction preview is checked
   against its txid, on Electrum as on Esplora. A server could answer with
   another transaction and set the value of the coin, and so the fee, the
@@ -554,8 +486,6 @@ The first release: the library both Gerfaut apps are built on.
   release page otherwise. A tag longer than 32 characters, or with
   spaces in it, is not taken for a version, and at most 1 MiB of the
   answer is read.
-- `Licence::paid_until` is the end of the paid time the certificate
-  signs, never the unsigned date the server sends beside it.
 - The key of a Coldcard-style JSON export is held to its SLIP-132 prefix
   like a pasted key: a multisig cosigner key, or a prefix for another
   script than the account's, is refused instead of imported under the
@@ -586,30 +516,12 @@ The first release: the library both Gerfaut apps are built on.
 - A QR code that holds another QR code is refused. Each level opened cost a
   frame of the stack, and a pasted text, or a file dropped on the broadcast
   page, could hold enough of them to end the app.
-- "Forget this key" first tells the Premium server about the wallets
-  removed from this device, and the removals it could not send stay queued
-  for the same key, entered again, along with any watched wallet removed
-  in between. They used to be dropped, and the server went on watching
-  wallets the app no longer had.
-- A Premium connection the vault failed to record stays on the server and
-  is sent again. It used to be revoked, and the retry made a new device
-  that waited ten days for an approval, the account's first one included.
 - A Coldcard export is read under its master fingerprint, the one a signer
   knows the wallet by, not the account's. A descriptor copied to a
   coordinator gave PSBTs the Coldcard would not sign. An account whose
   `first` address is not the one its key derives is refused.
-- A copy of the Premium state handed back after a wallet was removed no
-  longer brings its consent back, nor cancels its removal.
 - A private key written with JSON escapes inside an export is refused like
   any other, and never quoted in the error.
-- The Premium server's sentence is kept to one line of 200 characters,
-  control and direction characters dropped, on screen and in the vault.
-- A 4xx from the Premium server without its own error body settles
-  nothing: a connection or a key change under way is sent again as it was.
-  A proxy's page during a deployment used to drop the only copy of a new
-  key.
-- A Premium certificate replaces only an older one, so a slow refresh
-  answered after a key change no longer brings the old paid time back.
 - The balance of a watched address in the address list, and the date a coin
   unlocks on the policy page, saturate instead of wrapping around when a
   server sends values no coin can hold.
@@ -635,8 +547,7 @@ The first release: the library both Gerfaut apps are built on.
   SLIP-132 prefix already was.
 - A vault is written back at payload version 2, so a build older than this
   one refuses to open it rather than rewrite it without the fields it does
-  not know, the Premium device token and a key change under way among
-  them. The version is read first, on its own, so a vault from a later
+  not know. The version is read first, on its own, so a vault from a later
   build that gives a field another shape is refused as newer instead of
   being reported as corrupted.
 - The app lock's delay now starts when the answer comes back. It used to
