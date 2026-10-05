@@ -253,6 +253,15 @@ impl Default for VaultPayload {
     }
 }
 
+/// What earlier builds kept in the settings and this one no longer
+/// has: the Premium account, its key and device tokens among it. Read
+/// only to know whether a vault still holds it.
+#[derive(Deserialize)]
+struct Retired {
+    #[serde(default)]
+    premium: Option<serde::de::IgnoredAny>,
+}
+
 /// Handle on the vault file. Owns the key material, and the exclusive
 /// lock that keeps every other opener out while it lives.
 pub struct Vault {
@@ -307,7 +316,20 @@ impl Vault {
         // cannot be looked at (a permission, a storage error) fails the
         // open rather than being replaced by an empty one.
         if vault.path.try_exists()? {
-            let payload = vault.load()?;
+            let (payload, retired) = vault.read()?;
+            // What earlier builds kept and this one dropped, secrets
+            // among it, leaves the file now rather than at the next
+            // change. Only under the lock: unlocked, another copy of the
+            // app may be saving too. A save that fails leaves it to the
+            // next one, and the vault opens all the same.
+            if retired
+                && vault.lock.is_some()
+                && let Err(error) = vault.save(&payload)
+            {
+                log::warn!(
+                    "the vault could not be written back without its retired fields: {error}"
+                );
+            }
             Ok((vault, payload))
         } else {
             let payload = VaultPayload::default();
@@ -320,20 +342,34 @@ impl Vault {
     /// alone: a later build may give a field another shape, and its
     /// vault is one to refuse as newer, not one to call corrupted.
     pub fn load(&self) -> Result<VaultPayload, VaultError> {
+        self.read().map(|(payload, _)| payload)
+    }
+
+    /// [`Self::load`], and whether the file still holds what earlier
+    /// builds kept and this one dropped: see [`Retired`].
+    fn read(&self) -> Result<(VaultPayload, bool), VaultError> {
         #[derive(Deserialize)]
-        struct Version {
+        struct Head<'a> {
             version: u32,
+            /// As written: in a vault of a later build it may have
+            /// another shape.
+            #[serde(borrow, default)]
+            settings: Option<&'a serde_json::value::RawValue>,
         }
         let file = std::fs::read(&self.path)?;
         let plaintext = cipher::unseal(&file, &self.key)?;
         let corrupted = |e: serde_json::Error| VaultError::CorruptedPayload(e.to_string());
-        let Version { version } = serde_json::from_slice(&plaintext).map_err(corrupted)?;
+        let Head { version, settings } = serde_json::from_slice(&plaintext).map_err(corrupted)?;
         if version > PAYLOAD_VERSION {
             return Err(VaultError::UnsupportedVersion(version.min(255) as u8));
         }
+        let retired = settings.is_some_and(|settings| {
+            serde_json::from_str::<Retired>(settings.get())
+                .is_ok_and(|retired| retired.premium.is_some())
+        });
         let mut payload: VaultPayload = serde_json::from_slice(&plaintext).map_err(corrupted)?;
         payload.version = PAYLOAD_VERSION;
-        Ok(payload)
+        Ok((payload, retired))
     }
 
     /// Encrypts and writes the whole payload, atomically: the new file
@@ -791,6 +827,8 @@ mod tests {
         assert_eq!(payload.settings.app_prefs["desktop.theme"], "dark");
         assert_eq!(payload.wallets.len(), 1);
         assert_eq!(payload.wallets[0].meta.name, "Cold storage");
+        // Gone from the file at the open, before any change is saved.
+        assert!(!holds_premium(&path));
 
         vault.save(&payload).unwrap();
         assert!(!holds_premium(&path));
@@ -798,6 +836,33 @@ mod tests {
         let (_, reloaded) = Vault::open_or_create(&path, key()).unwrap();
         assert_eq!(reloaded.wallets[0].meta.id, "0000-test");
         assert_eq!(reloaded.settings.gap_limit, 42);
+    }
+
+    /// A vault with a Premium account that cannot be written back at the
+    /// open, in a directory that takes no new file, opens all the same,
+    /// and the account waits for a save that can be made.
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_with_premium_opens_where_it_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let sealed = cipher::seal(VAULT_WITH_PREMIUM.as_bytes(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+        std::fs::write(dir.path().join("gerfaut.vault.lock"), b"").unwrap();
+        let mode = |mode: u32| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(0o555);
+
+        let opened = Vault::open_or_create(&path, key());
+        let still_there = holds_premium(&path);
+        mode(0o755);
+        let (vault, payload) = opened.unwrap();
+        assert_eq!(payload.wallets[0].meta.name, "Cold storage");
+        assert!(still_there);
+        vault.save(&payload).unwrap();
+        assert!(!holds_premium(&path));
     }
 
     #[test]
