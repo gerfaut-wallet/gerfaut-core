@@ -3,10 +3,7 @@
 use super::*;
 use crate::backup::{BackupOptions, ImportChoices};
 use crate::input::parse_input;
-use crate::manager::tests::support::{
-    ADDRESS, BACKUP_PASSWORD, MULTIPATH, key, manager, seeded, store_premium,
-};
-use crate::premium::PremiumState;
+use crate::manager::tests::support::{ADDRESS, BACKUP_PASSWORD, MULTIPATH, key, manager, seeded};
 use crate::wallet::AddressWatchState;
 
 #[tokio::test]
@@ -314,43 +311,6 @@ async fn reorder_persists_and_leaves_the_rest_alone() {
     drop(manager);
     let manager = WalletManager::open(dir.path(), key()).unwrap();
     assert_eq!(names(manager.list_wallets(None).await), ["C", "B", "A"]);
-}
-
-#[tokio::test]
-async fn removing_a_watched_wallet_queues_its_unwatch() {
-    let dir = tempfile::tempdir().unwrap();
-    let manager = manager(dir.path()).await;
-    let parsed = parse_input(MULTIPATH).unwrap();
-
-    // No key: there is no server to tell.
-    let meta = manager
-        .add_wallet("Signet cold", &parsed, Network::Signet)
-        .await
-        .unwrap();
-    manager.remove_wallet(&meta.id).await.unwrap();
-    assert!(manager.premium_state().await.pending_unwatch.is_empty());
-
-    // A key and a yes: the removal waits for the server, and the yes
-    // goes with the wallet.
-    let meta = manager
-        .add_wallet("Signet cold", &parsed, Network::Signet)
-        .await
-        .unwrap();
-    let mut premium = PremiumState {
-        key: Some("abcdefghijkmnpqr".to_owned()),
-        ..PremiumState::default()
-    };
-    premium.consent(&meta.id, 100);
-    store_premium(&manager, premium).await;
-    manager.remove_wallet(&meta.id).await.unwrap();
-    let premium = manager.premium_state().await;
-    assert_eq!(premium.pending_unwatch, vec![meta.id.clone()]);
-    assert!(!premium.is_consented(&meta.id));
-
-    // It survives a reopen: the message waits in the vault.
-    drop(manager);
-    let manager = WalletManager::open(dir.path(), key()).unwrap();
-    assert_eq!(manager.premium_state().await.pending_unwatch, vec![meta.id]);
 }
 
 /// A pin is kept in the vault and carried by a backup, and the live

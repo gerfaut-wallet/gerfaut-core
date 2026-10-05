@@ -51,16 +51,13 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 # The sink and stream halves of that WebSocket; arti's bootstrap events
 # use it too.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-# Ed25519 verification of premium licences and heartbeats; the version
-# rustls already pulls in, so nothing new is compiled.
-ring = "0.17"
 # Reads a certificate the way it was written: its fingerprint's
 # subject and expiry for the acceptance dialog, and its public key
 # when the certificate predates X.509 v3 and webpki declines it.
 x509-parser = { version = "0.18", default-features = false }
 serde = { version = "1", features = ["derive"] }
-# `raw_value` keeps the exact text of the signed heartbeat: a signature
-# is over bytes, not over a value re-serialized this side.
+# `raw_value` keeps the result of an Electrum answer as its text until
+# the call that asked for it says what it should be.
 serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 # Says what the core gave up on, for whatever logger the app installs;

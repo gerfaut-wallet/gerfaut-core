@@ -188,13 +188,8 @@ impl WalletManager {
         })
     }
 
-    /// Removes a wallet from this device. One the user agreed to have
-    /// watched by the premium server is queued to be unwatched there
-    /// too, in the same write: the promise is that removing a wallet
-    /// here removes it there, and the removal cannot wait for the
-    /// network. [`Self::premium_flush_unwatch`] carries the message.
-    /// With the key logged out, the removal waits for that same key to
-    /// be entered again.
+    /// Removes a wallet from this device, and with it what the vault
+    /// kept to announce about it.
     pub async fn remove_wallet(&self, id: &str) -> CoreResult<()> {
         let result: CoreResult<()> = async {
             let mut state = self.state.lock().await;
@@ -207,11 +202,6 @@ impl WalletManager {
                 payload.unclaimed.retain(|news| news.wallet_id != id);
                 payload.announced.retain(|told| told.wallet_id != id);
                 payload.vanishing.retain(|missed| missed.wallet_id != id);
-                let premium = &mut payload.settings.premium;
-                let account = premium.has_key() || premium.pending_unwatch_account.is_some();
-                if account && premium.is_consented(id) {
-                    premium.queue_unwatch(id);
-                }
                 Ok(())
             })?;
             state.engines.remove(id);

@@ -1,7 +1,7 @@
 //! The settings: the backend of each network and the certificates
 //! accepted for it, the gap limit, the app's preferences, and Tor. A
-//! sync, a broadcast, the premium client, the update check and the price
-//! ask here whether they go through Tor, and by which proxy.
+//! sync, a broadcast, the update check and the price ask here whether
+//! they go through Tor, and by which proxy.
 
 use std::path::PathBuf;
 
@@ -17,15 +17,12 @@ impl WalletManager {
     // --- settings ------------------------------------------------------
 
     /// The settings as the apps may see them: the lock's hash stays in
-    /// the vault, the apps only need to know a lock exists and its kind,
-    /// and the premium device token stays too, as in
-    /// [`Self::premium_state`].
+    /// the vault, the apps only need to know a lock exists and its kind.
     pub async fn settings(&self) -> Settings {
         let mut settings = self.state.lock().await.payload.settings.clone();
         if let Some(lock) = &mut settings.app_lock {
             lock.secret = None;
         }
-        settings.premium.redact();
         settings
     }
 

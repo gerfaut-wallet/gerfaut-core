@@ -20,7 +20,6 @@ use crate::chain::tor::TorSettings;
 use crate::error::VaultError;
 use crate::lock::AppLock;
 use crate::network::Network;
-use crate::premium::PremiumState;
 use crate::wallet::AddressWatchState;
 use crate::wallet::meta::WalletMeta;
 
@@ -32,10 +31,9 @@ pub use cipher::VaultKey;
 /// whose loss costs something, not only with a breaking change. An
 /// earlier version is read as it is, new fields at their defaults, and
 /// written back as the current one; a migration that needs more goes in
-/// [`Vault::load`]. Version 2 holds what came after the first: this
-/// device's Premium token and the key change or connection under way,
-/// whose loss to an older build meant a new connection that waits ten
-/// days, or the only copy of a new Premium key.
+/// [`Vault::load`]. A field an earlier build wrote and this one no
+/// longer has is skipped as the payload is read, and left out of the
+/// next save.
 const PAYLOAD_VERSION: u32 = 2;
 
 /// One wallet and its chain state.
@@ -110,11 +108,6 @@ pub struct Settings {
     /// existed read as the default, the system Tor first.
     #[serde(default)]
     pub tor: TorSettings,
-    /// The premium account: its key, its last certificate, and which
-    /// wallets the user agreed to send to the server. In the encrypted
-    /// file because the key is the account. Empty until one is entered.
-    #[serde(default)]
-    pub premium: PremiumState,
 }
 
 fn default_gap_limit() -> u32 {
@@ -131,7 +124,6 @@ impl Default for Settings {
             electrum_certs: BTreeMap::new(),
             app_lock: None,
             tor: TorSettings::default(),
-            premium: PremiumState::default(),
         }
     }
 }

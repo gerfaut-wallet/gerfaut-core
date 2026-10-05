@@ -1,10 +1,10 @@
 //! The wallet manager: the facade every consumer talks to.
 //!
-//! Desktop (Tauri commands), mobile (FFI bridge), and later the server
-//! all drive this type. It owns the encrypted vault, keeps loaded BDK
-//! engines in memory, and coordinates syncs so that network I/O never
-//! blocks reads: requests are built under the lock, executed outside it,
-//! and applied back under the lock.
+//! Desktop (Tauri commands) and mobile (FFI bridge) both drive this
+//! type. It owns the encrypted vault, keeps loaded BDK engines in
+//! memory, and coordinates syncs so that network I/O never blocks
+//! reads: requests are built under the lock, executed outside it, and
+//! applied back under the lock.
 //!
 //! [`WalletManager`] is one type, its methods in the file that answers
 //! their question:
@@ -20,10 +20,6 @@
 //!   take.
 //! - `app_lock.rs`: who may open the app.
 //! - `backup.rs`: what a backup carries, and what a restore brings back.
-//! - `premium.rs`: what the premium account holds, and which wallets the
-//!   server is told to stop watching.
-//! - `devices.rs`: whether this device is connected to the account, and
-//!   which other devices are.
 //! - `live.rs`, beside this module: what the live watch follows, and
 //!   what is worth announcing.
 //!
@@ -53,8 +49,6 @@ use crate::wallet::views;
 mod app_lock;
 mod backup;
 mod broadcast;
-mod devices;
-mod premium;
 mod price;
 mod settings;
 mod sync;
@@ -141,21 +135,6 @@ pub struct Shared {
     /// The wallets a complete sync has read since the vault was opened:
     /// see [`WalletManager::sync_wallet`].
     complete_here: std::sync::Mutex<HashSet<String>>,
-    /// Held across a change of this device's premium connection, the
-    /// network call included: two connections made at once would leave
-    /// the server with a device nobody holds, and a log out racing a
-    /// connection could bring back the key it removed.
-    premium_changes: Mutex<()>,
-    /// Until when the server asked not to be sent a connection of a key
-    /// again, and that key: a rate limit
-    /// [`Self::premium_ensure_device`] waits out rather than meet again
-    /// at every poll. The server counts connections by key, so the wait
-    /// holds back a connection of that key and no other.
-    premium_connect_after: std::sync::Mutex<Option<(Instant, String)>>,
-    /// The key the premium clients built here check signed answers
-    /// against, in place of the one [`crate::premium::endpoint`] names.
-    #[cfg(test)]
-    premium_public_key: std::sync::Mutex<Option<String>>,
 }
 
 /// The last sync of a wallet to finish, when it started and how far it
@@ -197,10 +176,6 @@ impl WalletManager {
                 watch_setups: std::sync::atomic::AtomicU64::new(0),
                 syncing: std::sync::Mutex::new(HashMap::new()),
                 complete_here: std::sync::Mutex::new(HashSet::new()),
-                premium_changes: Mutex::new(()),
-                premium_connect_after: std::sync::Mutex::new(None),
-                #[cfg(test)]
-                premium_public_key: std::sync::Mutex::new(None),
             }),
         })
     }

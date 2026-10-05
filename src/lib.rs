@@ -1,8 +1,8 @@
 //! Core library of Gerfaut, a Bitcoin watch-only wallet.
 //!
-//! This crate is the single wallet implementation shared by the mobile app,
-//! the desktop app, and the server. It handles output descriptors, address
-//! derivation, chain data sources, and encrypted persistence.
+//! This crate is the single wallet implementation shared by the mobile app
+//! and the desktop app. It handles output descriptors, address derivation,
+//! chain data sources, and encrypted persistence.
 //!
 //! It is watch-only by design: there is no code to generate keys, handle
 //! seeds, or sign transactions, and there never will be. Inputs containing
@@ -19,7 +19,6 @@ pub mod live;
 pub mod lock;
 pub mod manager;
 pub mod network;
-pub mod premium;
 pub mod price;
 pub mod store;
 #[cfg(test)]
