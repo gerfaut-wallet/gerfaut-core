@@ -6,7 +6,7 @@ The Rust core of [Gerfaut](https://github.com/gerfaut-wallet), a Bitcoin watch-o
 
 > Status: pre-alpha. The library parses descriptors, keys, and addresses, syncs wallets over Esplora and Electrum, and persists everything in an encrypted vault. APIs are still moving.
 
-This library does everything a wallet does, except handle keys. It is the single implementation shared by the mobile app, the desktop app, and the server: all 3 read a descriptor exactly the same way because they all read it here.
+This library does everything a wallet does, except handle keys. It is the single implementation shared by the mobile app and the desktop app: both read a descriptor exactly the same way because they read it here.
 
 ## Scope
 

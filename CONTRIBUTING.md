@@ -60,7 +60,7 @@ Every app goes through `WalletManager`. The rest of `src/` answers one question 
 
 | Module | Question |
 |---|---|
-| `manager/`, `live.rs` | What can an app ask? The facade, one file per question, listed at the top of `manager/mod.rs`: settings and Tor, wallets, syncs, transactions to send, the price, the app lock, backups, the Premium account and its devices. Live alerts are in `live.rs`. |
+| `manager/`, `live.rs` | What can an app ask? The facade, one file per question, listed at the top of `manager/mod.rs`: settings and Tor, wallets, syncs, transactions to send, the price, the app lock and backups. Live alerts are in `live.rs`. |
 | `input/` | What did the user paste, scan or open? Descriptors, keys, addresses, exports, BSMS records, QR envelopes (`qr`), SLIP-132 prefixes (`xpub`). |
 | `wallet/` | What does a wallet hold, and who can spend it? Metadata, snapshots, the views the screens read, the policy page (`policy`). |
 | `chain/` | How does a sync reach a server? Esplora and Electrum, certificates, the public servers, Tor, and the sockets (`net`) that the live watch opens too. |
@@ -69,7 +69,6 @@ Every app goes through `WalletManager`. The rest of `src/` answers one question 
 | `store/` | How is it all kept on disk? The vault and its encryption (`cipher`). |
 | `backup.rs` | How do wallets leave the device? The encrypted backup file and its animated QR. |
 | `lock.rs` | Who may open the app? The PIN or password, and the delay after wrong guesses. |
-| `premium/` | What does the Premium account hold? The key, the devices, the licence, the server client. |
 | `broadcast.rs` | What does a signed transaction or a PSBT do, and how is it sent? |
 | `export.rs`, `format.rs` | How does an amount or a date read? The CSV export and the shared formatting. |
 | `price.rs`, `updates.rs` | What is a bitcoin worth, and is there a newer release? |
