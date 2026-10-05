@@ -685,6 +685,121 @@ mod tests {
         );
     }
 
+    /// The plaintext of a vault an earlier build wrote at version 2,
+    /// field for field, with the Premium account it kept in the
+    /// settings: the account key, this device's token, a connection and
+    /// a key change still unanswered, the tokens of past connections.
+    const VAULT_WITH_PREMIUM: &str = r#"{
+        "version": 2,
+        "settings": {
+            "active_network": "signet",
+            "backends": {},
+            "gap_limit": 42,
+            "app_prefs": {"desktop.theme": "dark"},
+            "electrum_certs": {},
+            "app_lock": null,
+            "tor": {"mode": "auto", "socks_proxy": null},
+            "premium": {
+                "key": "abcdefghijkmnpqr",
+                "certificate": "certificate.signature",
+                "watched": [{"wallet_id": "0000-test", "consented_at": 1790000000}],
+                "acknowledged_offline_until": 1790000100,
+                "pending_unwatch": ["1111-gone"],
+                "pending_unwatch_account": "abababababababababababababababababababababababababababababababab",
+                "device": {
+                    "id": "0f3b7c2e-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+                    "token": "gdt1_q83vEjRWeJC6ze8SNFZ4kLrN7xI0VniQus3vEjRWeJA",
+                    "connected_at": 1790000000
+                },
+                "disconnected": false,
+                "disconnected_reason": "too many devices",
+                "key_saved": true,
+                "checklist_hidden": true,
+                "announced_devices": ["d2"],
+                "pending_connect": {
+                    "key": "abcdefghijkmnpqr",
+                    "token": "gdt1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "platform": "linux"
+                },
+                "pending_key": "stuvwxyz23456789",
+                "pending_logouts": ["gdt1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"]
+            }
+        },
+        "wallets": [{
+            "meta": {
+                "id": "0000-test",
+                "name": "Cold storage",
+                "icon": "wallet",
+                "network": "signet",
+                "kind": {
+                    "type": "descriptors",
+                    "external": "wpkh(xpub.../0/*)#checksum",
+                    "internal": null,
+                    "script": "segwit"
+                },
+                "recognized_as": "descriptor",
+                "created_at": 1755000000,
+                "gap_limit": 20,
+                "scan_gap": 20,
+                "labels": {},
+                "last_sync": null,
+                "cached": {
+                    "balance": {
+                        "confirmed": 0,
+                        "trusted_pending": 0,
+                        "untrusted_pending": 0,
+                        "immature": 0,
+                        "total": 0,
+                        "pending_net_sats": null
+                    },
+                    "tx_count": 0
+                }
+            },
+            "changeset": null,
+            "address_state": null
+        }],
+        "announced": [],
+        "unclaimed": []
+    }"#;
+
+    /// Whether the vault at `path` still holds any of that account: its
+    /// section, or one of its secrets.
+    fn holds_premium(path: &Path) -> bool {
+        let plaintext = cipher::unseal(&std::fs::read(path).unwrap(), &key()).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        let text = String::from_utf8(plaintext).unwrap();
+        stored["settings"].get("premium").is_some()
+            || ["abcdefghijkmnpqr", "gdt1_", "stuvwxyz23456789"]
+                .iter()
+                .any(|secret| text.contains(secret))
+    }
+
+    /// A vault with a Premium account opens with everything else as it
+    /// was, and the account is gone from the vault once it is saved.
+    #[test]
+    fn a_vault_with_premium_opens_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let sealed = cipher::seal(VAULT_WITH_PREMIUM.as_bytes(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+        assert!(holds_premium(&path));
+
+        let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(payload.version, PAYLOAD_VERSION);
+        assert_eq!(payload.settings.active_network, Network::Signet);
+        assert_eq!(payload.settings.gap_limit, 42);
+        assert_eq!(payload.settings.app_prefs["desktop.theme"], "dark");
+        assert_eq!(payload.wallets.len(), 1);
+        assert_eq!(payload.wallets[0].meta.name, "Cold storage");
+
+        vault.save(&payload).unwrap();
+        assert!(!holds_premium(&path));
+        drop(vault);
+        let (_, reloaded) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(reloaded.wallets[0].meta.id, "0000-test");
+        assert_eq!(reloaded.settings.gap_limit, 42);
+    }
+
     #[test]
     fn wrong_key_cannot_open() {
         let dir = tempfile::tempdir().unwrap();
