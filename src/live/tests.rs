@@ -834,6 +834,45 @@ async fn a_sync_never_takes_a_watch_server_of_another_network() {
     );
 }
 
+/// While a watch runs, a sync that names no server goes first to the
+/// watch's: the one it has a session with, or, before it has one, the
+/// first it tries. With the automatic backend, that is the Electrum
+/// server of an operator the rotation goes through, not the web API at
+/// the head of the rotation. With no watch, no server.
+#[tokio::test]
+async fn a_running_watch_names_the_server_syncs_try_first() {
+    // The automatic backend and no wallet: the watch connects nowhere.
+    let dir = tempfile::tempdir().unwrap();
+    let manager = WalletManager::open(dir.path(), key()).unwrap();
+    manager.set_active_network(Network::Signet).await.unwrap();
+    assert_eq!(manager.live_server(), None);
+    let _events = manager.live_start_with(Some(timings())).await.unwrap();
+    let electrum = crate::chain::endpoints(
+        &crate::chain::BackendConfig::Public {
+            server: Some("electrum:mempool.space".to_owned()),
+        },
+        Network::Signet,
+        &crate::chain::TrustedCerts::new(),
+    )
+    .unwrap()
+    .remove(0);
+    assert_eq!(manager.watch_serving(), None);
+    assert_eq!(manager.live_server(), Some((Network::Signet, electrum)));
+    manager.live_stop().await;
+    assert_eq!(manager.live_server(), None);
+
+    // A watch with a session: the server it talks to.
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), server.backend()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    let serving = manager.watch_serving().expect("a session is open");
+    assert_eq!(manager.live_server(), Some(serving));
+    manager.live_stop().await;
+}
+
 /// A server behind the wallet whose chain never meets the wallet's, one
 /// of another network: the sync fails, saying so once the first block
 /// differs, and the payment the wallet holds is not taken for gone from

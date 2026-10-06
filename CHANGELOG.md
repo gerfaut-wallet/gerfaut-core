@@ -137,6 +137,16 @@ The first release: the library both Gerfaut apps are built on.
   meets the wallet's, even one behind it, makes the sync fail instead of
   making the wallet's transactions look gone, and an Esplora server whose
   latest blocks contradict the chain it agreed on is refused.
+- While the live watch runs, a sync of a wallet of the watched network
+  goes first to the server the watch talks to, whoever asks for it. While
+  the watch is still opening its connection, the sync goes to the server
+  the watch tries first. With the automatic backend on mainnet, that
+  server is Blockstream's Electrum server. In practice, one operator sees
+  the wallet's addresses instead of two, and the syncs no longer draw on
+  the 700 requests an hour that Blockstream's web API allows one IP
+  address. The other servers of the backend follow in their usual order,
+  for when that one fails. Without a watch, nothing changes: the
+  rotation starts with mempool.space.
 - A payment that a reorganisation replaced with a conflicting spend to
   someone else costs nothing more once a sync has seen it go. Before,
   each Esplora sync read the whole history of its address, and each watch

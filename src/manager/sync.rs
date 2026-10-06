@@ -182,7 +182,8 @@ fn plan_for(engine: &bdk_wallet::Wallet, reach: &Reach, gap_limit: u32) -> (chai
 
 impl WalletManager {
     /// Syncs one wallet against its network's backend. Public backends
-    /// are tried in order until one answers.
+    /// are tried in order until one answers, the server of a running
+    /// live watch first: see `sync_wallet_read`.
     ///
     /// Every revealed script is looked at, and nothing the wallet holds
     /// is fetched again. An Electrum server is asked for the history of
@@ -241,8 +242,10 @@ impl WalletManager {
     /// can lose it.
     ///
     /// `prefer` is a server to try first: the one the live watch listens
-    /// to, for a sync it asked for. Returns the report and the server
-    /// that answered; none when the report is another caller's.
+    /// to, for a sync it asked for. Without it, a running watch's server
+    /// still comes first ([`Self::live_server`]). Returns the report and
+    /// the server that answered; none when the report is another
+    /// caller's.
     pub(crate) async fn sync_wallet_read(
         &self,
         id: &str,
@@ -296,12 +299,16 @@ impl WalletManager {
             (meta, config, certs)
         };
         // The server of the watch that asked for this sync: it told of
-        // the change, so it holds what changed. Only a server a watch of
-        // the wallet's own network may talk to under its backend: the
-        // watch may have moved to another network, or another backend,
-        // since the sync was asked for, and a wallet's addresses never
-        // go to a server its backend does not name.
+        // the change, so it holds what changed. For any other sync, the
+        // server a running watch talks to: it already sees every script
+        // the watch follows, and a sync there shows the wallet to no
+        // second operator. Only a server a watch of the wallet's own
+        // network may talk to under its backend: the watch may have
+        // moved to another network, or another backend, since the sync
+        // was asked for, and a wallet's addresses never go to a server
+        // its backend does not name.
         let first = prefer
+            .or_else(|| self.live_server())
             .filter(|(network, prefer)| {
                 *network == meta.network
                     && crate::watch::servers_for(&config, meta.network, &certs)
