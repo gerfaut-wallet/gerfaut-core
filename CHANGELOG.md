@@ -283,6 +283,15 @@ The first release: the library both Gerfaut apps are built on.
   the list or refused by the server. The confirmation comes as news on
   the scripts of the transaction, and on a script nobody pushes it used
   to wait for the next regular sync.
+- Polling now picks up where the last session left off. A session ends
+  every half hour to try push again, and each new one used to start over
+  at the head of the list: on an Esplora server that pushes nothing, the
+  live watch only ever read some thirty addresses, about 840 on the
+  user's own node, and a payment to any other address waited for the
+  next regular sync. The rotation now runs through the whole list, even
+  when a wallet is added or removed between two sessions, so each
+  address is read about every N minutes, or every N/28 minutes on the
+  user's own node.
 - An Esplora server that limits the rate of requests (HTTP 429) is asked
   again once, after the wait its `Retry-After` names, in seconds or as a
   date, five seconds at least, instead of three times within two

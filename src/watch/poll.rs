@@ -13,7 +13,11 @@
 //! N/3 minutes. Every minute for each would be N requests a minute,
 //! which no public server would take from every client. A lookup reads
 //! the counters of `/scripthash/:hash`, which move when a transaction
-//! enters the mempool and again when it confirms.
+//! enters the mempool and again when it confirms. The turns are the
+//! list's, not a session's ([`Turns`]): a session that ends, every half
+//! hour to try push again, leaves the next one to go on from the script
+//! whose turn it was, so the whole list is read and not the same thirty
+//! scripts after each start.
 //!
 //! The user's own node ([`crate::chain::BackendConfig::is_own_node`])
 //! answers nobody else, and a round there looks up
@@ -118,10 +122,33 @@ impl Pace {
 /// mempool, and the coins they moved. Any difference is a change.
 pub(crate) type Fingerprint = crate::chain::esplora::Counts;
 
+/// Where the scripts that take turns stand: kept by the hub from one
+/// session to the next, and from one transport to the other.
+#[derive(Debug, Default)]
+pub(super) struct Turns {
+    /// The script whose turn is next, by its hex.
+    next: Option<String>,
+    /// Where that script stood among those taking turns: the turns go on
+    /// from there when it has left the list.
+    at: usize,
+}
+
+impl Turns {
+    /// Where the next turn falls among `rest`: on the script it was left
+    /// on, wherever a change of the list put it. Gone with its wallet,
+    /// the turn falls where it stood, or back at the head when the list
+    /// no longer reaches that far.
+    fn first(&self, rest: &[super::Entry]) -> usize {
+        self.next
+            .as_deref()
+            .and_then(|hex| rest.iter().position(|entry| entry.hex == hex))
+            .unwrap_or(if self.at < rest.len() { self.at } else { 0 })
+    }
+}
+
 /// Picks the scripts of each round and looks them up.
 pub(super) struct Poller {
     client: Arc<Client>,
-    cursor: usize,
     /// Lookups in a round.
     budget: usize,
     /// Lookups that go out at once.
@@ -147,7 +174,6 @@ impl Poller {
         };
         Ok(Poller {
             client: Arc::new(esplora::client(base, proxy)?),
-            cursor: 0,
             budget,
             at_once,
         })
@@ -160,18 +186,30 @@ impl Poller {
     }
 
     /// The scripts of the next round, among those past the first
-    /// `skip`, which a push connection already covers.
-    pub(super) fn plan(&mut self, watched: &Watched, skip: usize, hot: usize) -> Plan {
+    /// `skip`, which a push connection already covers: the first `hot`
+    /// of them, then the next ones in turn, `turns` moving past them.
+    pub(super) fn plan(
+        &self,
+        watched: &Watched,
+        turns: &mut Turns,
+        skip: usize,
+        hot: usize,
+    ) -> Plan {
         let pool = watched.entries.get(skip..).unwrap_or_default();
         let hot = hot.min(pool.len()).min(self.budget);
         let mut picked: Vec<&super::Entry> = pool[..hot].iter().collect();
         let rest = &pool[hot..];
-        let turns = (self.budget - hot).min(rest.len());
-        for turn in 0..turns {
-            picked.push(&rest[(self.cursor + turn) % rest.len()]);
-        }
         if !rest.is_empty() {
-            self.cursor = (self.cursor + turns) % rest.len();
+            let first = turns.first(rest);
+            let count = (self.budget - hot).min(rest.len());
+            for turn in 0..count {
+                picked.push(&rest[(first + turn) % rest.len()]);
+            }
+            let at = (first + count) % rest.len();
+            *turns = Turns {
+                next: Some(rest[at].hex.clone()),
+                at,
+            };
         }
         Plan {
             client: self.client.clone(),
@@ -292,7 +330,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         Err(Exit::Lost(detail)) => return Exit::Unreachable(detail),
         Err(exit) => return exit,
     };
-    let mut poller = match Poller::new(base, proxy.as_deref(), hub.config.backend.is_own_node()) {
+    let poller = match Poller::new(base, proxy.as_deref(), hub.config.backend.is_own_node()) {
         Ok(poller) => poller,
         Err(detail) => return Exit::Unreachable(detail),
     };
@@ -305,7 +343,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
     loop {
         // One round: the tip, then the scripts.
         let client = poller.client.clone();
-        let plan = poller.plan(&hub.watched, 0, HOT);
+        let plan = poller.plan(&hub.watched, &mut hub.turns, 0, HOT);
         let known_tip = tip.clone();
         let round = async move {
             let hash = client.tip_hash().await?.to_string();
@@ -381,16 +419,13 @@ mod tests {
     use super::*;
     use crate::watch::{WatchLimits, WatchedScript, WatchedWallet};
 
-    /// A round reads three scripts on any server, the head of the list
-    /// and one in turn, and thirty on the user's own node, a few at a
-    /// time; past the head, every script is read in its turn.
-    #[test]
-    fn a_round_reads_so_many_scripts() {
-        let wallet = WatchedWallet {
-            wallet_id: "w".to_owned(),
-            scripts: (0..100u32)
+    /// A wallet of `count` scripts, numbered from `from` in `tag`.
+    fn wallet(id: &str, tag: u8, from: u32, count: u32) -> WatchedWallet {
+        WatchedWallet {
+            wallet_id: id.to_owned(),
+            scripts: (from..from + count)
                 .map(|n| WatchedScript {
-                    script: format!("0014{n:040x}"),
+                    script: format!("0014{tag:02x}{n:038x}"),
                     lookahead: false,
                     status: None,
                     counts: None,
@@ -400,18 +435,95 @@ mod tests {
             pinned: false,
             holds_coins: false,
             unlisted: 0,
-        };
-        let watched = Watched::new(vec![wallet], WatchLimits::DEFAULT);
+        }
+    }
+
+    fn poller(own_node: bool) -> Poller {
+        Poller::new("http://127.0.0.1:9/api", None, own_node).unwrap()
+    }
+
+    /// A round reads three scripts on any server, the head of the list
+    /// and one in turn, and thirty on the user's own node, a few at a
+    /// time; past the head, every script is read in its turn.
+    #[test]
+    fn a_round_reads_so_many_scripts() {
+        let watched = Watched::new(vec![wallet("w", 0, 0, 100)], WatchLimits::DEFAULT);
         for (own_node, budget) in [(false, ROUND_BUDGET), (true, OWN_NODE_ROUND_BUDGET)] {
-            let mut poller = Poller::new("http://127.0.0.1:9/api", None, own_node).unwrap();
+            let poller = poller(own_node);
             assert_eq!(poller.at_once, if own_node { OWN_NODE_AT_ONCE } else { 1 });
+            let mut turns = Turns::default();
             let mut read = std::collections::HashSet::new();
             for _ in 0..(100 - HOT).div_ceil(budget - HOT) {
-                let plan = poller.plan(&watched, 0, HOT);
+                let plan = poller.plan(&watched, &mut turns, 0, HOT);
                 assert_eq!(plan.scripts.len(), budget);
                 read.extend(plan.scripts.into_iter().map(|(hex, _)| hex));
             }
             assert_eq!(read.len(), 100, "own node: {own_node}");
         }
+    }
+
+    /// One session of `rounds` rounds, with a poller of its own: the
+    /// scripts it read in turn, in order.
+    fn session(watched: &Watched, turns: &mut Turns, rounds: usize) -> Vec<String> {
+        let poller = poller(false);
+        (0..rounds)
+            .flat_map(|_| poller.plan(watched, turns, 0, HOT).scripts)
+            .filter(|(hex, _)| !watched.entries[..HOT].iter().any(|e| &e.hex == hex))
+            .map(|(hex, _)| hex)
+            .collect()
+    }
+
+    /// The scripts of a list that take turns, sorted.
+    fn in_turn(watched: &Watched) -> Vec<String> {
+        let mut hexes: Vec<String> = watched.entries[HOT..]
+            .iter()
+            .map(|e| e.hex.clone())
+            .collect();
+        hexes.sort();
+        hexes
+    }
+
+    fn sorted(mut hexes: Vec<String>) -> Vec<String> {
+        hexes.sort();
+        hexes
+    }
+
+    /// The turns go on from one session to the next, each with a poller
+    /// of its own, through a list that changes between them: a wallet
+    /// added, then a list that no longer reaches where the turns stood.
+    /// Every script of the list is read within a pass of it.
+    #[test]
+    fn the_turns_outlive_a_session_and_a_change_of_list() {
+        // Thirteen sessions of five rounds over 62 scripts in turn: the
+        // first 62 lookups are every one of them, once.
+        let one = Watched::new(vec![wallet("a", 1, 0, 64)], WatchLimits::DEFAULT);
+        let mut turns = Turns::default();
+        let read: Vec<String> = (0..13).flat_map(|_| session(&one, &mut turns, 5)).collect();
+        assert_eq!(sorted(read[..62].to_vec()), in_turn(&one));
+        assert_eq!(read[62..], read[..3]);
+
+        // A wallet added between two sessions takes its place in the
+        // list, rank by rank: the turns go on from the script they had
+        // reached, and a pass reads every script of the new list.
+        let expected = one.entries[HOT + read.len() % 62].hex.clone();
+        let two = Watched::new(
+            vec![wallet("a", 1, 0, 64), wallet("b", 2, 0, 20)],
+            WatchLimits::DEFAULT,
+        );
+        let pass = session(&two, &mut turns, two.entries.len() - HOT);
+        assert_eq!(pass[0], expected);
+        assert_eq!(sorted(pass), in_turn(&two));
+
+        // A list that shrank under the place the turns had reached, its
+        // script gone with its wallet: the turns start over at its head
+        // rather than skip part of it.
+        let short = Watched::new(vec![wallet("c", 3, 0, 10)], WatchLimits::DEFAULT);
+        let mut turns = Turns {
+            next: Some(two.entries[70].hex.clone()),
+            at: 68,
+        };
+        let pass = session(&short, &mut turns, 8);
+        let head: Vec<String> = short.entries[HOT..].iter().map(|e| e.hex.clone()).collect();
+        assert_eq!(pass, head);
     }
 }

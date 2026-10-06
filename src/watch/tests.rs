@@ -1867,6 +1867,51 @@ async fn the_next_polling_session_keeps_the_pace() {
     }
 }
 
+/// The turns of polling are the list's, not a session's: sessions that
+/// end after each round, as one does every half hour to try push again,
+/// read every script of the list between them, and not the head of the
+/// list and the first script in turn over and over.
+#[tokio::test]
+async fn polling_sessions_read_every_script_in_turn() {
+    let server = FakeMempool::start(false, 0).await;
+    let numbers: Vec<u8> = (1..=12).collect();
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &numbers, &[], false)],
+        Some(Timings {
+            poll: Duration::from_millis(40),
+            reprobe: Duration::ZERO,
+            ..timings()
+        }),
+    );
+    let keys: Vec<String> = numbers
+        .iter()
+        .map(|n| FakeMempool::rest_key(&script(*n)))
+        .collect();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (looked_up, rounds) = {
+            let state = server.state.lock().unwrap();
+            (state.looked_up.clone(), state.tips_asked.len())
+        };
+        let unread: Vec<usize> = (0..keys.len())
+            .filter(|i| !looked_up.contains(&keys[*i]))
+            .collect();
+        if unread.is_empty() {
+            // One round a session: ten of them, one script in turn each
+            // past the head, cover the ten scripts that take turns.
+            assert!(rounds >= 10, "{rounds} rounds");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "after {rounds} rounds, never read the scripts at {unread:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    watch.stop();
+}
+
 // --- the manager ---------------------------------------------------------------
 
 fn payment(confirmed: bool) -> Value {

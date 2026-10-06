@@ -84,7 +84,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         Err(Exit::Lost(detail)) => return Exit::Unreachable(detail),
         Err(exit) => return exit,
     };
-    let mut poller = match Poller::new(base, proxy.as_deref(), hub.config.backend.is_own_node()) {
+    let poller = match Poller::new(base, proxy.as_deref(), hub.config.backend.is_own_node()) {
         Ok(poller) => poller,
         Err(detail) => return Exit::Unreachable(detail),
     };
@@ -228,7 +228,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
             }
             () = tokio::time::sleep_until(next_round) => {
                 // The scripts the server does not push, and only those.
-                let plan = poller.plan(&hub.watched, tracked.len(), 0);
+                let plan = poller.plan(&hub.watched, &mut hub.turns, tracked.len(), 0);
                 match hub.during(plan.check()).await {
                     Ok(Ok(found)) => poll::apply(hub, found),
                     // The REST side failing does not end a push

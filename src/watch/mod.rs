@@ -557,6 +557,7 @@ impl LiveWatch {
             shunned: HashMap::new(),
             refusals: HashMap::new(),
             paces: HashMap::new(),
+            turns: poll::Turns::default(),
             heard_by: None,
             last_alive: SystemTime::now(),
             fixed_timings,
@@ -1067,6 +1068,9 @@ pub(crate) struct Hub {
     /// How often each Esplora server is read: its own, kept from one
     /// session to the next.
     paces: HashMap<Endpoint, poll::Pace>,
+    /// Which script polling reads next, kept from one session to the
+    /// next as well.
+    turns: poll::Turns,
     /// The server of the last session to open, whose refusals say how
     /// much of each wallet is heard.
     heard_by: Option<Endpoint>,
