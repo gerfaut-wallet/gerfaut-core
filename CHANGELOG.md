@@ -562,3 +562,11 @@ The first release: the library both Gerfaut apps are built on.
 - The app lock's delay now starts when the answer comes back. It used to
   start at the guess, so the time Argon2 took to check it came off the
   delay.
+- The next sync of a wallet tries first the server that answered the last
+  one, and that server is now told apart by its protocol and port as well
+  as its host. Matched on the host alone, a sync the live watch ran on
+  Blockstream's Electrum server, `blockstream.info:700`, put Blockstream's
+  web API at the head of every sync after it, and that web API takes 700
+  requests an hour from one IP address. `SyncStamp.server` records the
+  server. A stamp written before this field existed names none, and that
+  sync tries the servers in their usual order.

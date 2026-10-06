@@ -295,33 +295,28 @@ impl WalletManager {
             let (config, certs) = state.chain_setup(record.meta.network);
             (meta, config, certs)
         };
-        let mut endpoints = chain::endpoints(&config, meta.network, &certs)?;
-        // Try the backend that answered last time first: on networks
-        // where one public instance is blocked, this skips a dead
-        // 20-second timeout on every sync.
-        if let Some(stamp) = &meta.last_sync
-            && let Some(position) = endpoints
-                .iter()
-                .position(|endpoint| endpoint.label() == stamp.backend)
-            && position > 0
-        {
-            let preferred = endpoints.remove(position);
-            endpoints.insert(0, preferred);
-        }
-        // And before it, the server of the watch that asked for this
-        // sync: it told of the change, so it holds what changed. Only a
-        // server a watch of the wallet's own network may talk to under
-        // its backend: the watch may have moved to another network, or
-        // another backend, since the sync was asked for, and a wallet's
-        // addresses never go to a server its backend does not name.
-        if let Some((network, prefer)) = prefer
-            && network == meta.network
-            && crate::watch::servers_for(&config, meta.network, &certs)
-                .is_ok_and(|allowed| allowed.contains(&prefer))
-        {
-            endpoints.retain(|endpoint| *endpoint != prefer);
-            endpoints.insert(0, prefer);
-        }
+        // The server of the watch that asked for this sync: it told of
+        // the change, so it holds what changed. Only a server a watch of
+        // the wallet's own network may talk to under its backend: the
+        // watch may have moved to another network, or another backend,
+        // since the sync was asked for, and a wallet's addresses never
+        // go to a server its backend does not name.
+        let first = prefer
+            .filter(|(network, prefer)| {
+                *network == meta.network
+                    && crate::watch::servers_for(&config, meta.network, &certs)
+                        .is_ok_and(|allowed| allowed.contains(prefer))
+            })
+            .map(|(_, prefer)| prefer);
+        let answered = meta
+            .last_sync
+            .as_ref()
+            .and_then(|stamp| stamp.server.as_deref());
+        let endpoints = sync_order(
+            chain::endpoints(&config, meta.network, &certs)?,
+            answered,
+            first,
+        );
         let proxy = self.tor_proxy_for(&endpoints).await?;
 
         match &meta.kind {
@@ -426,6 +421,7 @@ impl WalletManager {
                         &mut state,
                         &meta.id,
                         &report,
+                        endpoint,
                         tx_count_after,
                         scanned,
                         complete,
@@ -509,7 +505,15 @@ impl WalletManager {
                         backend: endpoint.label(),
                     };
                     find_record_mut(&mut state.payload, &meta.id)?.address_state = Some(watch);
-                    finish_sync(&mut state, &meta.id, &report, tx_count_after, None, true)?;
+                    finish_sync(
+                        &mut state,
+                        &meta.id,
+                        &report,
+                        endpoint,
+                        tx_count_after,
+                        None,
+                        true,
+                    )?;
                     return Ok((report, endpoint.clone()));
                 }
             }
@@ -607,6 +611,34 @@ impl WalletManager {
     }
 }
 
+/// The order a sync tries the servers of its backend in. `first`, a
+/// server the live watch talks to, comes before all. Then the server
+/// that answered the last sync, `answered` as [`Endpoint::key`] gives
+/// it: on networks where one public instance is blocked, this skips a
+/// dead 20-second timeout on every sync. It is told by its protocol and
+/// port as well as its host, since an Electrum server that answered
+/// says nothing of the web API its operator runs at the same host. Then
+/// the rest, in the order the backend lists them.
+fn sync_order(
+    mut endpoints: Vec<Endpoint>,
+    answered: Option<&str>,
+    first: Option<Endpoint>,
+) -> Vec<Endpoint> {
+    if let Some(answered) = answered
+        && let Some(position) = endpoints
+            .iter()
+            .position(|endpoint| endpoint.key() == answered)
+    {
+        let answered = endpoints.remove(position);
+        endpoints.insert(0, answered);
+    }
+    if let Some(first) = first {
+        endpoints.retain(|endpoint| *endpoint != first);
+        endpoints.insert(0, first);
+    }
+    endpoints
+}
+
 /// One error covering every endpoint tried, so the user sees each
 /// backend's outcome instead of only the last one.
 pub(super) fn sync_failure(endpoints: &[Endpoint], attempts: Vec<String>) -> CoreError {
@@ -663,10 +695,13 @@ fn keep_older_history(watch: &mut AddressWatchState, previous: &AddressWatchStat
 /// must not make the cached figure drift. `scanned_gap` is the gap limit
 /// a full scan just covered, `None` after an incremental sync.
 /// `complete` says the sync read every script it could have.
+/// `answered` is the server that answered, which the next sync tries
+/// first.
 fn finish_sync(
     state: &mut ManagerState,
     id: &str,
     report: &SyncReport,
+    answered: &Endpoint,
     tx_count: u32,
     scanned_gap: Option<u32>,
     complete: bool,
@@ -687,6 +722,7 @@ fn finish_sync(
             at: now_secs(),
             tip_height: report.tip_height,
             backend: report.backend.clone(),
+            server: Some(answered.key()),
         });
     }
     state.vault.save(&state.payload)?;

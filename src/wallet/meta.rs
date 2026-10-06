@@ -37,6 +37,12 @@ pub struct SyncStamp {
     pub tip_height: u32,
     /// Human-readable backend identifier (URL host).
     pub backend: String,
+    /// The server that answered, told from any other one of the same
+    /// host: its protocol, host and port. The next sync of the wallet
+    /// tries it first. Absent from a stamp written before it existed,
+    /// and then that sync tries the servers in their usual order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
 }
 
 /// Totals cached in the vault so list views render without loading

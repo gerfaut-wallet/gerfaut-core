@@ -415,6 +415,24 @@ impl Endpoint {
         host_of(self.url()).unwrap_or_else(|| "backend".to_owned())
     }
 
+    /// What tells this server from any other a wallet may be synced
+    /// with: its protocol, its host and its port, never a path or what
+    /// comes before the host. The host alone does not:
+    /// `blockstream.info:700` is an Electrum server, and
+    /// `blockstream.info` the web API of the same operator, with limits
+    /// of its own.
+    pub(crate) fn key(&self) -> String {
+        let protocol = match self {
+            Endpoint::Esplora(_) => "esplora",
+            Endpoint::Electrum(_) => "electrum",
+        };
+        match host_and_port(self.url()) {
+            Some((host, Some(port))) => format!("{protocol} {host} {port}"),
+            Some((host, None)) => format!("{protocol} {host}"),
+            None => protocol.to_owned(),
+        }
+    }
+
     pub(crate) fn is_onion(&self) -> bool {
         is_onion(self.url())
     }
@@ -1044,6 +1062,30 @@ mod tests {
         assert_eq!(host_of("ssl://:50002"), None);
         assert_eq!(host_of("https://host name/"), None);
         assert_eq!(host_of(""), None);
+    }
+
+    /// A key names the protocol, the host and the port, and nothing a
+    /// URL may carry besides.
+    #[test]
+    fn keys_tell_the_servers_of_one_host_apart() {
+        let electrum = |url: &str| Endpoint::Electrum(electrum::Target::new(url, None));
+        let esplora = |url: &str| Endpoint::Esplora(url.to_owned());
+        assert_eq!(
+            electrum("ssl://blockstream.info:700").key(),
+            "electrum blockstream.info 700"
+        );
+        assert_eq!(
+            esplora("https://blockstream.info/api").key(),
+            "esplora blockstream.info"
+        );
+        assert_eq!(
+            esplora("http://user:pass@Node.Example.org:3002/api").key(),
+            "esplora node.example.org 3002"
+        );
+        assert_ne!(
+            esplora("http://node.example.org:3002/api").key(),
+            electrum("tcp://node.example.org:50001").key()
+        );
     }
 
     #[test]
