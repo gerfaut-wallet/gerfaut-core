@@ -2,11 +2,13 @@
 
 The Rust core of [Gerfaut](https://github.com/gerfaut-wallet), a Bitcoin watch-only wallet.
 
-![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-orange) ![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue)
-
-> Status: pre-alpha. The library parses descriptors, keys, and addresses, syncs wallets over Esplora and Electrum, and persists everything in an encrypted vault. APIs are still moving.
+![Status: public beta](https://img.shields.io/badge/status-public%20beta-yellow) ![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue)
 
 This library does everything a wallet does, except handle keys. It is the single implementation shared by the mobile app and the desktop app: both read a descriptor exactly the same way because they read it here.
+
+## Status: public beta
+
+Gerfaut is in public beta. Every 0.x version is a beta, and the API of this crate can still change from one version to the next. If you saw a problem in an app, report it in that app's issues ([desktop](https://github.com/gerfaut-wallet/gerfaut-desktop/issues), [Android](https://github.com/gerfaut-wallet/gerfaut-mobile/issues)). Report a problem in the library itself in the [issues](https://github.com/gerfaut-wallet/gerfaut-core/issues) here.
 
 ## Scope
 
