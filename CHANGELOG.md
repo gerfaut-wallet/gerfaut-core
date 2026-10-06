@@ -147,6 +147,11 @@ The first release: the library both Gerfaut apps are built on.
   address. The other servers of the backend follow in their usual order,
   for when that one fails. Without a watch, nothing changes: the
   rotation starts with mempool.space.
+- With the automatic backend, the live watch tries every Electrum server
+  of the operator it picked before it falls back to a mempool WebSocket.
+  On mainnet, `electrum.blockstream.info:50002` takes over when
+  `blockstream.info:700` fails, instead of mempool.space, whose WebSocket
+  pushes changes on ten scripts per connection.
 - A payment that a reorganisation replaced with a conflicting spend to
   someone else costs nothing more once a sync has seen it go. Before,
   each Esplora sync read the whole history of its address, and each watch

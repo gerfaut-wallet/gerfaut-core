@@ -1181,19 +1181,41 @@ fn the_automatic_backend_prefers_a_server_that_pushes() {
             .map(Endpoint::label)
             .collect::<Vec<_>>()
     };
-    // An Electrum server of an operator the rotation already goes
-    // through, then the rotation: no host the mode did not name.
+    // The Electrum servers of one operator the rotation already goes
+    // through, then the rotation: no host the mode did not name. When
+    // `blockstream.info:700` fails, Blockstream's other Electrum server
+    // pushes every script, where mempool.space's WebSocket pushes ten.
     assert_eq!(
         candidates_of(Network::Mainnet),
         vec![
             "blockstream.info",
+            "electrum.blockstream.info",
             "mempool.space",
             "blockstream.info",
             "mempool.emzy.de"
         ]
     );
+    let mut mainnet = config(BackendConfig::default());
+    mainnet.network = Network::Mainnet;
+    let mainnet = candidates(&mainnet).unwrap();
+    assert!(
+        mainnet[..2]
+            .iter()
+            .all(|endpoint| matches!(endpoint, Endpoint::Electrum(_)))
+    );
+    assert!(
+        mainnet[2..]
+            .iter()
+            .all(|endpoint| matches!(endpoint, Endpoint::Esplora(_)))
+    );
     assert_eq!(candidates_of(Network::Signet)[0], "mempool.space");
     assert_eq!(candidates_of(Network::Signet).len(), 4);
+    // Testnet4 lists the Electrum server of an operator the rotation
+    // does not go through: left out.
+    assert_eq!(
+        candidates_of(Network::Testnet4),
+        vec!["mempool.space", "mempool.space", "mempool.emzy.de"]
+    );
     assert!(matches!(
         candidates(&config(BackendConfig::default())).unwrap()[0],
         Endpoint::Electrum(_)

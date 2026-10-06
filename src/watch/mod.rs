@@ -1466,9 +1466,9 @@ async fn sleep_until(deadline: Option<Instant>) {
 // --- the supervisor ---------------------------------------------------------
 
 /// The servers to try, in order. An automatic public backend names no
-/// server: an Electrum server of the catalogue comes first when its
-/// operator is one the rotation already goes through, because it can
-/// push every script, and the rotation itself follows.
+/// server: the Electrum servers of the catalogue run by one operator
+/// the rotation already goes through come first, because they can push
+/// every script, and the rotation itself follows.
 fn candidates(config: &WatchConfig) -> Result<Vec<Endpoint>, String> {
     servers_for(&config.backend, config.network, &config.electrum_certs)
 }
@@ -1494,29 +1494,37 @@ pub(crate) fn servers_for(
         .map_err(|e| e.to_string())?;
     if config.backend == (BackendConfig::Public { server: None }) {
         let operators: Vec<String> = endpoints.iter().map(Endpoint::label).collect();
-        let pushing: Vec<Endpoint> = chain::public::public_servers(config.network)
+        let pushing: Vec<(String, Endpoint)> = chain::public::public_servers(config.network)
             .into_iter()
             .filter(|server| {
                 server.protocol == chain::public::ServerProtocol::Electrum && !server.self_signed
             })
-            .filter(|server| {
-                chain::host_of(&server.url).is_some_and(|host| {
-                    operators.iter().any(|operator| {
-                        host == *operator || host.ends_with(&format!(".{operator}"))
-                    })
-                })
-            })
             .filter_map(|server| {
+                let host = chain::host_of(&server.url)?;
+                let operator = operators
+                    .iter()
+                    .find(|operator| host == **operator || host.ends_with(&format!(".{operator}")))?
+                    .clone();
                 let chosen = BackendConfig::Public {
                     server: Some(server.id),
                 };
-                chain::endpoints(&chosen, config.network, &config.electrum_certs)
+                let endpoint = chain::endpoints(&chosen, config.network, &config.electrum_certs)
                     .ok()?
                     .into_iter()
-                    .next()
+                    .next()?;
+                Some((operator, endpoint))
             })
-            .take(1)
             .collect();
+        // Every Electrum server of the first operator that runs one, in
+        // the order of the catalogue: when one fails, the next one of
+        // the same operator pushes every script, where the mempool
+        // WebSocket after them pushes ten on mainnet, and the wallets
+        // stay with the one operator the syncs follow the watch to.
+        let first = pushing.first().map(|(operator, _)| operator.clone());
+        let pushing = pushing
+            .into_iter()
+            .filter(|(operator, _)| Some(operator) == first.as_ref())
+            .map(|(_, endpoint)| endpoint);
         endpoints.splice(0..0, pushing);
     }
     Ok(endpoints)
