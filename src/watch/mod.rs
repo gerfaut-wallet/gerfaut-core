@@ -116,10 +116,17 @@ pub const MAX_SCRIPTS_PER_WALLET: usize = 200;
 /// Scripts watched in all.
 pub const MAX_SCRIPTS: usize = 2_000;
 /// Scripts watched in all on the user's own node. Every one is a
-/// subscription the server keeps for the session: Fulcrum takes 75,000
-/// from one address by default, ElectrumX 50,000 per session, electrs
-/// sets no limit. A public server would refuse what passes its own
-/// limit, which is why this is for a node the user runs.
+/// subscription the server keeps for the session. By default, Fulcrum
+/// takes 75,000 from one address, and electrs as its author publishes it
+/// sets no limit. Blockstream's electrs takes 10,000 on a connection
+/// (`--electrum-subscription-limit`) and mempool's 100
+/// (`--electrum-max-subscriptions`). ElectrumX counts a cost instead,
+/// slows a session down past 1,000 and cuts it at 10,000
+/// (`COST_SOFT_LIMIT`, `COST_HARD_LIMIT`): 20,000 subscriptions pass the
+/// cut by its documentation, and are slowed down hard by its code. What
+/// a server will not take is left to the syncs. A public server would
+/// refuse what passes its own limit, which is why this is for a node the
+/// user runs, whose owner can raise it.
 pub const OWN_NODE_MAX_SCRIPTS: usize = 20_000;
 /// Scripts watched for one wallet on the user's own node: as many as
 /// in all, so that one large wallet may take the whole of it. They are
