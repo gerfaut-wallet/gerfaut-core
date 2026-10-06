@@ -246,6 +246,11 @@ The first release: the library both Gerfaut apps are built on.
   `truncate_address` and `broadcast::sats`. So are the `funded_sats` and
   `spent_sats` fields of `AddressWatchState`, which nothing read. A vault
   still writes them as zero, for the older builds that require them.
+- `frigate.2140.dev` is no longer among the public servers. It is a Silent
+  Payments server, and it hands every other request to an Electrum server
+  behind it, so a watch-only wallet gains nothing from it. A backend set
+  to it falls back to the automatic rotation, like any server a build
+  stops listing.
 
 ### Fixed
 

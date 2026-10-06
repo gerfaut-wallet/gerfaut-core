@@ -1308,13 +1308,19 @@ mod tests {
         let none = TrustedCerts::new();
         let automatic = endpoints(&BackendConfig::default(), Network::Mainnet, &none).unwrap();
         assert_eq!(automatic.len(), 3);
-        let retired = BackendConfig::Public {
-            server: Some("gone.example.org".to_owned()),
-        };
-        assert_eq!(
-            endpoints(&retired, Network::Mainnet, &none).unwrap(),
-            automatic
-        );
+        // An identifier no build knew, and one a later build dropped:
+        // `frigate.2140.dev`, a Silent Payments server that hands every
+        // other request to an Electrum server behind it.
+        for gone in ["gone.example.org", "electrum:frigate.2140.dev"] {
+            let retired = BackendConfig::Public {
+                server: Some(gone.to_owned()),
+            };
+            assert_eq!(
+                endpoints(&retired, Network::Mainnet, &none).unwrap(),
+                automatic,
+                "{gone}"
+            );
+        }
         // A network without a public instance still says so.
         assert!(endpoints(&BackendConfig::default(), Network::Regtest, &none).is_err());
     }

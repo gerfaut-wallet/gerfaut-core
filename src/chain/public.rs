@@ -5,7 +5,9 @@
 //! single-address wallet; they are what the automatic mode rotates
 //! through. The Electrum servers are the list Sparrow Wallet ships for
 //! the same networks, kept so a user who already trusts one of them can
-//! point Gerfaut at it without typing a URL.
+//! point Gerfaut at it without typing a URL. Its Silent Payments server
+//! is left out: it hands every other request to an Electrum server
+//! behind it, and a watch-only wallet has no use for the rest.
 //!
 //! Several of those Electrum servers sign their own certificate, which
 //! nothing public vouches for. They are listed all the same, marked, and
@@ -99,13 +101,6 @@ const MAINNET: &[Entry] = &[
         label: "electrum.diynodes.com:50022",
         protocol: Electrum,
         url: "ssl://electrum.diynodes.com:50022",
-        self_signed: false,
-    },
-    Entry {
-        id: "electrum:frigate.2140.dev",
-        label: "frigate.2140.dev:50002",
-        protocol: Electrum,
-        url: "ssl://frigate.2140.dev:50002",
         self_signed: false,
     },
     // The rest of Sparrow's list. These sign their own certificate:
