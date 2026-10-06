@@ -4,10 +4,10 @@ Gerfaut is a watch-only Bitcoin wallet. It never generates, stores, or handles p
 
 ## Reporting a vulnerability
 
-Do not report security vulnerabilities through public issues, discussions, or pull requests.
+Do not report a vulnerability in a public issue, discussion or pull request. Two private channels reach the maintainer:
 
+- GitHub: open the Security tab of this repository and select "Report a vulnerability" ([private vulnerability reporting](https://github.com/gerfaut-wallet/gerfaut-core/security/advisories/new)). Only you and the maintainer can read the report.
 - Email: info@pandul.fr (Loïc Morel, maintainer)
-- Once this repository is public, GitHub [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability) will also be enabled (Security tab, then "Report a vulnerability") and will become the preferred channel.
 
 Please include as much of the following as you can:
 
