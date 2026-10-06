@@ -262,6 +262,11 @@ struct Retired {
     premium: Option<serde::de::IgnoredAny>,
 }
 
+/// The app preferences earlier builds kept for that account, under keys
+/// that start with this: the ntfy topic of each of its channels among
+/// them. Nothing reads them any more, and they leave with the account.
+const RETIRED_PREFS: &str = "premium.";
+
 /// Handle on the vault file. Owns the key material, and the exclusive
 /// lock that keeps every other opener out while it lives.
 pub struct Vault {
@@ -346,7 +351,8 @@ impl Vault {
     }
 
     /// [`Self::load`], and whether the file still holds what earlier
-    /// builds kept and this one dropped: see [`Retired`].
+    /// builds kept and this one dropped: see [`Retired`] and
+    /// [`RETIRED_PREFS`]. The payload comes without either.
     fn read(&self) -> Result<(VaultPayload, bool), VaultError> {
         #[derive(Deserialize)]
         struct Head<'a> {
@@ -369,6 +375,10 @@ impl Vault {
         });
         let mut payload: VaultPayload = serde_json::from_slice(&plaintext).map_err(corrupted)?;
         payload.version = PAYLOAD_VERSION;
+        let prefs = &mut payload.settings.app_prefs;
+        let before = prefs.len();
+        prefs.retain(|key, _| !key.starts_with(RETIRED_PREFS));
+        let retired = retired || prefs.len() < before;
         Ok((payload, retired))
     }
 
@@ -724,14 +734,18 @@ mod tests {
     /// The plaintext of a vault an earlier build wrote at version 2,
     /// field for field, with the Premium account it kept in the
     /// settings: the account key, this device's token, a connection and
-    /// a key change still unanswered, the tokens of past connections.
+    /// a key change still unanswered, the tokens of past connections,
+    /// and the ntfy topic of a channel among the app preferences.
     const VAULT_WITH_PREMIUM: &str = r#"{
         "version": 2,
         "settings": {
             "active_network": "signet",
             "backends": {},
             "gap_limit": 42,
-            "app_prefs": {"desktop.theme": "dark"},
+            "app_prefs": {
+                "desktop.theme": "dark",
+                "premium.ntfy.0b9e2d4c-7a1f-4e63-9c58-2f0d1b3a6e7c": "gerfaut-q8Zr3vLmT1xKpW2n"
+            },
             "electrum_certs": {},
             "app_lock": null,
             "tor": {"mode": "auto", "socks_proxy": null},
@@ -799,15 +813,21 @@ mod tests {
     }"#;
 
     /// Whether the vault at `path` still holds any of that account: its
-    /// section, or one of its secrets.
+    /// section, a preference kept for it, or one of its secrets.
     fn holds_premium(path: &Path) -> bool {
         let plaintext = cipher::unseal(&std::fs::read(path).unwrap(), &key()).unwrap();
         let stored: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
         let text = String::from_utf8(plaintext).unwrap();
         stored["settings"].get("premium").is_some()
-            || ["abcdefghijkmnpqr", "gdt1_", "stuvwxyz23456789"]
-                .iter()
-                .any(|secret| text.contains(secret))
+            || text.contains("\"premium.")
+            || [
+                "abcdefghijkmnpqr",
+                "gdt1_",
+                "stuvwxyz23456789",
+                "gerfaut-q8Zr3vLmT1xKpW2n",
+            ]
+            .iter()
+            .any(|secret| text.contains(secret))
     }
 
     /// A vault with a Premium account opens with everything else as it
@@ -824,7 +844,11 @@ mod tests {
         assert_eq!(payload.version, PAYLOAD_VERSION);
         assert_eq!(payload.settings.active_network, Network::Signet);
         assert_eq!(payload.settings.gap_limit, 42);
-        assert_eq!(payload.settings.app_prefs["desktop.theme"], "dark");
+        // The ordinary preference stays, alone.
+        assert_eq!(
+            payload.settings.app_prefs,
+            BTreeMap::from([("desktop.theme".to_owned(), "dark".to_owned())])
+        );
         assert_eq!(payload.wallets.len(), 1);
         assert_eq!(payload.wallets[0].meta.name, "Cold storage");
         // Gone from the file at the open, before any change is saved.
@@ -836,6 +860,33 @@ mod tests {
         let (_, reloaded) = Vault::open_or_create(&path, key()).unwrap();
         assert_eq!(reloaded.wallets[0].meta.id, "0000-test");
         assert_eq!(reloaded.settings.gap_limit, 42);
+        assert_eq!(reloaded.settings.app_prefs["desktop.theme"], "dark");
+    }
+
+    /// A vault that holds a preference kept for that account and no
+    /// section of it is written back without the preference all the
+    /// same, and a preference that only looks like one stays.
+    #[test]
+    fn a_vault_with_premium_preferences_alone_opens_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let mut stored: serde_json::Value = serde_json::from_str(VAULT_WITH_PREMIUM).unwrap();
+        let settings = stored["settings"].as_object_mut().unwrap();
+        settings.remove("premium");
+        settings["app_prefs"]["premiums.note"] = "kept".into();
+        let sealed = cipher::seal(stored.to_string().as_bytes(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+        assert!(holds_premium(&path));
+
+        let (_, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert!(!holds_premium(&path));
+        let plaintext = cipher::unseal(&std::fs::read(&path).unwrap(), &key()).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(
+            written["settings"]["app_prefs"],
+            serde_json::json!({"desktop.theme": "dark", "premiums.note": "kept"})
+        );
+        assert_eq!(payload.settings.app_prefs.len(), 2);
     }
 
     /// A vault with a Premium account that cannot be written back at the
