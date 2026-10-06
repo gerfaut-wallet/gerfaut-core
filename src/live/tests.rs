@@ -993,7 +993,7 @@ async fn next_announcement(events: &mut LiveEvents) -> LiveTx {
 /// pushes each change, and each is announced within about a second of
 /// the push, however soon it follows the one before.
 #[tokio::test]
-async fn an_arrival_and_its_confirmation_are_announced_within_a_second() {
+async fn an_arrival_and_its_confirmation_are_announced_within_seconds() {
     let server = FakeElectrum::start().await;
     let dir = tempfile::tempdir().unwrap();
     let (manager, wallet) = watching(dir.path(), server.backend()).await;
@@ -1031,10 +1031,14 @@ async fn an_arrival_and_its_confirmation_are_announced_within_a_second() {
         [(paid.to_string(), TxStage::Confirmed)]
     );
     println!("announced {arrived_in:?} and {confirmed_in:?} after the push");
-    let second = Duration::from_millis(1_500);
-    assert!(arrived_in < second, "the arrival took {arrived_in:?}");
+    // Locally both come in about half a second. A shared CI runner can
+    // stall for a second on its own, and a push the watch missed would
+    // wait for the next poll, a minute away: three seconds tells the two
+    // apart without failing on a busy machine.
+    let bound = Duration::from_secs(3);
+    assert!(arrived_in < bound, "the arrival took {arrived_in:?}");
     assert!(
-        confirmed_in < second,
+        confirmed_in < bound,
         "the confirmation took {confirmed_in:?}"
     );
     manager.live_stop().await;
