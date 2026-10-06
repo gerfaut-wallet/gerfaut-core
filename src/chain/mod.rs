@@ -484,7 +484,7 @@ pub(crate) fn endpoints(
 /// order so that one blocked or down instance never looks like an empty
 /// wallet.
 fn automatic_endpoints(network: Network) -> CoreResult<Vec<Endpoint>> {
-    let urls = network.default_esplora_urls();
+    let urls = public::rotation(network);
     if urls.is_empty() {
         return Err(CoreError::BackendUnavailable(format!(
             "no public backend exists for {network}; configure your own node"

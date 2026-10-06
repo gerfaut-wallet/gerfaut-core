@@ -873,6 +873,62 @@ async fn a_running_watch_names_the_server_syncs_try_first() {
     manager.live_stop().await;
 }
 
+/// The server whose answer a wallet's last sync is stamped with.
+async fn answered_by(manager: &WalletManager, wallet: &str) -> Option<String> {
+    let state = manager.state.lock().await;
+    find_record(&state.payload, wallet)
+        .ok()?
+        .meta
+        .last_sync
+        .as_ref()?
+        .server
+        .clone()
+}
+
+/// An automatic backend whose rotation is one Esplora server and whose
+/// catalogue lists `electrum`, all of them local, and a manager on it
+/// watching [`ADDRESS`], synced once before any watch.
+async fn automatic(
+    dir: &std::path::Path,
+    rotation: &FakeMempool,
+    electrum: &[&FakeElectrum],
+) -> (crate::chain::public::StandIn, WalletManager, String) {
+    let stand_in = crate::chain::public::stand_in(
+        &[format!("http://{}/api", rotation.address)],
+        &electrum
+            .iter()
+            .map(|server| format!("tcp://{}", server.address))
+            .collect::<Vec<_>>(),
+    );
+    let (manager, wallet) = watching(dir, crate::chain::BackendConfig::default()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    (stand_in, manager, wallet)
+}
+
+/// While the watch has a session, a sync that names no server, such as
+/// the one the app runs when it opens, goes first to the watch's server
+/// and not to the head of the rotation: with the automatic backend, the
+/// syncs show the wallets to the operator the watch already shows them
+/// to, not to a second one.
+#[tokio::test]
+async fn a_sync_goes_first_to_the_server_the_watch_talks_to() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let live = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) = automatic(dir.path(), &rotation, &[&live]).await;
+    let rotation_key = format!("esplora 127.0.0.1 {}", rotation.address.port());
+    assert_eq!(answered_by(&manager, &wallet).await, Some(rotation_key));
+
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    assert_eq!(
+        answered_by(&manager, &wallet).await,
+        Some(format!("electrum 127.0.0.1 {}", live.address.port()))
+    );
+    manager.live_stop().await;
+}
+
 /// A server behind the wallet whose chain never meets the wallet's, one
 /// of another network: the sync fails, saying so once the first block
 /// differs, and the payment the wallet holds is not taken for gone from
