@@ -64,10 +64,21 @@ pub struct BackupWallet {
     pub name: String,
     pub network: Network,
     pub kind: WalletKind,
+    /// The gap limit when the backup was written. Kept for the format:
+    /// every build so far requires it. A restore ignores it, since the
+    /// gap limit is one setting shared by every wallet: the backup's
+    /// when its settings are applied, this device's otherwise.
     pub gap_limit: u32,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// When the wallet was added, unix seconds. Kept for the format, as
+    /// above: a restored wallet is dated by its restore.
     pub created_at: u64,
+    /// Watched live before any other wallet: see
+    /// [`WalletMeta::live_pinned`]. Left out while off, so a backup
+    /// with no wallet pinned reads as one written before pinning.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live_pinned: bool,
 }
 
 /// Everything a backup decrypts to. The settings fields are present
@@ -352,6 +363,7 @@ mod tests {
                     gap_limit: 20,
                     labels: BTreeMap::from([("addr:tb1q".to_owned(), "rent".to_owned())]),
                     created_at: 1_754_000_000,
+                    live_pinned: true,
                 },
                 BackupWallet {
                     name: "Watched".to_owned(),
@@ -362,12 +374,14 @@ mod tests {
                     gap_limit: 20,
                     labels: BTreeMap::new(),
                     created_at: 1_754_000_001,
+                    live_pinned: false,
                 },
             ],
             backends: Some(BTreeMap::from([(
                 Network::Signet,
                 BackendConfig::CustomEsplora {
                     url: "https://esplora.example.org/api".to_owned(),
+                    own_node: false,
                 },
             )])),
             electrum_certs: Some(BTreeMap::from([(
@@ -405,6 +419,23 @@ mod tests {
         assert!(!json.contains("backends"), "{json}");
         let opened = open(&seal(&bare, PASSWORD).unwrap(), PASSWORD).unwrap();
         assert_eq!(opened, bare);
+    }
+
+    /// A wallet pinned to the live watch says so in the backup; one that
+    /// is not says nothing, the way a backup written before pinning
+    /// existed reads.
+    #[test]
+    fn a_pin_rides_along_only_when_set() {
+        let json = serde_json::to_string(&payload()).unwrap();
+        assert_eq!(json.matches(r#""live_pinned":true"#).count(), 1, "{json}");
+        assert!(!json.contains(r#""live_pinned":false"#), "{json}");
+        let older = r#"{"name":"Old","network":"signet","kind":{"type":"single_address","address":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"},"gap_limit":20,"created_at":1}"#;
+        let wallet: BackupWallet = serde_json::from_str(older).unwrap();
+        assert!(!wallet.live_pinned);
+        assert_eq!(
+            serde_json::to_string(&wallet).unwrap(),
+            older.replace(r#""gap_limit":20,"#, r#""gap_limit":20,"labels":{},"#,)
+        );
     }
 
     #[test]

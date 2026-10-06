@@ -46,7 +46,8 @@ pub struct TxExtras {
 pub struct OpReturnData {
     /// Payload bytes in hex (pushes concatenated).
     pub hex: String,
-    /// The payload as text, when it is printable UTF-8.
+    /// The payload as text, when it is printable UTF-8 and holds
+    /// nothing that reorders the text around it on screen.
     pub text: Option<String>,
     /// Name of a recognized protocol payload, when the prefix says so.
     pub label: Option<String>,
@@ -145,10 +146,31 @@ pub fn op_return_of(script: &Script) -> Option<OpReturnData> {
         .map(|(_, name)| (*name).to_owned());
     let text = String::from_utf8(bytes.clone()).ok().filter(|s| {
         s.chars().count() >= 2
-            && s.chars().all(|c| !c.is_control())
+            && s.chars().all(|c| !c.is_control() && !is_bidi_control(c))
             && s.chars().any(|c| c.is_alphanumeric())
     });
     Some(OpReturnData { hex, text, label })
+}
+
+/// Whether a character changes the direction of the text around it: the
+/// marks, embeddings, overrides and isolates of the bidirectional
+/// algorithm, and the line and paragraph separators, which break a line
+/// where nothing shows one and, for the second, start that algorithm
+/// over. They are not control characters to Rust, and a payload anyone
+/// can write that holds one, shown as text, could make what follows it
+/// on screen, an amount or an address, read backwards or on a line of
+/// its own. Such a payload is shown in hex.
+pub(crate) fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Block height committed at the start of a coinbase script (BIP-34).
@@ -255,6 +277,36 @@ mod tests {
         let data = op_return_of(&script).expect("op_return");
         assert_eq!(data.text, None);
         assert_eq!(data.hex, "009f9296");
+    }
+
+    /// Text that would turn what follows it around on screen, or break
+    /// it onto a line of its own, is shown as the bytes it is; text
+    /// written right to left is text.
+    #[test]
+    fn op_return_with_a_direction_override_has_no_text() {
+        let payload = |text: &str| {
+            let script = Builder::new()
+                .push_opcode(OP_RETURN)
+                .push_slice(
+                    <&bdk_wallet::bitcoin::script::PushBytes>::try_from(text.as_bytes()).unwrap(),
+                )
+                .into_script();
+            op_return_of(&script).expect("op_return").text
+        };
+        for spoof in [
+            "paid \u{202E}1.0 BTC",
+            "\u{2067}refund\u{2069} 0.5",
+            "note\u{200F} 21",
+            "\u{061C}memo",
+            "fee 0.0001\u{2028}to bc1q",
+            "\u{2029}paid 1 BTC",
+        ] {
+            assert_eq!(payload(spoof), None, "{spoof:?}");
+        }
+        assert_eq!(
+            payload("\u{645}\u{631}\u{62D}\u{628}\u{627}").as_deref(),
+            Some("\u{645}\u{631}\u{62D}\u{628}\u{627}")
+        );
     }
 
     #[test]

@@ -2,11 +2,11 @@
 
 use std::time::Duration;
 
-use bdk_esplora::esplora_client::{self, api};
 use bdk_wallet::bitcoin::address::Address;
 
 use bdk_wallet::bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 
+pub(crate) mod api;
 pub(crate) mod page;
 pub(crate) mod sync;
 
@@ -27,16 +27,19 @@ const MAX_BODY: usize = 32 << 20;
 /// witness, costs nothing: this only stops a server that never ends.
 /// Four of the largest inscriptions there are fit in one page.
 const JSON_MAX: usize = 64 << 20;
-/// What one sync may keep of the transactions it reads, those the
-/// wallet lacks: what it stores then. A wallet paid dozens of the
-/// largest inscriptions there are fits; a server that invents
-/// transactions to fill memory does not.
-const KEEP_MAX: usize = 256 << 20;
 /// Chunks of an answer read ahead of its parsing.
 const CHUNKS_AHEAD: usize = 8;
-/// Tries of a request a server turned away for being busy: a public
-/// instance answers a burst with 429, and a moment later with the data.
+/// Tries of a request a server failed with an error of its own, which a
+/// moment later it may not.
 const TRIES: u32 = 4;
+/// The shortest wait after a server limited the rate of requests (429),
+/// whatever it named: mempool.space bans a client that keeps coming
+/// back too soon.
+const RATE_WAIT_MIN: Duration = Duration::from_secs(5);
+/// The longest wait a request sits through before it is asked again, a
+/// single time; past it the request fails at once, saying how long the
+/// server asked for.
+const RATE_WAIT_MAX: Duration = Duration::from_secs(60);
 /// The longest refusal read from a broadcast: the node's reason is one
 /// line, and a page of text is cut to its first 200 characters anyway.
 const REFUSAL_MAX: usize = 64 << 10;
@@ -83,18 +86,25 @@ pub(crate) struct Client {
     budget: Budget,
     /// What a sync kept so far of the transactions it read, and how
     /// much it may.
-    kept: std::sync::atomic::AtomicUsize,
-    keep_max: usize,
+    kept: crate::chain::Kept,
+    /// The longest wait the server asked for since it was last read:
+    /// see [`Client::take_rate_limit`].
+    rate_limit: std::sync::Mutex<Option<Duration>>,
 }
 
 impl Client {
     /// The answer to `path` under the instance's address, its body not
-    /// read yet; `None` when the server has nothing there (404). A busy
-    /// server is asked again a few times, a little later each time.
+    /// read yet; `None` when the server has nothing there (404). A server
+    /// that fails with an error of its own is asked again a few times, a
+    /// little later each time. One that limits the rate of requests is
+    /// asked again once, after the wait it named, five seconds at least
+    /// and a little more so that clients do not come back together, when
+    /// that wait is a minute at most.
     async fn open(&self, path: &str) -> Result<Option<reqwest::Response>, String> {
         let url = format!("{}{path}", self.base);
         let mut wait = Duration::from_millis(250);
         let mut tries = 1;
+        let mut limited = false;
         let response = loop {
             let response = self
                 .http
@@ -103,7 +113,18 @@ impl Client {
                 .await
                 .map_err(|e| describe_request(&e, self.budget))?;
             let status = response.status().as_u16();
-            if tries < TRIES && matches!(status, 429 | 500 | 502 | 503 | 504) {
+            if status == 429 {
+                let named = retry_after(response.headers()).unwrap_or_default();
+                let pause = named.max(RATE_WAIT_MIN);
+                self.limited(pause);
+                if limited || pause > RATE_WAIT_MAX {
+                    return Err(rate_limited(pause));
+                }
+                limited = true;
+                tokio::time::sleep(pause.mul_f64(1.0 + 0.2 * rand::random::<f64>())).await;
+                continue;
+            }
+            if tries < TRIES && matches!(status, 500 | 502 | 503 | 504) {
                 tokio::time::sleep(wait).await;
                 wait *= 2;
                 tries += 1;
@@ -180,19 +201,29 @@ impl Client {
             .map_err(|_| "unexpected response".to_owned())
     }
 
+    /// Notes that the server asked for `pause` before the next request.
+    fn limited(&self, pause: Duration) {
+        let mut asked = self
+            .rate_limit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *asked = (*asked).max(Some(pause));
+    }
+
+    /// The longest wait the server asked for since this was last called,
+    /// if it limited the rate of requests meanwhile, a request that went
+    /// through on its second try included: whoever asks it at a pace
+    /// learns it is too fast.
+    pub(crate) fn take_rate_limit(&self) -> Option<Duration> {
+        self.rate_limit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
     /// Counts `bytes` of transactions against what one sync may keep.
     pub(crate) fn keep(&self, bytes: usize) -> Result<(), String> {
-        let kept = self
-            .kept
-            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(bytes);
-        if kept > self.keep_max {
-            return Err(format!(
-                "the server sent more than {} MiB of transactions for one sync",
-                self.keep_max >> 20
-            ));
-        }
-        Ok(())
+        self.kept.add(bytes)
     }
 
     /// The body of an answer, read a chunk at a time, decompressed, and
@@ -366,8 +397,8 @@ pub(crate) struct Tally {
 }
 
 impl Counts {
-    pub(crate) fn of(stats: &esplora_client::api::ScriptHashStats) -> Self {
-        let tally = |side: &esplora_client::api::ScriptHashTxsSummary| Tally {
+    pub(crate) fn of(stats: &api::ScriptHashStats) -> Self {
+        let tally = |side: &api::ScriptHashTxsSummary| Tally {
             txs: u64::from(side.tx_count),
             funded: u64::from(side.funded_txo_count),
             funded_sats: side.funded_txo_sum,
@@ -404,9 +435,13 @@ pub(crate) fn client(url: &str, proxy: Option<&str>) -> Result<Client, String> {
 /// different waits, and a host that is down must not get the budget of
 /// a host that is slow.
 fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, String> {
+    // An Esplora API does not redirect. One that does would send the
+    // scripts of the wallet where the route was never checked: in the
+    // clear, or an onion name to the system's resolver.
     let mut builder = reqwest::Client::builder()
         .connect_timeout(budget.connect)
-        .timeout(budget.total);
+        .timeout(budget.total)
+        .redirect(reqwest::redirect::Policy::none());
     if crate::chain::is_onion(url) {
         let proxy = proxy.ok_or_else(|| crate::chain::tor::no_route(url))?;
         // socks5h: the proxy resolves the name; .onion never touches DNS.
@@ -421,16 +456,16 @@ fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, Strin
         http,
         base: url.trim_end_matches('/').to_owned(),
         budget,
-        kept: std::sync::atomic::AtomicUsize::new(0),
-        keep_max: usize::MAX,
+        kept: crate::chain::Kept::up_to(usize::MAX),
+        rate_limit: std::sync::Mutex::new(None),
     })
 }
 
 /// A client for one sync: the same, and what it keeps of the
-/// transactions it reads held to [`KEEP_MAX`].
+/// transactions it reads held to [`crate::chain::KEEP_MAX`].
 pub(crate) fn client_for_run(url: &str, proxy: Option<&str>) -> Result<Client, String> {
     let mut client = client(url, proxy)?;
-    client.keep_max = KEEP_MAX;
+    client.kept = crate::chain::Kept::up_to(crate::chain::KEEP_MAX);
     Ok(client)
 }
 
@@ -475,6 +510,65 @@ impl<B: AsRef<[u8]>> std::io::Read for ChunkReader<B> {
 }
 
 // --- errors ---------------------------------------------------------------
+
+/// The wait a `Retry-After` header names, in seconds or as the date to
+/// come back at, a day at most. A date already past, or written in one
+/// of the obsolete forms, reads as none: the shortest wait applies.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    let seconds = match value.parse::<u64>() {
+        Ok(seconds) => seconds,
+        Err(_) => http_date(value)?.checked_sub(crate::now_secs())?,
+    };
+    Some(Duration::from_secs(seconds.min(24 * 60 * 60)))
+}
+
+/// An HTTP date in the form servers send, `Sun, 06 Nov 1994 08:49:37
+/// GMT`, as unix seconds.
+fn http_date(text: &str) -> Option<u64> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let parts: [&str; 6] = text
+        .split_ascii_whitespace()
+        .collect::<Vec<_>>()
+        .try_into()
+        .ok()?;
+    let [_weekday, day, month, year, time, "GMT"] = parts else {
+        return None;
+    };
+    let day: u32 = day.parse().ok().filter(|day| (1..=31).contains(day))?;
+    let month = MONTHS.iter().position(|name| *name == month)? as u32 + 1;
+    let year: i64 = year
+        .parse()
+        .ok()
+        .filter(|year| (1970..=9999).contains(year))?;
+    let [hours, minutes, seconds]: [u64; 3] = time
+        .split(':')
+        .map(|part| part.parse().ok())
+        .collect::<Option<Vec<u64>>>()?
+        .try_into()
+        .ok()?;
+    if hours > 23 || minutes > 59 || seconds > 60 {
+        return None;
+    }
+    let days = u64::try_from(crate::format::days_from_civil(year, month, day)).ok()?;
+    days.checked_mul(86_400)?
+        .checked_add(hours * 3_600 + minutes * 60 + seconds)
+}
+
+/// A server that limited the rate of requests, and the wait it asked for.
+fn rate_limited(pause: Duration) -> String {
+    format!(
+        "{}, try again in {} s",
+        describe_status(429),
+        pause.as_secs()
+    )
+}
 
 fn describe_status(status: u16) -> String {
     let reason = match status {
@@ -571,14 +665,18 @@ pub(crate) struct HistoryRound {
     pub cursor: Option<String>,
 }
 
-/// Fetches the complete state of a single watched address.
+/// Fetches the complete state of a single watched address. `held` is
+/// what the wallet holds of it, which spares reading again the pages it
+/// already has: see [`history_round`].
 pub(crate) async fn fetch_address_state(
     client: &Client,
     address: &str,
     network: Network,
+    held: &[AddressTx],
 ) -> Result<AddressWatchState, String> {
     let address = parse_address(address, network)?;
     let our_script = address.script_pubkey();
+    check_network(client, network).await?;
 
     let tip_height = client.height().await?;
     let stats = client.address_stats(&address).await?;
@@ -590,6 +688,7 @@ pub(crate) async fn fetch_address_state(
         network,
         None,
         Some(stats.chain_stats.tx_count as usize),
+        held,
     )
     .await?;
 
@@ -600,7 +699,7 @@ pub(crate) async fn fetch_address_state(
         .map(|utxo| AddressUtxo {
             txid: utxo.txid.to_string(),
             vout: utxo.vout,
-            value_sats: utxo.value.to_sat(),
+            value_sats: utxo.value,
             height: utxo.status.block_height,
             timestamp: utxo.status.block_time,
         })
@@ -610,8 +709,6 @@ pub(crate) async fn fetch_address_state(
         txs: round.txs,
         utxos,
         tip_height,
-        funded_sats: stats.chain_stats.funded_txo_sum + stats.mempool_stats.funded_txo_sum,
-        spent_sats: stats.chain_stats.spent_txo_sum + stats.mempool_stats.spent_txo_sum,
         truncated: round.cursor.is_some(),
         history_cursor: round.cursor,
     })
@@ -631,7 +728,35 @@ pub(crate) async fn fetch_address_history(
     let from: Txid = from
         .parse()
         .map_err(|_| format!("invalid history cursor: {from}"))?;
-    history_round(client, &address, &our_script, network, Some(from), None).await
+    check_network(client, network).await?;
+    history_round(
+        client,
+        &address,
+        &our_script,
+        network,
+        Some(from),
+        None,
+        &[],
+    )
+    .await
+}
+
+/// Refuses a server whose genesis block is not the network's. Testnet,
+/// testnet4 and signet spell an address alike, and a server of another
+/// of them answers for it, with transactions the wallet's network never
+/// saw. A descriptor wallet's sync finds that out walking the wallet's
+/// chain down to the server's; a watched address keeps no chain, and
+/// asks.
+pub(crate) async fn check_network(client: &Client, network: Network) -> Result<(), String> {
+    let text = client.get_bytes("/block-height/0").await?;
+    let genesis: BlockHash = std::str::from_utf8(&text)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .ok_or_else(|| "unexpected response".to_owned())?;
+    if !crate::chain::is_genesis_of(network, genesis) {
+        return Err(crate::chain::ANOTHER_NETWORK.to_owned());
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_address(address: &str, network: Network) -> Result<Address, String> {
@@ -644,6 +769,13 @@ pub(crate) fn parse_address(address: &str, network: Network) -> Result<Address, 
 
 /// Pages through the address history from `from` (newest first when
 /// `None`), at most [`HISTORY_PAGES_PER_ROUND`] pages.
+///
+/// A page that lists only transactions of `held`, what the wallet holds,
+/// each at the height it holds it, ends the reading: the history below
+/// it is what the wallet holds, and the round is filled from there. An
+/// address paid a thousand times reads one page a sync, not forty. When
+/// what the wallet holds below would come to more than the server counts,
+/// the pages are read on.
 async fn history_round(
     client: &Client,
     address: &Address,
@@ -651,23 +783,35 @@ async fn history_round(
     network: Network,
     from: Option<Txid>,
     confirmed_total: Option<usize>,
+    held: &[AddressTx],
 ) -> Result<HistoryRound, String> {
+    let known: std::collections::HashMap<&str, Option<u32>> = held
+        .iter()
+        .map(|tx| (tx.txid.as_str(), tx.height))
+        .collect();
     // Each page is read into what the app shows as soon as it arrives,
     // and dropped: forty pages are never held as the server spelled them.
+    // What is kept of them, every input and output of each transaction,
+    // counts against what one sync may keep.
     let mut txs: Vec<AddressTx> = Vec::new();
     let mut confirmed = 0usize;
     let mut last_seen: Option<Txid> = None;
     let mut read = |page: Vec<PageTx>, txs: &mut Vec<AddressTx>| {
+        let mut all_held = true;
         for tx in page {
             if tx.status.confirmed {
                 confirmed += 1;
                 last_seen = Some(tx.txid);
             }
-            txs.push(to_address_tx(tx, our_script, network));
+            let tx = to_address_tx(tx, our_script, network);
+            all_held &= known.get(tx.txid.as_str()) == Some(&tx.height);
+            client.keep(crate::chain::held_by(&tx))?;
+            txs.push(tx);
         }
-        (confirmed, last_seen)
+        Ok::<_, String>((confirmed, last_seen, all_held))
     };
-    let (mut confirmed_so_far, mut last) = read(client.address_txs(address, from).await?, &mut txs);
+    let (mut confirmed_so_far, mut last, mut all_held) =
+        read(client.address_txs(address, from).await?, &mut txs)?;
     let mut cursor: Option<String> = None;
     let mut pages = 1usize;
     loop {
@@ -681,6 +825,20 @@ async fn history_round(
         let Some(last_seen) = last else {
             break;
         };
+        if all_held
+            && let Some(total) = confirmed_total
+            && let Some(filled) = fill_from_held(client, &mut txs, held, confirmed_so_far, total)?
+        {
+            confirmed_so_far += filled;
+            if confirmed_so_far < total {
+                cursor = txs
+                    .iter()
+                    .rev()
+                    .find(|tx| tx.height.is_some())
+                    .map(|tx| tx.txid.clone());
+            }
+            break;
+        }
         if pages >= HISTORY_PAGES_PER_ROUND {
             cursor = Some(last_seen.to_string());
             break;
@@ -690,10 +848,48 @@ async fn history_round(
         if page.is_empty() {
             break;
         }
-        (confirmed_so_far, last) = read(page, &mut txs);
+        (confirmed_so_far, last, all_held) = read(page, &mut txs)?;
     }
     Ok(HistoryRound { txs, cursor })
 }
+
+/// Fills a round read down to a page the wallet holds whole from the
+/// confirmed transactions it holds below that page, as many as a round
+/// takes. `None`, and nothing filled, when those and what was read
+/// would come to more than the server counts: what the wallet holds
+/// below is then not the server's history, and the pages are read on.
+fn fill_from_held(
+    client: &Client,
+    txs: &mut Vec<AddressTx>,
+    held: &[AddressTx],
+    confirmed_so_far: usize,
+    total: usize,
+) -> Result<Option<usize>, String> {
+    let Some(below) = txs.iter().rev().find_map(|tx| tx.height) else {
+        return Ok(None);
+    };
+    let taken: std::collections::HashSet<&str> = txs.iter().map(|tx| tx.txid.as_str()).collect();
+    let older: Vec<&AddressTx> = held
+        .iter()
+        .filter(|tx| tx.height.is_some_and(|height| height <= below))
+        .filter(|tx| !taken.contains(tx.txid.as_str()))
+        .collect();
+    if confirmed_so_far + older.len() > total {
+        return Ok(None);
+    }
+    let room = (HISTORY_PAGES_PER_ROUND * PAGE).saturating_sub(confirmed_so_far);
+    let older: Vec<AddressTx> = older.into_iter().take(room).cloned().collect();
+    for tx in &older {
+        client.keep(crate::chain::held_by(tx))?;
+    }
+    let filled = older.len();
+    txs.extend(older);
+    Ok(Some(filled))
+}
+
+/// Confirmed transactions an Esplora server lists in a page of a
+/// history, a script's or an address's.
+const PAGE: usize = 25;
 
 /// One esplora transaction as seen from the watched address.
 fn to_address_tx(
@@ -701,19 +897,21 @@ fn to_address_tx(
     our_script: &bdk_wallet::bitcoin::ScriptBuf,
     network: Network,
 ) -> AddressTx {
+    // Amounts as the server tells them: summed without wrapping around,
+    // as the Electrum path and the balance do.
     let received: u64 = tx
         .vout
         .iter()
         .filter(|v| v.scriptpubkey == *our_script)
         .map(|v| v.value)
-        .sum();
+        .fold(0, u64::saturating_add);
     let spent: u64 = tx
         .vin
         .iter()
         .filter_map(|v| v.prevout.as_ref())
         .filter(|p| p.scriptpubkey == *our_script)
         .map(|p| p.value)
-        .sum();
+        .fold(0, u64::saturating_add);
     let inputs = tx
         .vin
         .iter()
@@ -765,7 +963,7 @@ fn to_address_tx(
     let extras = tx_extras::analyze(&tx.to_tx(), |op| prevouts.get(op).cloned());
     AddressTx {
         txid: tx.txid.to_string(),
-        net_sats: received as i64 - spent as i64,
+        net_sats: crate::chain::net_sats(received, spent),
         fee_sats: (!is_coinbase).then_some(tx.fee),
         height: tx.status.block_height,
         timestamp: tx.status.block_time,
@@ -801,23 +999,13 @@ pub(crate) async fn broadcast(client: &Client, tx: &Transaction) -> Result<(), S
     client.post_tx(tx).await
 }
 
-/// Longest refusal shown, in characters, as for any other sentence a
-/// server writes.
-const NODE_MESSAGE_MAX: usize = 200;
-
 /// The reason inside a `sendrawtransaction` refusal, whichever way the
 /// server spelled it; the whole text when it is not one. Shown as the
 /// node's words, so kept to one short line: a server that answers a
 /// page of text, or instructions of its own, gets its first 200
-/// characters on screen, control characters dropped.
+/// characters on screen ([`crate::chain::server_words`]).
 pub(crate) fn node_message(text: &str) -> String {
-    let words = node_words(text);
-    let mut kept = words.chars().filter(|c| !c.is_control());
-    let mut short: String = kept.by_ref().take(NODE_MESSAGE_MAX).collect();
-    if kept.next().is_some() {
-        short.push('\u{2026}');
-    }
-    short
+    crate::chain::server_words(&node_words(text))
 }
 
 fn node_words(text: &str) -> String {
@@ -1088,6 +1276,245 @@ mod error_tests {
         );
     }
 
+    /// A server that answers each request with the next of `answers`,
+    /// whole HTTP answers, and the last one past them; and how many
+    /// requests it had.
+    async fn answering(
+        answers: Vec<String>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<usize>>,
+    ) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let counted = asked.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = vec![0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let answer = {
+                    let mut asked = counted.lock().unwrap();
+                    *asked += 1;
+                    answers[(*asked - 1).min(answers.len() - 1)].clone()
+                };
+                let _ = stream.write_all(answer.as_bytes()).await;
+            }
+        });
+        (address, asked)
+    }
+
+    /// A server that limits the rate of requests is asked again once,
+    /// after the wait it named, five seconds at least, and never at once;
+    /// past a minute, the request fails at once and says how long the
+    /// server asked for. Whoever asks at a pace learns of it either way.
+    #[tokio::test]
+    async fn a_rate_limit_is_waited_out_once() {
+        let limited = |named: &str| {
+            format!(
+                "HTTP/1.1 429 Too Many Requests\r\n{named}content-length: 0\r\n\
+                 connection: close\r\n\r\n"
+            )
+        };
+        let height = "HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\n812345";
+
+        let (long, asked) = answering(vec![limited("retry-after: 120\r\n")]).await;
+        let client = build(&format!("http://{long}"), None, PATIENT).unwrap();
+        assert_eq!(
+            client.height().await.unwrap_err(),
+            "HTTP 429: rate limited, try again in 120 s"
+        );
+        assert_eq!(*asked.lock().unwrap(), 1);
+        assert_eq!(client.take_rate_limit(), Some(Duration::from_secs(120)));
+        assert_eq!(client.take_rate_limit(), None);
+
+        let (short, asked_short) =
+            answering(vec![limited("retry-after: 1\r\n"), height.to_owned()]).await;
+        let (again, asked_again) = answering(vec![limited("")]).await;
+        let short = build(&format!("http://{short}"), None, PATIENT).unwrap();
+        let again = build(&format!("http://{again}"), None, PATIENT).unwrap();
+        let started = std::time::Instant::now();
+        let (read, refused) = tokio::join!(short.height(), again.height());
+        assert!(started.elapsed() >= RATE_WAIT_MIN);
+        assert_eq!(read.unwrap(), 812_345);
+        assert_eq!(
+            refused.unwrap_err(),
+            "HTTP 429: rate limited, try again in 5 s"
+        );
+        assert_eq!(*asked_short.lock().unwrap(), 2);
+        assert_eq!(*asked_again.lock().unwrap(), 2);
+        assert_eq!(short.take_rate_limit(), Some(RATE_WAIT_MIN));
+    }
+
+    /// `Retry-After` names a wait in seconds, or the date to come back at.
+    #[test]
+    fn a_retry_after_date_is_a_wait_until_then() {
+        let named = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
+            retry_after(&headers)
+        };
+        assert_eq!(named("17"), Some(Duration::from_secs(17)));
+        assert_eq!(
+            http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        let in_two_minutes = crate::now_secs() + 120;
+        let (year, month, day) = crate::format::civil_date(in_two_minutes);
+        let time = in_two_minutes % 86_400;
+        let months = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        let date = format!(
+            "Mon, {day:02} {} {year} {:02}:{:02}:{:02} GMT",
+            months[month as usize - 1],
+            time / 3_600,
+            time % 3_600 / 60,
+            time % 60
+        );
+        let wait = named(&date).unwrap();
+        assert!(
+            (Duration::from_secs(115)..=Duration::from_secs(120)).contains(&wait),
+            "{date}: {wait:?}"
+        );
+        assert_eq!(named("Sun, 06 Nov 1994 08:49:37 GMT"), None, "past");
+        assert_eq!(named("Sunday, 06-Nov-94 08:49:37 GMT"), None, "obsolete");
+        assert_eq!(named("soon"), None);
+        assert_eq!(
+            http_date("Sun, 06 Nov 99999999999999999 08:49:37 GMT"),
+            None
+        );
+    }
+
+    /// What a sync of an address keeps of each transaction, its raw
+    /// bytes and every input and output, counts against what one sync
+    /// may keep: a server that lists enough of them fails the sync
+    /// instead of filling memory.
+    #[tokio::test]
+    async fn an_address_keeps_so_much_and_no_more() {
+        use crate::testkit::{ADDRESS, FakeMempool, esplora_payment};
+        let server = FakeMempool::start(false, 0).await;
+        server.state.lock().unwrap().address_txs = (1..=3u8)
+            .map(|n| esplora_payment(n, n + 10, 50_000, true))
+            .collect();
+        let base = format!("http://{}/api", server.address);
+        let client = client_for_run(&base, None).unwrap();
+        let state = fetch_address_state(&client, ADDRESS, Network::Signet, &[])
+            .await
+            .unwrap();
+        assert_eq!(state.txs.len(), 3);
+        let one = crate::chain::held_by(&state.txs[0]);
+        assert!(one > state.txs[0].extras.as_ref().unwrap().raw_hex.len());
+        let mut tight = client_for_run(&base, None).unwrap();
+        tight.kept = crate::chain::Kept::up_to(one * 5 / 2);
+        let refused = fetch_address_state(&tight, ADDRESS, Network::Signet, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            refused.starts_with("the server sent more than"),
+            "{refused}"
+        );
+    }
+
+    /// A page that lists only what the wallet holds, as it holds it, ends
+    /// the reading of an address: the rest of the round comes from what
+    /// it holds, and the state is the one a whole reading gives. A first
+    /// page with news on it is read, and the page under it.
+    #[tokio::test]
+    async fn an_address_reads_no_page_past_one_it_holds() {
+        use crate::testkit::{ADDRESS, FakeMempool, esplora_payment};
+        let server = FakeMempool::start(false, 0).await;
+        server.state.lock().unwrap().address_txs = (1..=60u8)
+            .map(|n| esplora_payment(n, n + 100, 1_000, true))
+            .collect();
+        let base = format!("http://{}/api", server.address);
+        let fetch = |held: Vec<AddressTx>| {
+            let base = base.clone();
+            async move {
+                let client = client_for_run(&base, None).unwrap();
+                fetch_address_state(&client, ADDRESS, Network::Signet, &held)
+                    .await
+                    .unwrap()
+            }
+        };
+        let pages = || server.state.lock().unwrap().history_pages;
+
+        let whole = fetch(Vec::new()).await;
+        assert_eq!((whole.txs.len(), pages()), (60, 3));
+        let again = fetch(whole.txs.clone()).await;
+        assert_eq!(again, whole);
+        assert_eq!(pages(), 4, "one page");
+
+        server
+            .state
+            .lock()
+            .unwrap()
+            .address_txs
+            .insert(0, esplora_payment(61, 161, 2_000, false));
+        let arrived = fetch(again.txs.clone()).await;
+        assert_eq!(pages(), 6, "the first page and the one under it");
+        assert_eq!(arrived, fetch(Vec::new()).await);
+        assert_eq!(arrived.txs.len(), 61);
+        assert_eq!(arrived.txs[0].height, None);
+    }
+
+    /// A server that redirects is not followed: an Esplora instance
+    /// anywhere, and a fixed service elsewhere than its own host over
+    /// HTTPS. The redirection fails the request, and nothing reaches the
+    /// address it named.
+    #[tokio::test]
+    async fn a_redirection_is_not_followed() {
+        let (elsewhere, reached) = answering(vec![
+            "HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\n812345".to_owned(),
+        ])
+        .await;
+        let (redirecting, _) = answering(vec![format!(
+            "HTTP/1.1 301 Moved Permanently\r\nlocation: http://{elsewhere}/blocks/tip/height\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n"
+        )])
+        .await;
+        let client = build(&format!("http://{redirecting}"), None, PATIENT).unwrap();
+        assert_eq!(
+            client.height().await.unwrap_err(),
+            "HTTP 301: unexpected status"
+        );
+        let service = reqwest::Client::builder()
+            .redirect(crate::chain::redirects())
+            .build()
+            .unwrap();
+        let answer = service
+            .get(format!("http://{redirecting}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(answer.status().as_u16(), 301);
+        assert_eq!(*reached.lock().unwrap(), 0);
+    }
+
+    /// Amounts a server makes up, past what any coin holds, stop where
+    /// a number does: nothing panics in a build that checks, and nothing
+    /// wraps around to a payment out in one that does not.
+    #[test]
+    fn amounts_a_server_makes_up_do_not_wrap_around() {
+        use crate::testkit::ADDRESS_SCRIPT;
+        let listed = format!(
+            r#"{{"txid": "{txid}", "version": 2, "locktime": 0, "weight": 400, "fee": 0,
+                "vin": [{{"txid": "{txid}", "vout": 0, "is_coinbase": false, "sequence": 0, "scriptsig": "",
+                    "prevout": {{"scriptpubkey": "0014aa", "value": 1}}}}],
+                "vout": [{{"scriptpubkey": "{ours}", "value": {max}}},
+                    {{"scriptpubkey": "{ours}", "value": {max}}}],
+                "status": {{"confirmed": false}}}}"#,
+            txid = "01".repeat(32),
+            ours = ADDRESS_SCRIPT,
+            max = u64::MAX,
+        );
+        let page: PageTx = serde_json::from_str(&listed).unwrap();
+        let ours = ScriptBuf::from_hex(ADDRESS_SCRIPT).unwrap();
+        let read = to_address_tx(page, &ours, Network::Signet);
+        assert_eq!(read.net_sats, i64::MAX);
+        assert_eq!(crate::chain::net_sats(0, u64::MAX), -i64::MAX);
+    }
+
     /// A gzipped answer of a sensible size reads as it always did.
     #[tokio::test]
     async fn a_gzipped_answer_is_read() {
@@ -1116,14 +1543,14 @@ mod error_tests {
     #[test]
     fn a_sync_keeps_so_much_and_no_more() {
         let one_sync = client_for_run("http://127.0.0.1:9", None).unwrap();
-        one_sync.keep(KEEP_MAX - 1).unwrap();
+        one_sync.keep(crate::chain::KEEP_MAX - 1).unwrap();
         assert_eq!(
             one_sync.keep(2).unwrap_err(),
             "the server sent more than 256 MiB of transactions for one sync"
         );
         let watching = client("http://127.0.0.1:9", None).unwrap();
-        watching.keep(KEEP_MAX).unwrap();
-        watching.keep(KEEP_MAX).unwrap();
+        watching.keep(crate::chain::KEEP_MAX).unwrap();
+        watching.keep(crate::chain::KEEP_MAX).unwrap();
     }
 
     /// A history page listing an inscription of the largest kind: a

@@ -21,18 +21,21 @@ embedded-tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:tor-config"]
 
 [dependencies]
 bdk_wallet = "3.1"
-bdk_esplora = { version = "0.22", default-features = false, features = ["async-https-rustls", "tokio"] }
-bdk_electrum = { version = "0.24", default-features = false, features = ["use-rustls-ring"] }
+# The blocking Electrum client a descriptor sync speaks through, over a
+# stream the core opens itself: the version and features `bdk_electrum`
+# brought, when it was kept only to reach this.
+electrum-client = { version = "0.25", default-features = false, features = ["proxy", "rustls-ring"] }
 # `gzip`: Esplora answers are JSON, and compressed they are about a
 # quarter of the size. The client asks for it and decompresses on its
-# own; what reads a body whole still caps it where it did.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+# own; what reads a body whole still caps it where it did. `socks`: an
+# onion host is reached through the Tor proxy.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "socks"] }
 # Reads a server address the way the HTTP client will, so the Tor check
 # and the connection never mean two different hosts; the version
 # reqwest already pulls in, so nothing new is compiled.
 url = "2.5.8"
 # Direct, so Electrum connections can carry their own certificate
-# verifier; the same version and provider `bdk_electrum` pulls in.
+# verifier; the same version and provider `electrum-client` pulls in.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
 # The live watcher holds one connection open and waits on it, which the
@@ -48,16 +51,13 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 # The sink and stream halves of that WebSocket; arti's bootstrap events
 # use it too.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-# Ed25519 verification of premium licences and heartbeats; the version
-# rustls already pulls in, so nothing new is compiled.
-ring = "0.17"
 # Reads a certificate the way it was written: its fingerprint's
 # subject and expiry for the acceptance dialog, and its public key
 # when the certificate predates X.509 v3 and webpki declines it.
 x509-parser = { version = "0.18", default-features = false }
 serde = { version = "1", features = ["derive"] }
-# `raw_value` keeps the exact text of the signed heartbeat: a signature
-# is over bytes, not over a value re-serialized this side.
+# `raw_value` keeps the result of an Electrum answer as its text until
+# the call that asked for it says what it should be.
 serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 # Says what the core gave up on, for whatever logger the app installs;
@@ -77,7 +77,7 @@ zeroize = { version = "1", features = ["derive"] }
 fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 # Constant-time comparison of the app lock hash.
 subtle = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4"] }
 ur = "0.5"
 ciborium = "0.2"
 flate2 = "1"
@@ -94,12 +94,10 @@ tor-config = { version = "0.45", default-features = false, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-# Gzips the answers of a test server; already built for reqwest.
-flate2 = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-# So `tests/tls_provider.rs` can name the backend it expects. Already a
-# dependency above; this only makes it visible to the test crates.
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# `test-util`: a test can hold the clock of its runtime still, so that a
+# deadline under test runs out when the test says, not when a machine
+# busy with the rest of the suite gets round to it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 
 # arti pulls in `saturating-time`, whose limit search never terminates
 # on a clock coarser than a nanosecond: Windows counts 100 ns intervals,

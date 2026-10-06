@@ -11,7 +11,13 @@
 //! facts and the sigops of a transaction are read from them. A round is
 //! read a few transactions at a time, each turned into what the wallet
 //! keeps before the next ones come: what a round holds in memory is its
-//! result, not its transactions.
+//! result, not its transactions, and that result counts against what one
+//! sync may keep ([`crate::chain::KEEP_MAX`]).
+//!
+//! A transaction the wallet holds, at the height the server lists it
+//! now, is kept as it is, with the time of its block: a sync reads what
+//! is new or moved, and the transactions its inputs spend, not a round
+//! of a thousand transactions and their parents for each payment.
 
 use std::collections::{HashMap, HashSet};
 
@@ -25,6 +31,7 @@ use serde_json::json;
 use super::rpc::{CallError, Connection};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
+use crate::chain::{KEEP_MAX, Kept};
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
 use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
@@ -75,14 +82,17 @@ fn scripthash(script: &ScriptBuf) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Fetches the complete state of a single watched address.
+/// Fetches the complete state of a single watched address. `held` is
+/// what the wallet holds of it: a transaction it holds at the height the
+/// server lists it is kept as it is, and only the others are read.
 pub(crate) async fn fetch_state(
     target: &Target,
     address: &str,
     network: Network,
     proxy: Option<&str>,
+    held: &[AddressTx],
 ) -> Result<AddressWatchState, String> {
-    state_in_rounds_of(target, address, network, proxy, CONFIRMED_PER_ROUND).await
+    state_in_rounds_of(target, address, network, proxy, CONFIRMED_PER_ROUND, held).await
 }
 
 /// Fetches the next round of older transactions, after `from`.
@@ -102,10 +112,12 @@ async fn state_in_rounds_of(
     network: Network,
     proxy: Option<&str>,
     per_round: usize,
+    held: &[AddressTx],
 ) -> Result<AddressWatchState, String> {
     let ours = parse_address(address, network)?.script_pubkey();
     let hash = scripthash(&ours);
     let mut connection = Connection::open(target, proxy).await?;
+    check_network(&mut connection, network).await?;
     let tip: Tip = connection
         .call("blockchain.headers.subscribe", json!([]))
         .await?;
@@ -114,13 +126,21 @@ async fn state_in_rounds_of(
         .call("blockchain.scripthash.listunspent", json!([hash]))
         .await?;
     let (round, cursor) = round_of(&history, None, per_round)?;
-    let mut txs = read(&mut connection, &round, &ours, network).await?;
+    let kept = Kept::up_to(KEEP_MAX);
+    let mut txs = read(&mut connection, &round, &ours, network, &kept, held).await?;
 
-    let heights = txs
+    // The time of a block a transaction kept from `held` has already.
+    let mut times: HashMap<u32, u64> = txs
+        .iter()
+        .filter_map(|tx| Some((tx.height?, tx.timestamp?)))
+        .collect();
+    let heights: Vec<u32> = txs
         .iter()
         .filter_map(|tx| tx.height)
-        .chain(unspent.iter().filter_map(|coin| height_of(coin.height)));
-    let times = block_times(&mut connection, heights).await?;
+        .chain(unspent.iter().filter_map(|coin| height_of(coin.height)))
+        .filter(|height| !times.contains_key(height))
+        .collect();
+    times.extend(block_times(&mut connection, heights).await?);
     for tx in &mut txs {
         tx.timestamp = tx.height.and_then(|height| times.get(&height).copied());
     }
@@ -137,17 +157,10 @@ async fn state_in_rounds_of(
             }
         })
         .collect();
-    // Esplora counts these over the whole history. Here they cover the
-    // transactions read, which is all of them unless the history is
-    // longer than a round.
-    let funded_sats = sum_of(&txs, |tx| &tx.outputs);
-    let spent_sats = sum_of(&txs, |tx| &tx.inputs);
     Ok(AddressWatchState {
         txs,
         utxos,
         tip_height: tip.height,
-        funded_sats,
-        spent_sats,
         truncated: cursor.is_some(),
         history_cursor: cursor,
     })
@@ -166,23 +179,17 @@ async fn history_in_rounds_of(
         .parse()
         .map_err(|_| format!("invalid history cursor: {from}"))?;
     let mut connection = Connection::open(target, proxy).await?;
+    check_network(&mut connection, network).await?;
     let history = history(&mut connection, &scripthash(&ours)).await?;
     let (round, cursor) = round_of(&history, Some(from), per_round)?;
-    let mut txs = read(&mut connection, &round, &ours, network).await?;
+    let kept = Kept::up_to(KEEP_MAX);
+    let mut txs = read(&mut connection, &round, &ours, network, &kept, &[]).await?;
     let heights: Vec<u32> = txs.iter().filter_map(|tx| tx.height).collect();
     let times = block_times(&mut connection, heights).await?;
     for tx in &mut txs {
         tx.timestamp = tx.height.and_then(|height| times.get(&height).copied());
     }
     Ok(HistoryRound { txs, cursor })
-}
-
-fn sum_of(txs: &[AddressTx], side: impl Fn(&AddressTx) -> &Vec<TxIo>) -> u64 {
-    txs.iter()
-        .flat_map(|tx| side(tx).iter())
-        .filter(|io| io.is_mine)
-        .filter_map(|io| io.value_sats)
-        .fold(0u64, u64::saturating_add)
 }
 
 /// The whole history of a script. A server that will not send one this
@@ -297,18 +304,48 @@ fn decode(hex: &str, expected: Txid) -> Result<Transaction, CallError> {
     Ok(tx)
 }
 
-/// The transactions of a round, as the wallet keeps them.
+/// The transactions of a round, as the wallet keeps them, each counted
+/// in `kept`. One of `held`, what the wallet holds, at the height the
+/// server lists it now, is kept as it is: a sync reads only what is new
+/// or moved, and the transactions its inputs spend.
 async fn read(
     connection: &mut Connection,
     round: &[Picked],
     ours: &ScriptBuf,
     network: Network,
+    kept: &Kept,
+    held: &[AddressTx],
 ) -> Result<Vec<AddressTx>, String> {
+    let held: HashMap<&str, &AddressTx> = held.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
     // Outputs paying the address, from the transactions read so far:
     // what a spend from it takes as input, no fetch needed.
     let mut paid_to_us: HashMap<OutPoint, TxOut> = HashMap::new();
-    let mut read = Vec::with_capacity(round.len());
-    for chunk in round.chunks(TXS_AT_ONCE) {
+    let mut read: Vec<Option<AddressTx>> = vec![None; round.len()];
+    let mut fresh: Vec<(usize, Picked)> = Vec::new();
+    for (at, (txid, height)) in round.iter().enumerate() {
+        match held.get(txid.to_string().as_str()) {
+            Some(tx) if tx.height == *height => {
+                for (vout, output) in tx.outputs.iter().enumerate() {
+                    if output.is_mine
+                        && let Some(value) = output.value_sats
+                    {
+                        paid_to_us.insert(
+                            OutPoint::new(*txid, vout as u32),
+                            TxOut {
+                                value: bdk_wallet::bitcoin::Amount::from_sat(value),
+                                script_pubkey: ours.clone(),
+                            },
+                        );
+                    }
+                }
+                kept.add(crate::chain::held_by(tx))?;
+                read[at] = Some((*tx).clone());
+            }
+            _ => fresh.push((at, (*txid, *height))),
+        }
+    }
+    for picked in fresh.chunks(TXS_AT_ONCE) {
+        let chunk: Vec<Picked> = picked.iter().map(|(_, picked)| *picked).collect();
         let txids: Vec<Txid> = chunk.iter().map(|(txid, _)| *txid).collect();
         let txs = fetch_txs(connection, &txids).await?;
         for tx in &txs {
@@ -339,11 +376,13 @@ async fn read(
             }
         }
         fetch_outputs(connection, wanted, &mut prevouts).await?;
-        for (tx, (_, height)) in txs.iter().zip(chunk) {
-            read.push(to_address_tx(tx, *height, &prevouts, ours, network));
+        for ((tx, (_, height)), (at, _)) in txs.iter().zip(&chunk).zip(picked) {
+            let tx = to_address_tx(tx, *height, &prevouts, ours, network);
+            kept.add(crate::chain::held_by(&tx))?;
+            read[*at] = Some(tx);
         }
     }
-    Ok(read)
+    Ok(read.into_iter().flatten().collect())
 }
 
 /// Transactions by txid, in the order asked. One the server does not
@@ -404,6 +443,19 @@ async fn fetch_outputs(
             },
         )
         .await?;
+    Ok(())
+}
+
+/// Refuses a server whose genesis block is not the network's, as
+/// [`crate::chain::esplora::check_network`] does over Esplora.
+async fn check_network(connection: &mut Connection, network: Network) -> Result<(), String> {
+    let hex: String = connection
+        .call("blockchain.block.header", json!([0]))
+        .await?;
+    let genesis: Header = deserialize_hex(&hex).map_err(|_| "unexpected response".to_owned())?;
+    if !crate::chain::is_genesis_of(network, genesis.block_hash()) {
+        return Err(crate::chain::ANOTHER_NETWORK.to_owned());
+    }
     Ok(())
 }
 
@@ -518,7 +570,7 @@ fn to_address_tx(
     let extras = tx_extras::analyze(tx, |outpoint| prevouts.get(outpoint).cloned());
     AddressTx {
         txid: tx.compute_txid().to_string(),
-        net_sats: (received as i64).saturating_sub(spent as i64),
+        net_sats: crate::chain::net_sats(received, spent),
         fee_sats: fee,
         height,
         timestamp: None,
@@ -557,6 +609,99 @@ mod tests {
         (parent, payment, spend)
     }
 
+    /// What a round keeps of each transaction, its raw bytes and every
+    /// input and output, counts against what one sync may keep: a server
+    /// that sends enough of them fails the sync instead of filling
+    /// memory.
+    #[tokio::test]
+    async fn a_round_keeps_so_much_and_no_more() {
+        let server = FakeElectrum::start().await;
+        let (parent, payment, spend) = story();
+        for tx in [&parent, &payment, &spend] {
+            server.add_tx(tx);
+        }
+        let round: Vec<Picked> = vec![
+            (spend.compute_txid(), None),
+            (payment.compute_txid(), Some(90)),
+        ];
+        let ours = ScriptBuf::from_hex(OURS).unwrap();
+        let mut connection = Connection::open(&target(&server), None).await.unwrap();
+        let unbound = Kept::up_to(usize::MAX);
+        let all = read(
+            &mut connection,
+            &round,
+            &ours,
+            Network::Signet,
+            &unbound,
+            &[],
+        )
+        .await
+        .unwrap();
+        let first = crate::chain::held_by(&all[0]);
+        let tight = Kept::up_to(first);
+        let refused = read(&mut connection, &round, &ours, Network::Signet, &tight, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            refused.starts_with("the server sent more than"),
+            "{refused}"
+        );
+    }
+
+    /// What the wallet holds, at the height the server lists it now, is
+    /// not read again, nor the block it is in: a sync reads what is new
+    /// or moved, and comes to the state a whole reading gives.
+    #[tokio::test]
+    async fn a_sync_reads_only_what_is_new_or_moved() {
+        let server = FakeElectrum::start().await;
+        let (parent, payment, spend) = story();
+        for tx in [&parent, &payment, &spend] {
+            server.add_tx(tx);
+        }
+        server.set_history(
+            OURS,
+            &[(payment.compute_txid(), 90), (spend.compute_txid(), 0)],
+        );
+        server.set_unspent(OURS, &[(spend.compute_txid(), 1, 0, 19_500)]);
+        let asked = |method: &str| {
+            let state = server.state.lock().unwrap();
+            state.asked.iter().filter(|asked| *asked == method).count()
+        };
+        let fetch = |held: Vec<AddressTx>| {
+            let target = target(&server);
+            async move {
+                fetch_state(&target, ADDRESS, Network::Signet, None, &held)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let whole = fetch(Vec::new()).await;
+        let (txs, headers) = (
+            asked("blockchain.transaction.get"),
+            asked("blockchain.block.header"),
+        );
+        assert_eq!(txs, 3, "both, and the parent of the payment");
+        let again = fetch(whole.txs.clone()).await;
+        assert_eq!(again, whole);
+        assert_eq!(asked("blockchain.transaction.get"), txs);
+        // The genesis block, and no other.
+        assert_eq!(asked("blockchain.block.header"), headers + 1);
+
+        // The spend confirms: it alone is read, its input paid by the
+        // payment the wallet holds, and the one block it is in.
+        server.set_history(
+            OURS,
+            &[(payment.compute_txid(), 90), (spend.compute_txid(), 95)],
+        );
+        server.set_unspent(OURS, &[(spend.compute_txid(), 1, 95, 19_500)]);
+        let moved = fetch(again.txs.clone()).await;
+        assert_eq!(asked("blockchain.transaction.get"), txs + 1);
+        assert_eq!(asked("blockchain.block.header"), headers + 3);
+        assert_eq!(moved.txs[0].height, Some(95));
+        assert_eq!(moved, fetch(Vec::new()).await);
+    }
+
     #[tokio::test]
     async fn an_address_reads_over_electrum_as_over_esplora() {
         let server = FakeElectrum::start().await;
@@ -570,7 +715,7 @@ mod tests {
         );
         server.set_unspent(OURS, &[(spend.compute_txid(), 1, 0, 19_500)]);
 
-        let state = fetch_state(&target(&server), ADDRESS, Network::Signet, None)
+        let state = fetch_state(&target(&server), ADDRESS, Network::Signet, None, &[])
             .await
             .unwrap();
         assert_eq!(state.tip_height, 100);
@@ -607,7 +752,6 @@ mod tests {
                 timestamp: None,
             }]
         );
-        assert_eq!((state.funded_sats, state.spent_sats), (69_500, 50_000));
         assert!(!state.truncated);
         assert_eq!(state.history_cursor, None);
         assert_eq!(crate::wallet::views::address_balance(&state).total, 19_500);
@@ -635,7 +779,7 @@ mod tests {
         let txid = |n: usize| payments[n].compute_txid().to_string();
         let target = target(&server);
 
-        let first = state_in_rounds_of(&target, ADDRESS, Network::Signet, None, 2)
+        let first = state_in_rounds_of(&target, ADDRESS, Network::Signet, None, 2, &[])
             .await
             .unwrap();
         let listed: Vec<String> = first.txs.iter().map(|tx| tx.txid.clone()).collect();
@@ -684,7 +828,7 @@ mod tests {
             "blockchain.scripthash.get_history",
             "history too large".to_owned(),
         );
-        let refused = fetch_state(&target(&server), ADDRESS, Network::Signet, None)
+        let refused = fetch_state(&target(&server), ADDRESS, Network::Signet, None, &[])
             .await
             .unwrap_err();
         assert!(
@@ -696,7 +840,7 @@ mod tests {
         let server = FakeElectrum::start().await;
         server.state.lock().unwrap().flood =
             Some(("blockchain.scripthash.get_history", MAX_LINE + 4096));
-        let flooded = fetch_state(&target(&server), ADDRESS, Network::Signet, None)
+        let flooded = fetch_state(&target(&server), ADDRESS, Network::Signet, None, &[])
             .await
             .unwrap_err();
         assert!(
@@ -716,7 +860,7 @@ mod tests {
             payment.compute_txid(),
             bdk_wallet::bitcoin::consensus::encode::serialize_hex(&spend),
         );
-        let error = fetch_state(&target(&server), ADDRESS, Network::Signet, None)
+        let error = fetch_state(&target(&server), ADDRESS, Network::Signet, None, &[])
             .await
             .unwrap_err();
         assert_eq!(error, "unexpected response");
@@ -729,7 +873,7 @@ mod tests {
             "tcp://gerfautexample000000000000000000000000000000000000000.onion:50001",
             None,
         );
-        let error = fetch_state(&onion, ADDRESS, Network::Signet, None)
+        let error = fetch_state(&onion, ADDRESS, Network::Signet, None, &[])
             .await
             .unwrap_err();
         assert!(error.starts_with("tor: "), "{error}");
@@ -813,7 +957,7 @@ mod tests {
                 continue;
             };
             let Ok(stats) = addresses
-                .get_json::<bdk_esplora::esplora_client::api::AddressStats>(&format!(
+                .get_json::<crate::chain::esplora::api::AddressStats>(&format!(
                     "/address/{candidate}"
                 ))
                 .await
@@ -828,7 +972,7 @@ mod tests {
         let address = address.expect("a recent signet address with a short history");
         println!("reading {address}");
         let by_esplora =
-            crate::chain::esplora::fetch_address_state(&addresses, &address, Network::Signet)
+            crate::chain::esplora::fetch_address_state(&addresses, &address, Network::Signet, &[])
                 .await
                 .unwrap();
 
@@ -849,6 +993,7 @@ mod tests {
             &address,
             Network::Signet,
             None,
+            &[],
         )
         .await
         .unwrap();

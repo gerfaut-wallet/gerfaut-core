@@ -70,7 +70,8 @@ pub(crate) async fn check_update(
     let budget = if proxy.is_some() { 60 } else { 15 };
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(budget))
-        .user_agent("gerfaut");
+        .user_agent("gerfaut")
+        .redirect(crate::chain::redirects());
     if let Some(proxy) = proxy {
         let proxy = reqwest::Proxy::all(format!("socks5h://{proxy}"))
             .map_err(|e| CoreError::Tor(format!("invalid Tor proxy address: {e}")))?;
@@ -261,6 +262,7 @@ mod tests {
                 Network::Mainnet,
                 BackendConfig::CustomElectrum {
                     url: ONION.to_owned(),
+                    own_node: false,
                 },
             )
             .await
@@ -307,6 +309,7 @@ mod tests {
                 Network::Mainnet,
                 BackendConfig::CustomElectrum {
                     url: ONION.to_owned(),
+                    own_node: false,
                 },
             )
             .await

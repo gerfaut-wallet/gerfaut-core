@@ -36,6 +36,15 @@
 //! - [`WalletManager::live_tick`] is for a host whose timers stop
 //!   while it sleeps: call it from an alarm every few minutes, and
 //!   when the network comes back.
+//! - The status ([`WalletManager::live_status`], [`LiveEvent::Status`])
+//!   says how much of each wallet the watch hears, and what it leaves
+//!   to the regular syncs: the scripts past what it takes of one
+//!   wallet, or of all of them ([`crate::watch::WatchLimits`]). A
+//!   payment to one of those shows at the next sync. The user's own
+//!   node lifts both limits ([`crate::chain::BackendConfig::is_own_node`]);
+//!   pinned wallets come first
+//!   ([`WalletManager::set_wallet_live_pinned`]), then those holding
+//!   coins.
 //! - Stop the watch before the vault locks.
 //!
 //! # At exit
@@ -44,14 +53,17 @@
 //! connection is doing: the watcher is dropped where it waits, the
 //! syncs it started are abandoned with their connections, and the
 //! receiver of the events ends right after what it already holds.
-//! Nothing of the core runs on the blocking pool of the runtime (a name
-//! lookup aside, which the system resolver bounds), so a host can then
-//! exit the process, or drop its runtime with
+//! Nothing of the core waits on a server from the blocking pool of the
+//! runtime: what runs there is a name lookup, which the system resolver
+//! bounds, and the parsing of an Esplora answer as it arrives, which
+//! ends the moment the answer stops coming. So a host can then exit the
+//! process, or drop its runtime with
 //! [`tokio::runtime::Runtime::shutdown_timeout`], without waiting on a
 //! server. A sync the host started itself is abandoned the same way
 //! when its future is dropped.
 
 use std::collections::{BTreeSet, HashMap};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -60,17 +72,19 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
-use bdk_wallet::bitcoin::ScriptBuf;
+use bdk_wallet::bitcoin::{Address, ScriptBuf};
 
 use crate::chain::Endpoint;
 use crate::error::CoreResult;
-use crate::manager::{ManagerState, Reach, WalletManager};
+use crate::manager::{ManagerState, Reach, WalletManager, ensure_engine, find_record};
 use crate::network::Network;
 use crate::store::TxStage;
+use crate::wallet::meta::WalletKind;
 use crate::wallet::snapshot::SyncReport;
+use crate::wallet::views;
 use crate::watch::{
-    ChangeReason, LiveWatch, Timings, WatchConfig, WatchEvent, WatchEvents, WatchStatus,
-    WatchedWallet,
+    ChangeReason, LiveWatch, Timings, WatchConfig, WatchEvent, WatchEvents, WatchLimits,
+    WatchStatus, WatchedScript, WatchedWallet,
 };
 
 pub(crate) mod news;
@@ -210,6 +224,15 @@ impl Asked {
         }
     }
 
+    /// Whether this is the server's word that scripts moved: a change it
+    /// pushed, or the scripts whose status differs at a start or after a
+    /// reconnection. A block is not, nor a catch-up that cannot say what
+    /// moved, nor what the watch reads of its own accord.
+    fn claimed(&self) -> bool {
+        self.reason == ChangeReason::Activity
+            || (self.scripts.is_some() && self.reason != ChangeReason::NewBlock)
+    }
+
     /// How much of the wallet the sync reads: the scripts that moved; the
     /// ones waiting for a block, for a block; every script, counters
     /// first, when the transport cannot say which moved. A script past
@@ -243,16 +266,19 @@ type Synced = Result<SyncReport, String>;
 /// app pay that for as long as the watch runs. So past [`FREE_FUTILE`]
 /// such changes in a row, the sync the next one asks for waits, twice
 /// as long each time, up to a cap. A sync that finds something,
-/// whatever asked for it, ends the wait. A block, a reconnection and
-/// the catch-up of a start never wait: only what the server claims
-/// about a script does.
+/// whatever asked for it, ends the wait. A block, and the catch-up of a
+/// start or a reconnection that cannot say what moved, never wait: only
+/// what the server claims about a script does ([`Asked::claimed`]). A
+/// status that differs after a reconnection is such a claim: a server
+/// that drops the connection every minute and answers with statuses it
+/// made up would otherwise have them synced as often.
 #[derive(Debug, Default)]
 struct Futile(HashMap<String, u32>);
 
 impl Futile {
     /// How long the sync `asked` for this wallet waits before it runs.
     fn hold(&self, wallet_id: &str, asked: &Asked, timings: &Timings) -> Duration {
-        if asked.reason != ChangeReason::Activity {
+        if !asked.claimed() {
             return Duration::ZERO;
         }
         let futile = self.0.get(wallet_id).copied().unwrap_or(0);
@@ -270,7 +296,7 @@ impl Futile {
     fn settle(&mut self, wallet_id: &str, asked: &Asked, found: bool) {
         if found {
             self.0.remove(wallet_id);
-        } else if asked.reason == ChangeReason::Activity {
+        } else if asked.claimed() {
             let futile = self.0.entry(wallet_id.to_owned()).or_default();
             *futile = futile.saturating_add(1);
         }
@@ -315,9 +341,11 @@ fn config_of(state: &ManagerState) -> WatchConfig {
     }
 }
 
-/// The wallets of a network as the watcher takes them.
+/// The wallets of a network as the watcher takes them, each listed up
+/// to what a watch under the network's backend takes of one wallet.
 fn list_of(state: &mut ManagerState, network: Network) -> Vec<WatchedWallet> {
     let gap_limit = state.payload.settings.gap_limit;
+    let limits = WatchLimits::of(&state.payload.settings.backend_for(network));
     let ids: Vec<String> = state
         .payload
         .wallets
@@ -326,8 +354,111 @@ fn list_of(state: &mut ManagerState, network: Network) -> Vec<WatchedWallet> {
         .map(|record| record.meta.id.clone())
         .collect();
     ids.into_iter()
-        .filter_map(|id| crate::manager::watched_wallet(state, &id, gap_limit))
+        .filter_map(|id| watched_wallet(state, &id, gap_limit, limits.per_wallet))
         .collect()
+}
+
+/// One wallet as the live watch takes it: its scripts in the order a
+/// transport should cover them, `per_wallet` at most, whether it waits
+/// for a block, whether the user pinned it and whether it holds coins.
+/// `None` for a wallet that cannot be read, which is then not watched.
+fn watched_wallet(
+    state: &mut ManagerState,
+    id: &str,
+    gap_limit: u32,
+    per_wallet: usize,
+) -> Option<WatchedWallet> {
+    let record = find_record(&state.payload, id).ok()?;
+    let pinned = record.meta.live_pinned;
+    let (scripts, has_pending, holds_coins) = match &record.meta.kind {
+        WalletKind::SingleAddress { address } => {
+            let script = Address::from_str(address)
+                .ok()?
+                .require_network(record.meta.network.to_bitcoin())
+                .ok()?
+                .script_pubkey();
+            let has_pending = record
+                .address_state
+                .as_ref()
+                .is_some_and(|watch| watch.txs.iter().any(|tx| tx.height.is_none()));
+            let holds_coins = record
+                .address_state
+                .as_ref()
+                .is_some_and(|watch| !watch.utxos.is_empty());
+            let scripts = (
+                vec![WatchedScript {
+                    script: script.to_hex_string(),
+                    lookahead: false,
+                    status: record
+                        .address_state
+                        .as_ref()
+                        .and_then(views::address_status),
+                    // Its history may be cut short: nothing to compare
+                    // counters with.
+                    counts: None,
+                }],
+                0,
+            );
+            (scripts, has_pending, holds_coins)
+        }
+        WalletKind::Descriptors { .. } => {
+            let orders = std::mem::take(&mut state.orders);
+            let listed = ensure_engine(state, id).ok().map(|engine| {
+                (
+                    views::watch_scripts(engine, gap_limit, &orders, per_wallet),
+                    views::has_pending(engine),
+                    views::holds_coins(engine),
+                )
+            });
+            state.orders = orders;
+            listed?
+        }
+    };
+    // A wallet never synced holds nothing yet, which says nothing of
+    // what its scripts hold: an empty status matches none a server
+    // gives, and the watch syncs it once it starts.
+    let never_synced = find_record(&state.payload, id)
+        .ok()?
+        .meta
+        .last_sync
+        .is_none();
+    let (scripts, unlisted) = scripts;
+    let scripts = scripts
+        .into_iter()
+        .map(|script| WatchedScript {
+            status: if never_synced {
+                Some(String::new())
+            } else {
+                script.status
+            },
+            ..script
+        })
+        .collect();
+    Some(WatchedWallet {
+        wallet_id: id.to_owned(),
+        scripts,
+        has_pending,
+        pinned,
+        holds_coins,
+        unlisted,
+    })
+}
+
+/// The scripts a sync reads to look again for the payments of a wallet
+/// earlier syncs saw vanish, those whose second look is due at `now`:
+/// `None` when none is, empty for a watched address, whose sync reads
+/// its one script whatever it is asked.
+fn vanished_scripts(state: &mut ManagerState, id: &str, now: u64) -> Option<Vec<String>> {
+    let due = news::vanishing_due(&state.payload, id, now);
+    if due.is_empty() {
+        return None;
+    }
+    let record = find_record(&state.payload, id).ok()?;
+    if matches!(record.meta.kind, WalletKind::SingleAddress { .. }) {
+        return Some(Vec::new());
+    }
+    let engine = ensure_engine(state, id).ok()?;
+    Some(views::scripts_touched_by(engine, &due)).filter(|scripts| !scripts.is_empty())
 }
 
 impl WalletManager {
@@ -408,7 +539,8 @@ impl WalletManager {
         }
     }
 
-    /// Where the watch stands; off when none runs.
+    /// Where the watch stands, and how much of each wallet it hears;
+    /// off, and nothing heard, when none runs.
     pub async fn live_status(&self) -> WatchStatus {
         match self.live_slot().as_ref() {
             Some(running) => running.watch.status(),
@@ -540,7 +672,7 @@ impl WalletManager {
 
     /// Takes up to `max` pieces of the news waiting for a wallet.
     async fn claim_news(&self, wallet_id: &str, max: usize) -> CoreResult<Vec<LiveTx>> {
-        let now = crate::manager::now_secs();
+        let now = crate::now_secs();
         let mut state = self.state.lock().await;
         if max == 0 || news::waiting(&state.payload, wallet_id, now) == 0 {
             return Ok(Vec::new());
@@ -551,7 +683,7 @@ impl WalletManager {
     /// The wallets of the watched network with news nobody claimed, each
     /// with a report of its last sync, as the vault keeps it.
     async fn unclaimed_reports(&self) -> Vec<SyncReport> {
-        let now = crate::manager::now_secs();
+        let now = crate::now_secs();
         let state = self.state.lock().await;
         let network = state.payload.settings.active_network;
         state
@@ -584,7 +716,7 @@ impl WalletManager {
 
     /// How much news waits for a wallet.
     async fn news_waiting(&self, wallet_id: &str) -> usize {
-        let now = crate::manager::now_secs();
+        let now = crate::now_secs();
         news::waiting(&self.state.lock().await.payload, wallet_id, now)
     }
 
@@ -613,6 +745,8 @@ impl WalletManager {
         // When the watch last ran the complete sync of a wallet it found
         // due: one that failed is not tried again at every look.
         let mut tried: HashMap<String, tokio::time::Instant> = HashMap::new();
+        // The same for the look at a payment a sync saw vanish.
+        let mut rechecked: HashMap<String, tokio::time::Instant> = HashMap::new();
         // How often the watch looks for both, besides at each block.
         let mut looks = tokio::time::interval_at(tokio::time::Instant::now() + pace.due, pace.due);
         looks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -649,7 +783,7 @@ impl WalletManager {
                             continue;
                         }
                         WatchEvent::NewBlock { height } => {
-                            self.look(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, &mut owed, &mut tried).await;
+                            self.look(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, &mut owed, &mut tried, &mut rechecked).await;
                             LiveEvent::NewBlock { height }
                         }
                         WatchEvent::Status(status) => LiveEvent::Status(status),
@@ -668,6 +802,7 @@ impl WalletManager {
                     again.clear();
                     owed.clear();
                     tried.clear();
+                    rechecked.clear();
                 }
                 Some(report) = offered.recv() => {
                     // A sync of the watch's own under way claims it.
@@ -688,7 +823,7 @@ impl WalletManager {
                     }
                 }
                 _ = looks.tick() => {
-                    self.look(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, &mut owed, &mut tried).await;
+                    self.look(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, &mut owed, &mut tried, &mut rechecked).await;
                 }
                 Some(done) = syncs.join_next_with_id() => {
                     let (task, outcome) = match done {
@@ -835,7 +970,9 @@ impl WalletManager {
     /// day. The syncs the watch asks for read only what moved, and a
     /// phone can keep a watch for days with no other sync: this is what
     /// reads, once a day, whatever the watch cannot hear, such as a
-    /// script past what it follows of a wallet.
+    /// script past what it follows of a wallet. And the scripts of a
+    /// payment a sync saw vanish, ten minutes on, for a second sync to
+    /// say whether it dropped: nothing moves on them after it left.
     #[allow(clippy::too_many_arguments)]
     async fn look(
         &self,
@@ -847,12 +984,14 @@ impl WalletManager {
         pace: &Timings,
         owed: &mut HashMap<String, Asked>,
         tried: &mut HashMap<String, tokio::time::Instant>,
+        rechecked: &mut HashMap<String, tokio::time::Instant>,
     ) {
         if self.watch_serving().is_none() {
             return;
         }
         let now = tokio::time::Instant::now();
         tried.retain(|_, at| now.duration_since(*at) < DUE_RETRY);
+        rechecked.retain(|_, at| now.duration_since(*at) < DUE_RETRY);
         let mut asks: Vec<(String, Asked)> = owed.drain().collect();
         for wallet_id in self.due_complete().await {
             if tried.contains_key(&wallet_id) {
@@ -860,6 +999,14 @@ impl WalletManager {
             }
             tried.insert(wallet_id.clone(), now);
             asks.push((wallet_id, Asked::of(ChangeReason::Started, Vec::new())));
+        }
+        for (wallet_id, scripts) in self.due_rechecks().await {
+            if rechecked.contains_key(&wallet_id) {
+                continue;
+            }
+            rechecked.insert(wallet_id.clone(), now);
+            // Read as for a block: what is named, and no wait.
+            asks.push((wallet_id, Asked::of(ChangeReason::NewBlock, scripts)));
         }
         for (wallet_id, asked) in asks {
             self.ask(
@@ -871,7 +1018,7 @@ impl WalletManager {
     /// The wallets of the watched network whose last complete sync is a
     /// day old, or that never had one.
     async fn due_complete(&self) -> Vec<String> {
-        let now = crate::manager::now_secs();
+        let now = crate::now_secs();
         let state = self.state.lock().await;
         let network = state.payload.settings.active_network;
         state
@@ -881,6 +1028,24 @@ impl WalletManager {
             .filter(|record| record.meta.network == network)
             .filter(|record| !crate::manager::complete_lately(&record.meta, now))
             .map(|record| record.meta.id.clone())
+            .collect()
+    }
+
+    /// The wallets of the watched network with a payment a sync saw
+    /// vanish whose second look is due, and the scripts to read for it.
+    async fn due_rechecks(&self) -> Vec<(String, Vec<String>)> {
+        let now = crate::now_secs();
+        let mut state = self.state.lock().await;
+        let network = state.payload.settings.active_network;
+        let ids: Vec<String> = state
+            .payload
+            .wallets
+            .iter()
+            .filter(|record| record.meta.network == network)
+            .map(|record| record.meta.id.clone())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| vanished_scripts(&mut state, &id, now).map(|scripts| (id, scripts)))
             .collect()
     }
 

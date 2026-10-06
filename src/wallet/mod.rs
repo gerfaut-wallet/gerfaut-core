@@ -24,14 +24,9 @@ pub struct AddressWatchState {
     pub utxos: Vec<AddressUtxo>,
     /// Chain tip height at the last sync.
     pub tip_height: u32,
-    /// Sum of outputs funding the address, in satoshis (confirmed and
-    /// mempool combined).
-    pub funded_sats: u64,
-    /// Sum of inputs spending from the address, in satoshis (confirmed
-    /// and mempool combined).
-    pub spent_sats: u64,
     /// True when the address has more history than the sync fetched;
-    /// the totals above remain exact (they come from backend stats).
+    /// the coins above, and the balance read from them, still cover
+    /// all of it.
     #[serde(default)]
     pub truncated: bool,
     /// Txid to continue the history from, when older transactions

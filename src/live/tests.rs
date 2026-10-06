@@ -239,6 +239,9 @@ fn timings() -> crate::watch::Timings {
         hold: Duration::from_millis(100),
         hold_cap: Duration::from_millis(400),
         due: Duration::from_millis(100),
+        refused: Duration::from_millis(600),
+        limit_kept: Duration::from_secs(3600),
+        zero_limit_kept: Duration::from_secs(3600),
     }
 }
 
@@ -644,7 +647,7 @@ async fn cold_wallet(dir: &std::path::Path, server: &FakeElectrum) -> (WalletMan
 
 /// Makes the last complete sync of a wallet a day and an hour old.
 async fn age(manager: &WalletManager, wallet: &str) -> u64 {
-    let old = crate::manager::now_secs() - 25 * 60 * 60;
+    let old = crate::now_secs() - 25 * 60 * 60;
     let mut state = manager.state.lock().await;
     let record = state
         .payload
@@ -832,9 +835,9 @@ async fn a_sync_never_takes_a_watch_server_of_another_network() {
 }
 
 /// A server behind the wallet whose chain never meets the wallet's, one
-/// of another network: the sync fails, and the payment the wallet holds
-/// is not taken for gone from the chain. A server that only lags is
-/// read as before.
+/// of another network: the sync fails, saying so once the first block
+/// differs, and the payment the wallet holds is not taken for gone from
+/// the chain. A server that only lags is read as before.
 #[tokio::test]
 async fn a_server_behind_on_another_chain_is_refused() {
     let server = FakeElectrum::start().await;
@@ -855,13 +858,41 @@ async fn a_server_behind_on_another_chain_is_refused() {
         state.histories.clear();
     }
     let refused = manager.rescan_wallet(&wallet).await.unwrap_err();
-    assert!(refused.to_string().contains("never meets"), "{refused}");
+    assert!(
+        refused.to_string().contains(crate::chain::ANOTHER_NETWORK),
+        "{refused}"
+    );
     assert!(manager.sync_wallet(&wallet).await.is_err());
     assert!(held().await, "the payment was taken for gone");
 
     // The same chain, only behind: read.
     server.state.lock().unwrap().genesis = None;
     manager.sync_wallet(&wallet).await.unwrap();
+}
+
+/// A watched address keeps no chain to hold a server to: the server is
+/// asked for its genesis block instead, over either protocol, and one of
+/// another network is refused before it answers for an address that
+/// network spells alike.
+#[tokio::test]
+async fn an_address_is_never_read_on_another_network() {
+    let electrum = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), electrum.backend()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    electrum.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    let refused = manager.sync_wallet(&wallet).await.unwrap_err();
+    assert!(refused.to_string().contains("another network"), "{refused}");
+
+    let esplora = FakeMempool::start(false, 0).await;
+    manager
+        .set_backend(Network::Signet, esplora.backend())
+        .await
+        .unwrap();
+    manager.sync_wallet(&wallet).await.unwrap();
+    esplora.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    let refused = manager.sync_wallet(&wallet).await.unwrap_err();
+    assert!(refused.to_string().contains("another network"), "{refused}");
 }
 
 /// The watch moves to another network while it owes a wallet of the old
@@ -1029,9 +1060,9 @@ async fn next_sync(events: &mut LiveEvents, wallet: &str) -> (SyncReport, Durati
 }
 
 /// Past two pushed changes in a row that a sync found nothing behind,
-/// the next one waits, twice as long each time, up to the cap. Blocks,
-/// reconnections and starts never wait, nor does another wallet, and a
-/// sync that finds something ends the wait.
+/// the next one waits, twice as long each time, up to the cap. Blocks
+/// never wait, nor does another wallet, and a sync that finds something
+/// ends the wait.
 #[test]
 fn a_change_no_sync_finds_is_heard_less_and_less_often() {
     let second = Duration::from_secs(1);
@@ -1062,6 +1093,20 @@ fn a_change_no_sync_finds_is_heard_less_and_less_often() {
     assert_eq!(futile.hold("w", pushed, &pace), second * 5);
     futile.settle("w", block, true);
     assert_eq!(futile.hold("w", pushed, &pace), Duration::ZERO);
+
+    // Statuses that differ after a reconnection are the server's word as
+    // much as a pushed change: one that drops the connection again and
+    // again with statuses it made up is held the same. What the watch
+    // reads of its own accord is not.
+    let reconnected = &Asked::of(ChangeReason::Reconnected, vec!["00".to_owned()]);
+    let looked = &Asked::of(ChangeReason::NewBlock, vec!["00".to_owned()]);
+    let mut futile = Futile::default();
+    for _ in 0..FREE_FUTILE {
+        futile.settle("w", reconnected, false);
+        futile.settle("w", looked, false);
+    }
+    assert_eq!(futile.hold("w", reconnected, &pace), second);
+    assert_eq!(futile.hold("w", looked, &pace), Duration::ZERO);
 }
 
 /// A server forges a new status for the watched address again and
@@ -1152,14 +1197,27 @@ async fn a_fee_bump_is_announced_once_and_confirms_once() {
     assert!(sync_and_claim(&manager, &wallet).await.is_empty());
 }
 
+/// Moves the payments a sync saw vanish ten minutes back, as if the
+/// next sync came that much later.
+async fn ten_minutes_on(manager: &WalletManager) {
+    for entry in &mut manager.state.lock().await.payload.vanishing {
+        entry.missed_at -= news::DROPPED_AFTER;
+    }
+}
+
 /// The sender replaces the payment with one that no longer pays the
-/// address: it vanishes, and that is said once.
+/// address: it vanishes, and that is said once, by the sync that does
+/// not see it either ten minutes after the first.
 #[tokio::test]
 async fn a_bump_that_stops_paying_is_announced_as_dropped_once() {
     let server = FakeMempool::start(false, 0).await;
     let dir = tempfile::tempdir().unwrap();
     let (manager, wallet) = paid(&server, dir.path()).await;
     server.state.lock().unwrap().address_txs = Vec::new();
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    // Read again at once: the same server may still lag.
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    ten_minutes_on(&manager).await;
     let claimed = sync_and_claim(&manager, &wallet).await;
     assert_eq!(
         claimed,
@@ -1172,6 +1230,58 @@ async fn a_bump_that_stops_paying_is_announced_as_dropped_once() {
         }]
     );
     assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+}
+
+/// A server that does not list the payment, one that lags or one of a
+/// rotation that never heard of it, and the next sync lists it again:
+/// it is never said dropped, and the vault keeps nothing of it.
+#[tokio::test]
+async fn a_payment_one_sync_misses_is_not_announced_as_dropped() {
+    let server = FakeMempool::start(false, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = paid(&server, dir.path()).await;
+    server.state.lock().unwrap().address_txs = Vec::new();
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    server.state.lock().unwrap().address_txs = vec![esplora_payment(0x11, 0x22, 50_000, false)];
+    ten_minutes_on(&manager).await;
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    assert!(manager.state.lock().await.payload.vanishing.is_empty());
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+}
+
+/// A wallet removed takes with it the payments its syncs saw vanish:
+/// kept, they stayed in the vault for days, a removed wallet's.
+#[tokio::test]
+async fn a_removed_wallet_leaves_no_vanished_payment_behind() {
+    let server = FakeMempool::start(false, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = paid(&server, dir.path()).await;
+    server.state.lock().unwrap().address_txs = Vec::new();
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    assert_eq!(manager.state.lock().await.payload.vanishing.len(), 1);
+    manager.remove_wallet(&wallet).await.unwrap();
+    assert!(manager.state.lock().await.payload.vanishing.is_empty());
+}
+
+/// While the watch runs, a payment a sync saw vanish is looked at again
+/// ten minutes on, and said dropped then: nothing moves on its scripts
+/// after it left, and the next sync that reads them may be a day away.
+#[tokio::test]
+async fn the_watch_looks_again_at_a_payment_that_vanished() {
+    let server = FakeMempool::start(false, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = paid(&server, dir.path()).await;
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    assert!(caught_up(&mut events, &wallet).await.is_empty());
+    server.state.lock().unwrap().address_txs = Vec::new();
+    assert!(sync_and_claim(&manager, &wallet).await.is_empty());
+    ten_minutes_on(&manager).await;
+    let dropped = next_announcement(&mut events).await;
+    assert_eq!(
+        (dropped.txid.as_str(), dropped.stage),
+        (txid(0x11).as_str(), TxStage::Dropped)
+    );
+    manager.live_stop().await;
 }
 
 /// The sender replaces the payment with one that leaves the address a
@@ -1238,13 +1348,24 @@ fn a_descriptor_wallet_tells_replacements_and_vanished_payments() {
         .to_hex_string();
     let theirs = crate::testkit::script(9);
     let mut payload = VaultPayload::default();
-    // One sync: what the engine holds after `change`, against before.
-    let mut sync = |engine: &mut bdk_wallet::Wallet, change: &dyn Fn(&mut bdk_wallet::Wallet)| {
+    // One sync at `now` that read `read` of the wallet's scripts, all of
+    // them with `None`: what the engine holds after `change`, against
+    // before.
+    let mut sync_reading = |engine: &mut bdk_wallet::Wallet,
+                            now: u64,
+                            read: Option<&std::collections::HashSet<ScriptBuf>>,
+                            change: &dyn Fn(&mut bdk_wallet::Wallet)| {
+        let vanishing = news::vanishing(&payload, "w");
         let before = views::known(engine);
         change(engine);
         let moves = views::moves(engine, &before);
-        news::record(&mut payload, "w", false, &moves, NOW);
-        news::claim(&mut payload, "w", 10, NOW)
+        let recheck = views::recheck(engine, &vanishing, read);
+        news::record(&mut payload, "w", false, &moves, now);
+        news::settle(&mut payload, "w", &recheck, now);
+        news::claim(&mut payload, "w", 10, now)
+    };
+    let mut sync = |engine: &mut bdk_wallet::Wallet, change: &dyn Fn(&mut bdk_wallet::Wallet)| {
+        sync_reading(engine, NOW, None, change)
     };
     let pays = |n: u8, sats: u64| transaction(&[nowhere(n, 0)], &[(ours.as_str(), sats)]);
 
@@ -1299,12 +1420,25 @@ fn a_descriptor_wallet_tells_replacements_and_vanished_payments() {
         engine.apply_unconfirmed_txs([(elsewhere.clone(), 500)]);
         engine.apply_evicted_txs([(second.compute_txid(), 500)]);
     });
+    assert!(claimed.is_empty(), "one sync says nothing yet");
+    // What the watch reads to look for it again: the script it paid.
+    assert_eq!(
+        views::scripts_touched_by(&engine, &[second.compute_txid().to_string()]),
+        [ours.as_str()]
+    );
+    // Ten minutes on, a sync that read other scripts says nothing either;
+    // one that read the payment's says it dropped.
+    let later = NOW + news::DROPPED_AFTER;
+    let other = std::collections::HashSet::from([ScriptBuf::from_hex(&theirs).unwrap()]);
+    assert!(sync_reading(&mut engine, later, Some(&other), &|_| {}).is_empty());
+    let paid_to = std::collections::HashSet::from([ScriptBuf::from_hex(&ours).unwrap()]);
+    let claimed = sync_reading(&mut engine, later, Some(&paid_to), &|_| {});
     assert_eq!(
         staged(&claimed),
         [(second.compute_txid().to_string(), TxStage::Dropped)]
     );
     assert_eq!(claimed[0].net_sats, 20_000);
-    assert!(sync(&mut engine, &|_| {}).is_empty());
+    assert!(sync_reading(&mut engine, later, None, &|_| {}).is_empty());
 }
 
 /// A block heard in the same burst as a start or a reconnection, which

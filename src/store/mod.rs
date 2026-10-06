@@ -2,10 +2,11 @@
 //!
 //! The vault is a single encrypted file (see [`cipher`]) containing the
 //! wallet list, per-wallet chain state (BDK change sets, address-watch
-//! state), and settings. Wallet-scale data is small, so the whole
-//! payload is rewritten atomically on each save — no partial-write
-//! states to reason about, and the file is unreadable at rest without
-//! the key.
+//! state), and settings. The whole payload is rewritten atomically on
+//! each save — no partial-write states to reason about, and the file is
+//! unreadable at rest without the key. The price is a save that grows
+//! with the wallets: a BDK change set keeps every transaction, and a
+//! setting toggled rewrites them all.
 
 pub mod cipher;
 
@@ -19,15 +20,21 @@ use crate::chain::tor::TorSettings;
 use crate::error::VaultError;
 use crate::lock::AppLock;
 use crate::network::Network;
-use crate::premium::PremiumState;
 use crate::wallet::AddressWatchState;
 use crate::wallet::meta::WalletMeta;
 
-pub use cipher::{VaultKdf, VaultKey};
+pub use cipher::VaultKey;
 
-/// Current payload schema version. Bump on breaking changes and migrate
-/// in [`Vault::load`].
-const PAYLOAD_VERSION: u32 = 1;
+/// Current payload schema version. A build refuses a vault of a later
+/// version rather than read it without the fields it does not know and
+/// write it back without them, so the version goes up with every field
+/// whose loss costs something, not only with a breaking change. An
+/// earlier version is read as it is, new fields at their defaults, and
+/// written back as the current one; a migration that needs more goes in
+/// [`Vault::load`]. A field an earlier build wrote and this one no
+/// longer has is skipped as the payload is read, and left out of the
+/// next save.
+const PAYLOAD_VERSION: u32 = 2;
 
 /// One wallet and its chain state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,8 +45,34 @@ pub struct WalletRecord {
     #[serde(default)]
     pub changeset: Option<bdk_wallet::ChangeSet>,
     /// State of single-address wallets.
-    #[serde(default)]
+    #[serde(default, serialize_with = "address_state_as_stored")]
     pub address_state: Option<AddressWatchState>,
+}
+
+/// A watched address as the vault keeps it: with two totals that vaults
+/// of the first version carried, written as zero. No build reads them
+/// any more, but a build of that version requires them, and reads the
+/// whole payload before its version: without them, it would call a
+/// vault of a later build corrupted instead of refusing it as one.
+fn address_state_as_stored<S: serde::Serializer>(
+    state: &Option<AddressWatchState>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Stored<'a> {
+        #[serde(flatten)]
+        state: &'a AddressWatchState,
+        funded_sats: u64,
+        spent_sats: u64,
+    }
+    state
+        .as_ref()
+        .map(|state| Stored {
+            state,
+            funded_sats: 0,
+            spent_sats: 0,
+        })
+        .serialize(serializer)
 }
 
 /// Global settings stored in the vault.
@@ -75,11 +108,6 @@ pub struct Settings {
     /// existed read as the default, the system Tor first.
     #[serde(default)]
     pub tor: TorSettings,
-    /// The premium account: its key, its last certificate, and which
-    /// wallets the user agreed to send to the server. In the encrypted
-    /// file because the key is the account. Empty until one is entered.
-    #[serde(default)]
-    pub premium: PremiumState,
 }
 
 fn default_gap_limit() -> u32 {
@@ -96,7 +124,6 @@ impl Default for Settings {
             electrum_certs: BTreeMap::new(),
             app_lock: None,
             tor: TorSettings::default(),
-            premium: PremiumState::default(),
         }
     }
 }
@@ -169,6 +196,26 @@ pub struct Unclaimed {
     pub replaces: Option<String>,
 }
 
+/// An incoming payment announced as pending that a sync no longer saw,
+/// nothing paying the wallet in its place: it is said dropped once a
+/// later sync has read its scripts again and not seen it either. See
+/// [`crate::live::news`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Vanishing {
+    pub wallet_id: String,
+    pub txid: String,
+    /// The txid the payment was announced under: its own, or the first
+    /// one of the payment it is a fee bump of.
+    pub told_as: String,
+    /// Net effect on the wallet, in satoshis.
+    pub net_sats: i64,
+    /// The outputs it spends, txid and index: a replacement spends one
+    /// of them too.
+    pub spends: Vec<(String, u32)>,
+    /// When a sync first missed it, unix seconds.
+    pub missed_at: u64,
+}
+
 /// Everything the vault persists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VaultPayload {
@@ -186,6 +233,11 @@ pub struct VaultPayload {
     /// nothing.
     #[serde(default)]
     pub unclaimed: Vec<Unclaimed>,
+    /// Payments a sync saw vanish, oldest first, waiting for another
+    /// sync to say whether they dropped. Absent while there are none, and
+    /// from vaults written before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) vanishing: Vec<Vanishing>,
 }
 
 impl Default for VaultPayload {
@@ -196,9 +248,24 @@ impl Default for VaultPayload {
             wallets: Vec::new(),
             announced: Vec::new(),
             unclaimed: Vec::new(),
+            vanishing: Vec::new(),
         }
     }
 }
+
+/// What earlier builds kept in the settings and this one no longer
+/// has: the Premium account, its key and device tokens among it. Read
+/// only to know whether a vault still holds it.
+#[derive(Deserialize)]
+struct Retired {
+    #[serde(default)]
+    premium: Option<serde::de::IgnoredAny>,
+}
+
+/// The app preferences earlier builds kept for that account, under keys
+/// that start with this: the ntfy topic of each of its channels among
+/// them. Nothing reads them any more, and they leave with the account.
+const RETIRED_PREFS: &str = "premium.";
 
 /// Handle on the vault file. Owns the key material, and the exclusive
 /// lock that keeps every other opener out while it lives.
@@ -254,7 +321,20 @@ impl Vault {
         // cannot be looked at (a permission, a storage error) fails the
         // open rather than being replaced by an empty one.
         if vault.path.try_exists()? {
-            let payload = vault.load()?;
+            let (payload, retired) = vault.read()?;
+            // What earlier builds kept and this one dropped, secrets
+            // among it, leaves the file now rather than at the next
+            // change. Only under the lock: unlocked, another copy of the
+            // app may be saving too. A save that fails leaves it to the
+            // next one, and the vault opens all the same.
+            if retired
+                && vault.lock.is_some()
+                && let Err(error) = vault.save(&payload)
+            {
+                log::warn!(
+                    "the vault could not be written back without its retired fields: {error}"
+                );
+            }
             Ok((vault, payload))
         } else {
             let payload = VaultPayload::default();
@@ -263,18 +343,43 @@ impl Vault {
         }
     }
 
-    /// Reads and decrypts the whole payload.
+    /// Reads and decrypts the whole payload. Its version is read first,
+    /// alone: a later build may give a field another shape, and its
+    /// vault is one to refuse as newer, not one to call corrupted.
     pub fn load(&self) -> Result<VaultPayload, VaultError> {
+        self.read().map(|(payload, _)| payload)
+    }
+
+    /// [`Self::load`], and whether the file still holds what earlier
+    /// builds kept and this one dropped: see [`Retired`] and
+    /// [`RETIRED_PREFS`]. The payload comes without either.
+    fn read(&self) -> Result<(VaultPayload, bool), VaultError> {
+        #[derive(Deserialize)]
+        struct Head<'a> {
+            version: u32,
+            /// As written: in a vault of a later build it may have
+            /// another shape.
+            #[serde(borrow, default)]
+            settings: Option<&'a serde_json::value::RawValue>,
+        }
         let file = std::fs::read(&self.path)?;
         let plaintext = cipher::unseal(&file, &self.key)?;
-        let payload: VaultPayload = serde_json::from_slice(&plaintext)
-            .map_err(|e| VaultError::CorruptedPayload(e.to_string()))?;
-        if payload.version > PAYLOAD_VERSION {
-            return Err(VaultError::UnsupportedVersion(
-                payload.version.min(255) as u8
-            ));
+        let corrupted = |e: serde_json::Error| VaultError::CorruptedPayload(e.to_string());
+        let Head { version, settings } = serde_json::from_slice(&plaintext).map_err(corrupted)?;
+        if version > PAYLOAD_VERSION {
+            return Err(VaultError::UnsupportedVersion(version.min(255) as u8));
         }
-        Ok(payload)
+        let retired = settings.is_some_and(|settings| {
+            serde_json::from_str::<Retired>(settings.get())
+                .is_ok_and(|retired| retired.premium.is_some())
+        });
+        let mut payload: VaultPayload = serde_json::from_slice(&plaintext).map_err(corrupted)?;
+        payload.version = PAYLOAD_VERSION;
+        let prefs = &mut payload.settings.app_prefs;
+        let before = prefs.len();
+        prefs.retain(|key, _| !key.starts_with(RETIRED_PREFS));
+        let retired = retired || prefs.len() < before;
+        Ok((payload, retired))
     }
 
     /// Encrypts and writes the whole payload, atomically: the new file
@@ -436,15 +541,30 @@ fn write_then_swap(tmp: &Path, bytes: &[u8], target: &Path) -> std::io::Result<(
 fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        let mut delay = std::time::Duration::from_millis(10);
-        for _ in 0..5 {
-            match std::fs::rename(from, to) {
-                Err(e) if held_by_another(&e) => {
-                    std::thread::sleep(delay);
-                    delay *= 2;
-                }
-                other => return other,
+        rename_waiting(from, to, std::thread::sleep)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+}
+
+/// [`rename_over`] on Windows, `wait` taking each pause between two
+/// tries.
+#[cfg(windows)]
+fn rename_waiting(
+    from: &Path,
+    to: &Path,
+    mut wait: impl FnMut(std::time::Duration),
+) -> std::io::Result<()> {
+    let mut delay = std::time::Duration::from_millis(10);
+    for _ in 0..5 {
+        match std::fs::rename(from, to) {
+            Err(e) if held_by_another(&e) => {
+                wait(delay);
+                delay *= 2;
             }
+            other => return other,
         }
     }
     std::fs::rename(from, to)
@@ -489,6 +609,7 @@ mod tests {
             last_sync: None,
             complete_at: None,
             cached: CachedTotals::default(),
+            live_pinned: false,
         }
     }
 
@@ -514,6 +635,285 @@ mod tests {
         assert_eq!(reloaded.wallets.len(), 1);
         assert_eq!(reloaded.wallets[0].meta.name, "Cold storage");
         assert_eq!(reloaded.settings.active_network, Network::Signet);
+    }
+
+    /// A vault of an earlier version opens and is written back as the
+    /// current one, so that a build older than this one refuses it
+    /// instead of dropping what it cannot read; a later one is refused
+    /// here for the same reason.
+    #[test]
+    fn a_vault_is_written_back_at_the_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let written_at = |version: u32| {
+            let payload = VaultPayload {
+                version,
+                ..VaultPayload::default()
+            };
+            let sealed = cipher::seal(&serde_json::to_vec(&payload).unwrap(), &key()).unwrap();
+            std::fs::write(&path, sealed).unwrap();
+        };
+
+        written_at(1);
+        let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(payload.version, PAYLOAD_VERSION);
+        vault.save(&payload).unwrap();
+        assert_eq!(vault.load().unwrap().version, PAYLOAD_VERSION);
+        drop(vault);
+
+        written_at(PAYLOAD_VERSION + 1);
+        assert!(matches!(
+            Vault::open_or_create(&path, key()),
+            Err(VaultError::UnsupportedVersion(3))
+        ));
+
+        // A later build that gave a field another shape: still a newer
+        // vault, not a corrupted one.
+        let reshaped = serde_json::json!({
+            "version": PAYLOAD_VERSION + 1,
+            "settings": "of another shape",
+            "wallets": {},
+        });
+        let sealed = cipher::seal(&serde_json::to_vec(&reshaped).unwrap(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+        assert!(matches!(
+            Vault::open_or_create(&path, key()),
+            Err(VaultError::UnsupportedVersion(3))
+        ));
+    }
+
+    /// A build of the first version reads the whole payload before its
+    /// version, a watched address with the two totals it requires: it
+    /// reads a vault of this build that far, and refuses it for its
+    /// version, never as a corrupted one. This build reads it back as
+    /// it was.
+    #[test]
+    fn a_first_version_build_reaches_the_version_of_a_vault() {
+        #[derive(Deserialize)]
+        struct FirstAddressState {
+            tip_height: u32,
+            funded_sats: u64,
+            spent_sats: u64,
+        }
+        #[derive(Deserialize)]
+        struct FirstRecord {
+            address_state: Option<FirstAddressState>,
+        }
+        #[derive(Deserialize)]
+        struct FirstPayload {
+            version: u32,
+            wallets: Vec<FirstRecord>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let (vault, mut payload) = Vault::open_or_create(&path, key()).unwrap();
+        payload.wallets.push(WalletRecord {
+            meta: sample_meta(),
+            changeset: None,
+            address_state: Some(AddressWatchState {
+                tip_height: 7,
+                ..AddressWatchState::default()
+            }),
+        });
+        vault.save(&payload).unwrap();
+
+        let plaintext = cipher::unseal(&std::fs::read(&path).unwrap(), &key()).unwrap();
+        let first: FirstPayload = serde_json::from_slice(&plaintext).unwrap();
+        assert!(first.version > 1);
+        let state = first.wallets[0].address_state.as_ref().unwrap();
+        assert_eq!(
+            (state.tip_height, state.funded_sats, state.spent_sats),
+            (7, 0, 0)
+        );
+        assert_eq!(
+            vault.load().unwrap().wallets[0].address_state,
+            payload.wallets[0].address_state
+        );
+    }
+
+    /// The plaintext of a vault an earlier build wrote at version 2,
+    /// field for field, with the Premium account it kept in the
+    /// settings: the account key, this device's token, a connection and
+    /// a key change still unanswered, the tokens of past connections,
+    /// and the ntfy topic of a channel among the app preferences.
+    const VAULT_WITH_PREMIUM: &str = r#"{
+        "version": 2,
+        "settings": {
+            "active_network": "signet",
+            "backends": {},
+            "gap_limit": 42,
+            "app_prefs": {
+                "desktop.theme": "dark",
+                "premium.ntfy.0b9e2d4c-7a1f-4e63-9c58-2f0d1b3a6e7c": "gerfaut-q8Zr3vLmT1xKpW2n"
+            },
+            "electrum_certs": {},
+            "app_lock": null,
+            "tor": {"mode": "auto", "socks_proxy": null},
+            "premium": {
+                "key": "abcdefghijkmnpqr",
+                "certificate": "certificate.signature",
+                "watched": [{"wallet_id": "0000-test", "consented_at": 1790000000}],
+                "acknowledged_offline_until": 1790000100,
+                "pending_unwatch": ["1111-gone"],
+                "pending_unwatch_account": "abababababababababababababababababababababababababababababababab",
+                "device": {
+                    "id": "0f3b7c2e-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+                    "token": "gdt1_q83vEjRWeJC6ze8SNFZ4kLrN7xI0VniQus3vEjRWeJA",
+                    "connected_at": 1790000000
+                },
+                "disconnected": false,
+                "disconnected_reason": "too many devices",
+                "key_saved": true,
+                "checklist_hidden": true,
+                "announced_devices": ["d2"],
+                "pending_connect": {
+                    "key": "abcdefghijkmnpqr",
+                    "token": "gdt1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "platform": "linux"
+                },
+                "pending_key": "stuvwxyz23456789",
+                "pending_logouts": ["gdt1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"]
+            }
+        },
+        "wallets": [{
+            "meta": {
+                "id": "0000-test",
+                "name": "Cold storage",
+                "icon": "wallet",
+                "network": "signet",
+                "kind": {
+                    "type": "descriptors",
+                    "external": "wpkh(xpub.../0/*)#checksum",
+                    "internal": null,
+                    "script": "segwit"
+                },
+                "recognized_as": "descriptor",
+                "created_at": 1755000000,
+                "gap_limit": 20,
+                "scan_gap": 20,
+                "labels": {},
+                "last_sync": null,
+                "cached": {
+                    "balance": {
+                        "confirmed": 0,
+                        "trusted_pending": 0,
+                        "untrusted_pending": 0,
+                        "immature": 0,
+                        "total": 0,
+                        "pending_net_sats": null
+                    },
+                    "tx_count": 0
+                }
+            },
+            "changeset": null,
+            "address_state": null
+        }],
+        "announced": [],
+        "unclaimed": []
+    }"#;
+
+    /// Whether the vault at `path` still holds any of that account: its
+    /// section, a preference kept for it, or one of its secrets.
+    fn holds_premium(path: &Path) -> bool {
+        let plaintext = cipher::unseal(&std::fs::read(path).unwrap(), &key()).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        let text = String::from_utf8(plaintext).unwrap();
+        stored["settings"].get("premium").is_some()
+            || text.contains("\"premium.")
+            || [
+                "abcdefghijkmnpqr",
+                "gdt1_",
+                "stuvwxyz23456789",
+                "gerfaut-q8Zr3vLmT1xKpW2n",
+            ]
+            .iter()
+            .any(|secret| text.contains(secret))
+    }
+
+    /// A vault with a Premium account opens with everything else as it
+    /// was, and the account is gone from the vault once it is saved.
+    #[test]
+    fn a_vault_with_premium_opens_without_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let sealed = cipher::seal(VAULT_WITH_PREMIUM.as_bytes(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+        assert!(holds_premium(&path));
+
+        let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(payload.version, PAYLOAD_VERSION);
+        assert_eq!(payload.settings.active_network, Network::Signet);
+        assert_eq!(payload.settings.gap_limit, 42);
+        // The ordinary preference stays, alone.
+        assert_eq!(
+            payload.settings.app_prefs,
+            BTreeMap::from([("desktop.theme".to_owned(), "dark".to_owned())])
+        );
+        assert_eq!(payload.wallets.len(), 1);
+        assert_eq!(payload.wallets[0].meta.name, "Cold storage");
+        // Gone from the file at the open, before any change is saved.
+        assert!(!holds_premium(&path));
+
+        vault.save(&payload).unwrap();
+        assert!(!holds_premium(&path));
+        drop(vault);
+        let (_, reloaded) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(reloaded.wallets[0].meta.id, "0000-test");
+        assert_eq!(reloaded.settings.gap_limit, 42);
+        assert_eq!(reloaded.settings.app_prefs["desktop.theme"], "dark");
+    }
+
+    /// A vault that holds a preference kept for that account and no
+    /// section of it is written back without the preference all the
+    /// same, and a preference that only looks like one stays.
+    #[test]
+    fn a_vault_with_premium_preferences_alone_opens_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let mut stored: serde_json::Value = serde_json::from_str(VAULT_WITH_PREMIUM).unwrap();
+        let settings = stored["settings"].as_object_mut().unwrap();
+        settings.remove("premium");
+        settings["app_prefs"]["premiums.note"] = "kept".into();
+        let sealed = cipher::seal(stored.to_string().as_bytes(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+        assert!(holds_premium(&path));
+
+        let (_, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert!(!holds_premium(&path));
+        let plaintext = cipher::unseal(&std::fs::read(&path).unwrap(), &key()).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(
+            written["settings"]["app_prefs"],
+            serde_json::json!({"desktop.theme": "dark", "premiums.note": "kept"})
+        );
+        assert_eq!(payload.settings.app_prefs.len(), 2);
+    }
+
+    /// A vault with a Premium account that cannot be written back at the
+    /// open, in a directory that takes no new file, opens all the same,
+    /// and the account waits for a save that can be made.
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_with_premium_opens_where_it_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let sealed = cipher::seal(VAULT_WITH_PREMIUM.as_bytes(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+        std::fs::write(dir.path().join("gerfaut.vault.lock"), b"").unwrap();
+        let mode = |mode: u32| {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        mode(0o555);
+
+        let opened = Vault::open_or_create(&path, key());
+        let still_there = holds_premium(&path);
+        mode(0o755);
+        let (vault, payload) = opened.unwrap();
+        assert_eq!(payload.wallets[0].meta.name, "Cold storage");
+        assert!(still_there);
+        vault.save(&payload).unwrap();
+        assert!(!holds_premium(&path));
     }
 
     #[test]
@@ -712,7 +1112,10 @@ mod tests {
     }
 
     /// A scanner that holds the file just written, or the vault, for a
-    /// moment does not fail the save: the rename waits it out.
+    /// moment does not fail the save: the rename waits it out. Here the
+    /// holder lets go during the first pause, however long the machine
+    /// takes to get there; one the system itself adds, a scanner reading
+    /// the new file, is waited out as a save would.
     #[cfg(windows)]
     #[test]
     fn a_rename_waits_for_a_brief_holder_of_either_file() {
@@ -724,17 +1127,22 @@ mod tests {
         for held in ["source", "target"] {
             let source = dir.path().join("gerfaut.vault.1.tmp");
             std::fs::write(&source, held).unwrap();
-            let handle = std::fs::OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ)
-                .open(if held == "source" { &source } else { &target })
-                .unwrap();
-            let release = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                drop(handle);
-            });
-            rename_over(&source, &target).unwrap();
-            release.join().unwrap();
+            let mut handle = Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ)
+                    .open(if held == "source" { &source } else { &target })
+                    .unwrap(),
+            );
+            let mut pauses = 0;
+            rename_waiting(&source, &target, |delay| {
+                pauses += 1;
+                if handle.take().is_none() {
+                    std::thread::sleep(delay);
+                }
+            })
+            .unwrap();
+            assert!(pauses >= 1, "the {held} was renamed while held");
             assert_eq!(std::fs::read(&target).unwrap(), held.as_bytes());
         }
     }

@@ -24,10 +24,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bdk_electrum::electrum_client::raw_client::RawClient;
-use bdk_electrum::electrum_client::socks::Socks5Stream;
-use bdk_electrum::electrum_client::{self, ElectrumApi, Param};
 use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use electrum_client::raw_client::RawClient;
+use electrum_client::socks::Socks5Stream;
+use electrum_client::{self, ElectrumApi, Param};
 
 use super::tls::{self, ConnectError, Verdict};
 
@@ -64,7 +64,7 @@ const TCP_PORT: u16 = 50001;
 
 /// One Electrum server, with the certificate fingerprint the user
 /// accepted for it, if any.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Target {
     pub url: String,
     pub pin: Option<String>,
@@ -258,7 +258,7 @@ pub(crate) struct Guarded {
 
 /// The most one connection reads, every answer together: far past the
 /// full scan of any wallet a phone holds.
-const MAX_READ: usize = 256 << 20;
+pub(crate) const MAX_READ: usize = 256 << 20;
 
 impl Guarded {
     fn new(inner: Box<dyn Stream>, cancel: Arc<Cancel>, limit: usize) -> Self {
@@ -536,13 +536,7 @@ fn describe(error: &electrum_client::Error, timeout: Duration) -> String {
         },
         Error::IOError(io) => describe_io(io, timeout),
         Error::SharedIOError(io) => describe_io(io, timeout),
-        Error::Protocol(value) => {
-            let message = value
-                .get("message")
-                .and_then(|m| m.as_str())
-                .map_or_else(|| value.to_string(), str::to_owned);
-            format!("the server refused the request: {message}")
-        }
+        Error::Protocol(value) => format!("the server refused the request: {}", words(value)),
         Error::Message(text) => text.clone(),
         Error::InvalidDNSNameError(host) => format!("{host} is not a valid TLS host name"),
         Error::CouldNotCreateConnection(_) => "TLS handshake failed".to_owned(),
@@ -551,6 +545,16 @@ fn describe(error: &electrum_client::Error, timeout: Duration) -> String {
         }
         _ => "request failed".to_owned(),
     }
+}
+
+/// The message of a JSON-RPC error, as a screen may show it: see
+/// [`crate::chain::server_words`].
+pub(crate) fn words(error: &serde_json::Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| error.to_string(), str::to_owned);
+    crate::chain::server_words(&message)
 }
 
 fn describe_io(error: &std::io::Error, timeout: Duration) -> String {
@@ -652,24 +656,37 @@ pub(crate) async fn fetch_prevout(
 }
 
 /// Where a transaction stands, read off the history of one of its
-/// output scripts: height 0 means mempool, a height means confirmed,
-/// absence means the server does not have it.
+/// output scripts, `scripts` in the order they are tried: height 0
+/// means mempool, a height means confirmed, absence means the server
+/// does not have it. A script whose history the server refuses, one too
+/// long for it, is passed over for the next.
 pub(crate) async fn tx_standing(
     target: &Target,
     txid: Txid,
-    script: ScriptBuf,
+    scripts: Vec<ScriptBuf>,
     proxy: Option<&str>,
 ) -> Result<(bool, Option<u32>, u32), String> {
     let fail = failed(target);
     run(target, proxy, call_deadline(target), move |client| {
         let tip = client.block_headers_subscribe().map_err(&fail)?.height as u32;
-        let history = client.script_get_history(&script).map_err(&fail)?;
-        let entry = history.iter().find(|entry| entry.tx_hash == txid);
-        Ok(match entry {
-            None => (false, None, tip),
-            Some(entry) if entry.height > 0 => (true, Some(entry.height as u32), tip),
-            Some(_) => (true, None, tip),
-        })
+        let mut refused = None;
+        for script in &scripts {
+            let history = match client.script_get_history(script) {
+                Ok(history) => history,
+                Err(error @ electrum_client::Error::Protocol(_)) => {
+                    refused = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(fail(error)),
+            };
+            let entry = history.iter().find(|entry| entry.tx_hash == txid);
+            return Ok(match entry {
+                None => (false, None, tip),
+                Some(entry) if entry.height > 0 => (true, Some(entry.height as u32), tip),
+                Some(_) => (true, None, tip),
+            });
+        }
+        Err(refused.map_or_else(|| "the transaction creates nothing".to_owned(), fail))
     })
     .await
 }
@@ -682,6 +699,40 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    /// A transaction is looked up through one of its scripts: one a coin
+    /// may sit on before an OP_RETURN, and past one whose history the
+    /// server refuses, an exchange's deposit address for instance, the
+    /// next one.
+    #[tokio::test]
+    async fn a_transaction_is_found_past_a_script_the_server_refuses() {
+        use crate::testkit::{FakeElectrum, nowhere, script, scripthash, transaction};
+        let server = FakeElectrum::start().await;
+        let tx = transaction(
+            &[nowhere(1, 0)],
+            &[
+                ("6a0474657374", 0),
+                (&script(1), 1_000),
+                (&script(2), 2_000),
+                (&script(1), 3_000),
+            ],
+        );
+        let scripts = crate::chain::lookup_scripts(&tx);
+        let hex: Vec<String> = scripts.iter().map(|s| s.to_hex_string()).collect();
+        assert_eq!(hex, [script(1), script(2), "6a0474657374".to_owned()]);
+        server.set_history(&script(2), &[(tx.compute_txid(), 90)]);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .refused_histories
+            .insert(scripthash(&script(1)));
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        let standing = tx_standing(&target, tx.compute_txid(), scripts, None)
+            .await
+            .unwrap();
+        assert_eq!(standing, (true, Some(90), 100));
+    }
 
     /// A server that answers `server.version`, then starts its answer
     /// to the next request and never finishes it. It says when that
@@ -737,20 +788,35 @@ mod tests {
 
     /// A call is held to its deadline however the server stalls, and
     /// the connection is shut down when it runs out: the thread does
-    /// not go on reading. The deadline leaves a busy machine the time to
-    /// connect and ask; what is asserted is that the call ends with it.
-    #[tokio::test]
+    /// not go on reading.
+    ///
+    /// The clock of the runtime stands still until the server has the
+    /// request, and only then moves on to the deadline: however long a
+    /// machine busy with the rest of the suite takes to connect and ask,
+    /// the deadline runs out on a call that is waiting on the server,
+    /// and the call ends at the deadline to the millisecond.
+    #[tokio::test(start_paused = true)]
     async fn a_stalled_call_is_abandoned_at_its_deadline() {
         let (url, heard) = stalling_server();
         let deadline = Duration::from_secs(2);
-        let started = Instant::now();
-        let outcome = run(&Target::new(url, None), None, deadline, |client| {
+        // A blocking task holds a paused clock where it is while it runs.
+        let asked = tokio::task::spawn_blocking(move || {
+            within(&heard, "asked");
+            heard
+        });
+        let target = Target::new(url, None);
+        let started = tokio::time::Instant::now();
+        let call = run(&target, None, deadline, |client| {
             client.block_headers_subscribe().map_err(|e| e.to_string())
-        })
-        .await;
+        });
+        let (outcome, heard) = tokio::join!(call, asked);
+        let heard = heard.expect("the server never saw the request");
         assert_eq!(outcome.err().as_deref(), Some("no answer within 2 s"));
-        assert!(started.elapsed() < deadline + Duration::from_secs(2));
-        within(&heard, "asked");
+        let waited = started.elapsed();
+        assert!(
+            waited >= deadline && waited <= deadline + Duration::from_millis(1),
+            "the call ended after {waited:?}"
+        );
         within(&heard, "closed");
     }
 
@@ -1078,6 +1144,19 @@ mod tests {
             describe(&refusal, TIMEOUT),
             "the server refused the request: unknown method"
         );
+        // Whatever the server wrote, one short line: no line break, no
+        // mark that turns the text around, nothing past 200 characters.
+        let written = Error::Protocol(serde_json::json!({
+            "code": 1,
+            "message": format!("history \u{202E}too long\nsee {}", "x".repeat(300)),
+        }));
+        let shown = describe(&written, TIMEOUT);
+        let words = shown
+            .strip_prefix("the server refused the request: ")
+            .unwrap();
+        assert!(words.starts_with("history too longsee xx"), "{words}");
+        assert_eq!(words.chars().count(), 201);
+        assert!(words.ends_with('\u{2026}'));
         let garbled = Error::JSON(serde_json::from_str::<u32>("x").unwrap_err());
         assert_eq!(describe(&garbled, TIMEOUT), "unexpected response");
         assert_eq!(

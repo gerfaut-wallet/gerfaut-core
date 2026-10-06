@@ -4,11 +4,12 @@
 //! socket, and nothing of it waits on a thread.
 //!
 //! The socket is opened the way the live watcher opens its own
-//! ([`crate::watch::net`]): TCP, the Tor proxy in front of it for a
+//! ([`crate::chain::net`]): TCP, the Tor proxy in front of it for a
 //! hidden service and a refusal without one, TLS checked by the
 //! verifier every Electrum connection goes through, an accepted
 //! fingerprint included. Every answer is one line of at most
-//! [`super::MAX_LINE`] bytes, requests go out a window at a time, and
+//! [`super::MAX_LINE`] bytes, a connection reads [`super::MAX_READ`] at
+//! most, every answer together, requests go out a window at a time, and
 //! each answer has the socket timeout of the server to arrive in.
 
 use std::collections::HashMap;
@@ -20,8 +21,10 @@ use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 
-use super::{CLIENT_NAME, MAX_LINE, PROTOCOL, TIMEOUT, TOR_TIMEOUT, Target, parse, too_long};
-use crate::watch::net::{self, BoxStream, LineReader, LineTooLong, Security};
+use super::{
+    CLIENT_NAME, MAX_LINE, MAX_READ, PROTOCOL, TIMEOUT, TOR_TIMEOUT, Target, parse, too_long, words,
+};
+use crate::chain::net::{self, BoxStream, LineReader, LineTooLong, Security};
 
 /// Requests awaiting their answer at any time.
 const WINDOW: usize = 16;
@@ -74,6 +77,9 @@ pub(crate) struct Connection {
     next_id: u64,
     /// How long each answer may take to arrive.
     timeout: Duration,
+    /// Bytes read since the connection opened, and how many it may.
+    read: usize,
+    read_max: usize,
 }
 
 impl Connection {
@@ -99,6 +105,8 @@ impl Connection {
             writer,
             next_id: 0,
             timeout,
+            read: 0,
+            read_max: MAX_READ,
         };
         connection
             .call::<Value>("server.version", json!([CLIENT_NAME, [PROTOCOL, PROTOCOL]]))
@@ -199,6 +207,13 @@ impl Connection {
                 }
                 Ok(Ok(Some(line))) => line,
             };
+            self.read = self.read.saturating_add(line.len());
+            if self.read > self.read_max {
+                return Err(CallError::Failed(format!(
+                    "the server sent more than {} MiB on one connection",
+                    self.read_max >> 20
+                )));
+            }
             let Ok(envelope) = serde_json::from_slice::<Envelope<'_>>(&line) else {
                 continue;
             };
@@ -219,12 +234,35 @@ impl Connection {
     }
 }
 
-/// The message of a JSON-RPC error, kept short: it comes from the
-/// server and ends up on a screen.
-fn words(error: &Value) -> String {
-    let text = error
-        .get("message")
-        .and_then(Value::as_str)
-        .map_or_else(|| error.to_string(), str::to_owned);
-    text.chars().take(200).collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::FakeElectrum;
+
+    /// A connection reads so much in all, every answer together, and no
+    /// more: a server that keeps sending fails the call instead of
+    /// keeping the client reading.
+    #[tokio::test]
+    async fn a_connection_reads_so_much_and_no_more() {
+        let server = FakeElectrum::start().await;
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        let mut connection = Connection::open(&target, None).await.unwrap();
+        connection.read_max = connection.read + 1_000;
+        let mut answered = 0;
+        let headers = (0..50).map(|height| json!([height])).collect();
+        let refused = connection
+            .batch::<String>("blockchain.block.header", headers, |_, answer| {
+                answer?;
+                answered += 1;
+                Ok(())
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.starts_with("the server sent more than"),
+            "{refused}"
+        );
+        assert!(answered < 10, "{answered}");
+    }
 }

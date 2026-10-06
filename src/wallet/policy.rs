@@ -12,9 +12,10 @@
 //! A branch is read through its thresholds. A threshold is met with the
 //! k-th soonest of its items, so an "and" waits for its last lock, an
 //! "or" for its first, and `thresh(3, A, B, older(N1), older(N2))` for
-//! the nearer of its two locks. Everything said about a branch comes
-//! out of that one reading: whether it is open, when it opens, and
-//! which of its locks hold it back.
+//! the nearer of its two locks. Whether a branch is open, and when it
+//! opens, come out of that one reading. Which of its locks hold it back
+//! comes out of its shape: a lock does when, every key at hand, some
+//! way of meeting the branch turns on it.
 //!
 //! Times are approximate by nature. A block lock is converted at ten
 //! minutes a block, and a time lock is compared with the wall clock
@@ -24,14 +25,18 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use bdk_wallet::bitcoin::AddressType;
 use bdk_wallet::bitcoin::address::{Address, NetworkUnchecked};
 use bdk_wallet::miniscript::descriptor::SinglePubKey;
 use bdk_wallet::miniscript::policy::Liftable;
 use bdk_wallet::miniscript::policy::semantic::Policy;
-use bdk_wallet::miniscript::{AbsLockTime, Descriptor, DescriptorPublicKey, RelLockTime};
+use bdk_wallet::miniscript::{
+    AbsLockTime, Descriptor, DescriptorPublicKey, MiniscriptKey, RelLockTime, Threshold, Translator,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, CoreResult};
@@ -70,6 +75,9 @@ pub struct PolicyInput<'a> {
 /// One unspent output, reduced to what a timelock needs to know.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Coin {
+    /// The coin, `txid:vout`, and its value. The analysis reads neither:
+    /// it counts coins by their confirmation alone. They say which coin
+    /// it is, to whoever builds the list.
     pub outpoint: String,
     pub value_sats: u64,
     /// Confirmation height; `None` while the coin sits in the mempool.
@@ -86,9 +94,11 @@ pub struct Coin {
 pub enum PolicyKind {
     /// One key, nothing else.
     SingleKey,
-    /// One threshold of plain keys (`multi`, `sortedmulti`, `multi_a`).
+    /// One threshold of plain keys (`multi`, `sortedmulti`, `multi_a`),
+    /// each a different key.
     Multisig,
-    /// Anything with a timelock, a hash, or nested conditions.
+    /// Anything with a timelock, a hash, nested conditions, or a key
+    /// named twice.
     Miniscript,
     /// A watched address: no descriptor to read.
     Address,
@@ -231,10 +241,10 @@ pub enum LockState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timelock {
     pub lock: TimelockRef,
-    /// Whether the lock holds the branch back: whether meeting it, and
-    /// it alone, would bring the branch nearer to open. False for a lock
-    /// under a threshold that can be met without it, which is listed
-    /// but never holds the branch back.
+    /// Whether the lock holds the branch back: whether, every key at
+    /// hand, some way of meeting the branch turns on it. Both locks of
+    /// an "and" do. False for a lock under a threshold the keys meet
+    /// without it, which is listed but never holds the branch back.
     pub required: bool,
     pub state: LockState,
 }
@@ -340,7 +350,7 @@ pub fn analyze(input: PolicyInput<'_>) -> CoreResult<PolicySnapshot> {
     };
     let drafts = disjuncts(&policy)
         .into_iter()
-        .map(|branch| draft(branch, &book, &input.coins, &clock))
+        .map(|branch| draft(&branch, &book, &input.coins, &clock))
         .collect::<CoreResult<Vec<Draft>>>()?;
     let roles = assign_roles(&drafts);
     let branches: Vec<PolicyBranch> = drafts
@@ -454,32 +464,94 @@ fn lift(descriptor: &Descriptor<DescriptorPublicKey>) -> CoreResult<Semantic> {
     descriptor.lift().map_err(unreadable)
 }
 
-/// Whether a key is the BIP 341 unspendable point, written x-only or
-/// with the even-parity prefix of a full key.
-fn is_unspendable(key: &DescriptorPublicKey) -> bool {
-    let DescriptorPublicKey::Single(single) = key else {
-        return false;
-    };
-    match single.key {
-        SinglePubKey::XOnly(key) => key.to_string() == UNSPENDABLE_INTERNAL_KEY,
-        SinglePubKey::FullKey(key) => key.to_string() == format!("02{UNSPENDABLE_INTERNAL_KEY}"),
+/// The policy of a descriptor with every key reduced to its material,
+/// normalized and sorted: two descriptors that give the same keys the
+/// same say, on whatever paths and in whatever order, come out equal.
+/// What holds the change descriptor of a pair to the receive one, which
+/// alone is read on the policy page.
+pub(crate) fn policy_by_material(
+    descriptor: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<Policy<String>> {
+    type Pk = DescriptorPublicKey;
+    struct ByMaterial;
+    impl Translator<Pk, String, Infallible> for ByMaterial {
+        fn pk(&mut self, pk: &Pk) -> Result<String, Infallible> {
+            Ok(material(pk))
+        }
+        fn sha256(&mut self, hash: &<Pk as MiniscriptKey>::Sha256) -> Result<String, Infallible> {
+            Ok(hash.to_string())
+        }
+        fn hash256(&mut self, hash: &<Pk as MiniscriptKey>::Hash256) -> Result<String, Infallible> {
+            Ok(hash.to_string())
+        }
+        fn ripemd160(
+            &mut self,
+            hash: &<Pk as MiniscriptKey>::Ripemd160,
+        ) -> Result<String, Infallible> {
+            Ok(hash.to_string())
+        }
+        fn hash160(&mut self, hash: &<Pk as MiniscriptKey>::Hash160) -> Result<String, Infallible> {
+            Ok(hash.to_string())
+        }
     }
+    let Ok(policy) = lift(descriptor)?.translate_pk(&mut ByMaterial);
+    Ok(policy.normalized().sorted())
+}
+
+/// Whether a key is the BIP 341 unspendable point, whatever its form:
+/// x-only, a full key of either parity, or an extended key built on the
+/// point, which is how Liana writes the internal key of a vault whose
+/// primary path takes several keys. A child of such an extended key is
+/// the point plus a tweak anyone can compute, and nobody holds it
+/// either.
+fn is_unspendable(key: &DescriptorPublicKey) -> bool {
+    let point = match key {
+        DescriptorPublicKey::Single(single) => match single.key {
+            SinglePubKey::XOnly(key) => key,
+            SinglePubKey::FullKey(key) => key.inner.x_only_public_key().0,
+        },
+        DescriptorPublicKey::XPub(xkey) => xkey.xkey.public_key.x_only_public_key().0,
+        DescriptorPublicKey::MultiXPub(xkey) => xkey.xkey.public_key.x_only_public_key().0,
+    };
+    point.to_string() == UNSPENDABLE_INTERNAL_KEY
 }
 
 /// The top-level alternatives: the items of an outer "or", flattened,
-/// or the whole policy when it has none. An "or" of plain keys stays
-/// whole: a 1-of-n multisig, however the descriptor spells it, is one
-/// way to spend, open to any of its keys, not one way per key.
-fn disjuncts(policy: &Semantic) -> Vec<&Semantic> {
-    match policy {
-        Policy::Thresh(thresh) if thresh.k() == 1 && thresh.n() > 1 && !is_multisig(policy) => {
-            thresh
-                .iter()
-                .flat_map(|sub| disjuncts(sub.as_ref()))
-                .collect()
+/// or the whole policy when it has none. The plain keys among them stay
+/// together, where the first of them stands: a 1-of-n multisig, however
+/// the descriptor spells it and whatever path stands beside it, is one
+/// way to spend, open to any of its keys, not one way per key. The
+/// normalized policy no longer tells "A or B, or C after a year" from
+/// "A, or B, or C after a year", and the two spend alike.
+fn disjuncts(policy: &Semantic) -> Vec<Semantic> {
+    fn flatten<'p>(policy: &'p Semantic, into: &mut Vec<&'p Semantic>) {
+        match policy {
+            Policy::Thresh(thresh) if thresh.k() == 1 && thresh.n() > 1 && !is_multisig(policy) => {
+                for sub in thresh.iter() {
+                    flatten(sub.as_ref(), into);
+                }
+            }
+            other => into.push(other),
         }
-        other => vec![other],
     }
+    let mut alternatives = Vec::new();
+    flatten(policy, &mut alternatives);
+    let keys: Vec<Arc<Semantic>> = alternatives
+        .iter()
+        .filter(|alternative| matches!(alternative, Policy::Key(_)))
+        .map(|key| Arc::new((*key).clone()))
+        .collect();
+    if keys.len() < 2 {
+        return alternatives.into_iter().cloned().collect();
+    }
+    let mut group = Some(Policy::Thresh(Threshold::or_n(keys)));
+    alternatives
+        .into_iter()
+        .filter_map(|alternative| match alternative {
+            Policy::Key(_) => group.take(),
+            other => Some(other.clone()),
+        })
+        .collect()
 }
 
 /// A threshold of plain keys, nothing else under it.
@@ -492,10 +564,25 @@ fn is_multisig(policy: &Semantic) -> bool {
     }
 }
 
+/// The shape of a policy. A threshold that names one key twice, on two
+/// paths, is no plain multisig: "2 of 3" with Key A counted twice is
+/// Key A alone, plus anyone.
 fn kind_of(policy: &Semantic) -> PolicyKind {
     match policy {
         Policy::Key(_) => PolicyKind::SingleKey,
-        multisig if is_multisig(multisig) => PolicyKind::Multisig,
+        Policy::Thresh(thresh) if is_multisig(policy) => {
+            let mut seen = Vec::with_capacity(thresh.n());
+            for sub in thresh.iter() {
+                if let Policy::Key(pk) = sub.as_ref() {
+                    let material = material(pk);
+                    if seen.contains(&material) {
+                        return PolicyKind::Miniscript;
+                    }
+                    seen.push(material);
+                }
+            }
+            PolicyKind::Multisig
+        }
         _ => PolicyKind::Miniscript,
     }
 }
@@ -740,7 +827,7 @@ impl Remaining {
         Remaining {
             remaining_blocks: Some(blocks),
             remaining_seconds: Some(seconds),
-            unlocks_at_unix: Some(now + seconds),
+            unlocks_at_unix: Some(now.saturating_add(seconds)),
         }
     }
 
@@ -839,7 +926,12 @@ impl RelativeLock {
                 if waited >= seconds {
                     CoinLock::Unlocked
                 } else {
-                    CoinLock::Locked(Remaining::seconds(seconds - waited, since + seconds))
+                    // `since` is a server's block time: a date no block
+                    // has yet unlocks at the end of time, not in 1970.
+                    CoinLock::Locked(Remaining::seconds(
+                        seconds - waited,
+                        since.saturating_add(seconds),
+                    ))
                 }
             }
         }
@@ -988,9 +1080,6 @@ fn fold<T: Ord + Copy>(condition: &Condition, leaf: &mut impl FnMut(&Condition) 
 
 /// How a reading of a branch values the locks it meets.
 enum Lens<'a> {
-    /// Every lock pending, by an unknown amount: the shape of the
-    /// branch, whatever the chain says.
-    Shape,
     /// Absolute locks against the clock; relative ones as given, there
     /// being no coin to count them from.
     NoCoin(Estimate),
@@ -999,11 +1088,8 @@ enum Lens<'a> {
 }
 
 /// What `condition` still needs before it can be met, seen through
-/// `lens`. `met` names one lock by its position among the branch's
-/// locks, to be counted as met whatever it says: that is how a lock is
-/// found to hold the branch back, or not.
-fn estimate(condition: &Condition, lens: &Lens<'_>, clock: &Clock, met: Option<usize>) -> Estimate {
-    let mut position = 0usize;
+/// `lens`.
+fn estimate(condition: &Condition, lens: &Lens<'_>, clock: &Clock) -> Estimate {
     fold(condition, &mut |leaf| {
         let lock = match leaf {
             Condition::Key { .. } => return Estimate::Open,
@@ -1013,13 +1099,7 @@ fn estimate(condition: &Condition, lens: &Lens<'_>, clock: &Clock, met: Option<u
             Condition::After { lock } => Lock::Absolute(*lock),
             Condition::Older { lock } => Lock::Relative(*lock),
         };
-        let index = position;
-        position += 1;
-        if met == Some(index) {
-            return Estimate::Open;
-        }
         match (lens, lock) {
-            (Lens::Shape, _) => Estimate::Later(Remaining::default()),
             (_, Lock::Absolute(lock)) => match lock.remaining(clock) {
                 None => Estimate::Open,
                 Some(remaining) => Estimate::Later(remaining),
@@ -1035,7 +1115,7 @@ fn estimate(condition: &Condition, lens: &Lens<'_>, clock: &Clock, met: Option<u
 }
 
 /// The locks of a condition, in the order the policy names them: the
-/// order [`estimate`] counts positions in.
+/// order [`holds_back`] counts positions in.
 fn collect_locks(condition: &Condition, into: &mut Vec<Lock>) {
     match condition {
         Condition::After { lock } => into.push(Lock::Absolute(*lock)),
@@ -1049,13 +1129,81 @@ fn collect_locks(condition: &Condition, into: &mut Vec<Lock>) {
     }
 }
 
-/// Whether the lock at `position` holds the branch back: whether the
-/// branch would stand nearer to open, chain aside, were that lock alone
-/// met. A lock under a threshold that can be met without it is listed,
-/// but never holds the branch back.
-fn holds_back(condition: &Condition, position: usize, clock: &Clock) -> bool {
-    estimate(condition, &Lens::Shape, clock, Some(position))
-        != estimate(condition, &Lens::Shape, clock, None)
+/// What a condition comes to with every key at hand, chain aside.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// Met by the keys alone.
+    Met,
+    /// Never met, whatever the locks and preimages say.
+    Unmet,
+    /// Met or not, depending on its locks and preimages.
+    Turns,
+}
+
+fn shape(condition: &Condition) -> Shape {
+    match condition {
+        Condition::Key { .. } => Shape::Met,
+        Condition::After { .. } | Condition::Older { .. } | Condition::Preimage { .. } => {
+            Shape::Turns
+        }
+        // Miniscript writes no empty threshold; one asks for nothing.
+        Condition::Thresh { items, .. } if items.is_empty() => Shape::Met,
+        Condition::Thresh { k, items, .. } => {
+            let shapes: Vec<Shape> = items.iter().map(shape).collect();
+            let met = shapes.iter().filter(|s| **s == Shape::Met).count();
+            let turns = shapes.iter().filter(|s| **s == Shape::Turns).count();
+            let k = *k as usize;
+            if met >= k {
+                Shape::Met
+            } else if met + turns < k {
+                Shape::Unmet
+            } else {
+                Shape::Turns
+            }
+        }
+    }
+}
+
+/// Whether the lock at `position` holds the branch back: whether, every
+/// key at hand, some way of meeting the branch turns on that lock, the
+/// other locks and preimages met or not. Two locks an "and" needs both
+/// hold it back, each of them; a lock under a threshold the keys meet
+/// without it is listed, but never holds the branch back.
+///
+/// Each lock is a leaf of its own, so the question is asked on the way
+/// down: at every threshold above the lock, the other items have to be
+/// able to make up exactly one less than the threshold asks.
+fn holds_back(condition: &Condition, position: usize) -> bool {
+    fn down(condition: &Condition, position: usize, seen: &mut usize) -> Option<bool> {
+        match condition {
+            Condition::After { .. } | Condition::Older { .. } => {
+                let found = *seen == position;
+                *seen += 1;
+                found.then_some(true)
+            }
+            Condition::Key { .. } | Condition::Preimage { .. } => None,
+            Condition::Thresh { k, items, .. } => {
+                for (index, item) in items.iter().enumerate() {
+                    let Some(below) = down(item, position, seen) else {
+                        continue;
+                    };
+                    let (mut met, mut turns) = (0usize, 0usize);
+                    for (other, item) in items.iter().enumerate() {
+                        match shape(item) {
+                            _ if other == index => {}
+                            Shape::Met => met += 1,
+                            Shape::Turns => turns += 1,
+                            Shape::Unmet => {}
+                        }
+                    }
+                    let needed = (*k as usize).saturating_sub(1);
+                    return Some(below && met <= needed && needed <= met + turns);
+                }
+                None
+            }
+        }
+    }
+    down(condition, position, &mut 0).unwrap_or(false)
 }
 
 fn has_key(condition: &Condition) -> bool {
@@ -1084,8 +1232,8 @@ fn branch_state(condition: &Condition, coins: &[Coin], clock: &Clock) -> BranchS
     // Two readings with no coin, the relative locks taken as the worst
     // they can be, then as the best. Every coin falls between the two,
     // so when they agree the coins have no say and the answer is theirs.
-    let worst = estimate(condition, &Lens::NoCoin(Estimate::NoCoins), clock, None);
-    let best = estimate(condition, &Lens::NoCoin(Estimate::Open), clock, None);
+    let worst = estimate(condition, &Lens::NoCoin(Estimate::NoCoins), clock);
+    let best = estimate(condition, &Lens::NoCoin(Estimate::Open), clock);
     match worst {
         Estimate::Never => return BranchState::NeedsPreimage,
         Estimate::Open => return BranchState::SpendableNow,
@@ -1097,7 +1245,7 @@ fn branch_state(condition: &Condition, coins: &[Coin], clock: &Clock) -> BranchS
     }
     let mut tally = Tally::default();
     for coin in coins {
-        tally.add(match estimate(condition, &Lens::Coin(coin), clock, None) {
+        tally.add(match estimate(condition, &Lens::Coin(coin), clock) {
             Estimate::Open => CoinLock::Unlocked,
             Estimate::Later(remaining) => CoinLock::Locked(remaining),
             // Neither comes out of a reading over a coin once the two
@@ -1135,7 +1283,7 @@ fn draft(policy: &Semantic, book: &KeyBook, coins: &[Coin], clock: &Clock) -> Co
         .enumerate()
         .map(|(position, lock)| Timelock {
             lock: lock.reference(),
-            required: holds_back(&condition, position, clock),
+            required: holds_back(&condition, position),
             state: lock_state(*lock, coins, clock),
         })
         .collect();
@@ -1243,7 +1391,7 @@ fn summary(condition: &Condition, book: &KeyBook) -> String {
 
     let mut subjects: Vec<String> = Vec::new();
     if !keys.is_empty() {
-        subjects.push(key_list(&keys));
+        subjects.push(counted_list(&keys));
     }
     subjects.extend(groups);
     subjects.extend(preimages);
@@ -1275,20 +1423,25 @@ fn group_phrase(condition: &Condition, book: &KeyBook) -> String {
         .iter()
         .all(|item| matches!(item, Condition::Key { .. }));
     if all_keys {
+        let labels: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match item {
+                Condition::Key { key_id } => Some(book.label_by_id(key_id)),
+                _ => None,
+            })
+            .collect();
         if k == n {
-            let labels: Vec<&str> = items
-                .iter()
-                .filter_map(|item| match item {
-                    Condition::Key { key_id } => Some(book.label_by_id(key_id)),
-                    _ => None,
-                })
-                .collect();
-            return key_list(&labels);
+            return counted_list(&labels);
         }
-        if *k == 1 {
-            return format!("any of {n} keys");
-        }
-        return format!("any {k} of {n} keys");
+        let group = if *k == 1 {
+            format!("any of {n} keys")
+        } else {
+            format!("any {k} of {n} keys")
+        };
+        return match repeats(&labels) {
+            Some(repeats) => format!("{group}, {repeats}"),
+            None => group,
+        };
     }
     let nouns: Vec<String> = items.iter().map(|item| noun(item, book)).collect();
     if k == n {
@@ -1353,6 +1506,52 @@ fn key_list(labels: &[&str]) -> String {
         [] => "No key".to_owned(),
         [only] => format!("Key {only}"),
         _ => format!("Keys {}", join_and(letters)),
+    }
+}
+
+/// The keys of an "and", each named once, then the ones it names more
+/// than once: "Keys A and B, Key A counted twice". The same extended
+/// key on two paths is two keys to miniscript and one person to the
+/// user, who would otherwise read two letters where one signs twice.
+fn counted_list(labels: &[&str]) -> String {
+    let mut distinct: Vec<&str> = Vec::with_capacity(labels.len());
+    for label in labels {
+        if !distinct.contains(label) {
+            distinct.push(label);
+        }
+    }
+    let list = key_list(&distinct);
+    match repeats(labels) {
+        Some(_) if distinct.len() == 1 => format!("{list}, counted {}", times(labels.len())),
+        Some(repeats) => format!("{list}, {repeats}"),
+        None => list,
+    }
+}
+
+/// The keys a list names more than once, and how often: "Key A counted
+/// twice and Key C counted 3 times". `None` when each comes once.
+fn repeats(labels: &[&str]) -> Option<String> {
+    let mut counted: Vec<(&str, usize)> = Vec::new();
+    for label in labels {
+        match counted.iter_mut().find(|(seen, _)| seen == label) {
+            Some((_, count)) => *count += 1,
+            None => counted.push((label, 1)),
+        }
+    }
+    let phrases: Vec<String> = counted
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(label, count)| format!("{label} counted {}", times(count)))
+        .collect();
+    (!phrases.is_empty()).then(|| join_and(phrases))
+}
+
+/// "twice", then "3 times", "4 times"...
+fn times(count: usize) -> String {
+    if count == 2 {
+        "twice".to_owned()
+    } else {
+        format!("{count} times")
     }
 }
 
@@ -1436,23 +1635,7 @@ fn digits(value: u64) -> String {
 
 /// A unix time as a civil date, `2030-03-17`, UTC.
 fn date(unix: u64) -> String {
-    // Days since the epoch to a proleptic Gregorian date, after Howard
-    // Hinnant's `civil_from_days`.
-    let days = i64::try_from(unix / 86_400).unwrap_or(i64::MAX / 2);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    let (year, month, day) = crate::format::civil_date(unix);
     format!("{year:04}-{month:02}-{day:02}")
 }
 
@@ -1617,6 +1800,33 @@ mod tests {
         assert_eq!(snapshot.policy, "or(pk(Key A),pk(Key B),pk(Key C))");
         assert_eq!(snapshot.branches.len(), 1);
         assert_eq!(snapshot.branches[0].summary, "Any of 3 keys");
+        assert!(snapshot.branches[0].spendable_now);
+    }
+
+    /// Two everyday keys, either of them, and a third after a year: the
+    /// normalized policy holds three alternatives, and the two keys are
+    /// still one way to spend.
+    #[test]
+    fn a_one_of_n_beside_a_timed_path_stays_one_branch() {
+        let descriptor =
+            format!("wsh(or_d(multi(1,{A}/0/*,{B}/0/*),and_v(v:pkh({C}/0/*),older(52560))))");
+        let snapshot = wsh(&descriptor, Vec::new());
+        let roles: Vec<(BranchRole, &str, &str)> = snapshot
+            .branches
+            .iter()
+            .map(|b| (b.role, b.label.as_str(), b.summary.as_str()))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (BranchRole::Primary, "Primary", "Any of 2 keys"),
+                (
+                    BranchRole::Recovery,
+                    "Recovery",
+                    "Key C, once a coin has waited 52,560 blocks"
+                ),
+            ]
+        );
         assert!(snapshot.branches[0].spendable_now);
     }
 
@@ -1936,8 +2146,35 @@ mod tests {
         );
     }
 
+    /// A coin's time is a server's block time, and one past any clock
+    /// still reads as locked, until the end of time rather than 1970.
     #[test]
-    fn a_taproot_tree_has_a_branch_per_leaf() {
+    fn a_coin_dated_past_any_clock_stays_locked() {
+        let sequence = (1u32 << 22) | 100;
+        let descriptor = format!("wsh(or_d(pk({A}/0/*),and_v(v:pkh({B}/0/*),older({sequence}))))");
+        let snapshot = wsh(
+            &descriptor,
+            vec![coin("aa:0", Some(TIP - 10), Some(u64::MAX))],
+        );
+        assert_eq!(
+            snapshot.branches[1].state,
+            BranchState::PerCoin {
+                unlocked: 0,
+                waiting: 0,
+                locked: 1,
+                next: Some(Remaining {
+                    remaining_blocks: None,
+                    remaining_seconds: Some(51_200),
+                    unlocks_at_unix: Some(u64::MAX),
+                }),
+            }
+        );
+    }
+
+    /// The key path and a leaf of a single key are any of two keys: one
+    /// way to spend, beside the timed leaf.
+    #[test]
+    fn a_taproot_tree_reads_as_its_ways_to_spend() {
         let descriptor = format!("tr({A}/0/*,{{and_v(v:pk({B}/0/*),older(144)),pk({C}/0/*)}})");
         let snapshot = analyze_with(&descriptor, ScriptKind::Taproot, Vec::new());
         assert_eq!(snapshot.kind, PolicyKind::Miniscript);
@@ -1954,14 +2191,28 @@ mod tests {
         assert_eq!(
             roles,
             vec![
-                (BranchRole::Primary, "Primary", "Key A"),
+                (BranchRole::Primary, "Primary", "Any of 2 keys"),
                 (
                     BranchRole::Recovery,
                     "Recovery",
                     "Key B, once a coin has waited 144 blocks"
                 ),
-                (BranchRole::Primary, "Primary B", "Key C"),
             ]
+        );
+        assert_eq!(
+            snapshot.branches[0].condition,
+            Condition::Thresh {
+                k: 1,
+                n: 2,
+                items: vec![
+                    Condition::Key {
+                        key_id: "k0".into()
+                    },
+                    Condition::Key {
+                        key_id: "k2".into()
+                    },
+                ],
+            }
         );
         // Keys without an origin still carry their own fingerprint.
         assert_eq!(snapshot.keys[0].fingerprint, Some("3442193e".into()));
@@ -2019,6 +2270,57 @@ mod tests {
             matches!(refused, Err(CoreError::Descriptor(ref detail)) if detail.contains("no one")),
             "{refused:?}"
         );
+
+        // Written as a full key of the other parity, the point is just
+        // as nobody's.
+        let descriptor = format!("tr(03{UNSPENDABLE_INTERNAL_KEY},{{pk({B}/0/*),pk({C}/0/*)}})");
+        let snapshot = analyze_with(&descriptor, ScriptKind::Taproot, Vec::new());
+        assert_eq!(snapshot.keys.len(), 2);
+    }
+
+    /// The BIP 341 point as Liana writes the internal key of a taproot
+    /// vault whose primary path takes several keys: an extended key at
+    /// depth zero built on the point, here with SHA-256 of the public
+    /// keys of A, B and C for its chain code, derived on `<0;1>/*` like
+    /// the keys of the tree.
+    const NUMS_XPUB: &str = "xpub661MyMwAqRbcGsLpni91inzhhEbBpW2cGZFA476zeaNJtHUb7BVZ1cv4a6zPeKU4SCA773hHndeBrUPrEV5paZX4gfMgS4JhYM4zNJr5yNF";
+
+    #[test]
+    fn a_liana_taproot_vault_has_no_key_path() {
+        let descriptor = format!(
+            "tr({NUMS_XPUB}/<0;1>/*,{{multi_a(2,{A}/<0;1>/*,{B}/<0;1>/*),and_v(v:pk({C}/<0;1>/*),older(52560))}})"
+        );
+        let snapshot = analyze_with(&descriptor, ScriptKind::Taproot, Vec::new());
+        assert_eq!(
+            snapshot.policy,
+            "or(and(pk(Key A),pk(Key B)),and(pk(Key C),older(52560)))"
+        );
+        let keys: Vec<&str> = snapshot.keys.iter().map(|k| k.key_short.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![shorten(A), shorten(B), shorten(C)],
+            "the point is nobody's key"
+        );
+        let roles: Vec<(BranchRole, &str, &str)> = snapshot
+            .branches
+            .iter()
+            .map(|b| (b.role, b.label.as_str(), b.summary.as_str()))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (BranchRole::Primary, "Primary", "Keys A and B"),
+                (
+                    BranchRole::Recovery,
+                    "Recovery",
+                    "Key C, once a coin has waited 52,560 blocks"
+                ),
+            ]
+        );
+        assert!(
+            snapshot.branches.iter().all(|b| b.summary != "Key A"),
+            "no key spends this vault alone"
+        );
     }
 
     #[test]
@@ -2060,6 +2362,39 @@ mod tests {
             snapshot.branches[1].summary,
             "Key A, once a coin has waited 10 blocks"
         );
+    }
+
+    /// One extended key on two paths of a threshold signs twice: a
+    /// "2 of 3" where Key A counts twice is Key A alone. The sentence
+    /// says so, and the policy is no plain multisig.
+    #[test]
+    fn a_key_counted_twice_is_said_to_be() {
+        let descriptor = format!("wsh(sortedmulti(2,{A}/0/*,{A}/1/*,{B}/0/*))");
+        let snapshot = wsh(&descriptor, Vec::new());
+        assert_eq!(snapshot.kind, PolicyKind::Miniscript);
+        assert_eq!(snapshot.keys.len(), 2);
+        assert_eq!(
+            snapshot.branches[0].summary,
+            "Any 2 of 3 keys, Key A counted twice"
+        );
+
+        let descriptor = format!("wsh(multi(2,{A}/0/*,{A}/1/*))");
+        let snapshot = wsh(&descriptor, Vec::new());
+        assert_eq!(snapshot.kind, PolicyKind::Miniscript);
+        assert_eq!(snapshot.branches[0].summary, "Key A, counted twice");
+
+        let descriptor = format!(
+            "wsh(and_v(v:pk({A}/0/*),and_v(v:pk({B}/0/*),and_v(v:pk({A}/1/*),pk({A}/2/*)))))"
+        );
+        let snapshot = wsh(&descriptor, Vec::new());
+        assert_eq!(
+            snapshot.branches[0].summary,
+            "Keys A and B, Key A counted 3 times"
+        );
+
+        // Each key once is the plain multisig it always was.
+        let descriptor = format!("wsh(sortedmulti(2,{A}/0/*,{B}/0/*,{C}/0/*))");
+        assert_eq!(wsh(&descriptor, Vec::new()).kind, PolicyKind::Multisig);
     }
 
     #[test]
@@ -2225,6 +2560,42 @@ mod tests {
             wsh(&descriptor, Vec::new()).branches[0].state,
             BranchState::NoCoins
         );
+    }
+
+    /// Two locks a branch needs together each hold it back: meeting one
+    /// alone leaves the branch as far as it was, which is no reason to
+    /// call either optional. The branch is a timed one, not primary.
+    #[test]
+    fn locks_needed_together_both_hold_the_branch_back() {
+        let descriptor = format!(
+            "wsh(or_d(pk({A}/0/*),and_v(v:pkh({B}/0/*),and_v(v:after(900000),older(100)))))"
+        );
+        let snapshot = wsh(&descriptor, Vec::new());
+        let [primary, timed] = snapshot.branches.as_slice() else {
+            panic!("two branches, got {:?}", snapshot.branches);
+        };
+        assert_eq!(primary.role, BranchRole::Primary);
+        assert_eq!(timed.role, BranchRole::Recovery);
+        assert_eq!(timed.label, "Recovery");
+        assert_eq!(timed.timelocks.len(), 2);
+        assert!(timed.timelocks.iter().all(|lock| lock.required));
+        assert!(!timed.spendable_now);
+
+        // Two relative locks, and a preimage beside a lock, the same.
+        for descriptor in [
+            format!("wsh(and_v(v:pk({A}/0/*),and_v(v:older(100),older(200))))"),
+            format!(
+                "wsh(and_v(v:pk({A}/0/*),and_v(v:sha256({}),older(100))))",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            ),
+        ] {
+            let snapshot = wsh(&descriptor, Vec::new());
+            let branch = &snapshot.branches[0];
+            assert!(
+                branch.timelocks.iter().all(|lock| lock.required),
+                "{descriptor}"
+            );
+        }
     }
 
     #[test]

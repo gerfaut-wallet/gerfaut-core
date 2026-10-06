@@ -21,7 +21,7 @@ use bdk_wallet::bitcoin::script::Instruction;
 use bdk_wallet::bitcoin::secp256k1::Secp256k1;
 use bdk_wallet::bitcoin::sighash::{EcdsaSighashType, TapSighashType};
 use bdk_wallet::bitcoin::{
-    Address, Amount, OutPoint, Psbt, Script, ScriptBuf, Transaction, TxIn, TxOut, Witness,
+    Address, OutPoint, Psbt, Script, ScriptBuf, Transaction, TxIn, TxOut, Witness,
 };
 use bdk_wallet::miniscript::psbt::PsbtExt;
 use serde::{Deserialize, Serialize};
@@ -303,6 +303,26 @@ pub struct DecodedInput {
 /// transaction, or a QR envelope around one of those. Binary files are
 /// passed as hex by the apps.
 pub fn decode_transaction(input: &str) -> CoreResult<DecodedTx> {
+    let mut text = squeezed(input)?;
+    if crate::input::qr::is_envelope(&text) {
+        let progress = crate::input::qr::assemble(std::slice::from_ref(&text))?;
+        let Some(inner) = progress.text else {
+            return Err(tx_error(format!(
+                "this is part 1 of a {}-part QR code: scan it with the camera",
+                progress.total
+            )));
+        };
+        // Read the way the text around it was, whitespace taken out, so
+        // that an envelope split by a space is seen for one.
+        text = crate::input::qr::opened_once(squeezed(&inner)?)?;
+    }
+    let bytes = decode_bytes(&text)?;
+    decode_bytes_as_transaction(&bytes)
+}
+
+/// The text with all its whitespace taken out, as a transaction is
+/// written with none: refused when nothing is left, or too much.
+fn squeezed(input: &str) -> CoreResult<String> {
     let text: String = input.split_whitespace().collect();
     if text.is_empty() {
         return Err(tx_error("empty input"));
@@ -310,18 +330,7 @@ pub fn decode_transaction(input: &str) -> CoreResult<DecodedTx> {
     if text.len() > MAX_INPUT_LEN {
         return Err(tx_error("input too large"));
     }
-    if crate::input::qr::is_envelope(&text) {
-        let progress = crate::input::qr::assemble(std::slice::from_ref(&text))?;
-        return match progress.text {
-            Some(inner) => decode_transaction(&inner),
-            None => Err(tx_error(format!(
-                "this is part 1 of a {}-part QR code: scan it with the camera",
-                progress.total
-            ))),
-        };
-    }
-    let bytes = decode_bytes(&text)?;
-    decode_bytes_as_transaction(&bytes)
+    Ok(text)
 }
 
 /// Decodes raw bytes: a PSBT file or a serialized transaction.
@@ -898,11 +907,6 @@ pub fn outpoints(decoded: &DecodedTx) -> Vec<OutPoint> {
     decoded.tx.input.iter().map(|i| i.previous_output).collect()
 }
 
-/// Amount helper for callers that hold satoshis.
-pub fn sats(amount: Amount) -> u64 {
-    amount.to_sat()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,7 +915,7 @@ mod tests {
     /// break this test rather than fall silently into a tone. Red is a
     /// budget — it has to stay spendable the day it matters.
     #[test]
-    fn every_caution_has_a_tone_and_only_five_are_red() {
+    fn every_caution_has_a_tone_and_only_six_are_red() {
         use TxWarningKind::*;
         let table = [
             (Unsigned, TxSeverity::Alert),
@@ -948,7 +952,9 @@ mod tests {
         );
     }
     use bdk_wallet::bitcoin::hashes::Hash;
-    use bdk_wallet::bitcoin::{Sequence, TxIn, Txid, WPubkeyHash, Witness, absolute, transaction};
+    use bdk_wallet::bitcoin::{
+        Amount, Sequence, TxIn, Txid, WPubkeyHash, Witness, absolute, transaction,
+    };
 
     /// A well-formed DER signature with r = s = 1, then its type byte.
     /// Only its shape matters here: nothing checks it against a key.
@@ -1236,6 +1242,28 @@ mod tests {
         let unsigned = decode_transaction(&encode::serialize_hex(&unsigned_tx())).unwrap();
         assert!(!unsigned.ready);
         assert!(!unsigned.inputs[0].signed);
+    }
+
+    /// One envelope is opened, never one inside another: no wallet
+    /// nests them, and every level opened would cost the stack a frame.
+    #[test]
+    fn an_envelope_inside_an_envelope_is_refused() {
+        let wrap = |text: &str| {
+            let mut cbor = Vec::new();
+            ciborium::into_writer(&ciborium::Value::Bytes(text.as_bytes().to_vec()), &mut cbor)
+                .unwrap();
+            ur::ur::encode(&cbor, &ur::ur::Type::Bytes)
+        };
+        let once = wrap(&encode::serialize_hex(&signed_tx()));
+        assert!(decode_transaction(&once).unwrap().ready);
+        // Read as the page reads any text, whitespace taken out: an
+        // envelope split by a space or a line break is one all the same.
+        let split = format!("u r:{}", &once[3..]);
+        let spaced = format!("{}\n{}", &once[..10], &once[10..]);
+        for inner in [once.as_str(), split.as_str(), spaced.as_str()] {
+            let error = decode_transaction(&wrap(inner)).unwrap_err().to_string();
+            assert!(error.contains("holds another QR code"), "{inner}: {error}");
+        }
     }
 
     #[test]

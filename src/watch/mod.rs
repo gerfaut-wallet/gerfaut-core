@@ -23,11 +23,17 @@
 //! 2. **The WebSocket of a mempool instance** (`/api/v1/ws`), for an
 //!    Esplora backend that is one. It pushes every block, and
 //!    transactions for as many scripts as the server allows on one
-//!    connection: ten on the public instances, one by default. The
-//!    scripts past that number are covered by polling.
+//!    connection and one message carries: ten on the public instances
+//!    of mainnet, some six hundred on those of signet and the
+//!    testnets, one by default. The scripts past that number are
+//!    covered by polling.
 //! 3. **Short polling** of any other Esplora: once a minute, the tip
-//!    hash and at most three script lookups, the head of the list every
-//!    round and the rest in rotation. About 240 requests an hour.
+//!    hash and at most three script lookups, the first two of the list
+//!    every round and one more in rotation. About 240 requests an hour;
+//!    with N scripts past the first two, each is read about every N
+//!    minutes. On the user's own node, thirty lookups a round, every
+//!    N/28 minutes each. Past what a mempool instance pushes, all
+//!    three, or thirty, take turns: every N/3 minutes, or N/30.
 //!
 //! With the automatic public backend, an Electrum server of the
 //! catalogue run by an operator that mode already rotates through is
@@ -65,6 +71,20 @@
 //!   Electrum server is asked for every status again and the scripts
 //!   whose status differs from what the wallet holds are reported; the
 //!   other transports report every wallet once.
+//! - An Electrum server that refuses a script, or takes no more past
+//!   some number on one connection, is not asked for them again under
+//!   the configuration: they are reported once, when refused, and left
+//!   to the regular syncs. The status counts them with what the watch
+//!   leaves out ([`WalletCoverage`]). That number is asked again a day
+//!   after it was learned, an hour after when it is none: the session
+//!   open there ends, the next one asks for the whole list, and what
+//!   the server refuses again is not reported again. A number learned
+//!   from a cut for cost is not: the whole list would be cut again.
+//! - A server is asked for its genesis block before it hears of any
+//!   script. One of another network is refused, and left alone for a
+//!   quarter of an hour ([`Exit::Refused`]) while the next one is
+//!   tried. So is an Electrum server that cuts the watch for what it
+//!   costs; back there, the watch asks it for half as many scripts.
 //! - Timers stop while a phone sleeps. [`LiveWatch::tick`] is the
 //!   entry point a host alarm calls: it measures the pause on the wall
 //!   clock, pings at once, and cuts a backoff short.
@@ -73,7 +93,6 @@
 
 mod electrum;
 mod mempool;
-pub(crate) mod net;
 mod poll;
 #[cfg(test)]
 mod tests;
@@ -96,11 +115,66 @@ use crate::network::Network;
 pub const MAX_SCRIPTS_PER_WALLET: usize = 200;
 /// Scripts watched in all.
 pub const MAX_SCRIPTS: usize = 2_000;
+/// Scripts watched in all on the user's own node. Every one is a
+/// subscription the server keeps for the session. By default, Fulcrum
+/// takes 75,000 from one address, and electrs as its author publishes it
+/// sets no limit. Blockstream's electrs takes 10,000 on a connection
+/// (`--electrum-subscription-limit`) and mempool's 100
+/// (`--electrum-max-subscriptions`). ElectrumX counts a cost instead,
+/// slows a session down past 1,000 and cuts it at 10,000
+/// (`COST_SOFT_LIMIT`, `COST_HARD_LIMIT`): 20,000 subscriptions pass the
+/// cut by its documentation, and are slowed down hard by its code. What
+/// a server will not take is left to the syncs. A public server would
+/// refuse what passes its own limit, which is why this is for a node the
+/// user runs, whose owner can raise it.
+pub const OWN_NODE_MAX_SCRIPTS: usize = 20_000;
+/// Scripts watched for one wallet on the user's own node: as many as
+/// in all, so that one large wallet may take the whole of it. They are
+/// shared out between wallets rank by rank, so a large one never
+/// crowds out the head of a small one. What a longer list costs is the
+/// list itself, built under the lock of the vault after every sync,
+/// from scripts the wallet's index already holds: measured on a wallet
+/// that revealed 150,000 addresses, 20,000 of them take some tens of
+/// milliseconds where deriving them took seconds, and on a wallet of
+/// 30,000 transactions most of the time goes to reading its history,
+/// which a list of 200 reads all the same.
+pub const OWN_NODE_MAX_SCRIPTS_PER_WALLET: usize = OWN_NODE_MAX_SCRIPTS;
 /// The longest script read from a list, in bytes: the consensus limit.
 const MAX_SCRIPT_BYTES: usize = 10_000;
 /// Events held for a consumer that lags. They coalesce, so a full
 /// queue delays an event and never loses a wallet.
 const EVENT_QUEUE: usize = 64;
+
+/// How many scripts a watch takes of one wallet, and of all of them.
+/// What it leaves out is heard at the next regular sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchLimits {
+    pub per_wallet: usize,
+    pub total: usize,
+}
+
+impl WatchLimits {
+    /// What a watch asks of any server.
+    pub const DEFAULT: WatchLimits = WatchLimits {
+        per_wallet: MAX_SCRIPTS_PER_WALLET,
+        total: MAX_SCRIPTS,
+    };
+    /// What it asks of the user's own node.
+    pub const OWN_NODE: WatchLimits = WatchLimits {
+        per_wallet: OWN_NODE_MAX_SCRIPTS_PER_WALLET,
+        total: OWN_NODE_MAX_SCRIPTS,
+    };
+
+    /// The limits under a backend: higher when the user said it is their
+    /// own node ([`BackendConfig::is_own_node`]).
+    pub fn of(backend: &BackendConfig) -> WatchLimits {
+        if backend.is_own_node() {
+            WatchLimits::OWN_NODE
+        } else {
+            WatchLimits::DEFAULT
+        }
+    }
+}
 
 /// Everything the watcher needs to reach the backend, and nothing of
 /// the vault: a copy of four settings and the data directory, where
@@ -112,9 +186,11 @@ pub struct WatchConfig {
     pub electrum_certs: TrustedCerts,
     pub tor: TorSettings,
     pub data_dir: PathBuf,
-    /// Seconds between two keepalive pings; `None` is 240. Electrum
-    /// servers drop a session idle for about ten minutes. Held between
-    /// 30 and 540.
+    /// Seconds between two keepalive pings at most; `None` is 240. Each
+    /// wait is drawn between seven tenths of it and all of it: a ping on
+    /// the dot every four minutes marks the connection even through Tor.
+    /// Electrum servers drop a session idle for about ten minutes. Held
+    /// between 30 and 540.
     #[serde(default)]
     pub keepalive_secs: Option<u32>,
 }
@@ -151,6 +227,21 @@ pub struct WatchedWallet {
     /// The wallet holds an unconfirmed transaction, so a new block is
     /// worth a sync on a transport that does not push confirmations.
     pub has_pending: bool,
+    /// The user asked for this wallet to be watched before any other:
+    /// its scripts come first, up to what a watch takes of one wallet.
+    #[serde(default)]
+    pub pinned: bool,
+    /// The wallet holds a coin, confirmed or not. When the scripts are
+    /// shared out, its script of each rank goes before an empty
+    /// wallet's.
+    #[serde(default)]
+    pub holds_coins: bool,
+    /// Scripts worth watching past the end of `scripts`, which the list
+    /// stopped short of at what a watch takes of one wallet: zero when
+    /// it is whole. Counted in what the watch leaves out of the wallet
+    /// ([`WalletCoverage`]).
+    #[serde(default)]
+    pub unlisted: u32,
 }
 
 /// Why a wallet is reported. Reasons heard together are kept as the
@@ -234,7 +325,77 @@ pub struct WatchStatus {
     /// Scripts in the list.
     pub watched_scripts: u32,
     /// Scripts the server pushes changes for; the rest are polled.
+    /// Counted in steps of a hundred while an Electrum server answers
+    /// the subscriptions, the last count always.
     pub pushed_scripts: u32,
+    /// Scripts worth watching that the watch leaves to the regular
+    /// syncs, past what it takes of one wallet or of all of them, or
+    /// refused by the server it last opened a session with: a payment to
+    /// one of them shows at the next sync, not at once.
+    #[serde(default)]
+    pub left_out_scripts: u32,
+    /// The wallets those scripts belong to.
+    #[serde(default)]
+    pub left_out_wallets: u32,
+    /// How much of each wallet of the list the watch hears, in the
+    /// order of the list.
+    #[serde(default)]
+    pub wallets: Vec<WalletCoverage>,
+    /// What an Electrum server says it runs, the way it answers
+    /// `server.version`: "ElectrumX 1.18.0", "Fulcrum 1.12.0" and the
+    /// like, so that on the user's own node, an app that sees scripts
+    /// left out can name the setting of that server which takes more.
+    /// `None` over the other transports. Kept to one short line, as any
+    /// words of a server.
+    #[serde(default)]
+    pub server_software: Option<String>,
+}
+
+/// How much of one wallet the live watch hears.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WalletCoverage {
+    pub wallet_id: String,
+    pub coverage: Coverage,
+    /// Scripts of the wallet the watch hears, one it shares with
+    /// another wallet included: those of the list the server took, or
+    /// is still to be asked for.
+    pub watched_scripts: u32,
+    /// Scripts of the wallet worth watching that it leaves to the
+    /// regular syncs: past the caps on the list, or refused by the
+    /// server.
+    pub left_out_scripts: u32,
+}
+
+/// Whether a wallet is watched whole, in part, or only synced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Coverage {
+    /// Every script worth watching is: a payment shows at once.
+    Live,
+    /// The head of the wallet is: its coins first, then its newest
+    /// unused addresses and the ones ahead. A payment to the rest
+    /// shows at the next sync.
+    Partial,
+    /// None is: every payment shows at the next sync.
+    SyncOnly,
+}
+
+impl WalletCoverage {
+    fn of(wallet_id: String, watched_scripts: u32, left_out_scripts: u32) -> WalletCoverage {
+        let coverage = if watched_scripts == 0 {
+            Coverage::SyncOnly
+        } else if left_out_scripts == 0 {
+            Coverage::Live
+        } else {
+            Coverage::Partial
+        };
+        WalletCoverage {
+            wallet_id,
+            coverage,
+            watched_scripts,
+            left_out_scripts,
+        }
+    }
 }
 
 /// Durations of the watcher, in one place so tests can shorten them.
@@ -251,6 +412,8 @@ pub(crate) struct Timings {
     /// is held down further on, where the syncs run: one at a time per
     /// wallet, and less and less often when they find nothing.
     pub gap: Duration,
+    /// The longest wait between two keepalive pings: see
+    /// [`Timings::keepalive_wait`].
     pub keepalive: Duration,
     /// How long a ping may go unanswered.
     pub pong: Duration,
@@ -277,9 +440,26 @@ pub(crate) struct Timings {
     /// that failed, and looks for a wallet whose last complete sync is a
     /// day old. It also does at each block.
     pub due: Duration,
+    /// How long a server that refused the watch is left alone: see
+    /// [`Exit::Refused`].
+    pub refused: Duration,
+    /// How long the most an Electrum server takes on one connection is
+    /// kept before it is asked for the whole list again: see
+    /// [`Refusals::ran_out`].
+    pub limit_kept: Duration,
+    /// The same for a server that took none, which leaves the watch
+    /// nothing to push: kept a shorter while.
+    pub zero_limit_kept: Duration,
 }
 
 impl Timings {
+    /// The wait before the next keepalive ping, drawn between seven
+    /// tenths of [`Self::keepalive`] and all of it, never more: a server
+    /// drops a session idle for ten minutes.
+    pub(crate) fn keepalive_wait(&self) -> Duration {
+        self.keepalive.mul_f64(0.7 + 0.3 * rand::random::<f64>())
+    }
+
     pub(crate) fn of(config: &WatchConfig) -> Self {
         let keepalive = config.keepalive_secs.unwrap_or(240).clamp(30, 540);
         Timings {
@@ -299,6 +479,9 @@ impl Timings {
             hold: Duration::from_secs(30),
             hold_cap: Duration::from_secs(10 * 60),
             due: Duration::from_secs(10 * 60),
+            refused: Duration::from_secs(15 * 60),
+            limit_kept: Duration::from_secs(24 * 60 * 60),
+            zero_limit_kept: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -378,10 +561,15 @@ impl LiveWatch {
             statuses: HashMap::new(),
             fingerprints: HashMap::new(),
             track_limit: None,
+            shunned: HashMap::new(),
+            refusals: HashMap::new(),
+            paces: HashMap::new(),
+            turns: poll::Turns::default(),
+            heard_by: None,
             last_alive: SystemTime::now(),
             fixed_timings,
         };
-        hub.watched = Watched::new(wallets);
+        hub.watched = Watched::new(wallets, WatchLimits::of(&hub.config.backend));
         let (halt, halted) = watch::channel(false);
         tokio::spawn(watcher(hub, halted));
         (
@@ -470,101 +658,238 @@ pub(crate) struct Entry {
     pub counts: Vec<Option<poll::Fingerprint>>,
 }
 
-/// The list in the order transports cover it: the first script of
-/// every wallet, then the second of each, and so on, so that a
-/// transport that covers ten scripts covers the head of every wallet.
+/// The list in the order transports cover it, a transport that covers
+/// ten scripts covering its head. The scripts are taken rank by rank:
+/// the first script of every wallet, then the second of each, and so
+/// on, so the head of every wallet comes before the tail of any. The
+/// wallets the user pinned come first, rank by rank among themselves,
+/// up to what a watch takes of one wallet. The others follow, and at
+/// each rank a wallet that holds coins goes before an empty one, in the
+/// order of the list otherwise. Past the cap on the whole list, a script
+/// is left out, pinned or not, unless a wallet already in the list
+/// shares it: then it is heard for both.
 #[derive(Debug, Default)]
 pub(crate) struct Watched {
     pub wallets: Vec<(String, bool)>,
-    /// Wallets with scripts left out of the list: past what a watch
-    /// takes of one wallet, or of all of them.
-    pub capped: Vec<String>,
     pub entries: Vec<Entry>,
+    /// Scripts worth watching of each wallet, listed or not, in the
+    /// order of the wallets.
+    worth: Vec<u32>,
     by_hex: HashMap<String, usize>,
     by_scripthash: HashMap<String, usize>,
 }
 
+/// What a server refused of the list, kept for the configuration: the
+/// scripts it turned down one by one, a history too long for it to hash
+/// for instance, and the most it takes on one connection, once it said
+/// so or refused several in a row. The next session there asks for the
+/// head of the list up to that many, the scripts it turned down left
+/// out, and leaves the rest to the regular syncs, the way the cap on
+/// the list does. That most is only what the server took at one time:
+/// its operator may raise it, and a limit per address counts the other
+/// connections from it, which close. It is asked again once it ran out
+/// ([`Refusals::ran_out`]), unless it came from a cut for cost.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Refusals {
+    pub limit: Option<usize>,
+    /// When `limit` was learned, on the wall clock: it keeps running
+    /// while the computer sleeps, as the server's limit does.
+    pub learned: Option<SystemTime>,
+    /// `limit` is what was left after a cut for cost, ElectrumX past its
+    /// budget: asked again, the whole list would only be cut again, so
+    /// it holds for the configuration.
+    pub cut: bool,
+    /// Script hashes.
+    pub scripts: HashSet<String>,
+    /// Script hashes a limit that ran out had left out: reported when it
+    /// was learned and left to the regular syncs since, they are not
+    /// reported again if the server refuses them anew. Kept until a
+    /// session has had an answer for every script of its first pass, so
+    /// that one lost before the server refused them does not undo it.
+    pub left_out: HashSet<String>,
+}
+
+impl Refusals {
+    /// The server takes `limit` subscriptions on one connection, as of
+    /// now.
+    pub fn learn(&mut self, limit: usize) {
+        self.limit = Some(limit);
+        self.learned = Some(SystemTime::now());
+        self.cut = false;
+    }
+
+    /// The server cut the watch for what it costs, and the next session
+    /// there asks for `limit` scripts: see [`Self::cut`].
+    pub fn learn_cut(&mut self, limit: usize) {
+        self.learn(limit);
+        self.cut = true;
+    }
+
+    /// Whether the limit was kept long enough for the server to be asked
+    /// for the whole list again: [`Timings::limit_kept`] after it was
+    /// learned, [`Timings::zero_limit_kept`] when the server took none,
+    /// and never when it came from a cut for cost.
+    pub fn ran_out(&self, timings: &Timings, now: SystemTime) -> bool {
+        let (Some(limit), Some(learned)) = (self.limit, self.learned) else {
+            return false;
+        };
+        if self.cut {
+            return false;
+        }
+        let kept = if limit == 0 {
+            timings.zero_limit_kept
+        } else {
+            timings.limit_kept
+        };
+        match now.duration_since(learned) {
+            Ok(kept_for) => kept_for >= kept,
+            // The clock was set back past the moment it was learned:
+            // how long it was kept is unknown.
+            Err(_) => true,
+        }
+    }
+}
+
 impl Watched {
-    fn new(wallets: Vec<WatchedWallet>) -> Self {
+    fn new(wallets: Vec<WatchedWallet>, limits: WatchLimits) -> Self {
         use bdk_wallet::bitcoin::hashes::{Hash, sha256};
+        use bdk_wallet::bitcoin::hex::DisplayHex;
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
         let mut watched = Watched {
             wallets: wallets
                 .iter()
                 .map(|wallet| (wallet.wallet_id.clone(), wallet.has_pending))
                 .collect(),
+            // What is left out of each wallet is what is worth watching
+            // and not heard: the scripts listed past what a watch takes
+            // of one wallet, or whose rank the cap on the whole list cut
+            // off, and those the list itself stopped short of. A script
+            // listed twice counts once.
+            worth: wallets
+                .iter()
+                .map(|wallet| {
+                    let listed: HashSet<String> = wallet
+                        .scripts
+                        .iter()
+                        .map(|listed| listed.script.to_ascii_lowercase())
+                        .collect();
+                    count(listed.len()).saturating_add(wallet.unlisted)
+                })
+                .collect(),
             ..Watched::default()
         };
-        // How many scripts of each wallet made it into the list.
-        let mut kept = vec![0usize; wallets.len()];
-        let longest = wallets
-            .iter()
-            .map(|wallet| wallet.scripts.len().min(MAX_SCRIPTS_PER_WALLET))
-            .max()
-            .unwrap_or(0);
-        'ranks: for rank in 0..longest {
-            for (owner, wallet) in wallets.iter().enumerate() {
-                if rank >= MAX_SCRIPTS_PER_WALLET {
-                    break 'ranks;
-                }
-                let Some(listed) = wallet.scripts.get(rank) else {
-                    continue;
-                };
-                if listed.script.len() > 2 * MAX_SCRIPT_BYTES || listed.script.is_empty() {
-                    continue;
-                }
-                let Ok(script) = ScriptBuf::from_hex(&listed.script) else {
-                    continue;
-                };
-                let hex = listed.script.to_ascii_lowercase();
-                let status = listed
-                    .status
-                    .as_deref()
-                    .map(|status| status.chars().take(64).collect::<String>());
-                if let Some(&index) = watched.by_hex.get(&hex) {
-                    let entry = &mut watched.entries[index];
-                    if !entry.owners.contains(&owner) {
-                        entry.owners.push(owner);
-                        entry.statuses.push(status);
-                        entry.counts.push(listed.counts);
+        let (pinned, mut others): (Vec<usize>, Vec<usize>) =
+            (0..wallets.len()).partition(|&owner| wallets[owner].pinned);
+        // A stable sort: the list keeps its order within each side.
+        others.sort_by_key(|&owner| !wallets[owner].holds_coins);
+        for group in [pinned, others] {
+            let longest = group
+                .iter()
+                .map(|&owner| wallets[owner].scripts.len().min(limits.per_wallet))
+                .max()
+                .unwrap_or(0);
+            for rank in 0..longest {
+                for &owner in &group {
+                    let Some(listed) = wallets[owner].scripts.get(rank) else {
+                        continue;
+                    };
+                    if listed.script.len() > 2 * MAX_SCRIPT_BYTES || listed.script.is_empty() {
+                        continue;
                     }
-                    entry.lookahead &= listed.lookahead;
-                    kept[owner] += 1;
-                    continue;
+                    let hex = listed.script.to_ascii_lowercase();
+                    let status = || {
+                        listed
+                            .status
+                            .as_deref()
+                            .map(|status| status.chars().take(64).collect::<String>())
+                    };
+                    if let Some(&index) = watched.by_hex.get(&hex) {
+                        let entry = &mut watched.entries[index];
+                        if !entry.owners.contains(&owner) {
+                            entry.owners.push(owner);
+                            entry.statuses.push(status());
+                            entry.counts.push(listed.counts);
+                        }
+                        entry.lookahead &= listed.lookahead;
+                        continue;
+                    }
+                    if watched.entries.len() >= limits.total {
+                        continue;
+                    }
+                    let Ok(script) = ScriptBuf::from_hex(&listed.script) else {
+                        continue;
+                    };
+                    let mut digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
+                    digest.reverse();
+                    let scripthash = digest.to_lower_hex_string();
+                    watched.by_hex.insert(hex.clone(), watched.entries.len());
+                    watched
+                        .by_scripthash
+                        .insert(scripthash.clone(), watched.entries.len());
+                    watched.entries.push(Entry {
+                        script,
+                        hex,
+                        scripthash,
+                        lookahead: listed.lookahead,
+                        owners: vec![owner],
+                        statuses: vec![status()],
+                        counts: vec![listed.counts],
+                    });
                 }
-                if watched.entries.len() >= MAX_SCRIPTS {
-                    break 'ranks;
-                }
-                kept[owner] += 1;
-                let mut digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
-                digest.reverse();
-                let scripthash: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-                watched.by_hex.insert(hex.clone(), watched.entries.len());
-                watched
-                    .by_scripthash
-                    .insert(scripthash.clone(), watched.entries.len());
-                watched.entries.push(Entry {
-                    script,
-                    hex,
-                    scripthash,
-                    lookahead: listed.lookahead,
-                    owners: vec![owner],
-                    statuses: vec![status],
-                    counts: vec![listed.counts],
-                });
             }
         }
-        // A wallet listed with as many scripts as a watch takes of one,
-        // or whose tail the cap on the whole list cut off: what the
-        // scripts left out do is never heard.
-        watched.capped = wallets
-            .iter()
-            .zip(kept)
-            .filter(|(wallet, kept)| {
-                wallet.scripts.len() >= MAX_SCRIPTS_PER_WALLET || *kept < wallet.scripts.len()
-            })
-            .map(|(wallet, _)| wallet.wallet_id.clone())
-            .collect();
         watched
+    }
+
+    /// The entries a server is asked for, in the order of the list: all
+    /// of them, or under `refusals` of that server, the head of the list
+    /// up to what it takes, those it turned down left out.
+    pub fn heard<'a>(&'a self, refusals: Option<&'a Refusals>) -> impl Iterator<Item = &'a Entry> {
+        let limit = refusals.and_then(|r| r.limit).unwrap_or(usize::MAX);
+        self.entries
+            .iter()
+            .filter(move |entry| refusals.is_none_or(|r| !r.scripts.contains(&entry.scripthash)))
+            .take(limit)
+    }
+
+    /// The entries the limit of `refusals` keeps from a server: those
+    /// past the head of the list it takes, the ones it turned down
+    /// aside.
+    pub fn past_limit<'a>(&'a self, refusals: &'a Refusals) -> impl Iterator<Item = &'a Entry> {
+        self.entries
+            .iter()
+            .filter(move |entry| !refusals.scripts.contains(&entry.scripthash))
+            .skip(refusals.limit.unwrap_or(usize::MAX))
+    }
+
+    /// How much of each wallet is heard, in the order of the wallets:
+    /// see [`Self::heard`].
+    pub fn coverage(&self, refusals: Option<&Refusals>) -> Vec<WalletCoverage> {
+        let mut heard = vec![0u32; self.wallets.len()];
+        for entry in self.heard(refusals) {
+            for &owner in &entry.owners {
+                heard[owner] = heard[owner].saturating_add(1);
+            }
+        }
+        self.wallets
+            .iter()
+            .zip(heard)
+            .zip(&self.worth)
+            .map(|(((wallet_id, _), heard), worth)| {
+                WalletCoverage::of(wallet_id.clone(), heard, worth.saturating_sub(heard))
+            })
+            .collect()
+    }
+
+    /// The wallets with scripts that are not heard: past what a watch
+    /// takes of one wallet, or of all of them, or past what the server
+    /// takes.
+    pub fn capped(&self, refusals: Option<&Refusals>) -> Vec<String> {
+        self.coverage(refusals)
+            .into_iter()
+            .filter(|wallet| wallet.left_out_scripts > 0)
+            .map(|wallet| wallet.wallet_id)
+            .collect()
     }
 
     pub fn by_hex(&self, hex: &str) -> Option<&Entry> {
@@ -684,7 +1009,9 @@ impl Backoff {
 pub(crate) enum Exit {
     Stop,
     Reconfigured,
-    /// Try the transports again now: polling gives push another chance.
+    /// Try the transports again now: polling gives push another chance,
+    /// and a session whose server's limit ran out asks it for the whole
+    /// list again.
     Reprobe,
     /// A session was open and ended.
     Lost(String),
@@ -693,6 +1020,11 @@ pub(crate) enum Exit {
     /// The server is there and offers no push (a WebSocket upgrade
     /// answered with an HTTP refusal).
     NoPush(String),
+    /// The server will not do: one of another network, or one that cut
+    /// the watch for what it costs. It is left alone for
+    /// [`Timings::refused`], whatever else is tried meanwhile, so that
+    /// coming back does not cost it, or the watch, what it just did.
+    Refused(String),
 }
 
 /// What a session is woken for, besides its socket.
@@ -711,10 +1043,6 @@ pub(crate) enum Wake {
     /// Due reports were sent; nothing for the session to do.
     Flushed,
 }
-
-/// How far below the height kept a tip may read and still be a server
-/// that lags: past a day of blocks, the height kept was the wrong one.
-const TIP_LAG_MAX: u32 = 144;
 
 /// The state every transport shares and that outlives a connection.
 pub(crate) struct Hub {
@@ -739,6 +1067,20 @@ pub(crate) struct Hub {
     pub fingerprints: HashMap<String, poll::Fingerprint>,
     /// Scripts a mempool instance said it tracks per connection.
     pub track_limit: Option<usize>,
+    /// The servers that refused the watch, and until when each is left
+    /// alone: see [`Exit::Refused`].
+    shunned: HashMap<Endpoint, Instant>,
+    /// What each Electrum server refused of the list.
+    pub refusals: HashMap<Endpoint, Refusals>,
+    /// How often each Esplora server is read: its own, kept from one
+    /// session to the next.
+    paces: HashMap<Endpoint, poll::Pace>,
+    /// Which script polling reads next, kept from one session to the
+    /// next as well.
+    turns: poll::Turns,
+    /// The server of the last session to open, whose refusals say how
+    /// much of each wallet is heard.
+    heard_by: Option<Endpoint>,
     /// Wall clock of the last sign of life, to measure a suspension.
     last_alive: SystemTime,
     /// Timings given by a test, which a new configuration leaves alone.
@@ -749,7 +1091,26 @@ impl Hub {
     pub fn set_status(&mut self, change: impl FnOnce(&mut WatchStatus)) {
         let mut next = self.status.borrow().clone();
         change(&mut next);
-        next.watched_scripts = self.watched.entries.len() as u32;
+        // Off, the watch covers nothing, whatever wallets it was given.
+        let off = next.state == WatchState::Off;
+        next.watched_scripts = if off {
+            0
+        } else {
+            self.watched.entries.len() as u32
+        };
+        let coverage = if off {
+            Vec::new()
+        } else {
+            self.watched.coverage(self.heard_refusals())
+        };
+        next.left_out_scripts = coverage.iter().fold(0u32, |sum, wallet| {
+            sum.saturating_add(wallet.left_out_scripts)
+        });
+        next.left_out_wallets = coverage
+            .iter()
+            .filter(|wallet| wallet.left_out_scripts > 0)
+            .count() as u32;
+        next.wallets = coverage;
         if *self.status.borrow() == next {
             return;
         }
@@ -757,8 +1118,49 @@ impl Hub {
         let _ = self.events.try_send(WatchEvent::Status(next));
     }
 
+    /// What the server of the last session refused of the list.
+    fn heard_refusals(&self) -> Option<&Refusals> {
+        self.heard_by
+            .as_ref()
+            .and_then(|endpoint| self.refusals.get(endpoint))
+    }
+
+    /// Whether the limit learned of `endpoint` ran out: see
+    /// [`Refusals::ran_out`].
+    pub fn limit_ran_out(&self, endpoint: &Endpoint) -> bool {
+        self.refusals
+            .get(endpoint)
+            .is_some_and(|refusals| refusals.ran_out(&self.timings, SystemTime::now()))
+    }
+
+    /// Forgets the limit learned of `endpoint` once it ran out, so that
+    /// the session about to open asks that server for the whole list
+    /// again. The script hashes that limit left out go to
+    /// [`Refusals::left_out`]: reported when it was learned and left to
+    /// the regular syncs since, they are not reported again if the
+    /// server refuses them anew.
+    pub fn retry_limit(&mut self, endpoint: &Endpoint) {
+        if !self.limit_ran_out(endpoint) {
+            return;
+        }
+        let Some(refusals) = self.refusals.get_mut(endpoint) else {
+            return;
+        };
+        let left_out: Vec<String> = self
+            .watched
+            .past_limit(refusals)
+            .map(|entry| entry.scripthash.clone())
+            .collect();
+        refusals.left_out.extend(left_out);
+        refusals.limit = None;
+        refusals.learned = None;
+    }
+
     /// Notes the server a session is open with, or that none is.
     pub fn serve(&mut self, endpoint: Option<&Endpoint>) {
+        if let Some(endpoint) = endpoint {
+            self.heard_by = Some(endpoint.clone());
+        }
         let endpoint = endpoint.map(|endpoint| (self.config.network, endpoint.clone()));
         self.serving.send_if_modified(|serving| {
             let changed = *serving != endpoint;
@@ -797,18 +1199,21 @@ impl Hub {
 
     /// A tip was read. The first one is a baseline; a higher one after
     /// that is a block, and `sync_pending` says whether wallets waiting
-    /// for a confirmation are worth a sync on this transport. A lower
-    /// one is a server that lags, or one of several behind an address.
-    /// One far lower says the height kept was never real, a server's
-    /// invention or a slip: it becomes the baseline again, silently, so
-    /// that one height of four billion does not hide every block after
-    /// it.
+    /// for a confirmation are worth a sync on this transport. One that
+    /// pushes every change it hears says no, and a block then syncs only
+    /// the wallets waiting whose list the watch does not hear whole: the
+    /// scripts of their transaction may be among those it does not. A
+    /// lower one is a server that lags, or one of several behind an
+    /// address. One far lower says the height kept was never real, a
+    /// server's invention or a slip: it becomes the baseline again,
+    /// silently, so that one height of four billion does not hide every
+    /// block after it.
     pub fn new_tip(&mut self, height: u32, sync_pending: bool) {
         let Some(previous) = self.tip else {
             self.tip = Some(height);
             return;
         };
-        if height.saturating_add(TIP_LAG_MAX) < previous {
+        if height.saturating_add(chain::TIP_LAG_MAX) < previous {
             self.tip = Some(height);
             return;
         }
@@ -817,13 +1222,19 @@ impl Hub {
         }
         self.tip = Some(height);
         let _ = self.events.try_send(WatchEvent::NewBlock { height });
-        if sync_pending {
-            let now = Instant::now();
-            for (id, has_pending) in &self.watched.wallets {
-                if *has_pending {
-                    self.debounce
-                        .mark(id, ChangeReason::NewBlock, false, None, now);
-                }
+        let unheard: HashSet<String> = if sync_pending {
+            HashSet::new()
+        } else {
+            self.watched
+                .capped(self.heard_refusals())
+                .into_iter()
+                .collect()
+        };
+        let now = Instant::now();
+        for (id, has_pending) in &self.watched.wallets {
+            if *has_pending && (sync_pending || unheard.contains(id)) {
+                self.debounce
+                    .mark(id, ChangeReason::NewBlock, false, None, now);
             }
         }
     }
@@ -834,16 +1245,17 @@ impl Hub {
     /// every wallet, so the syncs that follow catch up, and one after a
     /// lost connection does the same. An exact transport has already
     /// reported each script whose status differs from what its wallet
-    /// holds; the first session reports whole the wallets whose list was
-    /// cut, since nothing tells what their tail did.
+    /// holds, or that the server refused; the first session reports
+    /// whole the wallets whose list was cut, since nothing tells what
+    /// their tail did.
     pub fn ready(&mut self, exact: bool) {
         if !self.caught_up {
             self.caught_up = true;
             if exact {
                 let now = Instant::now();
-                for id in &self.watched.capped {
+                for id in self.watched.capped(None) {
                     self.debounce
-                        .mark(id, ChangeReason::Started, false, None, now);
+                        .mark(&id, ChangeReason::Started, false, None, now);
                 }
             } else {
                 self.mark_all(ChangeReason::Started);
@@ -904,7 +1316,7 @@ impl Hub {
                         self.timings = Timings::of(&config);
                     }
                     self.config = *config;
-                    self.watched = Watched::new(wallets);
+                    self.watched = Watched::new(wallets, WatchLimits::of(&self.config.backend));
                     self.forget_baselines();
                     // The server of the old configuration, its certificate
                     // and its route with it, is no longer one to sync on.
@@ -912,7 +1324,7 @@ impl Hub {
                     Wake::Reconfigured
                 }
                 Some(Command::Wallets(wallets)) => {
-                    self.watched = Watched::new(wallets);
+                    self.watched = Watched::new(wallets, WatchLimits::of(&self.config.backend));
                     let kept: HashSet<&String> =
                         self.watched.wallets.iter().map(|(id, _)| id).collect();
                     self.debounce.pending.retain(|id, _| kept.contains(id));
@@ -940,7 +1352,34 @@ impl Hub {
         self.statuses.clear();
         self.fingerprints.clear();
         self.track_limit = None;
+        self.shunned.clear();
+        self.refusals.clear();
+        self.heard_by = None;
         self.debounce = Debouncer::default();
+    }
+
+    /// Leaves a server alone for a while, a little more or less than
+    /// [`Timings::refused`] so that a fleet of clients does not come back
+    /// at once.
+    fn shun(&mut self, endpoint: &Endpoint) {
+        let wait = self
+            .timings
+            .refused
+            .mul_f64(0.8 + 0.4 * rand::random::<f64>());
+        self.shunned.insert(endpoint.clone(), Instant::now() + wait);
+    }
+
+    /// The pace of the rounds that read an Esplora server.
+    fn pace(&mut self, endpoint: &Endpoint) -> &mut poll::Pace {
+        self.paces.entry(endpoint.clone()).or_default()
+    }
+
+    /// Whether a server is being left alone, and until when.
+    fn shunned_until(&self, endpoint: &Endpoint) -> Option<Instant> {
+        self.shunned
+            .get(endpoint)
+            .copied()
+            .filter(|until| *until > Instant::now())
     }
 
     /// Waits out a delay, or for ever without one, while commands and
@@ -1124,16 +1563,30 @@ async fn supervise(hub: &mut Hub) {
                 no_push = None;
             }
             Exit::Reprobe => no_push = None,
-            exit @ (Exit::Lost(_) | Exit::Unreachable(_) | Exit::NoPush(_)) => {
+            exit @ (Exit::Lost(_) | Exit::Unreachable(_) | Exit::NoPush(_) | Exit::Refused(_)) => {
                 if started.elapsed() >= hub.timings.stable {
                     backoff.reset();
                 }
-                let delay = backoff.delay(&hub.timings);
+                let mut delay = backoff.delay(&hub.timings);
+                // Every server refused the watch: none is asked again
+                // before the first of them may be.
+                if let Some(until) = candidates(&hub.config)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|endpoint| hub.shunned_until(endpoint))
+                    .collect::<Option<Vec<Instant>>>()
+                    .and_then(|untils| untils.into_iter().min())
+                {
+                    delay = delay.max(until.saturating_duration_since(Instant::now()));
+                }
                 // Without a session, the transport last tried is not one
                 // in use.
                 let established = matches!(exit, Exit::Lost(_));
                 hub.interrupted |= established;
-                let (Exit::Lost(detail) | Exit::Unreachable(detail) | Exit::NoPush(detail)) = exit
+                let (Exit::Lost(detail)
+                | Exit::Unreachable(detail)
+                | Exit::NoPush(detail)
+                | Exit::Refused(detail)) = exit
                 else {
                     continue;
                 };
@@ -1165,12 +1618,20 @@ async fn run_once(hub: &mut Hub, endpoints: &[Endpoint], no_push: &mut Option<In
     let mut last = Exit::Lost("no backend to watch".to_owned());
     let mut esplora: Vec<&Endpoint> = Vec::new();
     for endpoint in endpoints {
+        if hub.shunned_until(endpoint).is_some() {
+            last = Exit::Refused("the server refused the watch a moment ago".to_owned());
+            continue;
+        }
         match endpoint {
             Endpoint::Electrum(target) => {
                 let target = target.clone();
                 match electrum::run(hub, endpoint, &target).await {
                     // The next candidate may do.
                     Exit::Unreachable(detail) => last = Exit::Unreachable(detail),
+                    Exit::Refused(detail) => {
+                        hub.shun(endpoint);
+                        last = Exit::Refused(detail);
+                    }
                     exit => return exit,
                 }
             }
@@ -1185,6 +1646,10 @@ async fn run_once(hub: &mut Hub, endpoints: &[Endpoint], no_push: &mut Option<In
             };
             match mempool::run(hub, endpoint, url).await {
                 exit @ (Exit::NoPush(_) | Exit::Unreachable(_)) => last = exit,
+                exit @ Exit::Refused(_) => {
+                    hub.shun(endpoint);
+                    last = exit;
+                }
                 exit => return exit,
             }
         }
@@ -1194,8 +1659,15 @@ async fn run_once(hub: &mut Hub, endpoints: &[Endpoint], no_push: &mut Option<In
         let Endpoint::Esplora(url) = endpoint else {
             continue;
         };
+        if hub.shunned_until(endpoint).is_some() {
+            continue;
+        }
         match poll::run(hub, endpoint, url).await {
             exit @ Exit::Unreachable(_) => last = exit,
+            exit @ Exit::Refused(_) => {
+                hub.shun(endpoint);
+                last = exit;
+            }
             exit => return exit,
         }
     }

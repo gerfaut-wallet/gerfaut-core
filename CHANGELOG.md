@@ -36,8 +36,9 @@ The first release: the library both Gerfaut apps are built on.
   instead of waiting for the next scheduled sync. An Electrum server pushes
   changes on up to 200 scripts per wallet, 2,000 in all, and the regular
   syncs cover the rest. A mempool instance pushes blocks and as many
-  scripts as it allows per connection, ten on the public ones, and the rest
-  are polled. Any other Esplora is polled about once a minute, around 240
+  scripts as it allows per connection, ten on the public mainnet ones and
+  some six hundred on those of signet and the testnets, and the rest are
+  polled. Any other Esplora is polled about once a minute, around 240
   requests an hour. The connection takes the route a sync takes: Tor for
   an onion host, and never around it, with the same certificate checks.
   The server learns what a sync already tells it, plus how long the app
@@ -61,38 +62,34 @@ The first release: the library both Gerfaut apps are built on.
   repeats one. Settings and wallets change under a running watch without a
   call from the app, and a host whose timers sleep can ask for a connection
   check from an alarm.
-- The premium client reads a wallet the server refused: `watching` is false
-  and `refusal` says why, in the list and in a `wallet_refused` event. A
-  single address can be registered like a descriptor.
-- Premium devices. The account key now only connects a device: the server
-  hands that device a token of its own, which the vault keeps and which is
-  never shown, logged or handed to the apps, and every later request
-  carries that token instead of the key. A new device sees nothing and
-  changes nothing until another device approves it, or for ten days; the
-  first device an account ever has gets full access at once. The wallet
-  manager connects this device, lists the others, approves and disconnects
-  them, changes the key, logs out, and hands out each waiting device once
-  for a local notification. A vault written before devices, with a key and
-  no token, connects on its own, once. A device the server disowned, or
-  whose key it refuses for good (for example a key that already has every
-  device the server takes), keeps its key and waits for the user to
-  connect it again. A rate limit holds back only the key that hit it,
-  until the wait ends, rather than being met at every poll. A debug build
-  can point the premium client at a local server with
-  `GERFAUT_PREMIUM_URL` and `GERFAUT_PREMIUM_PUBLIC_KEY`; a release build
-  has no code that reads them.
-- A lost answer from the premium server costs neither a key nor a device.
-  The device token and the new key of a key change are drawn on the device
-  and written to the vault before the request leaves, and the same request
-  is sent again until the server answers it; the server takes it as the
-  one it already carried out. While a key change is unanswered the apps
-  say so, and nothing that would lose the new key is allowed. If the
-  server disconnects the device in the meantime, the change was never
-  applied, and the device drops it. A device that logs out while the
-  server is out of reach keeps its token queued, never shown, until the
-  server hears of it. Moving to another account first tells the old one
-  about its removed wallets, with the old token, and none of those
-  removals ever goes to the new account.
+- "This is my node". A custom backend can be marked as the user's own
+  node with `own_node`, on `BackendConfig::CustomElectrum` and
+  `CustomEsplora`. It is off by default and left out of the stored form
+  while off, so a vault or a backup written before it reads and writes
+  back the same; the public backend cannot be one, and nothing checks the
+  claim. On the user's own node the live watch takes 20,000 scripts in all
+  instead of 2,000, and one wallet may take all of them instead of 200:
+  a public server charges every subscription and refuses them past its
+  own limit, a node of one's own does not. The switch travels with the
+  backend in a backup.
+- The live watch shares its scripts out between wallets rank by rank, the
+  first script of every wallet, then the second, and so on. Wallets the
+  user pinned come first, up to what a watch takes of one wallet; then,
+  at each rank, a wallet that holds coins goes before an empty one.
+  `WalletManager::set_wallet_live_pinned` pins a wallet, and
+  `WalletMeta.live_pinned`, kept in the vault and carried by backups,
+  says which are.
+- The status of the live watch says how much of each wallet it hears.
+  `WatchStatus.wallets` gives each wallet `live`, `partial` or
+  `sync_only`, with the scripts it watches and the ones it leaves to the
+  regular syncs, and `left_out_scripts` and `left_out_wallets` add them
+  up, so an app can say when a payment will only show at the next sync.
+- `WatchStatus.server_software` gives what an Electrum server says it
+  runs, as it answers `server.version` ("ElectrumX 1.18.0", "Fulcrum
+  1.12.0"), so that on the user's own node, when the watch leaves
+  scripts out, an app can name the setting of that server that takes
+  more. It is `None` over the other transports, and absent from a
+  status written before.
 - One sync of a wallet runs at a time. A caller that arrives while one runs
   waits for it, then runs its own, since the running sync may have read
   the wallet before the payment the caller came for arrived. Callers that
@@ -100,9 +97,10 @@ The first release: the library both Gerfaut apps are built on.
 - On a phone, the built-in Tor client uses reduced channel padding, so a
   connection held open for hours lets the radio sleep between cells. A
   desktop keeps the normal level.
-- Encrypted local storage: XChaCha20-Poly1305 under an Argon2id key, an app
-  lock that slows repeated attempts and survives a restart, and an encrypted
-  backup file that doubles as the sync format between two devices.
+- Encrypted local storage: XChaCha20-Poly1305 under a key the platform
+  keeps, an app lock hashed with Argon2id that slows repeated attempts and
+  survives a restart, and an encrypted backup file, sealed under a password
+  with Argon2id, that also carries the wallets from one device to another.
 
 ### Changed
 
@@ -164,18 +162,75 @@ The first release: the library both Gerfaut apps are built on.
   announced. A change heard on one script at the same time as a
   reconnection no longer narrows the whole-wallet sync the reconnection
   asks for.
+- The list of scripts the live watch follows, built after every sync,
+  reads each script the wallet revealed from the wallet's index instead
+  of deriving it again. On a wallet that revealed tens of thousands of
+  addresses, that is milliseconds instead of seconds. While an Electrum
+  server takes the subscriptions, the count the status gives moves in
+  steps of a hundred, not one event per script.
+- The live watch lists each wallet's scripts that hold coins first, where
+  a spend shows, then the newest receive addresses it revealed and has
+  not seen used, up to the gap limit, and the gap limit ahead of them,
+  then the change addresses the same way, then the rest, newest first.
+  The unused receive addresses used to come first, oldest first: a
+  merchant's wallet that reveals an address per invoice, many never
+  paid, filled the 200 scripts a watch takes of a wallet with them, and
+  neither a spend of its coins nor a payment to its next addresses was
+  heard before the next sync.
+- A sync of a watched address reads only what is new or moved. Over
+  Electrum, a transaction the wallet holds, at the height the server
+  lists it now, is kept as it is, with the time of its block, and only
+  the others are fetched, with the transactions their inputs spend. Over
+  Esplora, the reading stops at the first page that lists nothing but
+  what the wallet holds, and the rest of the round comes from it. An
+  address paid a thousand times, watched live, used to cost thousands of
+  requests and megabytes for each payment.
+- The core no longer depends on `bdk_esplora`, nor on `esplora-client`
+  with it: it already spoke to Esplora on its own, and kept them for six
+  types of what a server answers, which it now reads itself. Nor on
+  `bdk_electrum`, kept only to reach `electrum-client`, on which it now
+  depends directly, at the same version and with the same features.
+- On the WebSocket of a mempool instance, the live watch asks for as
+  many scripts as one message carries, some six hundred, instead of a
+  hundred: the public instances of signet and the testnets track 1,337
+  on one connection, and the rest were polled three a minute. The
+  message stays under the 50,000 bytes past which such an instance cuts
+  the connection.
+- The keepalive ping of the live watch comes at random between seven
+  tenths of its wait and all of it, never later: a ping every four
+  minutes on the dot marked the connection even through Tor.
+- On the user's own node, polling reads thirty scripts a minute, four at
+  a time, instead of three. On a server that pushes nothing, polling
+  reads the first two scripts of the list every round and the rest in
+  turn, so with N scripts past those two, each is read about every N
+  minutes, and every N/28 minutes on one's own node. Past what a mempool
+  instance pushes, every script polled takes its turn: every N/3
+  minutes, or N/30 on one's own node. All of them are read at the next
+  regular sync. Every minute for each would be N requests a minute,
+  which no public server would take from every client.
 - The live watch keeps each wallet complete on its own. At each block,
   and every ten minutes, it reruns any sync that failed, and reads every
   script of any wallet that has gone a day without a complete sync. A
   phone can keep a watch running for days with no other sync, and the
   watch cannot hear every script.
-- Backup files are sealed under a heavier Argon2id profile than the vault
+- Backup files are sealed under a heavier Argon2id profile than before
   (64 MiB of memory, three passes): a backup travels, and whoever holds a
   copy can guess at its password offline for as long as the file exists.
   This version still opens backups written under the lighter profile, but
   a build older than this one cannot open the files it writes. A backup
   from a newer Gerfaut is now refused by name, with a message that says to
   update, instead of being reported as a wrong password.
+- `price::fetch_price` and `price::fetch_price_history` are no longer
+  public: an app asks the wallet manager, which takes the route of the
+  syncs.
+
+### Removed
+
+- Nothing called these, so they are gone: `store::VaultKdf`,
+  `cipher::kdf_kind`, `format_btc_signed`, `truncate_middle`,
+  `truncate_address` and `broadcast::sats`. So are the `funded_sats` and
+  `spent_sats` fields of `AddressWatchState`, which nothing read. A vault
+  still writes them as zero, for the older builds that require them.
 
 ### Fixed
 
@@ -191,20 +246,137 @@ The first release: the library both Gerfaut apps are built on.
   goes where the client would take it: through Tor when it is one, in the
   clear when it is not. The host is stored in lower case; the userinfo
   before an `@` keeps its own.
-- The ids the premium server hands out are percent-encoded before they go
-  into a URL path.
-- A 401, 403, 404 or 410 from the premium server counts as its answer only
-  when it comes in the server's own error body. The bare status is what a
-  captive portal or a proxy answers, and it no longer makes the app forget
-  a key or a wallet the server still holds.
-- A 429 from the premium server that names a wait is a rate limit of its
-  own, with the wait it named, an hour at most. Telling the server about
-  removed wallets stops at one and keeps the rest for later, instead of
-  sending every request behind it to be turned away too.
+- The live watch asks a server for its genesis block before it hears of
+  any script, over Electrum as over Esplora, and refuses one of another
+  network: a signet port typed for testnet4 reported changes that never
+  happened on the wallet's network. A refused server is left alone for a
+  quarter of an hour while the next one is tried. A sync whose server
+  disagrees with the wallet on a block now asks for its genesis block
+  too, and says "the server is on another network" at once, instead of
+  walking the wallet's chain down to it one request a block.
+- The live watch remembers what an Electrum server refuses. A server takes
+  so many subscriptions on one connection, 100 on the Electrum server of
+  mempool.space, and at each reconnection the watch used to ask it for the
+  whole list again, get the rest refused, and sync every script it gave up
+  on. Now a refused script is synced once, when the server refuses it, and
+  the next connection asks only for the head of the list, up to what the
+  server took; the regular syncs cover the rest. The watch keeps that limit
+  for a day, then asks the server for the whole list again. A limit of zero
+  lasts an hour: a server that refused every subscription no longer leaves
+  Live with nothing to push until the configuration changes. Scripts the
+  server refuses again are not synced a second time, even if the
+  connection that asks for them again drops before the server refuses
+  them. The status counts those scripts out, so `WatchStatus.wallets` and
+  `left_out_scripts` say what the server really took, on the user's own
+  node as on a public server.
+- An Electrum server that cuts the live watch for what it costs, an
+  ElectrumX past its budget, is left alone for a quarter of an hour, as
+  one of another network is, and asked for half as many scripts when the
+  watch comes back to it. ElectrumX keeps that cost against the address
+  for a while, and the watch used to come back within two minutes with
+  the same burst. The watch keeps to that smaller list until the
+  configuration changes: asked for the whole list again, ElectrumX would
+  cut it again. Subscriptions go out ten at a time instead of 25, as many
+  as ElectrumX serves at once before it slows a session down.
+- Over Electrum, a block now syncs a wallet waiting for a confirmation
+  when the live watch does not hear all of its scripts, past the caps on
+  the list or refused by the server. The confirmation comes as news on
+  the scripts of the transaction, and on a script nobody pushes it used
+  to wait for the next regular sync.
+- Polling now picks up where the last session left off. A session ends
+  every half hour to try push again, and each new one used to start over
+  at the head of the list: on an Esplora server that pushes nothing, the
+  live watch only ever read some thirty addresses, about 840 on the
+  user's own node, and a payment to any other address waited for the
+  next regular sync. The rotation now runs through the whole list, even
+  when a wallet is added or removed between two sessions, so each
+  address is read about every N minutes, or every N/28 minutes on the
+  user's own node.
+- An Esplora server that limits the rate of requests (HTTP 429) is asked
+  again once, after the wait its `Retry-After` names, in seconds or as a
+  date, five seconds at least, instead of three times within two
+  seconds; past a minute the
+  request fails at once and says how long the server asked for.
+  mempool.space bans a client that keeps coming back too soon. Polling
+  a server that limits it waits twice as long between rounds each time,
+  up to ten minutes, and back to a minute half an hour after the last
+  limit; a round turned away no longer counts as a server lost.
+- A sync of a watched address keeps 256 MiB at most of the transactions
+  it reads, as a sync of a descriptor wallet already did: each one is
+  kept whole, its raw bytes and every input and output, and a server
+  could list transactions of hundreds of thousands of inputs until the
+  phone ran out of memory. Over Electrum, a connection of that sync also
+  reads 256 MiB at most, every answer together.
+- The HTTP clients of the core no longer follow a redirection anywhere:
+  an Esplora server's not at all, and the price and update services'
+  only to their own host, over HTTPS. A redirection carried the request,
+  the scripts of a wallet among them, where its route was never checked:
+  in the clear, or an onion name to the system's resolver.
+- What a server writes in a refusal or an error reaches a screen as one
+  short line on every path: 200 characters at most, without control
+  characters or the marks that turn the text around them, the line and
+  paragraph separators included. A sync over Electrum passed a server's
+  error on whole, sixteen megabytes or a text that read backwards.
+- A watched address sums the amounts a server lists without wrapping
+  around, over Esplora as it already did over Electrum, and the net of a
+  transaction stops at what a signed number holds. A made-up amount past
+  what any coin holds made a build that checks panic, and showed in one
+  that does not as a huge payment out.
+- On a desktop, the built-in Tor client checks again, as arti does by
+  default, that no other account of the machine can write to its state,
+  where it keeps its guards and the directory it trusts. Only a phone,
+  whose app storage the system keeps private to the app, skips it.
+- A server that drops the live watch's connection again and again, and
+  names scripts it made up as moved on each new one, has the syncs they
+  ask for wait longer and longer, as a server that pushes made-up changes
+  already did. A connection dropped every minute had those scripts
+  synced every minute, day and night.
+- Over Electrum, where a broadcast transaction stands is read through
+  an output a coin may sit on, an OP_RETURN only last, and through the
+  next one when the server refuses a history. It was read through the
+  first output, an OP_RETURN or an exchange's deposit address with a
+  history too long for the server, and failed while the transaction
+  confirmed.
+- An incoming payment announced as pending is said dropped only once a
+  second sync, ten minutes or more after the first one that missed it,
+  has read its scripts again and not seen it either. A server that lags,
+  or one of the rotation that never heard of the payment, made a single
+  sync announce as dropped a payment that was still coming. A sync that
+  sees the payment again, or a fee bump of it, forgets it; a sync that
+  did not read its scripts says nothing of it; a replacement that cuts
+  the payment down is still said at once. The vault keeps what this
+  needs only while such a payment waits, so a vault written before reads
+  and writes the same. While the live watch runs, it reads the scripts
+  of such a payment again itself ten minutes on, nothing moving on them
+  once it left. A wallet removed takes such a payment out of the vault
+  with it.
+- A watched address is never read from a server of another network.
+  Testnet, testnet4 and signet spell an address alike, and a server of
+  the wrong one answered for it with transactions the wallet's network
+  never saw. A descriptor wallet's sync already caught it, walking the
+  wallet's chain; an address keeps none, so its sync now asks the server
+  for its genesis block first, over Electrum and Esplora, and is refused
+  by one of another network.
+- An OP_RETURN payload that holds a character changing the direction of
+  the text, a bidirectional mark, embedding, override or isolate, or a
+  line or paragraph separator, is no longer read as text: shown as text,
+  it could make an amount or an address beside it read backwards, or push
+  it onto a line of its own. Its bytes are shown in hex instead.
 - The update check takes the route the syncs take. With an onion backend
   configured on any network it goes through the same Tor proxy, and when
   Tor cannot be had it does not go at all, where it used to ask GitHub in
   the clear. It now runs from the wallet manager only.
+- The price now takes the route the syncs take, as the update check
+  already does. When a backend on any network is an onion address, the
+  price goes through the same Tor proxy, and when Tor cannot be reached it
+  does not go out at all. Before, the price source was asked in the clear
+  every minute. The request now runs from the wallet manager only, which
+  refuses a currency or a range the source cannot serve before it resolves
+  any route.
+- The first address shown before a wallet is added is now derived for the
+  network the wallet goes to, given in `ImportOptions::network`. On
+  regtest, a test key showed the `tb1…` address of signet, which no
+  regtest wallet ever gives. It now shows its `bcrt1…` address.
 - A sync of a descriptor wallet also reads its receive addresses past the
   last one it revealed, the way a full scan does: up to the gap limit, and
   further past any that holds a transaction. A payment to an address the
@@ -213,9 +385,6 @@ The first release: the library both Gerfaut apps are built on.
   rescan used to find it. With the default gap limit of 20, that costs a
   sync 21 more requests on Esplora, and 2 more round trips carrying 20
   requests on Electrum, plus the tip and the latest headers.
-- Switching a wallet off on the premium server withdraws the consent kept
-  for it once the server has nothing left under its id, so removing the
-  wallet later has nothing to tell the server.
 - A custom server address is stored the way a scan reads it, the host in
   lower case and an IPv6 literal in brackets, and one the URL parser cannot
   read is refused when saved, with the reason. Stored as typed, an address
@@ -254,9 +423,11 @@ The first release: the library both Gerfaut apps are built on.
   parsed input the app handed back altered, went straight to the wallet
   engine, which took the key and stored it in the vault. Every wallet is
   now checked again as it is created.
-- A multi-part UR that announces more than 100,000 parts is refused. One
+- A multi-part UR that announces more than 5,000 parts is refused. One
   frame announcing about four billion, pasted or scanned, made the decoder
-  ask for tens of gigabytes and ended the app on the spot.
+  ask for tens of gigabytes and ended the app on the spot, and a frame of a
+  few bytes that mixed half of 100,000 parts cost seconds of work, paid
+  again for every frame scanned after it.
 - An Electrum address whose host still holds a port, such as
   `ssl://[x.onion:50001]:50002` or `x.onion:50001:50002`, is refused. The
   Tor check did not see the onion in it, and the certificate check, which
@@ -266,30 +437,22 @@ The first release: the library both Gerfaut apps are built on.
 - A sync that brings a transaction worth more than 21 million bitcoin,
   which only a lying server can send for one still out of a block, is
   refused like a failed server, and the next one is tried. Stored, such a
-  transaction made every later look at the wallet crash the app. The
-  balance of a watched address saturates instead of wrapping around when
-  a server lists coins no one can hold.
+  transaction made every later look at the wallet crash the app. So is
+  one that spends the same coin twice, and an answer whose amounts,
+  added to what the wallet already holds, pass what the wallet's sums
+  can hold: thousands of invented unconfirmed payments, each within the
+  21 million, crashed the app the same way once added up into a balance.
+  The balance of a watched address saturates instead of wrapping around
+  when a server lists coins no one can hold.
 - The transaction preview reads the signature hash type of every
   signature it finds, and a signature made with `SIGHASH_NONE` or
   `SIGHASH_SINGLE` gets a warning of its own, `uncommitted_outputs`,
   read as an alert. Such a signature leaves some or all of the outputs
   open, so a node that relays the transaction can send that money
   elsewhere, and the outputs the preview showed were only a suggestion.
-- The Telegram link puts the server's code in the link only when Telegram
-  would take it as a start parameter: 1 to 64 letters, digits, `_` and
-  `-`. Any other code, which could have changed what the link says, is
-  left out, and the link only opens the bot.
 - The key derived from a password or a platform key is wiped on every way
   out of a seal or an open, a failure included, and Argon2 now wipes its
   own working hashes as well.
-- The premium client follows no redirect and reads at most 2 MiB of an
-  answer. A redirect used to take the request on to the host it named,
-  body included, and with it the device token or a new key; an answer of
-  any size was held in memory whole.
-- The premium client goes through Tor as soon as a backend of any network
-  is an onion, the way the update check does. It used to look at the
-  network on screen only, so switching to one whose backend is in the
-  clear showed this device's address to the premium server.
 - A previous transaction fetched for the transaction preview is checked
   against its txid, on Electrum as on Esplora. A server could answer with
   another transaction and set the value of the coin, and so the fee, the
@@ -312,13 +475,26 @@ The first release: the library both Gerfaut apps are built on.
 - A live watch that read an impossible tip height, from a lying server or
   a slip, no longer ignores every block after it: a height more than a
   day of blocks below the one kept becomes the baseline again.
+- A server can no longer put made-up blocks into a wallet's chain for
+  good. Its tip is refused past any height a chain can have reached (one
+  block a minute since the genesis block, with a clock set back read as
+  the day this release was written), and its latest blocks are taken
+  only as a chain: one per height, each the parent of the next, and over
+  Electrum the last one the tip it announced, each mined on mainnet and
+  testnet4 at a target no easier than the network allows. That stops a
+  header no one mined; it does not prove the work the chain asks for at
+  that height. A wallet that already holds such blocks, far above
+  the tip of the server it syncs with next, drops them: a single answer
+  with a height of four billion used to give every transaction billions
+  of confirmations, every timelock of the policy as expired, and every
+  later Esplora sync a failure, even on an honest server. An Esplora
+  server a little behind the wallet now leaves its chain as it is, as an
+  Electrum server already did, instead of failing the sync.
 - The update check keeps the page it links to only when it is one of the
   repository's release pages on GitHub, and falls back to the latest
   release page otherwise. A tag longer than 32 characters, or with
   spaces in it, is not taken for a version, and at most 1 MiB of the
   answer is read.
-- `Licence::paid_until` is the end of the paid time the certificate
-  signs, never the unsigned date the server sends beside it.
 - The key of a Coldcard-style JSON export is held to its SLIP-132 prefix
   like a pasted key: a multisig cosigner key, or a prefix for another
   script than the account's, is refused instead of imported under the
@@ -327,3 +503,62 @@ The first release: the library both Gerfaut apps are built on.
   unconfirmed transactions no longer announces a payment as dropped for
   missing from that page. Anyone could push it off by sending the
   address enough dust.
+- The policy page reads the internal key of a Liana taproot vault for what
+  it is. Liana writes that unspendable key as an extended key built on the
+  BIP 341 point, and the page took it for a key of its own: on every vault
+  with several keys on its main path, it showed a "Key A" that could spend
+  at once, alone.
+- A threshold that counts one key twice says so, "Any 2 of 3 keys, Key A
+  counted twice". A coordinator holding two places in a 2-of-3 used to read
+  as three keys.
+- When a branch needs two locks together, a date and a delay, both are
+  marked as required, where they read as optional, and the branch is no
+  longer called primary as if it could spend now.
+- A 1-of-n beside a timed path stays one way to spend, "Any of n keys",
+  instead of n primary branches. So do a taproot key path and a leaf of a
+  single key: "Any of 2 keys", beside the timed leaf.
+- A pair of descriptors is held together: the change descriptor must have
+  the receive descriptor's script type, keys and conditions, on other
+  paths. The policy page reads the receive one, and change goes to the
+  other: a pair that disagreed, a 2-of-3 for payments and a single key for
+  change, was imported without a word.
+- A QR code that holds another QR code is refused. Each level opened cost a
+  frame of the stack, and a pasted text, or a file dropped on the broadcast
+  page, could hold enough of them to end the app.
+- A Coldcard export is read under its master fingerprint, the one a signer
+  knows the wallet by, not the account's. A descriptor copied to a
+  coordinator gave PSBTs the Coldcard would not sign. An account whose
+  `first` address is not the one its key derives is refused.
+- A private key written with JSON escapes inside an export is refused like
+  any other, and never quoted in the error.
+- The balance of a watched address in the address list, and the date a coin
+  unlocks on the policy page, saturate instead of wrapping around when a
+  server sends values no coin can hold.
+- A QR code is refused rather than guessed at: a key path step out of
+  range, a network its format does not name, a 32-byte key, which is a
+  private key in that format, or two animated BBQr codes scanned at once,
+  whose parts used to be glued together.
+- A `crypto-output` QR code whose key names no child path is still read as
+  the receive and change branches (`/<0;1>/*`), and Gerfaut now says so.
+  `QrProgress.warnings` carries `assumed_branches`, and parsing a pasted
+  code returns it too, so the app can ask the user to compare the first
+  address with the signer.
+- More imports work: a key scanned alone as `ur:crypto-hdkey`, the
+  descriptor file Sparrow exports, a payment URI (`bitcoin:…?amount=…`)
+  scanned from another wallet's receive screen, a BSMS record inside a QR
+  envelope, and a BSMS record for regtest. A BSMS record with more than
+  four lines is refused, and so is a descriptor file whose three
+  descriptors do not describe the same wallet.
+- A `ypub` or a `zpub` keeps the script its prefix names: picking another
+  one no longer builds a wallet of addresses the exporting wallet never
+  shows, and the confirmation screen no longer offers another. A key under
+  a BIP-48 or BIP-45 origin is refused as a multisig cosigner's key, as its
+  SLIP-132 prefix already was.
+- A vault is written back at payload version 2, so a build older than this
+  one refuses to open it rather than rewrite it without the fields it does
+  not know. The version is read first, on its own, so a vault from a later
+  build that gives a field another shape is refused as newer instead of
+  being reported as corrupted.
+- The app lock's delay now starts when the answer comes back. It used to
+  start at the guess, so the time Argon2 took to check it came off the
+  delay.

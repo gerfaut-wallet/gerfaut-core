@@ -35,6 +35,9 @@ fn timings() -> Timings {
         hold: Duration::from_millis(100),
         hold_cap: Duration::from_millis(400),
         due: Duration::from_secs(3600),
+        refused: Duration::from_millis(600),
+        limit_kept: Duration::from_secs(3600),
+        zero_limit_kept: Duration::from_secs(3600),
     }
 }
 
@@ -62,6 +65,9 @@ fn wallet(id: &str, scripts: &[u8], lookahead: &[u8], has_pending: bool) -> Watc
             })
             .collect(),
         has_pending,
+        pinned: false,
+        holds_coins: false,
+        unlisted: 0,
     }
 }
 
@@ -150,6 +156,8 @@ async fn electrum_pushes_a_change_once_per_burst() {
     assert_eq!(status.state, WatchState::Connected);
     assert_eq!(status.transport, Some(WatchTransport::Electrum));
     assert_eq!(status.server.as_deref(), Some("127.0.0.1"));
+    // What the server says it runs, for the settings of a node.
+    assert_eq!(status.server_software.as_deref(), Some("fake 1.0"));
     assert_eq!(status.watched_scripts, 4);
     // The head of every wallet first, then the next rank.
     assert_eq!(
@@ -304,21 +312,40 @@ async fn electrum_reconnects_and_reports_what_moved_meanwhile() {
     assert_eq!(server.subscriptions().len(), 2, "no reconnection for that");
 }
 
+/// How many requests of a method the server has had, over every
+/// connection.
+fn asked(server: &FakeElectrum, method: &str) -> usize {
+    let state = server.state.lock().unwrap();
+    state.asked.iter().filter(|asked| *asked == method).count()
+}
+
+/// Drops the connection and waits for the next one to have asked for
+/// what it asks for, and for whatever it reports to be reported.
+async fn reconnected(server: &FakeElectrum, events: &mut WatchEvents) {
+    let sessions = asked(server, "blockchain.headers.subscribe");
+    server.hang_up();
+    within("connected again", WAIT, || {
+        asked(server, "blockchain.headers.subscribe") > sessions
+    })
+    .await;
+    no_event(events, Duration::from_millis(300)).await;
+}
+
 /// A script the server refused has no status to compare with: it is
-/// reported, for a sync to say what it holds. Read on the next
-/// connection, it is compared like any other.
+/// reported once, for a sync to say what it holds, and is not asked of
+/// that server again. A reconnection neither asks for it nor reports
+/// it: it is left to the regular syncs, and the status counts it out.
+/// A new configuration asks for it again.
 #[tokio::test]
-async fn electrum_reports_what_it_never_read_after_a_reconnection() {
+async fn a_script_the_server_refused_is_left_to_the_syncs() {
     let server = FakeElectrum::start().await;
     server.state.lock().unwrap().refuse.insert(
         "blockchain.scripthash.subscribe",
         "history too long".to_owned(),
     );
-    let (watch, mut events) = LiveWatch::start_with(
-        config(server.backend()),
-        vec![wallet("a", &[1], &[], false), wallet("b", &[2], &[], false)],
-        Some(timings()),
-    );
+    let wallets = vec![wallet("a", &[1], &[], false), wallet("b", &[2], &[], false)];
+    let (watch, mut events) =
+        LiveWatch::start_with(config(server.backend()), wallets.clone(), Some(timings()));
     // Refused, and answered all the same: the watch is ready.
     let mut seen = vec![next_event(&mut events).await, next_event(&mut events).await];
     seen.sort_by_key(|event| format!("{event:?}"));
@@ -329,7 +356,18 @@ async fn electrum_reports_what_it_never_read_after_a_reconnection() {
             moved("b", ChangeReason::Started, false, &[2]),
         ]
     );
-    assert_eq!(watch.status().pushed_scripts, 0);
+    let status = watch.status();
+    assert_eq!(status.pushed_scripts, 0);
+    assert_eq!((status.left_out_wallets, status.left_out_scripts), (2, 2));
+    assert!(
+        status
+            .wallets
+            .iter()
+            .all(|wallet| wallet.coverage == Coverage::SyncOnly)
+    );
+
+    // The server would take them now, and one of them moved: the next
+    // connection asks for neither, and reports nothing.
     server.state.lock().unwrap().refuse.clear();
     server
         .state
@@ -337,20 +375,342 @@ async fn electrum_reports_what_it_never_read_after_a_reconnection() {
         .unwrap()
         .statuses
         .insert(scripthash(&script(2)), Some("bb".to_owned()));
-    server.hang_up();
+    reconnected(&server, &mut events).await;
+    assert_eq!(asked(&server, "blockchain.scripthash.subscribe"), 2);
+    assert_eq!(watch.status().left_out_scripts, 2);
+
+    watch.reconfigure(config(server.backend()), wallets);
     assert_eq!(
         next_event(&mut events).await,
-        moved("b", ChangeReason::Reconnected, false, &[2])
+        moved("b", ChangeReason::Started, false, &[2])
     );
-    until(&watch, "subscribed", |s| s.pushed_scripts == 2).await;
+    let status = until(&watch, "subscribed", |s| s.pushed_scripts == 2).await;
+    assert_eq!(status.left_out_scripts, 0);
     no_event(&mut events, Duration::from_millis(300)).await;
 }
 
-/// A server that refuses subscription after subscription is at its
-/// limit, and the scripts still waiting their turn are not asked for.
-/// Nothing watches them from then on, and nothing says what they did
-/// while nothing listened: each is reported, as a refused one is, for a
-/// sync to catch up on it.
+/// A server that takes so many subscriptions on one connection and no
+/// more, whether its refusal says so or it only refuses one after the
+/// other: what it took is watched, and every script past it is reported
+/// once, for a sync of its own. The next connection asks for the head
+/// of the list up to what it took, and reports nothing for the rest;
+/// the status says how much of the wallet is heard.
+#[tokio::test]
+async fn electrum_keeps_to_what_a_server_takes() {
+    let all: Vec<u8> = (1..=10).collect();
+    for words in ["subscription limit reached (3 max per client)", "nope"] {
+        let server = FakeElectrum::start().await;
+        server.state.lock().unwrap().subscription_limit = Some((3, words));
+        let (watch, mut events) = LiveWatch::start_with(
+            config(server.backend()),
+            vec![wallet("a", &all, &[], false)],
+            Some(timings()),
+        );
+        let mut reported = BTreeSet::new();
+        while reported.len() < 7 {
+            match next_event(&mut events).await {
+                WatchEvent::WalletChanged {
+                    wallet_id,
+                    reason,
+                    scripts,
+                    ..
+                } => {
+                    assert_eq!((wallet_id.as_str(), reason), ("a", ChangeReason::Started));
+                    reported.extend(scripts);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let past: BTreeSet<String> = (4..=10).map(script).collect();
+        assert_eq!(reported, past, "{words}");
+        let status = watch.status();
+        assert_eq!(status.pushed_scripts, 3);
+        assert_eq!(
+            status.wallets,
+            [WalletCoverage {
+                wallet_id: "a".to_owned(),
+                coverage: Coverage::Partial,
+                watched_scripts: 3,
+                left_out_scripts: 7,
+            }]
+        );
+
+        let before = asked(&server, "blockchain.scripthash.subscribe");
+        reconnected(&server, &mut events).await;
+        within("asked for the head", WAIT, || {
+            server
+                .subscriptions()
+                .get(1)
+                .is_some_and(|asked| asked.len() == 3)
+        })
+        .await;
+        let head: Vec<String> = (1..=3).map(|n| scripthash(&script(n))).collect();
+        assert_eq!(server.subscriptions()[1], head, "{words}");
+        assert_eq!(
+            asked(&server, "blockchain.scripthash.subscribe"),
+            before + 3
+        );
+        until(&watch, "subscribed again", |s| s.pushed_scripts == 3).await;
+        // The scripts past the limit are not reported again.
+        no_event(&mut events, Duration::from_millis(300)).await;
+    }
+}
+
+/// The most a server takes is asked again once it ran out, on a new
+/// connection while the one open holds: the next session asks for the
+/// whole list. Refused again past the same point, the scripts that
+/// limit left out are not reported again: the regular syncs have them.
+/// Once the server takes them all, the watch hears the whole list.
+#[tokio::test]
+async fn a_learned_limit_is_asked_again_once_it_ran_out() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().subscription_limit =
+        Some((3, "subscription limit reached (3 max per client)"));
+    let all: Vec<u8> = (1..=10).collect();
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            limit_kept: Duration::from_millis(500),
+            ..timings()
+        }),
+    );
+    let mut reported = BTreeSet::new();
+    while reported.len() < 7 {
+        match next_event(&mut events).await {
+            WatchEvent::WalletChanged { scripts, .. } => reported.extend(scripts),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let past: BTreeSet<String> = (4..=10).map(script).collect();
+    assert_eq!(reported, past);
+    // Read from the first connection: the second may already be open.
+    assert_eq!(server.subscriptions()[0].len(), 3);
+
+    within("asked for the whole list again", WAIT, || {
+        asked(&server, "blockchain.scripthash.subscribe") >= 2 * all.len()
+    })
+    .await;
+    assert!(server.subscriptions().len() >= 2);
+    no_event(&mut events, Duration::from_millis(300)).await;
+
+    server.state.lock().unwrap().subscription_limit = None;
+    let status = until(&watch, "heard whole", |s| s.pushed_scripts == 10).await;
+    assert_eq!(
+        status.wallets,
+        [WalletCoverage {
+            wallet_id: "a".to_owned(),
+            coverage: Coverage::Live,
+            watched_scripts: 10,
+            left_out_scripts: 0,
+        }]
+    );
+    no_event(&mut events, Duration::from_millis(300)).await;
+}
+
+/// A session that asks for the whole list again may be lost before the
+/// server refuses anything: the next one, which has no limit to keep
+/// to, still does not report again what the limit had left out.
+#[tokio::test]
+async fn a_retry_lost_before_a_refusal_reports_nothing_again() {
+    const SUBSCRIBE: &str = "blockchain.scripthash.subscribe";
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().subscription_limit =
+        Some((3, "subscription limit reached (3 max per client)"));
+    let all: Vec<u8> = (1..=10).collect();
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            limit_kept: Duration::from_millis(500),
+            ..timings()
+        }),
+    );
+    let mut reported = BTreeSet::new();
+    while reported.len() < 7 {
+        match next_event(&mut events).await {
+            WatchEvent::WalletChanged { scripts, .. } => reported.extend(scripts),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // The retry hears nothing back, and is given up on.
+    server.state.lock().unwrap().stall = Some(SUBSCRIBE);
+    within("the retry asks", WAIT, || {
+        asked(&server, SUBSCRIBE) > all.len()
+    })
+    .await;
+    server.state.lock().unwrap().stall = None;
+
+    within("a third connection refused past three", WAIT, || {
+        server
+            .subscriptions()
+            .get(2)
+            .is_some_and(|taken| taken.len() == 3)
+    })
+    .await;
+    let status = until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 3
+    })
+    .await;
+    assert_eq!(status.wallets[0].left_out_scripts, 7);
+    no_event(&mut events, Duration::from_millis(500)).await;
+}
+
+/// A server that took no subscription at all leaves Live nothing to
+/// push: it is asked again sooner than one that took some.
+#[tokio::test]
+async fn a_server_that_took_none_is_asked_again_sooner() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().subscription_limit =
+        Some((0, "subscription limit reached (0 max per client)"));
+    let all: Vec<u8> = (1..=10).collect();
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            limit_kept: Duration::from_secs(3600),
+            zero_limit_kept: Duration::from_millis(500),
+            ..timings()
+        }),
+    );
+    let mut reported = BTreeSet::new();
+    while reported.len() < all.len() {
+        match next_event(&mut events).await {
+            WatchEvent::WalletChanged { scripts, .. } => reported.extend(scripts),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let status = until(&watch, "refused", |s| {
+        s.pushed_scripts == 0 && s.detail.is_some()
+    })
+    .await;
+    assert_eq!(status.wallets[0].coverage, Coverage::SyncOnly);
+
+    server.state.lock().unwrap().subscription_limit = None;
+    let status = until(&watch, "heard whole", |s| s.pushed_scripts == 10).await;
+    assert_eq!(status.wallets[0].coverage, Coverage::Live);
+    no_event(&mut events, Duration::from_millis(300)).await;
+}
+
+/// A server that cuts the watch for what it costs, ElectrumX past its
+/// budget, is left alone a long while, and asked for half as many
+/// scripts when the watch comes back to it. Each script that leaves
+/// out is reported once, for a sync of its own, as one given up on a
+/// refusal is.
+#[tokio::test]
+async fn a_server_that_cuts_the_watch_for_its_cost_is_asked_less() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().cost_cut = Some(6);
+    let refused = Duration::from_secs(1);
+    let started = std::time::Instant::now();
+    let all: Vec<u8> = (1..=10).collect();
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            refused,
+            // What a cut leaves is not asked again, however long it is kept.
+            limit_kept: Duration::from_millis(200),
+            ..timings()
+        }),
+    );
+    let status = until(&watch, "cut", |s| s.state == WatchState::Reconnecting).await;
+    assert_eq!(status.detail.as_deref(), Some("excessive resource usage"));
+    let mut reported = BTreeSet::new();
+    while reported.len() < 7 {
+        match next_event(&mut events).await {
+            WatchEvent::WalletChanged {
+                wallet_id,
+                reason,
+                scripts,
+                ..
+            } => {
+                assert_eq!((wallet_id.as_str(), reason), ("a", ChangeReason::Started));
+                reported.extend(scripts);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let past: BTreeSet<String> = (4..=10).map(script).collect();
+    assert_eq!(reported, past);
+    within("connected again", WAIT, || {
+        server.subscriptions().len() == 2
+    })
+    .await;
+    // Left alone four fifths of the wait at least, not the backoff of a
+    // lost connection.
+    assert!(started.elapsed() >= refused.mul_f64(0.8));
+    within("asked for half", WAIT, || {
+        server.subscriptions()[1].len() == 3
+    })
+    .await;
+    let head: Vec<String> = (1..=3).map(|n| scripthash(&script(n))).collect();
+    assert_eq!(server.subscriptions()[1], head);
+    let status = until(&watch, "connected", |s| s.state == WatchState::Connected).await;
+    assert_eq!(
+        status.wallets[0],
+        WalletCoverage {
+            wallet_id: "a".to_owned(),
+            coverage: Coverage::Partial,
+            watched_scripts: 3,
+            left_out_scripts: 7,
+        }
+    );
+    no_event(&mut events, Duration::from_millis(800)).await;
+    assert_eq!(server.subscriptions().len(), 2);
+}
+
+/// Over Electrum a confirmation comes as the new status of the scripts
+/// of the transaction. A wallet waiting for one, whose list the watch
+/// does not hear whole, past the caps or what the server takes, may
+/// wait on a script nothing pushes: a block syncs it. One heard whole
+/// waits for the push.
+#[tokio::test]
+async fn a_block_syncs_a_waiting_wallet_the_watch_does_not_hear_whole() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().subscription_limit =
+        Some((2, "subscription limit reached (2 max per client)"));
+    // The list is 1, 5, 2, 3, 4: the server takes 1 and 5.
+    let (_watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![
+            wallet("a", &[1, 2, 3, 4], &[], true),
+            wallet("b", &[5], &[], true),
+        ],
+        Some(timings()),
+    );
+    let mut refused = BTreeSet::new();
+    while refused.len() < 3 {
+        match next_event(&mut events).await {
+            WatchEvent::WalletChanged {
+                wallet_id, scripts, ..
+            } if wallet_id == "a" => refused.extend(scripts),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    server.push(
+        json!({
+            "jsonrpc": "2.0", "method": "blockchain.headers.subscribe",
+            "params": [{ "height": 101, "hex": "00" }],
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock { height: 101 }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        changed("a", ChangeReason::NewBlock, false)
+    );
+    no_event(&mut events, Duration::from_millis(300)).await;
+}
+
+/// A server that says it takes no more subscriptions is at its limit,
+/// and the scripts still waiting their turn are not asked for. Nothing
+/// watches them from then on, and nothing says what they did while
+/// nothing listened: each is reported, as a refused one is, for a sync
+/// to catch up on it. Once: the next connection asks for none.
 #[tokio::test]
 async fn electrum_reports_the_scripts_it_gave_up_on() {
     let server = FakeElectrum::start().await;
@@ -382,10 +742,10 @@ async fn electrum_reports_the_scripts_it_gave_up_on() {
     }
     let expected: BTreeSet<String> = all.iter().map(|n| script(*n)).collect();
     assert_eq!(reported, expected);
-    assert!(
-        server.subscriptions()[0].len() < all.len(),
-        "the queue was given up"
-    );
+    let before = asked(&server, "blockchain.scripthash.subscribe");
+    assert!(before < all.len(), "the queue was given up");
+    reconnected(&server, &mut events).await;
+    assert_eq!(asked(&server, "blockchain.scripthash.subscribe"), before);
 }
 
 #[tokio::test]
@@ -444,6 +804,58 @@ async fn electrum_gives_up_on_a_server_that_stops_answering() {
     .await;
 }
 
+/// A server of another network is refused before it hears of a script,
+/// over Electrum as over Esplora, and left alone a while: it would
+/// report changes that never happened on the wallet's network. Once it
+/// serves the wallet's network, the watch takes it.
+#[tokio::test]
+async fn a_server_of_another_network_is_refused_and_left_alone() {
+    let electrum = FakeElectrum::start().await;
+    electrum.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    let wallets = vec![wallet("a", &[1], &[], false)];
+    let (watch, _events) = LiveWatch::start_with(
+        config(electrum.backend()),
+        wallets.clone(),
+        Some(Timings {
+            refused: Duration::from_secs(3600),
+            ..timings()
+        }),
+    );
+    let status = until(&watch, "refused", |s| s.state == WatchState::Reconnecting).await;
+    assert_eq!(
+        status.detail.as_deref(),
+        Some(crate::chain::ANOTHER_NETWORK)
+    );
+    assert!(!electrum.was_asked("blockchain.scripthash.subscribe"));
+    // Left alone, whatever the host asks meanwhile.
+    watch.tick();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(electrum.subscriptions().len(), 1);
+    // A new configuration tries it again at once.
+    electrum.state.lock().unwrap().genesis = None;
+    watch.reconfigure(config(electrum.backend()), wallets);
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+
+    let mempool = FakeMempool::start(false, 0).await;
+    mempool.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    let (watch, _events) = LiveWatch::start_with(
+        config(mempool.backend()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(timings()),
+    );
+    let status = until(&watch, "refused", |s| s.state == WatchState::Reconnecting).await;
+    assert_eq!(
+        status.detail.as_deref(),
+        Some(crate::chain::ANOTHER_NETWORK)
+    );
+    assert!(mempool.state.lock().unwrap().looked_up.is_empty());
+    mempool.state.lock().unwrap().genesis = None;
+    until(&watch, "polling", |s| s.state == WatchState::Polling).await;
+}
+
 /// An onion backend with no Tor to go through: the watcher says why and
 /// keeps trying, and no connection is ever opened around Tor.
 #[tokio::test]
@@ -456,9 +868,11 @@ async fn an_onion_backend_without_tor_never_connects_in_the_clear() {
     for backend in [
         BackendConfig::CustomElectrum {
             url: format!("tcp://{onion}:50001"),
+            own_node: false,
         },
         BackendConfig::CustomEsplora {
             url: format!("http://{onion}/api"),
+            own_node: false,
         },
     ] {
         let mut config = config(backend);
@@ -496,6 +910,13 @@ async fn a_mempool_websocket_pushes_what_it_tracks_and_polls_the_rest() {
     assert_eq!(status.state, WatchState::Connected);
     assert_eq!(status.transport, Some(WatchTransport::MempoolWebsocket));
     assert_eq!(status.watched_scripts, 4);
+    // The status counts the list once it is sent, the server answering
+    // only a refusal: what the server read is what it records, a moment
+    // later on a loaded machine.
+    within("tracked", WAIT, || {
+        !server.state.lock().unwrap().tracked.is_empty()
+    })
+    .await;
     assert_eq!(
         server.state.lock().unwrap().tracked,
         vec![vec![script(1), script(4)]]
@@ -723,6 +1144,30 @@ async fn a_new_configuration_moves_the_watch() {
     until(&watch, "off", |s| s.state == WatchState::Off).await;
 }
 
+/// Off, the watch says it covers nothing, wallets with no script to
+/// watch included: an app shows no coverage while Live does not run.
+#[tokio::test]
+async fn an_idle_watch_covers_no_wallet() {
+    let server = FakeElectrum::start().await;
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &[], &[], false)],
+        Some(timings()),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let status = watch.status();
+    assert_eq!(status.state, WatchState::Off);
+    assert!(status.wallets.is_empty(), "{:?}", status.wallets);
+    assert_eq!(
+        (
+            status.watched_scripts,
+            status.left_out_scripts,
+            status.left_out_wallets
+        ),
+        (0, 0, 0)
+    );
+}
+
 // --- the parts on their own ---------------------------------------------------
 
 #[test]
@@ -784,13 +1229,16 @@ fn wallets_the_whole_list_cut_short_are_caught_up_whole() {
                 })
                 .collect(),
             has_pending: false,
+            pinned: false,
+            holds_coins: false,
+            unlisted: 0,
         })
         .collect();
     wallets.insert(0, wallet("small", &[1, 2, 3], &[], false));
-    let watched = Watched::new(wallets);
+    let watched = Watched::new(wallets, WatchLimits::DEFAULT);
     assert_eq!(watched.entries.len(), MAX_SCRIPTS);
     let expected: Vec<String> = (0..15).map(|w| format!("w{w}")).collect();
-    assert_eq!(watched.capped, expected);
+    assert_eq!(watched.capped(None), expected);
 }
 
 #[test]
@@ -804,10 +1252,10 @@ fn a_list_is_cut_to_what_can_be_watched() {
         counts: None,
     });
     wallets.push(wallet("b", &[1, 1, 250], &[1], false));
-    let watched = Watched::new(wallets);
+    let watched = Watched::new(wallets, WatchLimits::DEFAULT);
     assert_eq!(watched.entries.len(), MAX_SCRIPTS_PER_WALLET + 1);
     // Cut, so a start reports it whole.
-    assert_eq!(watched.capped, vec!["a".to_owned()]);
+    assert_eq!(watched.capped(None), vec!["a".to_owned()]);
     // Shared by two wallets, and revealed in one of them: not lookahead.
     let shared = watched.by_hex(&script(1)).unwrap();
     assert_eq!(shared.owners.len(), 2);
@@ -819,6 +1267,409 @@ fn a_list_is_cut_to_what_can_be_watched() {
             .hex,
         script(250)
     );
+}
+
+/// A wallet of `count` distinct scripts, numbered from `first`.
+fn numbered(id: &str, first: u32, count: u32) -> WatchedWallet {
+    WatchedWallet {
+        wallet_id: id.to_owned(),
+        scripts: (first..first + count)
+            .map(|n| WatchedScript {
+                script: format!("0014{n:040x}"),
+                lookahead: false,
+                status: None,
+                counts: None,
+            })
+            .collect(),
+        has_pending: false,
+        pinned: false,
+        holds_coins: false,
+        unlisted: 0,
+    }
+}
+
+/// The same, pinned or holding coins as said.
+fn flagged(id: &str, first: u32, count: u32, pinned: bool, holds_coins: bool) -> WatchedWallet {
+    WatchedWallet {
+        pinned,
+        holds_coins,
+        ..numbered(id, first, count)
+    }
+}
+
+/// The wallet of each script of the list, in its order: the first that
+/// lists it.
+fn first_owners(watched: &Watched) -> Vec<usize> {
+    watched
+        .entries
+        .iter()
+        .map(|entry| entry.owners[0])
+        .collect()
+}
+
+/// The wallets the user pinned come first, rank by rank among
+/// themselves and up to what a watch takes of one wallet, whatever the
+/// others hold. Pinned past the cap on the whole list, they leave the
+/// others nothing.
+#[test]
+fn pinned_wallets_are_watched_first() {
+    let wallets = || {
+        vec![
+            flagged("funded", 0, 10, false, true),
+            flagged("pinned", 100, 10, true, false),
+            flagged("also pinned", 200, 10, true, false),
+        ]
+    };
+    let roomy = WatchLimits {
+        per_wallet: 20,
+        total: 25,
+    };
+    let watched = Watched::new(wallets(), roomy);
+    let owners = first_owners(&watched);
+    assert_eq!(owners[..4], [1, 2, 1, 2]);
+    assert!(owners[..20].iter().all(|&owner| owner != 0));
+    assert_eq!(owners[20..], [0; 5]);
+    assert_eq!(watched.capped(None), vec!["funded".to_owned()]);
+
+    let tight = WatchLimits {
+        per_wallet: 20,
+        total: 15,
+    };
+    let watched = Watched::new(wallets(), tight);
+    let owners = first_owners(&watched);
+    assert_eq!(owners.len(), 15);
+    assert!(!owners.contains(&0));
+    assert_eq!(watched.capped(None).len(), 3);
+}
+
+/// Among the wallets nobody pinned, at each rank one that holds coins
+/// goes first, and the order of the list holds otherwise: when the cap
+/// cuts a rank short, an empty wallet loses its script before a funded
+/// one does.
+#[test]
+fn wallets_holding_coins_go_first_at_each_rank() {
+    let wallets = vec![
+        flagged("empty", 0, 10, false, false),
+        flagged("funded", 100, 10, false, true),
+        flagged("also empty", 200, 10, false, false),
+    ];
+    let limits = WatchLimits {
+        per_wallet: 20,
+        total: 25,
+    };
+    let watched = Watched::new(wallets, limits);
+    let owners = first_owners(&watched);
+    assert_eq!(owners[..6], [1, 0, 2, 1, 0, 2]);
+    let kept = |owner| owners.iter().filter(|&&listed| listed == owner).count();
+    assert_eq!((kept(0), kept(1), kept(2)), (8, 9, 8));
+}
+
+/// A script two wallets list is one subscription heard for both, the
+/// pinned one and the other, even once the list is full.
+#[test]
+fn a_shared_script_is_heard_for_every_wallet_that_lists_it() {
+    let shared = numbered("", 3, 1).scripts.remove(0);
+    let own = numbered("", 600, 1).scripts.remove(0);
+    let other = WatchedWallet {
+        scripts: vec![shared.clone(), own.clone()],
+        ..flagged("other", 0, 0, false, true)
+    };
+    let limits = WatchLimits {
+        per_wallet: 20,
+        total: 10,
+    };
+    let watched = Watched::new(vec![other, flagged("pinned", 0, 10, true, false)], limits);
+    assert_eq!(watched.entries.len(), 10);
+    assert_eq!(watched.by_hex(&shared.script).unwrap().owners, [1, 0]);
+    assert!(watched.by_hex(&own.script).is_none());
+    assert_eq!(watched.capped(None), vec!["other".to_owned()]);
+}
+
+/// What the watch hears of each wallet: all of it, its head, or
+/// nothing, with what it leaves out counted, the scripts a list stopped
+/// short of included.
+#[test]
+fn each_wallet_is_live_in_part_or_left_to_the_syncs() {
+    fn coverage(wallets: &[WalletCoverage]) -> Vec<(&str, Coverage, u32, u32)> {
+        wallets
+            .iter()
+            .map(|wallet| {
+                (
+                    wallet.wallet_id.as_str(),
+                    wallet.coverage,
+                    wallet.watched_scripts,
+                    wallet.left_out_scripts,
+                )
+            })
+            .collect::<Vec<_>>()
+    }
+    let cut_short = WatchedWallet {
+        unlisted: 7,
+        ..numbered("cut short", 100, 10)
+    };
+    let limits = WatchLimits {
+        per_wallet: 20,
+        total: 30,
+    };
+    let watched = Watched::new(
+        vec![
+            numbered("small", 0, 5),
+            numbered("large", 200, 30),
+            cut_short,
+        ],
+        limits,
+    );
+    assert_eq!(
+        coverage(&watched.coverage(None)),
+        [
+            ("small", Coverage::Live, 5, 0),
+            ("large", Coverage::Partial, 15, 15),
+            ("cut short", Coverage::Partial, 10, 7),
+        ]
+    );
+    assert_eq!(
+        watched.capped(None),
+        vec!["large".to_owned(), "cut short".to_owned()]
+    );
+
+    // Pinned wallets that take it all leave nothing to the others.
+    let limits = WatchLimits {
+        per_wallet: 20,
+        total: 2,
+    };
+    let watched = Watched::new(
+        vec![
+            numbered("other", 10, 1),
+            flagged("pinned", 0, 2, true, false),
+        ],
+        limits,
+    );
+    assert_eq!(
+        coverage(&watched.coverage(None)),
+        [
+            ("other", Coverage::SyncOnly, 0, 1),
+            ("pinned", Coverage::Live, 2, 0),
+        ]
+    );
+}
+
+/// What a server refused is counted out of each wallet: the scripts it
+/// turned down one by one, and those past the most it takes, the head
+/// of the list being what it is asked for.
+#[test]
+fn what_a_server_refused_is_counted_out() {
+    let watched = Watched::new(
+        vec![
+            wallet("a", &[1, 2, 3], &[], false),
+            wallet("b", &[4, 5], &[], false),
+        ],
+        WatchLimits::DEFAULT,
+    );
+    // The list is 1, 4, 2, 5, 3; 4 was refused, and two are taken.
+    let refusals = Refusals {
+        limit: Some(2),
+        scripts: HashSet::from([scripthash(&script(4))]),
+        ..Refusals::default()
+    };
+    let heard: Vec<&str> = watched
+        .heard(Some(&refusals))
+        .map(|entry| entry.hex.as_str())
+        .collect();
+    assert_eq!(heard, [script(1), script(2)]);
+    let coverage: Vec<(Coverage, u32, u32)> = watched
+        .coverage(Some(&refusals))
+        .iter()
+        .map(|wallet| {
+            (
+                wallet.coverage,
+                wallet.watched_scripts,
+                wallet.left_out_scripts,
+            )
+        })
+        .collect();
+    assert_eq!(
+        coverage,
+        [(Coverage::Partial, 2, 1), (Coverage::SyncOnly, 0, 2)]
+    );
+    assert_eq!(
+        watched.capped(Some(&refusals)),
+        ["a".to_owned(), "b".to_owned()]
+    );
+    assert!(watched.capped(None).is_empty());
+    assert_eq!(watched.heard(None).count(), 5);
+    let past: Vec<&str> = watched
+        .past_limit(&refusals)
+        .map(|entry| entry.hex.as_str())
+        .collect();
+    assert_eq!(past, [script(5), script(3)]);
+}
+
+/// The most a server takes is kept a day, and a limit of none an hour:
+/// past that, the server is asked for the whole list again. A wall
+/// clock set back before the limit was learned asks again too. What a
+/// cut for cost left is kept for the configuration.
+#[test]
+fn a_learned_limit_runs_out() {
+    let timings = Timings::of(&config(BackendConfig::Public { server: None }));
+    let learned = SystemTime::now();
+    let after = |secs: u64| learned + Duration::from_secs(secs);
+    let mut refusals = Refusals {
+        limit: Some(100),
+        learned: Some(learned),
+        ..Refusals::default()
+    };
+    assert!(!refusals.ran_out(&timings, after(23 * 3600 + 59 * 60)));
+    assert!(refusals.ran_out(&timings, after(24 * 3600)));
+    refusals.limit = Some(0);
+    assert!(!refusals.ran_out(&timings, after(59 * 60)));
+    assert!(refusals.ran_out(&timings, after(3600)));
+    assert!(refusals.ran_out(&timings, learned - Duration::from_secs(60)));
+    // What a cut for cost left is never asked again.
+    refusals.limit = Some(100);
+    refusals.cut = true;
+    assert!(!refusals.ran_out(&timings, after(48 * 3600)));
+    assert!(!refusals.ran_out(&timings, learned - Duration::from_secs(60)));
+    // Nothing learned, nothing to run out.
+    assert!(!Refusals::default().ran_out(&timings, after(48 * 3600)));
+}
+
+/// The status a screen reads says how much of each wallet the watch
+/// hears and what it leaves to the syncs, and says it again when the
+/// backend becomes the user's own node, which takes the whole list.
+#[tokio::test]
+async fn the_status_says_how_much_of_each_wallet_is_live() {
+    let server = FakeElectrum::start().await;
+    let wallets = || vec![numbered("large", 0, 250), numbered("small", 1_000, 3)];
+    let (watch, _events) =
+        LiveWatch::start_with(config(server.backend()), wallets(), Some(timings()));
+    let status = until(&watch, "subscribed", |s| s.pushed_scripts == 203).await;
+    assert_eq!((status.left_out_wallets, status.left_out_scripts), (1, 50));
+    assert_eq!(
+        status.wallets,
+        vec![
+            WalletCoverage {
+                wallet_id: "large".to_owned(),
+                coverage: Coverage::Partial,
+                watched_scripts: 200,
+                left_out_scripts: 50,
+            },
+            WalletCoverage {
+                wallet_id: "small".to_owned(),
+                coverage: Coverage::Live,
+                watched_scripts: 3,
+                left_out_scripts: 0,
+            },
+        ]
+    );
+
+    let BackendConfig::CustomElectrum { url, .. } = server.backend() else {
+        unreachable!("the fake server is an Electrum one");
+    };
+    let own = BackendConfig::CustomElectrum {
+        url,
+        own_node: true,
+    };
+    watch.reconfigure(config(own), wallets());
+    let status = until(&watch, "subscribed whole", |s| s.pushed_scripts == 253).await;
+    assert_eq!((status.left_out_wallets, status.left_out_scripts), (0, 0));
+    assert!(
+        status
+            .wallets
+            .iter()
+            .all(|wallet| wallet.coverage == Coverage::Live)
+    );
+}
+
+/// A long list is told in steps as the server answers, the last count
+/// always: not one status per script.
+#[tokio::test]
+async fn subscriptions_are_told_in_steps() {
+    let server = FakeElectrum::start().await;
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![numbered("large", 0, 150), numbered("small", 1_000, 50)],
+        Some(timings()),
+    );
+    let mut told = Vec::new();
+    while told.last() != Some(&200) {
+        match tokio::time::timeout(WAIT, events.next()).await {
+            Ok(Some(WatchEvent::Status(status))) if status.pushed_scripts > 0 => {
+                told.push(status.pushed_scripts);
+            }
+            Ok(Some(_)) => {}
+            other => panic!("never subscribed whole: {other:?}, told {told:?}"),
+        }
+    }
+    told.dedup();
+    assert_eq!(told, [100, 200]);
+    assert_eq!(watch.status().pushed_scripts, 200);
+}
+
+/// A status, or a wallet list, written before coverage and pinning
+/// existed still reads, with nothing left out and nothing pinned.
+#[test]
+fn a_status_and_a_list_from_before_coverage_still_read() {
+    let status: WatchStatus = serde_json::from_str(
+        r#"{"state":"connected","transport":"electrum","server":"node.example.org","detail":null,"watched_scripts":3,"pushed_scripts":3}"#,
+    )
+    .unwrap();
+    assert_eq!((status.left_out_scripts, status.left_out_wallets), (0, 0));
+    assert!(status.wallets.is_empty());
+    assert_eq!(status.server_software, None);
+    let wallet: WatchedWallet =
+        serde_json::from_str(r#"{"wallet_id":"w","scripts":[],"has_pending":false}"#).unwrap();
+    assert!(!wallet.pinned && !wallet.holds_coins);
+    assert_eq!(wallet.unlisted, 0);
+    let json = serde_json::to_string(&WalletCoverage {
+        wallet_id: "w".to_owned(),
+        coverage: Coverage::SyncOnly,
+        watched_scripts: 0,
+        left_out_scripts: 4,
+    })
+    .unwrap();
+    assert_eq!(
+        json,
+        r#"{"wallet_id":"w","coverage":"sync_only","watched_scripts":0,"left_out_scripts":4}"#
+    );
+}
+
+/// On the user's own node a watch takes ten times as many scripts in
+/// all, and a wallet may take all of them; anywhere else, what it took
+/// before. The two wallets that share the whole of it share it evenly.
+#[test]
+fn the_users_own_node_lifts_what_a_watch_takes() {
+    let own = |own_node| BackendConfig::CustomElectrum {
+        url: "ssl://node.example.org:50002".to_owned(),
+        own_node,
+    };
+    assert_eq!(
+        WatchLimits::of(&BackendConfig::default()),
+        WatchLimits::DEFAULT
+    );
+    assert_eq!(WatchLimits::of(&own(false)), WatchLimits::DEFAULT);
+    assert_eq!(WatchLimits::of(&own(true)), WatchLimits::OWN_NODE);
+    assert_eq!(WatchLimits::OWN_NODE.total, 20_000);
+
+    let large = || vec![numbered("large", 0, 5_000)];
+    let anywhere = Watched::new(large(), WatchLimits::DEFAULT);
+    assert_eq!(anywhere.entries.len(), MAX_SCRIPTS_PER_WALLET);
+    assert_eq!(anywhere.capped(None), vec!["large".to_owned()]);
+    let at_home = Watched::new(large(), WatchLimits::OWN_NODE);
+    assert_eq!(at_home.entries.len(), 5_000);
+    assert!(at_home.capped(None).is_empty());
+
+    let two = vec![numbered("a", 0, 15_000), numbered("b", 100_000, 15_000)];
+    let shared = Watched::new(two, WatchLimits::OWN_NODE);
+    assert_eq!(shared.entries.len(), OWN_NODE_MAX_SCRIPTS);
+    let owned_by = |owner: usize| {
+        shared
+            .entries
+            .iter()
+            .filter(|entry| entry.owners == [owner])
+            .count()
+    };
+    assert_eq!((owned_by(0), owned_by(1)), (10_000, 10_000));
+    assert_eq!(shared.capped(None), vec!["a".to_owned(), "b".to_owned()]);
 }
 
 /// A block marked in the burst of a reconnection that cannot say what
@@ -928,6 +1779,139 @@ fn a_backoff_doubles_up_to_its_cap() {
     assert!(backoff.delay(&timings) <= timings.backoff_first);
 }
 
+/// A keepalive ping comes at the latest when it is due, and at random
+/// before: never on the dot, never past what a server waits for.
+#[test]
+fn a_keepalive_comes_at_random_within_its_wait() {
+    let timings = Timings {
+        keepalive: Duration::from_secs(240),
+        ..timings()
+    };
+    let waits: Vec<Duration> = (0..200).map(|_| timings.keepalive_wait()).collect();
+    assert!(
+        waits
+            .iter()
+            .all(|wait| { *wait >= Duration::from_secs(168) && *wait <= Duration::from_secs(240) })
+    );
+    let first = waits[0];
+    assert!(waits.iter().any(|wait| *wait != first), "drawn, not fixed");
+}
+
+/// A server that limits the rate of requests is polled half as often
+/// each time it does, ten minutes apart at most, never sooner than the
+/// wait it named, and as usual half an hour after it last did.
+#[test]
+fn a_server_that_limits_the_rate_is_polled_less_often() {
+    let every = Duration::from_secs(60);
+    let around = |wait: Duration, pace: Duration| {
+        assert!(
+            wait >= pace.mul_f64(0.85) && wait <= pace.mul_f64(1.15),
+            "{wait:?} {pace:?}"
+        );
+    };
+    let now = Instant::now();
+    let mut pace = poll::Pace::default();
+    around(pace.wait(every, now), every);
+    pace.limited(Duration::from_secs(5), now);
+    around(pace.wait(every, now), every * 2);
+    pace.limited(Duration::from_secs(5), now);
+    around(pace.wait(every, now), every * 4);
+    for _ in 0..20 {
+        pace.limited(Duration::from_secs(5), now);
+    }
+    around(pace.wait(every, now), Duration::from_secs(600));
+    // A wait the server named longer than that is waited out, by the
+    // session that set it as by the next one.
+    pace.limited(Duration::from_secs(3_600), now);
+    assert!(pace.wait(every, now) >= Duration::from_secs(3_600));
+    assert!(pace.first_wait(now) >= Duration::from_secs(3_600));
+    // Half an hour after the last limit, the usual pace, the wait the
+    // server named still kept to.
+    let later = now + Duration::from_secs(30 * 60);
+    assert!(pace.wait(every, later) >= Duration::from_secs(30 * 60));
+    let past = now + Duration::from_secs(3_600);
+    around(pace.wait(every, past), every);
+    assert_eq!(poll::Pace::default().first_wait(now), Duration::ZERO);
+}
+
+/// The pace of the rounds is the server's, not a session's: a session
+/// that ends, here after each round, leaves the next round where it
+/// set it, and the next session asks nothing of the server before.
+#[tokio::test]
+async fn the_next_polling_session_keeps_the_pace() {
+    let server = FakeMempool::start(false, 0).await;
+    let every = Duration::from_millis(300);
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            poll: every,
+            reprobe: Duration::ZERO,
+            ..timings()
+        }),
+    );
+    let rounds = 4;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while server.state.lock().unwrap().tips_asked.len() < rounds {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no {rounds} rounds within {WAIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    watch.stop();
+    let asked = server.state.lock().unwrap().tips_asked.clone();
+    for (round, pair) in asked.windows(2).enumerate() {
+        let gap = pair[1] - pair[0];
+        assert!(gap >= every.mul_f64(0.85), "round {round}: {gap:?}");
+    }
+}
+
+/// The turns of polling are the list's, not a session's: sessions that
+/// end after each round, as one does every half hour to try push again,
+/// read every script of the list between them, and not the head of the
+/// list and the first script in turn over and over.
+#[tokio::test]
+async fn polling_sessions_read_every_script_in_turn() {
+    let server = FakeMempool::start(false, 0).await;
+    let numbers: Vec<u8> = (1..=12).collect();
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &numbers, &[], false)],
+        Some(Timings {
+            poll: Duration::from_millis(40),
+            reprobe: Duration::ZERO,
+            ..timings()
+        }),
+    );
+    let keys: Vec<String> = numbers
+        .iter()
+        .map(|n| FakeMempool::rest_key(&script(*n)))
+        .collect();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (looked_up, rounds) = {
+            let state = server.state.lock().unwrap();
+            (state.looked_up.clone(), state.tips_asked.len())
+        };
+        let unread: Vec<usize> = (0..keys.len())
+            .filter(|i| !looked_up.contains(&keys[*i]))
+            .collect();
+        if unread.is_empty() {
+            // One round a session: ten of them, one script in turn each
+            // past the head, cover the ten scripts that take turns.
+            assert!(rounds >= 10, "{rounds} rounds");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "after {rounds} rounds, never read the scripts at {unread:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    watch.stop();
+}
+
 // --- the manager ---------------------------------------------------------------
 
 fn payment(confirmed: bool) -> Value {
@@ -981,6 +1965,9 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
                 counts: None,
             }],
             has_pending: false,
+            pinned: false,
+            holds_coins: false,
+            unlisted: 0,
         }]
     );
     manager.sync_wallet(&wallet.id).await.unwrap();
@@ -1309,11 +2296,15 @@ async fn live_the_three_transports_see_signet_move() {
             })
             .collect(),
         has_pending: true,
+        pinned: false,
+        holds_coins: false,
+        unlisted: 0,
     }];
     // The Electrum server may sign its own certificate: accepted here
     // the way the settings screen does it, by its fingerprint.
     let mut electrum = config(BackendConfig::CustomElectrum {
         url: SIGNET_ELECTRUM.to_owned(),
+        own_node: false,
     });
     let inspected = crate::chain::electrum::inspect(&crate::chain::electrum::Target::new(
         SIGNET_ELECTRUM,
