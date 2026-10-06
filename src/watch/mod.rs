@@ -500,6 +500,9 @@ pub struct LiveWatch {
     status: watch::Receiver<WatchStatus>,
     /// The server the open session talks to.
     serving: watch::Receiver<Option<(Network, Endpoint)>>,
+    /// The server of the last session, while the watch still counts on
+    /// it: see [`LiveWatch::held`].
+    held: watch::Receiver<Option<(Network, Endpoint)>>,
     /// Set once to stop the watcher, whatever it is waiting on.
     halt: watch::Sender<bool>,
 }
@@ -546,8 +549,10 @@ impl LiveWatch {
         let (event_tx, events) = mpsc::channel(EVENT_QUEUE);
         let (status_tx, status) = watch::channel(WatchStatus::default());
         let (serving_tx, serving) = watch::channel(None);
+        let (held_tx, held) = watch::channel(None);
         let mut hub = Hub {
             serving: serving_tx,
+            held: held_tx,
             config,
             timings,
             watched: Watched::default(),
@@ -577,6 +582,7 @@ impl LiveWatch {
                 commands,
                 status,
                 serving,
+                held,
                 halt,
             },
             WatchEvents { events },
@@ -621,6 +627,20 @@ impl LiveWatch {
             return None;
         }
         self.serving.borrow().clone()
+    }
+
+    /// The server of the last session the watch opened, and the network
+    /// it is watched for, until the watch fails to reach it again or
+    /// leaves it alone: between two sessions, the server the watch most
+    /// likely comes back to. A lost session keeps it, since the phone
+    /// that slept or changed networks lost it, not the server. None
+    /// before a first session, under a new configuration, and once the
+    /// watch stops.
+    pub(crate) fn held(&self) -> Option<(Network, Endpoint)> {
+        if *self.halt.borrow() {
+            return None;
+        }
+        self.held.borrow().clone()
     }
 
     /// Stops the watcher and closes its connection, at once: the task
@@ -1053,6 +1073,8 @@ pub(crate) struct Hub {
     events: mpsc::Sender<WatchEvent>,
     status: watch::Sender<WatchStatus>,
     serving: watch::Sender<Option<(Network, Endpoint)>>,
+    /// See [`LiveWatch::held`].
+    held: watch::Sender<Option<(Network, Endpoint)>>,
     debounce: Debouncer,
     tip: Option<u32>,
     /// Every wallet was reported once under this configuration, when
@@ -1160,6 +1182,12 @@ impl Hub {
     pub fn serve(&mut self, endpoint: Option<&Endpoint>) {
         if let Some(endpoint) = endpoint {
             self.heard_by = Some(endpoint.clone());
+            let held = Some((self.config.network, endpoint.clone()));
+            self.held.send_if_modified(|was| {
+                let changed = *was != held;
+                *was = held;
+                changed
+            });
         }
         let endpoint = endpoint.map(|endpoint| (self.config.network, endpoint.clone()));
         self.serving.send_if_modified(|serving| {
@@ -1355,7 +1383,20 @@ impl Hub {
         self.shunned.clear();
         self.refusals.clear();
         self.heard_by = None;
+        self.held.send_replace(None);
         self.debounce = Debouncer::default();
+    }
+
+    /// The watch could not open a session with this server, or leaves
+    /// it alone: no sync is to count on it any longer.
+    fn give_up_on(&mut self, endpoint: &Endpoint) {
+        self.held.send_if_modified(|held| match held {
+            Some((_, held_by)) if held_by == endpoint => {
+                *held = None;
+                true
+            }
+            _ => false,
+        });
     }
 
     /// Leaves a server alone for a while, a little more or less than
@@ -1367,6 +1408,7 @@ impl Hub {
             .refused
             .mul_f64(0.8 + 0.4 * rand::random::<f64>());
         self.shunned.insert(endpoint.clone(), Instant::now() + wait);
+        self.give_up_on(endpoint);
     }
 
     /// The pace of the rounds that read an Esplora server.
@@ -1466,9 +1508,9 @@ async fn sleep_until(deadline: Option<Instant>) {
 // --- the supervisor ---------------------------------------------------------
 
 /// The servers to try, in order. An automatic public backend names no
-/// server: an Electrum server of the catalogue comes first when its
-/// operator is one the rotation already goes through, because it can
-/// push every script, and the rotation itself follows.
+/// server: the Electrum servers of the catalogue run by one operator
+/// the rotation already goes through come first, because they can push
+/// every script, and the rotation itself follows.
 fn candidates(config: &WatchConfig) -> Result<Vec<Endpoint>, String> {
     servers_for(&config.backend, config.network, &config.electrum_certs)
 }
@@ -1494,29 +1536,37 @@ pub(crate) fn servers_for(
         .map_err(|e| e.to_string())?;
     if config.backend == (BackendConfig::Public { server: None }) {
         let operators: Vec<String> = endpoints.iter().map(Endpoint::label).collect();
-        let pushing: Vec<Endpoint> = chain::public::public_servers(config.network)
+        let pushing: Vec<(String, Endpoint)> = chain::public::public_servers(config.network)
             .into_iter()
             .filter(|server| {
                 server.protocol == chain::public::ServerProtocol::Electrum && !server.self_signed
             })
-            .filter(|server| {
-                chain::host_of(&server.url).is_some_and(|host| {
-                    operators.iter().any(|operator| {
-                        host == *operator || host.ends_with(&format!(".{operator}"))
-                    })
-                })
-            })
             .filter_map(|server| {
+                let host = chain::host_of(&server.url)?;
+                let operator = operators
+                    .iter()
+                    .find(|operator| host == **operator || host.ends_with(&format!(".{operator}")))?
+                    .clone();
                 let chosen = BackendConfig::Public {
                     server: Some(server.id),
                 };
-                chain::endpoints(&chosen, config.network, &config.electrum_certs)
+                let endpoint = chain::endpoints(&chosen, config.network, &config.electrum_certs)
                     .ok()?
                     .into_iter()
-                    .next()
+                    .next()?;
+                Some((operator, endpoint))
             })
-            .take(1)
             .collect();
+        // Every Electrum server of the first operator that runs one, in
+        // the order of the catalogue: when one fails, the next one of
+        // the same operator pushes every script, where the mempool
+        // WebSocket after them pushes ten on mainnet, and the wallets
+        // stay with the one operator the syncs follow the watch to.
+        let first = pushing.first().map(|(operator, _)| operator.clone());
+        let pushing = pushing
+            .into_iter()
+            .filter(|(operator, _)| Some(operator) == first.as_ref())
+            .map(|(_, endpoint)| endpoint);
         endpoints.splice(0..0, pushing);
     }
     Ok(endpoints)
@@ -1533,6 +1583,7 @@ async fn watcher(mut hub: Hub, mut halted: watch::Receiver<bool>) {
     }
     hub.watched = Watched::default();
     hub.serve(None);
+    hub.held.send_replace(None);
     hub.set_status(|status| *status = WatchStatus::default());
 }
 
@@ -1627,7 +1678,10 @@ async fn run_once(hub: &mut Hub, endpoints: &[Endpoint], no_push: &mut Option<In
                 let target = target.clone();
                 match electrum::run(hub, endpoint, &target).await {
                     // The next candidate may do.
-                    Exit::Unreachable(detail) => last = Exit::Unreachable(detail),
+                    Exit::Unreachable(detail) => {
+                        hub.give_up_on(endpoint);
+                        last = Exit::Unreachable(detail);
+                    }
                     Exit::Refused(detail) => {
                         hub.shun(endpoint);
                         last = Exit::Refused(detail);
@@ -1645,7 +1699,11 @@ async fn run_once(hub: &mut Hub, endpoints: &[Endpoint], no_push: &mut Option<In
                 continue;
             };
             match mempool::run(hub, endpoint, url).await {
-                exit @ (Exit::NoPush(_) | Exit::Unreachable(_)) => last = exit,
+                exit @ Exit::NoPush(_) => last = exit,
+                exit @ Exit::Unreachable(_) => {
+                    hub.give_up_on(endpoint);
+                    last = exit;
+                }
                 exit @ Exit::Refused(_) => {
                     hub.shun(endpoint);
                     last = exit;
@@ -1663,7 +1721,10 @@ async fn run_once(hub: &mut Hub, endpoints: &[Endpoint], no_push: &mut Option<In
             continue;
         }
         match poll::run(hub, endpoint, url).await {
-            exit @ Exit::Unreachable(_) => last = exit,
+            exit @ Exit::Unreachable(_) => {
+                hub.give_up_on(endpoint);
+                last = exit;
+            }
             exit @ Exit::Refused(_) => {
                 hub.shun(endpoint);
                 last = exit;

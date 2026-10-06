@@ -804,6 +804,43 @@ async fn electrum_gives_up_on_a_server_that_stops_answering() {
     .await;
 }
 
+/// Between two sessions, the server of the last one stays the one a
+/// sync may try first: a lost session keeps it, since the device lost
+/// it, and a failed attempt to reach that server again drops it.
+#[tokio::test]
+async fn a_lost_session_keeps_its_server_until_it_cannot_be_reached() {
+    let server = FakeElectrum::start().await;
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            keepalive: Duration::from_secs(3600),
+            connect: Duration::from_secs(2),
+            ..timings()
+        }),
+    );
+    // Before a first session, nothing to count on.
+    assert_eq!(watch.held(), None);
+    until(&watch, "subscribed", |s| s.pushed_scripts == 1).await;
+    let serving = watch.serving().expect("a session is open");
+    assert_eq!(watch.held(), Some(serving.clone()));
+
+    server.state.lock().unwrap().silent = true;
+    watch.tick();
+    until(&watch, "reconnecting", |s| {
+        s.state == WatchState::Reconnecting
+    })
+    .await;
+    assert_eq!(watch.serving(), None);
+    assert_eq!(watch.held(), Some(serving));
+    // The server does not answer the next session either.
+    let started = std::time::Instant::now();
+    while watch.held().is_some() {
+        assert!(started.elapsed() < WAIT, "still counted on");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// A server of another network is refused before it hears of a script,
 /// over Electrum as over Esplora, and left alone a while: it would
 /// report changes that never happened on the wallet's network. Once it
@@ -1181,19 +1218,41 @@ fn the_automatic_backend_prefers_a_server_that_pushes() {
             .map(Endpoint::label)
             .collect::<Vec<_>>()
     };
-    // An Electrum server of an operator the rotation already goes
-    // through, then the rotation: no host the mode did not name.
+    // The Electrum servers of one operator the rotation already goes
+    // through, then the rotation: no host the mode did not name. When
+    // `blockstream.info:700` fails, Blockstream's other Electrum server
+    // pushes every script, where mempool.space's WebSocket pushes ten.
     assert_eq!(
         candidates_of(Network::Mainnet),
         vec![
             "blockstream.info",
+            "electrum.blockstream.info",
             "mempool.space",
             "blockstream.info",
             "mempool.emzy.de"
         ]
     );
+    let mut mainnet = config(BackendConfig::default());
+    mainnet.network = Network::Mainnet;
+    let mainnet = candidates(&mainnet).unwrap();
+    assert!(
+        mainnet[..2]
+            .iter()
+            .all(|endpoint| matches!(endpoint, Endpoint::Electrum(_)))
+    );
+    assert!(
+        mainnet[2..]
+            .iter()
+            .all(|endpoint| matches!(endpoint, Endpoint::Esplora(_)))
+    );
     assert_eq!(candidates_of(Network::Signet)[0], "mempool.space");
     assert_eq!(candidates_of(Network::Signet).len(), 4);
+    // Testnet4 lists the Electrum server of an operator the rotation
+    // does not go through: left out.
+    assert_eq!(
+        candidates_of(Network::Testnet4),
+        vec!["mempool.space", "mempool.space", "mempool.emzy.de"]
+    );
     assert!(matches!(
         candidates(&config(BackendConfig::default())).unwrap()[0],
         Endpoint::Electrum(_)

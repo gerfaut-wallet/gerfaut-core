@@ -834,6 +834,114 @@ async fn a_sync_never_takes_a_watch_server_of_another_network() {
     );
 }
 
+/// The server whose answer a wallet's last sync is stamped with.
+async fn answered_by(manager: &WalletManager, wallet: &str) -> Option<String> {
+    let state = manager.state.lock().await;
+    find_record(&state.payload, wallet)
+        .ok()?
+        .meta
+        .last_sync
+        .as_ref()?
+        .server
+        .clone()
+}
+
+/// An automatic backend whose rotation is one Esplora server and whose
+/// catalogue lists `electrum`, all of them local, and a manager on it
+/// watching [`ADDRESS`], synced once before any watch.
+async fn automatic(
+    dir: &std::path::Path,
+    rotation: &FakeMempool,
+    electrum: &[&FakeElectrum],
+) -> (crate::chain::public::StandIn, WalletManager, String) {
+    let stand_in = crate::chain::public::stand_in(
+        &[format!("http://{}/api", rotation.address)],
+        &electrum
+            .iter()
+            .map(|server| format!("tcp://{}", server.address))
+            .collect::<Vec<_>>(),
+    );
+    let (manager, wallet) = watching(dir, crate::chain::BackendConfig::default()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    (stand_in, manager, wallet)
+}
+
+/// While the watch has a session, a sync that names no server, such as
+/// the one the app runs when it opens, goes first to the watch's server
+/// and not to the head of the rotation: with the automatic backend, the
+/// syncs show the wallets to the operator the watch already shows them
+/// to, not to a second one.
+#[tokio::test]
+async fn a_sync_goes_first_to_the_server_the_watch_talks_to() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let live = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) = automatic(dir.path(), &rotation, &[&live]).await;
+    let rotation_key = format!("esplora 127.0.0.1 {}", rotation.address.port());
+    assert_eq!(answered_by(&manager, &wallet).await, Some(rotation_key));
+
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    assert_eq!(
+        answered_by(&manager, &wallet).await,
+        Some(format!("electrum 127.0.0.1 {}", live.address.port()))
+    );
+    manager.live_stop().await;
+}
+
+/// A watch that has no session yet, its first server refused and the
+/// next one not answering, sends no sync to either: a server the watch
+/// could not reach, such as one on a port the network drops, would make
+/// every sync wait on it before the next. The syncs keep to their order.
+#[tokio::test]
+async fn a_sync_never_goes_first_where_the_watch_failed() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let refused = FakeElectrum::start().await;
+    refused.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    let stalled = FakeElectrum::start().await;
+    stalled.state.lock().unwrap().silent = true;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) =
+        automatic(dir.path(), &rotation, &[&refused, &stalled]).await;
+
+    let pace = crate::watch::Timings {
+        connect: Duration::from_secs(60),
+        refused: Duration::from_secs(3600),
+        ..timings()
+    };
+    let _events = manager.live_start_with(Some(pace)).await.unwrap();
+    let opening = std::time::Instant::now();
+    while !stalled.was_asked("server.version") {
+        assert!(
+            opening.elapsed() < WAIT,
+            "the watch never reached the second server"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(refused.was_asked("server.version"));
+    assert_eq!(manager.live_server(), None);
+
+    let asked = |server: &FakeElectrum| server.state.lock().unwrap().asked.len();
+    let (refused_before, stalled_before) = (asked(&refused), asked(&stalled));
+    manager.sync_wallet(&wallet).await.unwrap();
+    assert_eq!(
+        asked(&refused),
+        refused_before,
+        "the sync went to the refused server"
+    );
+    assert_eq!(
+        asked(&stalled),
+        stalled_before,
+        "the sync went to the stalled server"
+    );
+    assert_eq!(
+        answered_by(&manager, &wallet).await,
+        Some(format!("esplora 127.0.0.1 {}", rotation.address.port()))
+    );
+    manager.live_stop().await;
+}
+
 /// A server behind the wallet whose chain never meets the wallet's, one
 /// of another network: the sync fails, saying so once the first block
 /// differs, and the payment the wallet holds is not taken for gone from

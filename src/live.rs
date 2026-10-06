@@ -1056,6 +1056,21 @@ impl WalletManager {
             .and_then(|running| running.watch.serving())
     }
 
+    /// The server a sync tries first while the live watch runs, and the
+    /// network the watch is on: the one the watch has a session with,
+    /// or, between two sessions, the one it last had a session with,
+    /// unless it failed to reach it since or leaves it alone
+    /// ([`crate::watch::LiveWatch::held`]). The watch already shows that
+    /// server every script it follows, so a sync there shows the wallet
+    /// to no other operator. None before the watch's first session: a
+    /// server the watch has yet to reach may be one the network drops,
+    /// and every sync would then wait on it before the next one.
+    pub(crate) fn live_server(&self) -> Option<(Network, Endpoint)> {
+        let slot = self.live_slot();
+        let watch = &slot.as_ref()?.watch;
+        watch.serving().or_else(|| watch.held())
+    }
+
     /// The sync a change asked for, run under one of the permits once
     /// `hold` has passed: of the scripts that moved when the watch named
     /// them, on the server the watch listens to first, which holds what

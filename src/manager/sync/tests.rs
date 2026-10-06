@@ -117,3 +117,46 @@ async fn regtest_public_backend_is_unavailable() {
         Err(CoreError::BackendUnavailable(_))
     ));
 }
+
+/// The server that answered the last sync goes first in the next one,
+/// told by its protocol and port as well as its host. Blockstream's
+/// Electrum server, `blockstream.info:700`, answering a sync the live
+/// watch asked for used to put Blockstream's web API, at the same host
+/// and with limits of its own, ahead of the rotation in every sync
+/// after it.
+#[test]
+fn the_server_that_answered_is_told_by_protocol_and_port() {
+    let none = chain::TrustedCerts::new();
+    let rotation =
+        chain::endpoints(&chain::BackendConfig::default(), Network::Mainnet, &none).unwrap();
+    let electrum = chain::endpoints(
+        &chain::BackendConfig::Public {
+            server: Some("electrum:blockstream.info".to_owned()),
+        },
+        Network::Mainnet,
+        &none,
+    )
+    .unwrap()
+    .remove(0);
+    let web = rotation[1].clone();
+    assert_eq!(web.label(), "blockstream.info");
+    assert_eq!(electrum.label(), web.label(), "one host for both");
+
+    // Electrum answered: the rotation keeps its order.
+    assert_eq!(
+        sync_order(rotation.clone(), Some(&electrum.key()), None),
+        rotation
+    );
+    // The web API answered: it goes first.
+    assert_eq!(
+        sync_order(rotation.clone(), Some(&web.key()), None),
+        vec![web.clone(), rotation[0].clone(), rotation[2].clone()]
+    );
+    // A stamp written before servers were told apart names none.
+    assert_eq!(sync_order(rotation.clone(), None, None), rotation);
+    // The server of the watch comes before the one that answered.
+    assert_eq!(
+        sync_order(rotation.clone(), Some(&web.key()), Some(electrum.clone())),
+        vec![electrum, web, rotation[0].clone(), rotation[2].clone()]
+    );
+}

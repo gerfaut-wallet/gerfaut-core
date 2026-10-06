@@ -137,6 +137,26 @@ The first release: the library both Gerfaut apps are built on.
   meets the wallet's, even one behind it, makes the sync fail instead of
   making the wallet's transactions look gone, and an Esplora server whose
   latest blocks contradict the chain it agreed on is refused.
+- While the live watch runs, a sync of a wallet of the watched network
+  goes first to the server the watch talks to, whoever asks for the sync.
+  Between two sessions, it goes to the server of the last one, unless the
+  watch has failed to reach it since or leaves it alone. Before the
+  watch's first session, the sync keeps to its usual order: a server the
+  watch has yet to reach may be one the network drops, and every sync
+  would wait on it. With the automatic backend on mainnet, the watch's
+  server is Blockstream's Electrum server. In practice, the syncs show
+  the wallet's addresses to one operator instead of two, and no longer
+  draw on the 700 requests an hour that Blockstream's web API allows one
+  IP address. A broadcast, a transaction preview and the older history of
+  a watched address still go to the rotation. The other servers of the
+  backend follow in their usual order, for when the watch's server fails.
+  Without a watch, nothing changes: the rotation starts with
+  mempool.space.
+- With the automatic backend, the live watch tries every Electrum server
+  of the operator it picked before it falls back to a mempool WebSocket.
+  On mainnet, `electrum.blockstream.info:50002` takes over when
+  `blockstream.info:700` fails, instead of mempool.space, whose WebSocket
+  pushes changes on ten scripts per connection.
 - A payment that a reorganisation replaced with a conflicting spend to
   someone else costs nothing more once a sync has seen it go. Before,
   each Esplora sync read the whole history of its address, and each watch
@@ -231,6 +251,11 @@ The first release: the library both Gerfaut apps are built on.
   `truncate_address` and `broadcast::sats`. So are the `funded_sats` and
   `spent_sats` fields of `AddressWatchState`, which nothing read. A vault
   still writes them as zero, for the older builds that require them.
+- `frigate.2140.dev` is no longer among the public servers. It is a Silent
+  Payments server, and it hands every other request to an Electrum server
+  behind it, so a watch-only wallet gains nothing from it. A backend set
+  to it falls back to the automatic rotation, like any server a build
+  stops listing.
 
 ### Fixed
 
@@ -562,3 +587,11 @@ The first release: the library both Gerfaut apps are built on.
 - The app lock's delay now starts when the answer comes back. It used to
   start at the guess, so the time Argon2 took to check it came off the
   delay.
+- The next sync of a wallet tries first the server that answered the last
+  one, and that server is now told apart by its protocol and port as well
+  as its host. Matched on the host alone, a sync the live watch ran on
+  Blockstream's Electrum server, `blockstream.info:700`, put Blockstream's
+  web API at the head of every sync after it, and that web API takes 700
+  requests an hour from one IP address. `SyncStamp.server` records the
+  server. A stamp written before this field existed names none, and that
+  sync tries the servers in their usual order.

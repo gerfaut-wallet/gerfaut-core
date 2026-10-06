@@ -5,7 +5,9 @@
 //! single-address wallet; they are what the automatic mode rotates
 //! through. The Electrum servers are the list Sparrow Wallet ships for
 //! the same networks, kept so a user who already trusts one of them can
-//! point Gerfaut at it without typing a URL.
+//! point Gerfaut at it without typing a URL. Its Silent Payments server
+//! is left out: it hands every other request to an Electrum server
+//! behind it, and a watch-only wallet has no use for the rest.
 //!
 //! Several of those Electrum servers sign their own certificate, which
 //! nothing public vouches for. They are listed all the same, marked, and
@@ -99,13 +101,6 @@ const MAINNET: &[Entry] = &[
         label: "electrum.diynodes.com:50022",
         protocol: Electrum,
         url: "ssl://electrum.diynodes.com:50022",
-        self_signed: false,
-    },
-    Entry {
-        id: "electrum:frigate.2140.dev",
-        label: "frigate.2140.dev:50002",
-        protocol: Electrum,
-        url: "ssl://frigate.2140.dev:50002",
         self_signed: false,
     },
     // The rest of Sparrow's list. These sign their own certificate:
@@ -202,7 +197,19 @@ const TESTNET4: &[Entry] = &[
     },
 ];
 
+#[cfg(test)]
+thread_local! {
+    /// The servers a test of this thread puts in place of the public
+    /// ones: see [`stand_in`].
+    static STAND_IN: std::cell::Cell<Option<&'static [Entry]>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn entries(network: Network) -> &'static [Entry] {
+    #[cfg(test)]
+    if let Some(entries) = STAND_IN.get() {
+        return entries;
+    }
     match network {
         Network::Mainnet => MAINNET,
         Network::Signet => SIGNET,
@@ -225,6 +232,61 @@ pub fn public_servers(network: Network) -> Vec<PublicServer> {
             self_signed: entry.self_signed,
         })
         .collect()
+}
+
+/// The Esplora instances the automatic backend rotates through, in the
+/// order it tries them.
+pub(crate) fn rotation(network: Network) -> Vec<&'static str> {
+    #[cfg(test)]
+    if let Some(entries) = STAND_IN.get() {
+        return entries
+            .iter()
+            .filter(|entry| entry.protocol == Esplora)
+            .map(|entry| entry.url)
+            .collect();
+    }
+    network.default_esplora_urls().to_vec()
+}
+
+/// Puts local servers in place of the public ones of every network, for
+/// the tests of this thread, until the guard is dropped: the automatic
+/// backend then rotates through `esplora`, and the live watch finds
+/// `electrum` in the catalogue, each in its order. Each is the address
+/// a fake server of `crate::testkit` gives, all on one host, which
+/// stands for one operator.
+#[cfg(test)]
+pub(crate) fn stand_in(esplora: &[String], electrum: &[String]) -> StandIn {
+    let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+    let entry = |protocol: ServerProtocol, url: &String| {
+        let label = crate::chain::host_and_port(url)
+            .map(|(host, port)| format!("{host}:{}", port.unwrap_or_default()))
+            .unwrap_or_default();
+        Entry {
+            id: leak(format!("{protocol:?}:{label}").to_lowercase()),
+            label: leak(label),
+            protocol,
+            url: leak(url.clone()),
+            self_signed: false,
+        }
+    };
+    let entries: Vec<Entry> = esplora
+        .iter()
+        .map(|url| entry(Esplora, url))
+        .chain(electrum.iter().map(|url| entry(Electrum, url)))
+        .collect();
+    STAND_IN.set(Some(Box::leak(entries.into_boxed_slice())));
+    StandIn
+}
+
+/// Puts the public servers back when dropped: see [`stand_in`].
+#[cfg(test)]
+pub(crate) struct StandIn;
+
+#[cfg(test)]
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        STAND_IN.set(None);
+    }
 }
 
 /// Looks up one server by the identifier stored in the settings.
