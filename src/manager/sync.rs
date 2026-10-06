@@ -300,13 +300,14 @@ impl WalletManager {
         };
         // The server of the watch that asked for this sync: it told of
         // the change, so it holds what changed. For any other sync, the
-        // server a running watch talks to: it already sees every script
-        // the watch follows, and a sync there shows the wallet to no
-        // second operator. Only a server a watch of the wallet's own
-        // network may talk to under its backend: the watch may have
-        // moved to another network, or another backend, since the sync
-        // was asked for, and a wallet's addresses never go to a server
-        // its backend does not name.
+        // server a running watch talks to, or last talked to
+        // (`live_server`): it already sees every script the watch
+        // follows, and a sync there shows the wallet to no second
+        // operator. Only a server a watch of the wallet's own network
+        // may talk to under its backend: the watch may have moved to
+        // another network, or another backend, since the sync was asked
+        // for, and a wallet's addresses never go to a server its backend
+        // does not name.
         let first = prefer
             .or_else(|| self.live_server())
             .filter(|(network, prefer)| {

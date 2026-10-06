@@ -1058,23 +1058,17 @@ impl WalletManager {
 
     /// The server a sync tries first while the live watch runs, and the
     /// network the watch is on: the one the watch has a session with,
-    /// or, while it opens one, the first it tries. The watch already
-    /// shows that server every script it follows, so a sync there shows
-    /// the wallet to no other operator. With the automatic backend, the
-    /// syncs would otherwise go to the web API at the head of the
-    /// rotation, a second operator, as they do when no watch runs.
+    /// or, between two sessions, the one it last had a session with,
+    /// unless it failed to reach it since or leaves it alone
+    /// ([`crate::watch::LiveWatch::held`]). The watch already shows that
+    /// server every script it follows, so a sync there shows the wallet
+    /// to no other operator. None before the watch's first session: a
+    /// server the watch has yet to reach may be one the network drops,
+    /// and every sync would then wait on it before the next one.
     pub(crate) fn live_server(&self) -> Option<(Network, Endpoint)> {
         let slot = self.live_slot();
-        let running = slot.as_ref()?;
-        running.watch.serving().or_else(|| {
-            let config = &running.config;
-            let first =
-                crate::watch::servers_for(&config.backend, config.network, &config.electrum_certs)
-                    .ok()?
-                    .into_iter()
-                    .next()?;
-            Some((config.network, first))
-        })
+        let watch = &slot.as_ref()?.watch;
+        watch.serving().or_else(|| watch.held())
     }
 
     /// The sync a change asked for, run under one of the permits once

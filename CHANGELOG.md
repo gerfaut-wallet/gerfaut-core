@@ -138,15 +138,20 @@ The first release: the library both Gerfaut apps are built on.
   making the wallet's transactions look gone, and an Esplora server whose
   latest blocks contradict the chain it agreed on is refused.
 - While the live watch runs, a sync of a wallet of the watched network
-  goes first to the server the watch talks to, whoever asks for it. While
-  the watch is still opening its connection, the sync goes to the server
-  the watch tries first. With the automatic backend on mainnet, that
-  server is Blockstream's Electrum server. In practice, one operator sees
-  the wallet's addresses instead of two, and the syncs no longer draw on
-  the 700 requests an hour that Blockstream's web API allows one IP
-  address. The other servers of the backend follow in their usual order,
-  for when that one fails. Without a watch, nothing changes: the
-  rotation starts with mempool.space.
+  goes first to the server the watch talks to, whoever asks for the sync.
+  Between two sessions, it goes to the server of the last one, unless the
+  watch has failed to reach it since or leaves it alone. Before the
+  watch's first session, the sync keeps to its usual order: a server the
+  watch has yet to reach may be one the network drops, and every sync
+  would wait on it. With the automatic backend on mainnet, the watch's
+  server is Blockstream's Electrum server. In practice, the syncs show
+  the wallet's addresses to one operator instead of two, and no longer
+  draw on the 700 requests an hour that Blockstream's web API allows one
+  IP address. A broadcast, a transaction preview and the older history of
+  a watched address still go to the rotation. The other servers of the
+  backend follow in their usual order, for when the watch's server fails.
+  Without a watch, nothing changes: the rotation starts with
+  mempool.space.
 - With the automatic backend, the live watch tries every Electrum server
   of the operator it picked before it falls back to a mempool WebSocket.
   On mainnet, `electrum.blockstream.info:50002` takes over when
