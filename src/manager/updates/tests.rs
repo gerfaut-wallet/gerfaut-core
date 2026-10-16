@@ -135,6 +135,23 @@ async fn the_first_day_asks_nothing_and_the_next_one_does() {
     assert_eq!(manager.update_status("0.1.0").await, status);
 }
 
+/// A clock a year ahead at the first launch, then set right: the first
+/// day asks nothing all the same, counted from the right time.
+#[tokio::test]
+async fn a_clock_ahead_at_the_first_launch_still_waits_a_day() {
+    let releases = Releases::start("v0.2.0").await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = open(dir.path()).await;
+
+    releases.session(&manager, "0.1.0", NOW + 365 * DAY).await;
+    releases.session(&manager, "0.1.0", NOW).await;
+    releases.session(&manager, "0.1.0", NOW + DAY - 1).await;
+    assert_eq!(releases.visits(), 0);
+
+    releases.session(&manager, "0.1.0", NOW + DAY).await;
+    assert_eq!(releases.visits(), 1);
+}
+
 /// A check counts whatever its answer, and what it found is the
 /// vault's: a restart neither asks again within the day nor forgets.
 /// None of it is in the preferences the apps write.

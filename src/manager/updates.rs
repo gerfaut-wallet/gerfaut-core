@@ -64,10 +64,7 @@ impl WalletManager {
         // The first session is the start of the day that asks nothing,
         // whatever the setting says now: turned on later, the check
         // does not wait a day more.
-        self.note_update(|record| {
-            record.first_session_at.get_or_insert(now);
-        })
-        .await;
+        self.note_update(|record| record.session_at(now)).await;
         if due {
             self.check_on_its_own(api, repo, now).await;
         }
