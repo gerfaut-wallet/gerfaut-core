@@ -719,12 +719,18 @@ pub fn build_preview(
         .enumerate()
         .map(|(i, input)| {
             let facts = input_facts.get(i).cloned().unwrap_or_default();
-            // What the wallet or the backend holds at that outpoint
-            // comes first: the PSBT's own word about the coin it spends
-            // is its author's, and a finalized input is never checked
-            // against anything. The PSBT fills in only where neither
-            // knows the coin.
-            let prevout = facts.prevout.or_else(|| decoded.inputs[i].prevout.clone());
+            // A coin the PSBT proves, read in the previous transaction its
+            // outpoint commits to, is the coin itself: nothing outweighs
+            // it, least of all a server's listing. Otherwise what the
+            // wallet or the backend holds at that outpoint comes first:
+            // the PSBT's own word about the coin it spends is its
+            // author's, and a finalized input is never checked against
+            // anything. The PSBT fills in only where neither knows it.
+            let prevout = if decoded.inputs[i].prevout_proven {
+                decoded.inputs[i].prevout.clone()
+            } else {
+                facts.prevout.or_else(|| decoded.inputs[i].prevout.clone())
+            };
             TxInputPreview {
                 txid: input.previous_output.txid.to_string(),
                 vout: input.previous_output.vout,
@@ -836,8 +842,20 @@ pub fn build_preview(
                 .wallet
                 .as_ref()
                 .map_or("the backend", |wallet| wallet.name.as_str());
-            warnings.push(TxWarning::new(
-                TxWarningKind::InputMismatch,
+            let message = if decoded.inputs[i].prevout_proven {
+                // The previous transaction proves the coin; the other
+                // word is what was listed, and it is the one in doubt.
+                format!(
+                    "Input {i} is not what {source} says: {source} knows this coin as {} sats \
+                     on {}, but the previous transaction the PSBT carries, the one this \
+                     input spends, pays {} sats to {}. The value shown and the fee go by \
+                     that transaction.",
+                    known.value.to_sat(),
+                    place(known),
+                    claimed.value.to_sat(),
+                    place(claimed)
+                )
+            } else {
                 format!(
                     "Input {i} is not what the PSBT says: it declares {} sats on {}, but \
                      {source} knows this coin as {} sats on {}. The fee shown goes by \
@@ -846,8 +864,9 @@ pub fn build_preview(
                     place(claimed),
                     known.value.to_sat(),
                     place(known)
-                ),
-            ));
+                )
+            };
+            warnings.push(TxWarning::new(TxWarningKind::InputMismatch, message));
         }
         if facts.unknown {
             warnings.push(TxWarning::new(
@@ -1860,6 +1879,52 @@ mod tests {
         assert!(fee.blocking, "{}", fee.message);
         assert_eq!(preview.readiness, TxReadiness::Refused);
         assert!(preview.hex.is_none());
+    }
+
+    /// A watched address lists a coin at 1 000 sats; the PSBT carries the
+    /// previous transaction, which pays it 100 000. The transaction is
+    /// the coin, the listing a server's word: the value and the fee go
+    /// by the transaction, the disagreement is said, and nothing is
+    /// refused over the listed amount.
+    #[test]
+    fn a_proven_value_outweighs_a_listed_one() {
+        let decoded = psbt_spending(&[(100_000, true)], &[90_000]);
+        let listed = vec![InputFacts {
+            prevout: Some(TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: p2wpkh(0x33),
+            }),
+            wallet: Some(WalletRef {
+                id: "w2".into(),
+                name: "Watch".into(),
+            }),
+            spent: Some(false),
+            ..Default::default()
+        }];
+        let preview = build_preview(&decoded, Network::Signet, &listed, &[], Some(100), 0);
+        assert_eq!(preview.inputs[0].value_sats, Some(100_000));
+        assert_eq!(preview.fee_sats, Some(10_000));
+        assert_eq!(preview.readiness, TxReadiness::Ready);
+        assert!(preview.hex.is_some());
+        let mismatch = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InputMismatch)
+            .expect("the listing contradicts the transaction");
+        assert!(!mismatch.blocking);
+        assert!(
+            mismatch
+                .message
+                .contains("Watch knows this coin as 1000 sats"),
+            "{}",
+            mismatch.message
+        );
+        assert!(
+            mismatch.message.contains("go by that transaction"),
+            "{}",
+            mismatch.message
+        );
+        assert!(!preview.warnings.iter().any(|w| w.blocking));
     }
 
     /// One coin proven, the other only declared: the overspend rests on
