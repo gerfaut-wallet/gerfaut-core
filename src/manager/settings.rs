@@ -1,5 +1,5 @@
 //! The settings: the backend of each network and the certificates
-//! accepted for it, the gap limit, the app's preferences, and Tor. A
+//! accepted for it, the gap limit, the preferences, and Tor. A
 //! sync, a broadcast, the update check and the price ask here whether
 //! they go through Tor, and by which proxy.
 
@@ -9,6 +9,7 @@ use crate::chain::tor::{self, TorRoute, TorSettings, TorStatus};
 use crate::chain::{self, BackendConfig, CertificateReport, CertificateStatus, Endpoint};
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
+use crate::prefs::{Preferences, PreferencesChange};
 use crate::store::Settings;
 
 use super::WalletManager;
@@ -166,12 +167,38 @@ impl WalletManager {
         result
     }
 
-    /// Stores one small app preference (theme, hidden balances, ...) in
-    /// the encrypted vault.
+    /// Stores one small preference of an app (theme, sidebar, ...) in
+    /// the encrypted vault. A key the shared preferences were once kept
+    /// under is refused: written there, nothing would read it, and the
+    /// app that wrote it would not know. Those go through
+    /// [`Self::set_preferences`].
     pub async fn set_app_pref(&self, key: String, value: String) -> CoreResult<()> {
+        if crate::prefs::LEGACY_KEYS.contains(&key.as_str()) {
+            return Err(CoreError::InvalidInput {
+                kind: "app preference",
+                detail: format!("`{key}` is one of the shared preferences"),
+            });
+        }
         self.state.lock().await.commit(|payload| {
             payload.settings.app_prefs.insert(key, value);
             Ok(())
+        })
+    }
+
+    /// The preferences both apps keep: see [`crate::prefs`].
+    pub async fn preferences(&self) -> Preferences {
+        self.state.lock().await.payload.settings.preferences
+    }
+
+    /// Changes some of the preferences both apps keep, and answers them
+    /// all as stored. The currency wins and the source follows: a pair
+    /// that no source quotes is never stored (see
+    /// [`Preferences::change`]).
+    pub async fn set_preferences(&self, change: PreferencesChange) -> CoreResult<Preferences> {
+        self.state.lock().await.commit(|payload| {
+            let preferences = &mut payload.settings.preferences;
+            *preferences = preferences.change(&change);
+            Ok(*preferences)
         })
     }
 
@@ -268,33 +295,6 @@ impl WalletManager {
         })
     }
 
-    /// Asks GitHub for the latest release of `owner/repo` and compares
-    /// it with the running version: for the button, and for the check
-    /// the apps run on their own once a day. It takes the route the
-    /// syncs take. When [`Self::uses_tor`] says so it goes through the
-    /// Tor proxy a sync would resolve, and when that proxy cannot be
-    /// had it fails with [`CoreError::Tor`] before any request exists:
-    /// never a request in the clear. Anything else that goes wrong is
-    /// "could not check".
-    pub async fn check_update(
-        &self,
-        repo: &str,
-        current_version: &str,
-    ) -> CoreResult<crate::updates::UpdateCheck> {
-        self.check_update_at(crate::updates::GITHUB_API, repo, current_version)
-            .await
-    }
-
-    pub(crate) async fn check_update_at(
-        &self,
-        api: &str,
-        repo: &str,
-        current_version: &str,
-    ) -> CoreResult<crate::updates::UpdateCheck> {
-        let proxy = self.beside_syncs_proxy().await?;
-        crate::updates::check_update(api, repo, current_version, proxy.as_deref()).await
-    }
-
     /// The proxy for a request that is not a sync, the update check and
     /// the price among them: the Tor route a sync would resolve when
     /// [`Self::uses_tor`] says so, nothing otherwise. When Tor is
@@ -306,6 +306,20 @@ impl WalletManager {
         }
         let (settings, data_dir) = self.tor_setup().await;
         Ok(Some(tor::resolve(&settings, &data_dir).await?.proxy()))
+    }
+
+    /// [`Self::beside_syncs_proxy`] without starting Tor: a Tor that
+    /// already runs, or [`CoreError::Tor`]. For a request the app makes
+    /// on its own and that can wait for a sync or the live watch to
+    /// bring Tor up, the update check of a session: Android asks again
+    /// at every return to the screen and the desktop every hour, and
+    /// neither starts the built-in client for a check.
+    pub(super) async fn running_beside_syncs_proxy(&self) -> CoreResult<Option<String>> {
+        if !self.uses_tor().await {
+            return Ok(None);
+        }
+        let settings = self.state.lock().await.payload.settings.tor.clone();
+        Ok(Some(tor::resolve_running(&settings).await?.proxy()))
     }
 
     /// Whether the backend of the active network is reached through

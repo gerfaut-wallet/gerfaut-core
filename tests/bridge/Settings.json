@@ -1,0 +1,47 @@
+{
+  "fresh": {
+    "active_network": "mainnet",
+    "backends": {},
+    "gap_limit": 20,
+    "app_prefs": {},
+    "electrum_certs": {},
+    "app_lock": null,
+    "tor": {"mode": "auto", "socks_proxy": null},
+    "preferences": {
+      "unit": "btc",
+      "masked": false,
+      "fiat": false,
+      "fiat_currency": "eur",
+      "price_source": "coingecko",
+      "notify_new_tx": false,
+      "explorer_ack": false
+    }
+  },
+  "configured": {
+    "active_network": "signet",
+    "backends": {
+      "mainnet": {
+        "type": "custom_electrum",
+        "url": "tcp://umbrel.local:50001",
+        "own_node": true
+      },
+      "signet": {"type": "public_esplora"}
+    },
+    "gap_limit": 50,
+    "app_prefs": {"theme": "dark"},
+    "electrum_certs": {
+      "electrum.example.org:50002": "65:E2:79:2B:7E:69:3A:24:C1:DA:BA:FF:89:52:15:E6:60:C0:BD:24:A4:AC:1D:69:7A:AE:20:24:E1:27:11:52"
+    },
+    "app_lock": {"kind": "pin", "biometric": true},
+    "tor": {"mode": "system", "socks_proxy": "127.0.0.1:9150"},
+    "preferences": {
+      "unit": "sats",
+      "masked": true,
+      "fiat": true,
+      "fiat_currency": "chf",
+      "price_source": "kraken",
+      "notify_new_tx": true,
+      "explorer_ack": true
+    }
+  }
+}

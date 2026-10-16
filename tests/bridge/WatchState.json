@@ -1,0 +1,7 @@
+{
+  "off": "off",
+  "connecting": "connecting",
+  "connected": "connected",
+  "reconnecting": "reconnecting",
+  "polling": "polling"
+}

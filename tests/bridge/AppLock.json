@@ -1,0 +1,4 @@
+{
+  "pin_with_biometrics": {"kind": "pin", "biometric": true},
+  "password": {"kind": "password", "biometric": false}
+}

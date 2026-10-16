@@ -1,0 +1,51 @@
+{
+  "input_of_the_wallet": {
+    "address": "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx",
+    "value_sats": 1000000,
+    "is_mine": true,
+    "change": false,
+    "op_return": null,
+    "prev_txid": "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf",
+    "prev_vout": 0
+  },
+  "unknown_input": {
+    "address": null,
+    "value_sats": null,
+    "is_mine": false,
+    "change": false,
+    "op_return": null,
+    "prev_txid": "b23a6a8439c0dde5515893e7c90c1e3233b8616e634470f20dc4928bcf3609bc",
+    "prev_vout": 3
+  },
+  "payment": {
+    "address": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+    "value_sats": 250000,
+    "is_mine": false,
+    "change": false,
+    "op_return": null,
+    "prev_txid": null,
+    "prev_vout": null
+  },
+  "change": {
+    "address": "tb1qgtw9wgs0gtszee9feyd4fs00wprftdqxkr6f8n",
+    "value_sats": 749660,
+    "is_mine": true,
+    "change": true,
+    "op_return": null,
+    "prev_txid": null,
+    "prev_vout": null
+  },
+  "op_return": {
+    "address": null,
+    "value_sats": 0,
+    "is_mine": false,
+    "change": false,
+    "op_return": {
+      "hex": "48656c6c6f2066726f6d207468652047657266617574207465737473",
+      "text": "Hello from the Gerfaut tests",
+      "label": null
+    },
+    "prev_txid": null,
+    "prev_vout": null
+  }
+}

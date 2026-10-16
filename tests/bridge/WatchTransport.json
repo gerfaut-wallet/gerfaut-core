@@ -1,0 +1,5 @@
+{
+  "electrum": "electrum",
+  "mempool_websocket": "mempool_websocket",
+  "esplora_polling": "esplora_polling"
+}

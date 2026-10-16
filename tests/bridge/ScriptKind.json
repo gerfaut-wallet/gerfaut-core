@@ -1,0 +1,9 @@
+{
+  "legacy": "legacy",
+  "nested_segwit": "nested_segwit",
+  "segwit": "segwit",
+  "taproot": "taproot",
+  "witness_script": "witness_script",
+  "legacy_script": "legacy_script",
+  "bare": "bare"
+}

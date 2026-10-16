@@ -1,0 +1,27 @@
+{
+  "revealed": {
+    "external": [
+      {
+        "index": 0,
+        "address": "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx",
+        "used": true,
+        "balance_sats": 1000000
+      },
+      {
+        "index": 1,
+        "address": "tb1qm4na5x7ptxxwepp7xmrsgv7t6hv2yw9h55s5r8",
+        "used": false,
+        "balance_sats": 0
+      }
+    ],
+    "internal": [
+      {
+        "index": 0,
+        "address": "tb1qgtw9wgs0gtszee9feyd4fs00wprftdqxkr6f8n",
+        "used": true,
+        "balance_sats": 1000000
+      }
+    ],
+    "truncated": false
+  }
+}

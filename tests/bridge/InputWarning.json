@@ -1,0 +1,8 @@
+{
+  "assumed_segwit": "assumed_segwit",
+  "slip132_converted": "slip132_converted",
+  "change_not_tracked": "change_not_tracked",
+  "multiple_accounts_in_file": "multiple_accounts_in_file",
+  "non_standard_derivation": "non_standard_derivation",
+  "assumed_branches": "assumed_branches"
+}

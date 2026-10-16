@@ -1,5 +1,6 @@
 //! Previews of a transaction whose coins only the backend can vouch
-//! for, against an Esplora on loopback or none at all.
+//! for, against an Esplora on loopback or none at all; and the
+//! broadcasts the vault keeps once the network took them.
 
 use super::*;
 use crate::chain::BackendConfig;
@@ -716,4 +717,195 @@ async fn a_contradicted_listing_sends_the_coin_to_the_backend() {
         .expect("the backend's answer about the coin");
     assert!(spent.blocking);
     assert_eq!(preview.readiness, TxReadiness::Refused);
+}
+
+// --- recent broadcasts ---------------------------------------------------
+
+/// An Esplora on loopback that takes every transaction posted to it, or
+/// refuses each in the node's words when `refusal` says so.
+async fn esplora_taking(refusal: Option<&'static str>) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            // The whole request, its body too: an answer sent over bytes
+            // left unread would go with a reset.
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+                let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse().ok())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            let (status, body) = match refusal {
+                None => ("200 OK", "accepted"),
+                Some(words) => ("400 Bad Request", words),
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    format!("http://{address}/api")
+}
+
+/// A manager whose regtest backend is [`esplora_taking`].
+async fn sending(dir: &std::path::Path, refusal: Option<&'static str>) -> WalletManager {
+    let manager = manager(dir).await;
+    manager
+        .set_backend(
+            Network::Regtest,
+            BackendConfig::CustomEsplora {
+                url: esplora_taking(refusal).await,
+                own_node: false,
+            },
+        )
+        .await
+        .unwrap();
+    manager
+}
+
+/// A transaction the decoder takes for signed, spending a coin of
+/// nobody's, as hex: `n` tells two apart.
+fn signed(n: u8) -> String {
+    use crate::testkit::{nowhere, script, transaction};
+    let mut tx = transaction(&[nowhere(n, 0)], &[(&script(n), 50_000)]);
+    tx.input[0].witness.push([0x30; 71]);
+    tx.input[0].witness.push([0x02; 33]);
+    bdk_wallet::bitcoin::consensus::encode::serialize_hex(&tx)
+}
+
+/// What the network took is kept with what the apps show of it, read
+/// back after a restart, network by network.
+#[tokio::test]
+async fn a_broadcast_the_network_took_is_kept_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = sending(dir.path(), None).await;
+    let hex = signed(1);
+    let report = manager
+        .broadcast_transaction(Network::Regtest, &hex)
+        .await
+        .unwrap();
+
+    let kept = manager.recent_broadcasts(Network::Regtest).await;
+    assert_eq!(
+        kept,
+        [RecentBroadcast {
+            txid: report.txid,
+            network: Network::Regtest,
+            hex,
+            backend: report.backend,
+            at: report.at,
+        }]
+    );
+    assert!(manager.recent_broadcasts(Network::Signet).await.is_empty());
+    drop(manager);
+    let reopened = WalletManager::open(dir.path(), crate::manager::tests::support::key()).unwrap();
+    assert_eq!(reopened.recent_broadcasts(Network::Regtest).await, kept);
+}
+
+/// A transaction the node refused was never sent: nothing is kept.
+#[tokio::test]
+async fn a_refused_broadcast_is_not_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = sending(
+        dir.path(),
+        Some("sendrawtransaction RPC error -26: min relay fee not met"),
+    )
+    .await;
+    let error = manager
+        .broadcast_transaction(Network::Regtest, &signed(1))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("min relay fee not met"),
+        "{error}"
+    );
+    assert!(manager.recent_broadcasts(Network::Regtest).await.is_empty());
+}
+
+/// Newest first, a transaction sent again moved up rather than listed
+/// twice, and one forgotten gone for good, a restart included.
+#[tokio::test]
+async fn a_forgotten_broadcast_stays_forgotten() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = sending(dir.path(), None).await;
+    let mut txids = Vec::new();
+    for hex in [signed(1), signed(2), signed(1)] {
+        let report = manager
+            .broadcast_transaction(Network::Regtest, &hex)
+            .await
+            .unwrap();
+        txids.push(report.txid);
+    }
+    let listed = |manager: WalletManager| async move {
+        manager
+            .recent_broadcasts(Network::Regtest)
+            .await
+            .into_iter()
+            .map(|sent| sent.txid)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        listed(manager.clone()).await,
+        [txids[0].as_str(), &txids[1]]
+    );
+
+    manager.forget_broadcast(&txids[0]).await.unwrap();
+    // Already so: no error.
+    manager.forget_broadcast(&txids[0]).await.unwrap();
+    assert_eq!(listed(manager.clone()).await, [txids[1].as_str()]);
+    drop(manager);
+    let reopened = WalletManager::open(dir.path(), crate::manager::tests::support::key()).unwrap();
+    assert_eq!(listed(reopened).await, [txids[1].as_str()]);
+}
+
+/// A disk that takes no save does not cost a broadcast its answer: the
+/// transaction is on the network, and kept for this session. The next
+/// save that goes through writes it. Forgetting, which the user
+/// decides, is refused instead, and changes nothing.
+#[tokio::test]
+async fn a_broadcast_kept_where_no_save_goes_through_is_still_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = sending(dir.path(), None).await;
+    manager.state.lock().await.vault.fail_saves(true);
+    let report = manager
+        .broadcast_transaction(Network::Regtest, &signed(1))
+        .await
+        .unwrap();
+    assert_eq!(manager.recent_broadcasts(Network::Regtest).await.len(), 1);
+    assert!(manager.forget_broadcast(&report.txid).await.is_err());
+    assert_eq!(manager.recent_broadcasts(Network::Regtest).await.len(), 1);
+
+    manager.state.lock().await.vault.fail_saves(false);
+    manager
+        .set_app_pref("desktop.theme".to_owned(), "dark".to_owned())
+        .await
+        .unwrap();
+    drop(manager);
+    let reopened = WalletManager::open(dir.path(), crate::manager::tests::support::key()).unwrap();
+    let kept = reopened.recent_broadcasts(Network::Regtest).await;
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].txid, report.txid);
 }

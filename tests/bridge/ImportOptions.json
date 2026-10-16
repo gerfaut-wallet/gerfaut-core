@@ -1,0 +1,12 @@
+{
+  "as_read": {"script": null, "derivation": null, "network": null},
+  "chosen": {
+    "script": "segwit",
+    "derivation": {
+      "receive": "0/*",
+      "change": "1/*",
+      "origin": "[73c5da0a/84'/0'/0']"
+    },
+    "network": "mainnet"
+  }
+}

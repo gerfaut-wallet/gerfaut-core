@@ -1,0 +1,7 @@
+{
+  "absolute": {
+    "kind": "absolute",
+    "lock": {"kind": "time", "unix": 1899979200}
+  },
+  "relative": {"kind": "relative", "lock": {"kind": "blocks", "blocks": 52560}}
+}

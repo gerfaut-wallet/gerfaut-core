@@ -1,0 +1,62 @@
+{
+  "idle": {
+    "mode": "auto",
+    "socks_proxy": "127.0.0.1:9050",
+    "via": null,
+    "socks": null,
+    "running": false,
+    "bootstrapped": false,
+    "bootstrap_percent": 0,
+    "error": null,
+    "embedded_available": true,
+    "system_socks_trusted": true
+  },
+  "through_system": {
+    "mode": "auto",
+    "socks_proxy": "127.0.0.1:9050",
+    "via": "system",
+    "socks": "127.0.0.1:9050",
+    "running": false,
+    "bootstrapped": false,
+    "bootstrap_percent": 0,
+    "error": null,
+    "embedded_available": true,
+    "system_socks_trusted": true
+  },
+  "built_in_starting": {
+    "mode": "embedded",
+    "socks_proxy": "127.0.0.1:9050",
+    "via": null,
+    "socks": null,
+    "running": true,
+    "bootstrapped": false,
+    "bootstrap_percent": 40,
+    "error": null,
+    "embedded_available": true,
+    "system_socks_trusted": true
+  },
+  "built_in_running_untrusted_loopback": {
+    "mode": "auto",
+    "socks_proxy": "127.0.0.1:9050",
+    "via": "embedded",
+    "socks": "127.0.0.1:41935",
+    "running": true,
+    "bootstrapped": true,
+    "bootstrap_percent": 100,
+    "error": null,
+    "embedded_available": true,
+    "system_socks_trusted": false
+  },
+  "built_in_failed": {
+    "mode": "embedded",
+    "socks_proxy": "127.0.0.1:9050",
+    "via": null,
+    "socks": null,
+    "running": false,
+    "bootstrapped": false,
+    "bootstrap_percent": 0,
+    "error": "could not reach the Tor network",
+    "embedded_available": true,
+    "system_socks_trusted": true
+  }
+}

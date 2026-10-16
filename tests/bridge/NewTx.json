@@ -1,0 +1,12 @@
+{
+  "received": {
+    "txid": "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf",
+    "net_sats": 1000000,
+    "confirmed": true
+  },
+  "sent": {
+    "txid": "0e9fd1596c4b1dfca8ddcd36c567f11da43cf17968a5b912f0e67c5198f643f1",
+    "net_sats": -250340,
+    "confirmed": false
+  }
+}

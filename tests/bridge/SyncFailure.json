@@ -1,0 +1,6 @@
+{
+  "unreachable": {
+    "wallet_id": "a7d40b19-5c3e-4f82-b6a1-2e9c8d7f0b54",
+    "message": "sync failed via electrum.example.org: connection refused"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "mainnet": "mainnet",
+  "signet": "signet",
+  "testnet4": "testnet4",
+  "regtest": "regtest"
+}

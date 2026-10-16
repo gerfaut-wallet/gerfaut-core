@@ -1,0 +1,4 @@
+{
+  "system": {"socks": "127.0.0.1:9050", "via": "system"},
+  "embedded": {"socks": "127.0.0.1:41935", "via": "embedded"}
+}

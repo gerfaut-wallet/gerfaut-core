@@ -1,0 +1,31 @@
+{
+  "spendable_now": {"kind": "spendable_now"},
+  "locked": {
+    "kind": "locked",
+    "until": {
+      "remaining_blocks": null,
+      "remaining_seconds": null,
+      "unlocks_at_unix": null
+    }
+  },
+  "per_coin": {
+    "kind": "per_coin",
+    "unlocked": 0,
+    "waiting": 1,
+    "locked": 1,
+    "next": {
+      "remaining_blocks": 4320,
+      "remaining_seconds": 2592000,
+      "unlocks_at_unix": 1752592000
+    }
+  },
+  "per_coin_none_left": {
+    "kind": "per_coin",
+    "unlocked": 2,
+    "waiting": 0,
+    "locked": 0,
+    "next": null
+  },
+  "no_coins": {"kind": "no_coins"},
+  "needs_preimage": {"kind": "needs_preimage"}
+}

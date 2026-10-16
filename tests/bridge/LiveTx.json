@@ -1,0 +1,30 @@
+{
+  "mempool": {
+    "wallet_id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+    "txid": "0e9fd1596c4b1dfca8ddcd36c567f11da43cf17968a5b912f0e67c5198f643f1",
+    "net_sats": 84000,
+    "stage": "mempool",
+    "replaces": null
+  },
+  "confirmed": {
+    "wallet_id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+    "txid": "0e9fd1596c4b1dfca8ddcd36c567f11da43cf17968a5b912f0e67c5198f643f1",
+    "net_sats": 84000,
+    "stage": "confirmed",
+    "replaces": null
+  },
+  "dropped": {
+    "wallet_id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+    "txid": "0e9fd1596c4b1dfca8ddcd36c567f11da43cf17968a5b912f0e67c5198f643f1",
+    "net_sats": 84000,
+    "stage": "dropped",
+    "replaces": null
+  },
+  "replacing": {
+    "wallet_id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+    "txid": "a8ba035ac05569201237c5cbf064dade0de2cedcf0c2d25480575cc77fc9dec2",
+    "net_sats": 84000,
+    "stage": "mempool",
+    "replaces": "0e9fd1596c4b1dfca8ddcd36c567f11da43cf17968a5b912f0e67c5198f643f1"
+  }
+}

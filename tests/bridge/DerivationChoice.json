@@ -1,0 +1,9 @@
+{
+  "usual": {"receive": "0/*", "change": "1/*", "origin": null},
+  "chosen": {
+    "receive": "0/*",
+    "change": "1/*",
+    "origin": "[73c5da0a/84'/0'/0']"
+  },
+  "receive_only": {"receive": "0/*", "change": null, "origin": null}
+}

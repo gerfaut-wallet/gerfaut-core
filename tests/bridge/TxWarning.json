@@ -1,0 +1,20 @@
+{
+  "spends_watched": {
+    "kind": "spends_watched",
+    "message": "Spends coins of Savings.",
+    "severity": "info",
+    "blocking": false
+  },
+  "unsigned": {
+    "kind": "unsigned",
+    "message": "The input carries no signature: the network will refuse this transaction. It has to go back to the signer.",
+    "severity": "alert",
+    "blocking": true
+  },
+  "input_spent": {
+    "kind": "input_spent",
+    "message": "Input 0 is already spent by another transaction, which is in a block. The network will refuse this one.",
+    "severity": "alert",
+    "blocking": true
+  }
+}

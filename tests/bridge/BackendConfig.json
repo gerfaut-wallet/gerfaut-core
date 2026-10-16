@@ -1,0 +1,22 @@
+{
+  "public_rotation": {"type": "public_esplora"},
+  "public_one": {"type": "public_esplora", "server": "mempool.space"},
+  "custom_esplora": {
+    "type": "custom_esplora",
+    "url": "https://esplora.example.org/api"
+  },
+  "custom_esplora_own_node": {
+    "type": "custom_esplora",
+    "url": "http://umbrel.local:3002/api",
+    "own_node": true
+  },
+  "custom_electrum": {
+    "type": "custom_electrum",
+    "url": "ssl://electrum.example.org:50002"
+  },
+  "custom_electrum_own_node": {
+    "type": "custom_electrum",
+    "url": "tcp://umbrel.local:50001",
+    "own_node": true
+  }
+}

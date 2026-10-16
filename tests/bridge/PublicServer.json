@@ -1,0 +1,23 @@
+{
+  "esplora": {
+    "id": "mempool.space",
+    "label": "mempool.space",
+    "protocol": "esplora",
+    "url": "https://mempool.space/api",
+    "self_signed": false
+  },
+  "electrum": {
+    "id": "electrum:blockstream.info",
+    "label": "blockstream.info:700",
+    "protocol": "electrum",
+    "url": "ssl://blockstream.info:700",
+    "self_signed": false
+  },
+  "self_signed": {
+    "id": "electrum:bitcoin.lu.ke",
+    "label": "bitcoin.lu.ke:50002",
+    "protocol": "electrum",
+    "url": "ssl://bitcoin.lu.ke:50002",
+    "self_signed": true
+  }
+}

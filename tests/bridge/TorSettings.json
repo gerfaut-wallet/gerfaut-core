@@ -1,0 +1,4 @@
+{
+  "default": {"mode": "auto", "socks_proxy": null},
+  "system_proxy": {"mode": "system", "socks_proxy": "127.0.0.1:9150"}
+}

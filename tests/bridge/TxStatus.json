@@ -1,0 +1,13 @@
+{
+  "confirmed": {
+    "state": "confirmed",
+    "height": 799995,
+    "timestamp": 1749997000
+  },
+  "confirmed_without_time": {
+    "state": "confirmed",
+    "height": 800000,
+    "timestamp": null
+  },
+  "pending": {"state": "pending"}
+}

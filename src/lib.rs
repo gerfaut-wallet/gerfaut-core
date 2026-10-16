@@ -9,6 +9,8 @@
 //! private key material are rejected at the parsing boundary.
 
 pub mod backup;
+#[cfg(test)]
+mod bridge_contract;
 pub mod broadcast;
 pub mod chain;
 pub mod error;
@@ -19,6 +21,7 @@ pub mod live;
 pub mod lock;
 pub mod manager;
 pub mod network;
+pub mod prefs;
 pub mod price;
 pub mod store;
 #[cfg(test)]
@@ -27,7 +30,7 @@ pub mod updates;
 pub mod wallet;
 pub mod watch;
 
-pub use error::{CoreError, CoreResult};
+pub use error::{CoreError, CoreResult, ErrorCode};
 pub use manager::WalletManager;
 pub use network::Network;
 

@@ -1,0 +1,4 @@
+{
+  "any_server": {"per_wallet": 200, "total": 2000},
+  "own_node": {"per_wallet": 20000, "total": 20000}
+}

@@ -1,0 +1,16 @@
+{
+  "every_source": {
+    "currency": "eur",
+    "code": "EUR",
+    "name": "Euro",
+    "reach": "every",
+    "sources": ["coingecko", "kraken", "mempool_space"]
+  },
+  "coingecko_only": {
+    "currency": "inr",
+    "code": "INR",
+    "name": "Indian rupee",
+    "reach": "coingecko_only",
+    "sources": ["coingecko"]
+  }
+}

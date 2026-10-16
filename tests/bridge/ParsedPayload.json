@@ -1,0 +1,18 @@
+{
+  "descriptors": {
+    "type": "descriptors",
+    "external": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)#76ngmkux",
+    "internal": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)#0wkfxrv7",
+    "script": "segwit"
+  },
+  "descriptors_without_change": {
+    "type": "descriptors",
+    "external": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)#76ngmkux",
+    "internal": null,
+    "script": "segwit"
+  },
+  "address": {
+    "type": "address",
+    "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "plain": {
+    "format": "plain",
+    "received": 1,
+    "total": 1,
+    "complete": true,
+    "text": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)",
+    "warnings": []
+  },
+  "part_of_ur": {
+    "format": "ur",
+    "received": 1,
+    "total": 3,
+    "complete": false,
+    "text": null,
+    "warnings": []
+  },
+  "ur_read_with_assumptions": {
+    "format": "ur",
+    "received": 3,
+    "total": 3,
+    "complete": true,
+    "text": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)",
+    "warnings": ["assumed_branches"]
+  }
+}

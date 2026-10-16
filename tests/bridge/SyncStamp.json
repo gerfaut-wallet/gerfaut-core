@@ -1,0 +1,13 @@
+{
+  "electrum": {
+    "at": 1749999880,
+    "tip_height": 800000,
+    "backend": "electrum.example.org",
+    "server": "ssl://electrum.example.org:50002"
+  },
+  "before_servers_were_named": {
+    "at": 1749999880,
+    "tip_height": 800000,
+    "backend": "electrum.example.org"
+  }
+}

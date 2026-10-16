@@ -1,0 +1,116 @@
+{
+  "synced": {
+    "meta": {
+      "id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+      "name": "Savings",
+      "icon": "piggy_bank",
+      "network": "signet",
+      "kind": {
+        "type": "descriptors",
+        "external": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)#76ngmkux",
+        "internal": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)#0wkfxrv7",
+        "script": "segwit"
+      },
+      "recognized_as": "multipath_descriptor",
+      "created_at": 1747408000,
+      "gap_limit": 20,
+      "scan_gap": 20,
+      "labels": {
+        "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf": "October salary"
+      },
+      "last_sync": {
+        "at": 1749999880,
+        "tip_height": 800000,
+        "backend": "electrum.example.org",
+        "server": "ssl://electrum.example.org:50002"
+      },
+      "complete_at": 1749996400,
+      "cached": {
+        "balance": {
+          "confirmed": 1250000,
+          "trusted_pending": 0,
+          "untrusted_pending": 0,
+          "immature": 0,
+          "total": 1250000,
+          "pending_net_sats": null
+        },
+        "tx_count": 2
+      },
+      "live_pinned": true
+    },
+    "balance": {
+      "confirmed": 1250000,
+      "trusted_pending": 0,
+      "untrusted_pending": 84000,
+      "immature": 0,
+      "total": 1334000,
+      "pending_net_sats": 84000
+    },
+    "txs": [
+      {
+        "txid": "0e9fd1596c4b1dfca8ddcd36c567f11da43cf17968a5b912f0e67c5198f643f1",
+        "net_sats": -250340,
+        "fee_sats": 340,
+        "status": {"state": "pending"},
+        "confirmations": 0
+      },
+      {
+        "txid": "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf",
+        "net_sats": 1000000,
+        "fee_sats": null,
+        "status": {
+          "state": "confirmed",
+          "height": 799995,
+          "timestamp": 1749997000
+        },
+        "confirmations": 6
+      }
+    ],
+    "tip_height": 800000,
+    "truncated": false
+  },
+  "busy_address": {
+    "meta": {
+      "id": "e2b85c07-1f6a-4c93-8d4e-7a0b3c5f9e26",
+      "name": "Donations",
+      "icon": "landmark",
+      "network": "mainnet",
+      "kind": {
+        "type": "single_address",
+        "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+      },
+      "recognized_as": "address",
+      "created_at": 1715440000,
+      "gap_limit": 20,
+      "scan_gap": 20,
+      "labels": {},
+      "last_sync": {
+        "at": 1749999400,
+        "tip_height": 800000,
+        "backend": "mempool.space"
+      },
+      "cached": {
+        "balance": {
+          "confirmed": 21000,
+          "trusted_pending": 0,
+          "untrusted_pending": 0,
+          "immature": 0,
+          "total": 21000,
+          "pending_net_sats": null
+        },
+        "tx_count": 1
+      }
+    },
+    "balance": {
+      "confirmed": 21000,
+      "trusted_pending": 0,
+      "untrusted_pending": 0,
+      "immature": 0,
+      "total": 21000,
+      "pending_net_sats": null
+    },
+    "txs": [],
+    "tip_height": 800000,
+    "truncated": true
+  }
+}

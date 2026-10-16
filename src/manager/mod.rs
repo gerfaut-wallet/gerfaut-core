@@ -10,16 +10,17 @@
 //! their question:
 //!
 //! - `settings.rs`: which backend and which certificates, the gap limit,
-//!   the app's preferences, and whether a connection goes through Tor;
-//!   the update check, for that last reason.
+//!   the app's preferences, and whether a connection goes through Tor.
 //! - `wallets.rs`: which wallets, in which order, and what each holds.
 //! - `sync.rs`: how far a sync reads, and which caller waits for which.
-//! - `broadcast.rs`: what a transaction does, and where it stands once
-//!   sent.
+//! - `broadcast.rs`: what a transaction does, the last ones sent, and
+//!   where each stands.
 //! - `price.rs`: what a bitcoin is worth, asked by the route the syncs
 //!   take.
 //! - `app_lock.rs`: who may open the app.
 //! - `backup.rs`: what a backup carries, and what a restore brings back.
+//! - `updates.rs`: when the app asks for the latest release on its own,
+//!   what it announces, and what the user closed.
 //! - `live.rs`, beside this module: what the live watch follows, and
 //!   what is worth announcing.
 //!
@@ -52,6 +53,7 @@ mod broadcast;
 mod price;
 mod settings;
 mod sync;
+mod updates;
 mod wallets;
 
 pub(crate) use sync::{Reach, complete_lately};
@@ -130,6 +132,9 @@ pub struct Shared {
     /// Counts the readings of what the watch should follow, so an older
     /// one never replaces a newer one on the running watch.
     pub(crate) watch_setups: std::sync::atomic::AtomicU64,
+    /// What the notifications of Live may still spend this minute, for
+    /// every caller of the process: see [`WalletManager::notices`].
+    pub(crate) notice_budgets: std::sync::Mutex<crate::live::notice::Budgets>,
     /// One sync at a time per wallet, and when the last one ended.
     syncing: std::sync::Mutex<HashMap<String, SyncSlot>>,
     /// The wallets a complete sync has read since the vault was opened:
@@ -174,6 +179,7 @@ impl WalletManager {
                 attempts: Mutex::new(attempts),
                 live: std::sync::Mutex::new(None),
                 watch_setups: std::sync::atomic::AtomicU64::new(0),
+                notice_budgets: std::sync::Mutex::new(crate::live::notice::Budgets::new()),
                 syncing: std::sync::Mutex::new(HashMap::new()),
                 complete_here: std::sync::Mutex::new(HashSet::new()),
             }),

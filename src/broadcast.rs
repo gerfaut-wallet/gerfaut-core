@@ -328,6 +328,35 @@ pub struct BroadcastStatus {
     pub at: u64,
 }
 
+/// How many broadcasts the vault remembers, every network together.
+pub const RECENT_BROADCASTS: usize = 10;
+
+/// A transaction this app handed to the network, kept so that where it
+/// stands can be asked again after a restart: see
+/// [`crate::WalletManager::recent_broadcasts`]. Nothing in it is not
+/// already public once it is sent: no PSBT, nothing of a wallet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentBroadcast {
+    pub txid: String,
+    pub network: Network,
+    /// The transaction as sent, hex: what a status check decodes.
+    pub hex: String,
+    /// Host that accepted it. Empty for one the Android app remembered
+    /// before the vault did, which did not keep it.
+    #[serde(default)]
+    pub backend: String,
+    /// Unix timestamp, seconds.
+    pub at: u64,
+}
+
+impl RecentBroadcast {
+    /// Whether `hex` reads as a transaction whose txid is `txid`.
+    pub(crate) fn holds_together(&self) -> bool {
+        encode::deserialize_hex::<Transaction>(&self.hex)
+            .is_ok_and(|tx| tx.compute_txid().to_string() == self.txid)
+    }
+}
+
 /// A transaction decoded from any accepted form, before the chain is
 /// consulted.
 #[derive(Debug, Clone)]

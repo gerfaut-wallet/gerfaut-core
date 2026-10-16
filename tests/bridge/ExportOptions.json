@@ -1,0 +1,14 @@
+{
+  "everything": {
+    "from": null,
+    "to": null,
+    "direction": null,
+    "include_pending": true
+  },
+  "filtered": {
+    "from": 1747321600,
+    "to": 1750000000,
+    "direction": "incoming",
+    "include_pending": false
+  }
+}

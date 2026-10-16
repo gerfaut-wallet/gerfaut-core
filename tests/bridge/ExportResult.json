@@ -1,0 +1,6 @@
+{
+  "two_rows": {
+    "csv": "txid,date_utc,block_height,confirmations,direction,amount_sats,amount_btc,fee_sats\n6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf,2025-06-15 14:16:40,799995,6,in,1000000,0.01000000,\n0e9fd1596c4b1dfca8ddcd36c567f11da43cf17968a5b912f0e67c5198f643f1,,,0,out,-250340,-0.00250340,340\n",
+    "rows": 2
+  }
+}

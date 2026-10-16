@@ -1,0 +1,9 @@
+{
+  "descriptor": "descriptor",
+  "descriptor_pair": "descriptor_pair",
+  "multipath_descriptor": "multipath_descriptor",
+  "extended_key": "extended_key",
+  "address": "address",
+  "wallet_export": "wallet_export",
+  "bsms": "bsms"
+}

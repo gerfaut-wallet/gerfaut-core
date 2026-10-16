@@ -15,11 +15,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::broadcast::{RECENT_BROADCASTS, RecentBroadcast};
 use crate::chain::BackendConfig;
 use crate::chain::tor::TorSettings;
 use crate::error::VaultError;
 use crate::lock::AppLock;
 use crate::network::Network;
+use crate::prefs::Preferences;
+use crate::updates::UpdateRecord;
 use crate::wallet::AddressWatchState;
 use crate::wallet::meta::WalletMeta;
 
@@ -34,7 +37,7 @@ pub use cipher::VaultKey;
 /// [`Vault::load`]. A field an earlier build wrote and this one no
 /// longer has is skipped as the payload is read, and left out of the
 /// next save.
-const PAYLOAD_VERSION: u32 = 2;
+const PAYLOAD_VERSION: u32 = 3;
 
 /// One wallet and its chain state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,9 +91,10 @@ pub struct Settings {
     /// address syncs scan, and where the apps warn on Receive.
     #[serde(default = "default_gap_limit")]
     pub gap_limit: u32,
-    /// Small app-side preferences (theme, hidden balances, ...) kept in
-    /// the same encrypted file so nothing leaks in plain preference
-    /// stores. Keys are namespaced by the apps.
+    /// Small preferences of one app (theme, sidebar, welcome tour, ...)
+    /// kept in the same encrypted file so nothing leaks in plain
+    /// preference stores. Keys are namespaced by the apps. What both
+    /// apps keep with the same meaning is in [`Self::preferences`].
     #[serde(default)]
     pub app_prefs: BTreeMap<String, String>,
     /// Electrum certificates the user accepted, by `host:port`. An
@@ -108,6 +112,12 @@ pub struct Settings {
     /// existed read as the default, the system Tor first.
     #[serde(default)]
     pub tor: TorSettings,
+    /// The preferences both apps keep with the same meaning. A vault
+    /// written before they had a record of their own kept them among
+    /// [`Self::app_prefs`], and they are taken from there when it is
+    /// read: see [`crate::prefs`].
+    #[serde(default)]
+    pub preferences: Preferences,
 }
 
 fn default_gap_limit() -> u32 {
@@ -124,6 +134,7 @@ impl Default for Settings {
             electrum_certs: BTreeMap::new(),
             app_lock: None,
             tor: TorSettings::default(),
+            preferences: Preferences::default(),
         }
     }
 }
@@ -238,6 +249,17 @@ pub struct VaultPayload {
     /// from vaults written before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) vanishing: Vec<Vanishing>,
+    /// The update check: its setting, when it last went out, and what
+    /// it found and the user closed. Apart from the app preferences,
+    /// which the apps write as they like: the core decides all of it.
+    /// A vault written before reads as the check on, nothing known.
+    #[serde(default)]
+    pub updates: UpdateRecord,
+    /// The transactions this app broadcast, newest first, one per txid
+    /// and [`RECENT_BROADCASTS`] at most. Absent while there are none,
+    /// and from vaults written before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) broadcasts: Vec<RecentBroadcast>,
 }
 
 impl Default for VaultPayload {
@@ -249,7 +271,45 @@ impl Default for VaultPayload {
             announced: Vec::new(),
             unclaimed: Vec::new(),
             vanishing: Vec::new(),
+            updates: UpdateRecord::default(),
+            broadcasts: Vec::new(),
         }
+    }
+}
+
+impl VaultPayload {
+    /// Puts a transaction just sent at the head of the recent
+    /// broadcasts, in place of an earlier record of the same txid, and
+    /// lets the oldest go past [`RECENT_BROADCASTS`].
+    pub(crate) fn remember_broadcast(&mut self, sent: RecentBroadcast) {
+        self.broadcasts.retain(|kept| kept.txid != sent.txid);
+        self.broadcasts.insert(0, sent);
+        self.broadcasts.truncate(RECENT_BROADCASTS);
+    }
+
+    /// Takes in the broadcasts an app kept under [`APP_BROADCASTS`]
+    /// before the vault kept them itself, after those it already holds,
+    /// and removes the preference: whether there was one. An entry that
+    /// does not read, or whose bytes are not the transaction its txid
+    /// names, stays out.
+    fn adopt_app_broadcasts(&mut self) -> bool {
+        let Some(raw) = self.settings.app_prefs.remove(APP_BROADCASTS) else {
+            return false;
+        };
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap_or_default();
+        for entry in entries {
+            if self.broadcasts.len() >= RECENT_BROADCASTS {
+                break;
+            }
+            let Ok(entry) = serde_json::from_value::<RecentBroadcast>(entry) else {
+                continue;
+            };
+            if entry.holds_together() && !self.broadcasts.iter().any(|kept| kept.txid == entry.txid)
+            {
+                self.broadcasts.push(entry);
+            }
+        }
+        true
     }
 }
 
@@ -262,10 +322,28 @@ struct Retired {
     premium: Option<serde::de::IgnoredAny>,
 }
 
-/// The app preferences earlier builds kept for that account, under keys
-/// that start with this: the ntfy topic of each of its channels among
-/// them. Nothing reads them any more, and they leave with the account.
-const RETIRED_PREFS: &str = "premium.";
+/// Whether the settings, as written, hold the record of the preferences
+/// both apps keep. A vault written before it existed kept them among the
+/// app preferences, where they are taken from once: see
+/// [`crate::prefs`].
+#[derive(Deserialize)]
+struct Recorded {
+    #[serde(default)]
+    preferences: Option<serde::de::IgnoredAny>,
+}
+
+/// The app preferences earlier builds kept under keys that start with
+/// these, which nothing reads any more and which leave the vault at the
+/// open: the ones kept for that account, the ntfy topic of each of its
+/// channels among them, and the ones the desktop (`update.`) and Android
+/// (`updates.`) kept for the update check, which the vault now keeps in
+/// a record of its own.
+const RETIRED_PREFS: [&str; 3] = ["premium.", "update.", "updates."];
+
+/// The app preference the recent broadcasts were kept under, as a JSON
+/// list, before the vault kept them: see
+/// [`VaultPayload::adopt_app_broadcasts`].
+const APP_BROADCASTS: &str = "broadcast.recent";
 
 /// Handle on the vault file. Owns the key material, and the exclusive
 /// lock that keeps every other opener out while it lives.
@@ -351,8 +429,9 @@ impl Vault {
     }
 
     /// [`Self::load`], and whether the file still holds what earlier
-    /// builds kept and this one dropped: see [`Retired`] and
-    /// [`RETIRED_PREFS`]. The payload comes without either.
+    /// builds kept and this one dropped or keeps elsewhere: see
+    /// [`Retired`], [`RETIRED_PREFS`] and [`APP_BROADCASTS`]. The payload
+    /// comes without any of them.
     fn read(&self) -> Result<(VaultPayload, bool), VaultError> {
         #[derive(Deserialize)]
         struct Head<'a> {
@@ -373,12 +452,23 @@ impl Vault {
             serde_json::from_str::<Retired>(settings.get())
                 .is_ok_and(|retired| retired.premium.is_some())
         });
+        let unrecorded = settings.is_some_and(|settings| {
+            serde_json::from_str::<Recorded>(settings.get())
+                .is_ok_and(|recorded| recorded.preferences.is_none())
+        });
         let mut payload: VaultPayload = serde_json::from_slice(&plaintext).map_err(corrupted)?;
         payload.version = PAYLOAD_VERSION;
+        if unrecorded {
+            let settings = &mut payload.settings;
+            settings.preferences = crate::prefs::adopt(&mut settings.app_prefs);
+        }
         let prefs = &mut payload.settings.app_prefs;
         let before = prefs.len();
-        prefs.retain(|key, _| !key.starts_with(RETIRED_PREFS));
+        prefs.retain(|key, _| !RETIRED_PREFS.iter().any(|retired| key.starts_with(retired)));
         let retired = retired || prefs.len() < before;
+        // Taken in once: the vault written back without the preference
+        // is one no later open reads it from.
+        let retired = payload.adopt_app_broadcasts() || retired;
         Ok((payload, retired))
     }
 
@@ -709,7 +799,7 @@ mod tests {
         written_at(PAYLOAD_VERSION + 1);
         assert!(matches!(
             Vault::open_or_create(&path, key()),
-            Err(VaultError::UnsupportedVersion(3))
+            Err(VaultError::UnsupportedVersion(4))
         ));
 
         // A later build that gave a field another shape: still a newer
@@ -723,7 +813,7 @@ mod tests {
         std::fs::write(&path, sealed).unwrap();
         assert!(matches!(
             Vault::open_or_create(&path, key()),
-            Err(VaultError::UnsupportedVersion(3))
+            Err(VaultError::UnsupportedVersion(4))
         ));
     }
 
@@ -934,6 +1024,48 @@ mod tests {
         assert_eq!(payload.settings.app_prefs.len(), 2);
     }
 
+    /// What both apps kept for the update check among the app
+    /// preferences, before the vault had a record of it, leaves the file
+    /// at the open, and a preference that only looks like one stays.
+    #[test]
+    fn a_vault_with_update_preferences_opens_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let mut stored: serde_json::Value = serde_json::from_str(VAULT_WITH_PREMIUM).unwrap();
+        let settings = stored["settings"].as_object_mut().unwrap();
+        settings.remove("premium");
+        let prefs = &mut settings["app_prefs"];
+        prefs
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| key == "desktop.theme");
+        prefs["update.auto"] = "0".into();
+        prefs["update.checked_at"] = "1790000000".into();
+        prefs["update.dismissed"] = "0.2.0".into();
+        prefs["updates.auto"] = "1".into();
+        prefs["updates.latest"] = "9.9.9".into();
+        prefs["updated.note"] = "kept".into();
+        let sealed = cipher::seal(stored.to_string().as_bytes(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
+        let kept = serde_json::json!({"desktop.theme": "dark", "updated.note": "kept"});
+        assert_eq!(
+            serde_json::to_value(&payload.settings.app_prefs).unwrap(),
+            kept
+        );
+        // Gone from the file at the open, before any change is saved.
+        let written = |path: &Path| -> serde_json::Value {
+            let plaintext = cipher::unseal(&std::fs::read(path).unwrap(), &key()).unwrap();
+            serde_json::from_slice(&plaintext).unwrap()
+        };
+        assert_eq!(written(&path)["settings"]["app_prefs"], kept);
+        assert_eq!(payload.updates, UpdateRecord::default());
+        drop(vault);
+        let (_, reloaded) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(reloaded.settings.app_prefs, payload.settings.app_prefs);
+    }
+
     /// A vault with a Premium account that cannot be written back at the
     /// open, in a directory that takes no new file, opens all the same,
     /// and the account waits for a save that can be made.
@@ -959,6 +1091,124 @@ mod tests {
         assert!(still_there);
         vault.save(&payload).unwrap();
         assert!(!holds_premium(&path));
+    }
+
+    /// A sent transaction as an app kept it: `n` tells two apart.
+    fn sent(n: u8, network: Network) -> RecentBroadcast {
+        use crate::testkit::{nowhere, script, transaction};
+        let tx = transaction(&[nowhere(n, 0)], &[(&script(n), 50_000)]);
+        RecentBroadcast {
+            txid: tx.compute_txid().to_string(),
+            network,
+            hex: bdk_wallet::bitcoin::consensus::encode::serialize_hex(&tx),
+            backend: "mempool.space".to_owned(),
+            at: 1_790_000_000 + u64::from(n),
+        }
+    }
+
+    /// The last ten broadcasts, every network together, newest first,
+    /// and a transaction sent again is moved up rather than listed twice.
+    #[test]
+    fn the_recent_broadcasts_are_the_last_ten() {
+        let mut payload = VaultPayload::default();
+        for n in 1..=11 {
+            let network = if n % 2 == 0 {
+                Network::Signet
+            } else {
+                Network::Mainnet
+            };
+            payload.remember_broadcast(sent(n, network));
+        }
+        let order = |payload: &VaultPayload| -> Vec<u64> {
+            payload
+                .broadcasts
+                .iter()
+                .map(|kept| kept.at - 1_790_000_000)
+                .collect()
+        };
+        assert_eq!(order(&payload), [11, 10, 9, 8, 7, 6, 5, 4, 3, 2]);
+        payload.remember_broadcast(sent(5, Network::Mainnet));
+        assert_eq!(order(&payload), [5, 11, 10, 9, 8, 7, 6, 4, 3, 2]);
+    }
+
+    /// The list the apps kept among their preferences is taken in at the
+    /// first open, after what the vault holds, and the preference leaves
+    /// the file then: no later open reads it again. An entry of the
+    /// Android app, which kept no host, comes in with none; one that
+    /// does not read, or whose bytes are another transaction, stays out.
+    #[test]
+    fn the_broadcasts_the_apps_kept_are_taken_in_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let desktop = sent(1, Network::Signet);
+        let mut android = serde_json::to_value(sent(2, Network::Mainnet)).unwrap();
+        android.as_object_mut().unwrap().remove("backend");
+        let mut mismatched = serde_json::to_value(sent(3, Network::Signet)).unwrap();
+        mismatched["hex"] = sent(4, Network::Signet).hex.into();
+        let kept_already = sent(5, Network::Signet);
+        let list = serde_json::json!([
+            desktop,
+            android,
+            {"txid": "ab", "network": "signet"},
+            mismatched,
+            kept_already,
+        ]);
+        let mut payload = VaultPayload::default();
+        payload.broadcasts.push(kept_already.clone());
+        payload
+            .settings
+            .app_prefs
+            .insert("desktop.theme".to_owned(), "dark".to_owned());
+        payload
+            .settings
+            .app_prefs
+            .insert(APP_BROADCASTS.to_owned(), list.to_string());
+        let sealed = cipher::seal(&serde_json::to_vec(&payload).unwrap(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        let expected = vec![
+            kept_already,
+            desktop,
+            RecentBroadcast {
+                backend: String::new(),
+                ..sent(2, Network::Mainnet)
+            },
+        ];
+        let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(payload.broadcasts, expected);
+        assert_eq!(
+            payload.settings.app_prefs,
+            BTreeMap::from([("desktop.theme".to_owned(), "dark".to_owned())])
+        );
+        // Gone from the file at the open, before any change is saved.
+        let plaintext = cipher::unseal(&std::fs::read(&path).unwrap(), &key()).unwrap();
+        assert!(
+            !String::from_utf8(plaintext)
+                .unwrap()
+                .contains(APP_BROADCASTS)
+        );
+        drop(vault);
+        let (_, reopened) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(reopened.broadcasts, expected);
+    }
+
+    /// A preference that is no list at all is dropped like any entry
+    /// that does not read: the vault opens, with nothing taken in.
+    #[test]
+    fn an_unreadable_list_of_broadcasts_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let mut payload = VaultPayload::default();
+        payload
+            .settings
+            .app_prefs
+            .insert(APP_BROADCASTS.to_owned(), "{not json".to_owned());
+        let sealed = cipher::seal(&serde_json::to_vec(&payload).unwrap(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        let (_, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert!(payload.broadcasts.is_empty());
+        assert!(payload.settings.app_prefs.is_empty());
     }
 
     #[test]
@@ -1270,6 +1520,112 @@ mod tests {
         assert!(!haystack.contains("wpkh"));
     }
 
+    /// The plaintext of a vault the desktop wrote with an earlier build,
+    /// at version 2: the preferences both apps keep, among the app's
+    /// own, as the strings it wrote them in.
+    const VAULT_BEFORE_PREFERENCES: &str = r#"{
+        "version": 2,
+        "settings": {
+            "active_network": "signet",
+            "backends": {},
+            "gap_limit": 20,
+            "app_prefs": {
+                "broadcast.recent": "[]",
+                "desktop.masked": "1",
+                "desktop.sidebar": "collapsed",
+                "desktop.theme": "dark",
+                "display.fiat": "1",
+                "display.fiat_currency": "chf",
+                "display.fiat_source": "kraken",
+                "display.unit": "sats",
+                "home.price_range": "year",
+                "notify.new_tx": "1",
+                "onboarding.seen": "1",
+                "privacy.explorer_ack": "1",
+                "update.auto": "0"
+            },
+            "electrum_certs": {},
+            "app_lock": null,
+            "tor": {"mode": "auto", "socks_proxy": null}
+        },
+        "wallets": [],
+        "announced": [],
+        "unclaimed": []
+    }"#;
+
+    /// A vault written before the preferences had a record opens with
+    /// them taken from the app preferences, read the way the app read
+    /// them, and written back in their record at the current version.
+    /// Once there, they are not taken again.
+    #[test]
+    fn a_vault_before_the_preferences_record_keeps_them() {
+        use crate::prefs::Unit;
+        use crate::price::{FiatCurrency, PriceSource};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let sealed = cipher::seal(VAULT_BEFORE_PREFERENCES.as_bytes(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+        let adopted = Preferences {
+            unit: Unit::Sats,
+            masked: true,
+            fiat: true,
+            fiat_currency: FiatCurrency::Chf,
+            price_source: PriceSource::Kraken,
+            notify_new_tx: true,
+            explorer_ack: true,
+        };
+        let own = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect()
+        };
+        // The recent broadcasts left with the shared preferences: the
+        // vault keeps them in a record of their own too, and the update
+        // check as well.
+        let app_alone = own(&[
+            ("desktop.sidebar", "collapsed"),
+            ("desktop.theme", "dark"),
+            ("home.price_range", "year"),
+            ("onboarding.seen", "1"),
+        ]);
+
+        let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(payload.settings.preferences, adopted);
+        assert_eq!(payload.settings.app_prefs, app_alone);
+        assert_eq!(payload.settings.active_network, Network::Signet);
+
+        vault.save(&payload).unwrap();
+        let plaintext = cipher::unseal(&std::fs::read(&path).unwrap(), &key()).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(written["version"], PAYLOAD_VERSION);
+        assert_eq!(
+            written["settings"]["preferences"],
+            serde_json::to_value(adopted).unwrap()
+        );
+        assert_eq!(
+            written["settings"]["app_prefs"],
+            serde_json::to_value(&app_alone).unwrap()
+        );
+        drop(vault);
+
+        let (vault, reloaded) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(reloaded.settings.preferences, adopted);
+        assert_eq!(reloaded.settings.app_prefs, app_alone);
+
+        // A record already there is the truth: a key of the old shape
+        // beside it is not read again.
+        let mut changed = reloaded;
+        changed.settings.preferences.unit = Unit::Btc;
+        changed
+            .settings
+            .app_prefs
+            .insert("display.unit".to_owned(), "sats".to_owned());
+        vault.save(&changed).unwrap();
+        assert_eq!(vault.load().unwrap().settings.preferences.unit, Unit::Btc);
+    }
+
     #[test]
     fn settings_fall_back_to_public_backend() {
         let settings = Settings::default();
@@ -1300,5 +1656,51 @@ mod tests {
         assert!(json.contains(r#""tor":{"mode":"system","socks_proxy":"127.0.0.1:9150"}"#));
         let again: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(again.tor, settings.tor);
+    }
+
+    /// A vault written before the update check had a record of its own
+    /// opens with the check on and nothing known, whatever preferences
+    /// the apps kept for it then. The record is written back with the
+    /// rest, the settings and the wallets as they were. A build that
+    /// predates it does not read that vault: it is written at version 3,
+    /// and a build of version 2 refuses it rather than drop the record
+    /// and the shared preferences at its next save.
+    #[test]
+    fn a_vault_without_an_update_record_opens_with_the_check_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let mut stored: serde_json::Value = serde_json::from_str(VAULT_WITH_PREMIUM).unwrap();
+        let prefs = &mut stored["settings"]["app_prefs"];
+        prefs["update.auto"] = "0".into();
+        prefs["update.latest"] = "9.9.9".into();
+        prefs["updates.latest"] = "9.9.9".into();
+        prefs["updates.checked_at"] = "1".into();
+        let sealed = cipher::seal(&serde_json::to_vec(&stored).unwrap(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        let (vault, mut payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(payload.updates, UpdateRecord::default());
+        let status = payload.updates.status("0.1.0");
+        assert!(status.automatic);
+        assert_eq!(status.announce, None);
+        assert_eq!(payload.wallets.len(), 1);
+
+        payload.updates.answered("v0.2.0");
+        vault.save(&payload).unwrap();
+        drop(vault);
+        let (vault, reloaded) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(reloaded.updates, payload.updates);
+
+        #[derive(Deserialize)]
+        struct Earlier {
+            version: u32,
+            settings: Settings,
+            wallets: Vec<WalletRecord>,
+        }
+        let plaintext = cipher::unseal(&std::fs::read(vault.path()).unwrap(), &key()).unwrap();
+        let earlier: Earlier = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(earlier.version, PAYLOAD_VERSION);
+        assert_eq!(earlier.settings.gap_limit, 42);
+        assert_eq!(earlier.wallets.len(), 1);
     }
 }

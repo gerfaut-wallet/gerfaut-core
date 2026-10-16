@@ -1,0 +1,185 @@
+{
+  "ready": {
+    "txid": "40d6a7e07b4c3e49fc00670b4b309f13f4534f60f9dfbae3706d10947a2163e0",
+    "source": "raw_transaction",
+    "network": "signet",
+    "inputs": [
+      {
+        "txid": "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf",
+        "vout": 0,
+        "value_sats": 1000000,
+        "address": "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx",
+        "signed": true,
+        "wallet": {
+          "id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+          "name": "Savings"
+        }
+      }
+    ],
+    "outputs": [
+      {
+        "index": 0,
+        "value_sats": 250000,
+        "address": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+        "op_return": null,
+        "wallet": null,
+        "change": false
+      },
+      {
+        "index": 1,
+        "value_sats": 749660,
+        "address": "tb1qgtw9wgs0gtszee9feyd4fs00wprftdqxkr6f8n",
+        "op_return": null,
+        "wallet": {
+          "id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+          "name": "Savings"
+        },
+        "change": true
+      }
+    ],
+    "fee_sats": 340,
+    "fee_rate_sat_vb": 2.4113475177304964,
+    "fee_unknown_reason": null,
+    "amounts_declared": false,
+    "vsize": 141,
+    "weight": 561,
+    "size": 222,
+    "version": 2,
+    "locktime": 799999,
+    "rbf": true,
+    "ready": true,
+    "readiness": "ready",
+    "warnings": [
+      {
+        "kind": "spends_watched",
+        "message": "Spends coins of Savings.",
+        "severity": "info",
+        "blocking": false
+      }
+    ],
+    "hex": "02000000000101bfe14b9fe1ce3c848dbdf171140350ea75fd8ac6eda7b4b9dffbb1023ce484630000000000fdffffff0290d0030000000000160014751e76e8199196d454941c45d1b3a323f1433bd65c700b000000000016001442dc57220f42e02ce4a9c91b54c1ef704695b4060247303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303021020202020202020202020202020202020202020202020202020202020202020202ff340c00"
+  },
+  "unsigned_psbt": {
+    "txid": "40d6a7e07b4c3e49fc00670b4b309f13f4534f60f9dfbae3706d10947a2163e0",
+    "source": "psbt",
+    "network": "signet",
+    "inputs": [
+      {
+        "txid": "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf",
+        "vout": 0,
+        "value_sats": 1000000,
+        "address": "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx",
+        "signed": false,
+        "wallet": null
+      }
+    ],
+    "outputs": [
+      {
+        "index": 0,
+        "value_sats": 250000,
+        "address": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+        "op_return": null,
+        "wallet": null,
+        "change": false
+      },
+      {
+        "index": 1,
+        "value_sats": 749660,
+        "address": "tb1qgtw9wgs0gtszee9feyd4fs00wprftdqxkr6f8n",
+        "op_return": null,
+        "wallet": {
+          "id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+          "name": "Savings"
+        },
+        "change": true
+      }
+    ],
+    "fee_sats": 340,
+    "fee_rate_sat_vb": 3.0088495575221237,
+    "fee_unknown_reason": null,
+    "amounts_declared": true,
+    "vsize": 113,
+    "weight": 452,
+    "size": 113,
+    "version": 2,
+    "locktime": 799999,
+    "rbf": true,
+    "ready": false,
+    "readiness": "unsigned",
+    "warnings": [
+      {
+        "kind": "unsigned",
+        "message": "The input carries no signature: the network will refuse this transaction. It has to go back to the signer.",
+        "severity": "alert",
+        "blocking": true
+      }
+    ],
+    "hex": null
+  },
+  "refused": {
+    "txid": "40d6a7e07b4c3e49fc00670b4b309f13f4534f60f9dfbae3706d10947a2163e0",
+    "source": "raw_transaction",
+    "network": "signet",
+    "inputs": [
+      {
+        "txid": "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf",
+        "vout": 0,
+        "value_sats": 1000000,
+        "address": "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx",
+        "signed": true,
+        "wallet": {
+          "id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+          "name": "Savings"
+        }
+      }
+    ],
+    "outputs": [
+      {
+        "index": 0,
+        "value_sats": 250000,
+        "address": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+        "op_return": null,
+        "wallet": null,
+        "change": false
+      },
+      {
+        "index": 1,
+        "value_sats": 749660,
+        "address": "tb1qgtw9wgs0gtszee9feyd4fs00wprftdqxkr6f8n",
+        "op_return": null,
+        "wallet": {
+          "id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+          "name": "Savings"
+        },
+        "change": true
+      }
+    ],
+    "fee_sats": 340,
+    "fee_rate_sat_vb": 2.4113475177304964,
+    "fee_unknown_reason": null,
+    "amounts_declared": false,
+    "vsize": 141,
+    "weight": 561,
+    "size": 222,
+    "version": 2,
+    "locktime": 799999,
+    "rbf": true,
+    "ready": false,
+    "readiness": "refused",
+    "warnings": [
+      {
+        "kind": "input_spent",
+        "message": "Input 0 is already spent by another transaction, which is in a block. The network will refuse this one.",
+        "severity": "alert",
+        "blocking": true
+      },
+      {
+        "kind": "spends_watched",
+        "message": "Spends coins of Savings.",
+        "severity": "info",
+        "blocking": false
+      }
+    ],
+    "hex": null
+  }
+}

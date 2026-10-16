@@ -1,0 +1,62 @@
+{
+  "with_settings": {
+    "created_at": 1749913600,
+    "wallets": [
+      {
+        "index": 0,
+        "name": "Savings",
+        "network": "signet",
+        "kind": {
+          "type": "descriptors",
+          "external": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)#76ngmkux",
+          "internal": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)#0wkfxrv7",
+          "script": "segwit"
+        },
+        "already_watched": false
+      },
+      {
+        "index": 1,
+        "name": "Donations",
+        "network": "mainnet",
+        "kind": {
+          "type": "single_address",
+          "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        },
+        "already_watched": true
+      }
+    ],
+    "has_settings": true,
+    "backends": [{"network": "mainnet", "backend": "electrum.example.org"}],
+    "electrum_hosts": ["electrum.example.org:50002"]
+  },
+  "wallets_only": {
+    "created_at": 1749913600,
+    "wallets": [
+      {
+        "index": 0,
+        "name": "Savings",
+        "network": "signet",
+        "kind": {
+          "type": "descriptors",
+          "external": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)#76ngmkux",
+          "internal": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)#0wkfxrv7",
+          "script": "segwit"
+        },
+        "already_watched": false
+      },
+      {
+        "index": 1,
+        "name": "Donations",
+        "network": "mainnet",
+        "kind": {
+          "type": "single_address",
+          "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        },
+        "already_watched": true
+      }
+    ],
+    "has_settings": false,
+    "backends": [],
+    "electrum_hosts": []
+  }
+}

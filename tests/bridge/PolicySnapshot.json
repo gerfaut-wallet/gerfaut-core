@@ -1,0 +1,741 @@
+{
+  "recovery_paths": {
+    "kind": "miniscript",
+    "script": "witness_script",
+    "descriptor": "wsh(or_d(multi(2,xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/0/*,xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw/0/*),or_i(and_v(v:pkh(xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ/0/*),older(52560)),or_i(and_v(v:pkh(xpub6D4BDPcP2GT577Vvch3R8wDkScZWzQzMMUm3PWbmWvVJrZwQY4VUNgqFJPMM3No2dFDFGTsxxpG5uJh7n7epu4trkrX7x7DogT5Uv6fcLW5/0/*),older(26280)),and_v(v:multi(2,xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ/1/*,xpub6D4BDPcP2GT577Vvch3R8wDkScZWzQzMMUm3PWbmWvVJrZwQY4VUNgqFJPMM3No2dFDFGTsxxpG5uJh7n7epu4trkrX7x7DogT5Uv6fcLW5/1/*),older(4320))))))",
+    "policy": "or(and(pk(Key A),pk(Key B)),and(pk(Key C),older(52560)),and(pk(Key D),older(26280)),and(pk(Key C),pk(Key D),older(4320)))",
+    "keys": [
+      {
+        "id": "k0",
+        "label": "Key A",
+        "fingerprint": "3442193e",
+        "origin_path": null,
+        "key_short": "xpub661M…GMcet8"
+      },
+      {
+        "id": "k1",
+        "label": "Key B",
+        "fingerprint": "5c1bd648",
+        "origin_path": null,
+        "key_short": "xpub68Gm…vgGDnw"
+      },
+      {
+        "id": "k2",
+        "label": "Key C",
+        "fingerprint": "bef5a2f9",
+        "origin_path": null,
+        "key_short": "xpub6ASu…puCkwQ"
+      },
+      {
+        "id": "k3",
+        "label": "Key D",
+        "fingerprint": "ee7ab90c",
+        "origin_path": null,
+        "key_short": "xpub6D4B…6fcLW5"
+      }
+    ],
+    "branches": [
+      {
+        "id": "b0",
+        "role": "primary",
+        "label": "Primary",
+        "summary": "Keys A and B",
+        "condition": {
+          "kind": "thresh",
+          "k": 2,
+          "n": 2,
+          "items": [
+            {"kind": "key", "key_id": "k0"},
+            {"kind": "key", "key_id": "k1"}
+          ]
+        },
+        "timelocks": [],
+        "state": {"kind": "spendable_now"},
+        "spendable_now": true,
+        "tone": "confirmed"
+      },
+      {
+        "id": "b3",
+        "role": "recovery",
+        "label": "Recovery",
+        "summary": "Keys C and D, once a coin has waited 4,320 blocks",
+        "condition": {
+          "kind": "thresh",
+          "k": 3,
+          "n": 3,
+          "items": [
+            {"kind": "key", "key_id": "k2"},
+            {"kind": "key", "key_id": "k3"},
+            {"kind": "older", "lock": {"kind": "blocks", "blocks": 4320}}
+          ]
+        },
+        "timelocks": [
+          {
+            "lock": {
+              "kind": "relative",
+              "lock": {"kind": "blocks", "blocks": 4320}
+            },
+            "required": true,
+            "state": {
+              "kind": "per_coin",
+              "unlocked": 1,
+              "waiting": 1,
+              "locked": 1,
+              "next": {
+                "remaining_blocks": 319,
+                "remaining_seconds": 191400,
+                "unlocks_at_unix": 1750191400
+              }
+            }
+          }
+        ],
+        "state": {
+          "kind": "per_coin",
+          "unlocked": 1,
+          "waiting": 1,
+          "locked": 1,
+          "next": {
+            "remaining_blocks": 319,
+            "remaining_seconds": 191400,
+            "unlocks_at_unix": 1750191400
+          }
+        },
+        "spendable_now": false,
+        "tone": "pending"
+      },
+      {
+        "id": "b2",
+        "role": "emergency",
+        "label": "Emergency",
+        "summary": "Key D, once a coin has waited 26,280 blocks",
+        "condition": {
+          "kind": "thresh",
+          "k": 2,
+          "n": 2,
+          "items": [
+            {"kind": "key", "key_id": "k3"},
+            {"kind": "older", "lock": {"kind": "blocks", "blocks": 26280}}
+          ]
+        },
+        "timelocks": [
+          {
+            "lock": {
+              "kind": "relative",
+              "lock": {"kind": "blocks", "blocks": 26280}
+            },
+            "required": true,
+            "state": {
+              "kind": "per_coin",
+              "unlocked": 1,
+              "waiting": 1,
+              "locked": 1,
+              "next": {
+                "remaining_blocks": 22279,
+                "remaining_seconds": 13367400,
+                "unlocks_at_unix": 1763367400
+              }
+            }
+          }
+        ],
+        "state": {
+          "kind": "per_coin",
+          "unlocked": 1,
+          "waiting": 1,
+          "locked": 1,
+          "next": {
+            "remaining_blocks": 22279,
+            "remaining_seconds": 13367400,
+            "unlocks_at_unix": 1763367400
+          }
+        },
+        "spendable_now": false,
+        "tone": "neutral"
+      },
+      {
+        "id": "b1",
+        "role": "other",
+        "label": "Recovery 3",
+        "summary": "Key C, once a coin has waited 52,560 blocks",
+        "condition": {
+          "kind": "thresh",
+          "k": 2,
+          "n": 2,
+          "items": [
+            {"kind": "key", "key_id": "k2"},
+            {"kind": "older", "lock": {"kind": "blocks", "blocks": 52560}}
+          ]
+        },
+        "timelocks": [
+          {
+            "lock": {
+              "kind": "relative",
+              "lock": {"kind": "blocks", "blocks": 52560}
+            },
+            "required": true,
+            "state": {
+              "kind": "per_coin",
+              "unlocked": 1,
+              "waiting": 1,
+              "locked": 1,
+              "next": {
+                "remaining_blocks": 48559,
+                "remaining_seconds": 29135400,
+                "unlocks_at_unix": 1779135400
+              }
+            }
+          }
+        ],
+        "state": {
+          "kind": "per_coin",
+          "unlocked": 1,
+          "waiting": 1,
+          "locked": 1,
+          "next": {
+            "remaining_blocks": 48559,
+            "remaining_seconds": 29135400,
+            "unlocks_at_unix": 1779135400
+          }
+        },
+        "spendable_now": false,
+        "tone": "neutral"
+      }
+    ],
+    "tip_height": 800000,
+    "computed_at": 1750000000,
+    "time_basis": "wall_clock",
+    "coins": 3,
+    "has_timelocks": true
+  },
+  "relative": {
+    "kind": "miniscript",
+    "script": "witness_script",
+    "descriptor": "wsh(or_d(pk(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/0/*),and_v(v:pkh(xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw/0/*),older(52560))))",
+    "policy": "or(pk(Key A),and(pk(Key B),older(52560)))",
+    "keys": [
+      {
+        "id": "k0",
+        "label": "Key A",
+        "fingerprint": "3442193e",
+        "origin_path": null,
+        "key_short": "xpub661M…GMcet8"
+      },
+      {
+        "id": "k1",
+        "label": "Key B",
+        "fingerprint": "5c1bd648",
+        "origin_path": null,
+        "key_short": "xpub68Gm…vgGDnw"
+      }
+    ],
+    "branches": [
+      {
+        "id": "b0",
+        "role": "primary",
+        "label": "Primary",
+        "summary": "Key A",
+        "condition": {"kind": "key", "key_id": "k0"},
+        "timelocks": [],
+        "state": {"kind": "spendable_now"},
+        "spendable_now": true,
+        "tone": "confirmed"
+      },
+      {
+        "id": "b1",
+        "role": "recovery",
+        "label": "Recovery",
+        "summary": "Key B, once a coin has waited 52,560 blocks",
+        "condition": {
+          "kind": "thresh",
+          "k": 2,
+          "n": 2,
+          "items": [
+            {"kind": "key", "key_id": "k1"},
+            {"kind": "older", "lock": {"kind": "blocks", "blocks": 52560}}
+          ]
+        },
+        "timelocks": [
+          {
+            "lock": {
+              "kind": "relative",
+              "lock": {"kind": "blocks", "blocks": 52560}
+            },
+            "required": true,
+            "state": {
+              "kind": "per_coin",
+              "unlocked": 1,
+              "waiting": 0,
+              "locked": 1,
+              "next": {
+                "remaining_blocks": 42559,
+                "remaining_seconds": 25535400,
+                "unlocks_at_unix": 1775535400
+              }
+            }
+          }
+        ],
+        "state": {
+          "kind": "per_coin",
+          "unlocked": 1,
+          "waiting": 0,
+          "locked": 1,
+          "next": {
+            "remaining_blocks": 42559,
+            "remaining_seconds": 25535400,
+            "unlocks_at_unix": 1775535400
+          }
+        },
+        "spendable_now": false,
+        "tone": "neutral"
+      }
+    ],
+    "tip_height": 800000,
+    "computed_at": 1750000000,
+    "time_basis": "wall_clock",
+    "coins": 2,
+    "has_timelocks": true
+  },
+  "relative_open": {
+    "kind": "miniscript",
+    "script": "witness_script",
+    "descriptor": "wsh(or_d(pk(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/0/*),and_v(v:pkh(xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw/0/*),older(52560))))",
+    "policy": "or(pk(Key A),and(pk(Key B),older(52560)))",
+    "keys": [
+      {
+        "id": "k0",
+        "label": "Key A",
+        "fingerprint": "3442193e",
+        "origin_path": null,
+        "key_short": "xpub661M…GMcet8"
+      },
+      {
+        "id": "k1",
+        "label": "Key B",
+        "fingerprint": "5c1bd648",
+        "origin_path": null,
+        "key_short": "xpub68Gm…vgGDnw"
+      }
+    ],
+    "branches": [
+      {
+        "id": "b0",
+        "role": "primary",
+        "label": "Primary",
+        "summary": "Key A",
+        "condition": {"kind": "key", "key_id": "k0"},
+        "timelocks": [],
+        "state": {"kind": "spendable_now"},
+        "spendable_now": true,
+        "tone": "confirmed"
+      },
+      {
+        "id": "b1",
+        "role": "recovery",
+        "label": "Recovery",
+        "summary": "Key B, once a coin has waited 52,560 blocks",
+        "condition": {
+          "kind": "thresh",
+          "k": 2,
+          "n": 2,
+          "items": [
+            {"kind": "key", "key_id": "k1"},
+            {"kind": "older", "lock": {"kind": "blocks", "blocks": 52560}}
+          ]
+        },
+        "timelocks": [
+          {
+            "lock": {
+              "kind": "relative",
+              "lock": {"kind": "blocks", "blocks": 52560}
+            },
+            "required": true,
+            "state": {
+              "kind": "per_coin",
+              "unlocked": 2,
+              "waiting": 0,
+              "locked": 0,
+              "next": null
+            }
+          }
+        ],
+        "state": {
+          "kind": "per_coin",
+          "unlocked": 2,
+          "waiting": 0,
+          "locked": 0,
+          "next": null
+        },
+        "spendable_now": false,
+        "tone": "confirmed"
+      }
+    ],
+    "tip_height": 800000,
+    "computed_at": 1750000000,
+    "time_basis": "wall_clock",
+    "coins": 2,
+    "has_timelocks": true
+  },
+  "absolute": {
+    "kind": "miniscript",
+    "script": "witness_script",
+    "descriptor": "wsh(or_d(pk(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/0/*),or_i(and_v(v:pkh(xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw/0/*),after(1899979200)),and_v(v:pkh(xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ/0/*),after(801432)))))",
+    "policy": "or(pk(Key A),and(pk(Key B),after(1899979200)),and(pk(Key C),after(801432)))",
+    "keys": [
+      {
+        "id": "k0",
+        "label": "Key A",
+        "fingerprint": "3442193e",
+        "origin_path": null,
+        "key_short": "xpub661M…GMcet8"
+      },
+      {
+        "id": "k1",
+        "label": "Key B",
+        "fingerprint": "5c1bd648",
+        "origin_path": null,
+        "key_short": "xpub68Gm…vgGDnw"
+      },
+      {
+        "id": "k2",
+        "label": "Key C",
+        "fingerprint": "bef5a2f9",
+        "origin_path": null,
+        "key_short": "xpub6ASu…puCkwQ"
+      }
+    ],
+    "branches": [
+      {
+        "id": "b0",
+        "role": "primary",
+        "label": "Primary",
+        "summary": "Key A",
+        "condition": {"kind": "key", "key_id": "k0"},
+        "timelocks": [],
+        "state": {"kind": "spendable_now"},
+        "spendable_now": true,
+        "tone": "confirmed"
+      },
+      {
+        "id": "b2",
+        "role": "recovery",
+        "label": "Recovery",
+        "summary": "Key C after block 801,432",
+        "condition": {
+          "kind": "thresh",
+          "k": 2,
+          "n": 2,
+          "items": [
+            {"kind": "key", "key_id": "k2"},
+            {"kind": "after", "lock": {"kind": "height", "height": 801432}}
+          ]
+        },
+        "timelocks": [
+          {
+            "lock": {
+              "kind": "absolute",
+              "lock": {"kind": "height", "height": 801432}
+            },
+            "required": true,
+            "state": {
+              "kind": "locked",
+              "until": {
+                "remaining_blocks": 1432,
+                "remaining_seconds": 859200,
+                "unlocks_at_unix": 1750859200
+              }
+            }
+          }
+        ],
+        "state": {
+          "kind": "locked",
+          "until": {
+            "remaining_blocks": 1432,
+            "remaining_seconds": 859200,
+            "unlocks_at_unix": 1750859200
+          }
+        },
+        "spendable_now": false,
+        "tone": "pending"
+      },
+      {
+        "id": "b1",
+        "role": "emergency",
+        "label": "Emergency",
+        "summary": "Key B after 2030-03-17",
+        "condition": {
+          "kind": "thresh",
+          "k": 2,
+          "n": 2,
+          "items": [
+            {"kind": "key", "key_id": "k1"},
+            {"kind": "after", "lock": {"kind": "time", "unix": 1899979200}}
+          ]
+        },
+        "timelocks": [
+          {
+            "lock": {
+              "kind": "absolute",
+              "lock": {"kind": "time", "unix": 1899979200}
+            },
+            "required": true,
+            "state": {
+              "kind": "locked",
+              "until": {
+                "remaining_blocks": null,
+                "remaining_seconds": 149979200,
+                "unlocks_at_unix": 1899979200
+              }
+            }
+          }
+        ],
+        "state": {
+          "kind": "locked",
+          "until": {
+            "remaining_blocks": null,
+            "remaining_seconds": 149979200,
+            "unlocks_at_unix": 1899979200
+          }
+        },
+        "spendable_now": false,
+        "tone": "neutral"
+      }
+    ],
+    "tip_height": 800000,
+    "computed_at": 1750000000,
+    "time_basis": "wall_clock",
+    "coins": 1,
+    "has_timelocks": true
+  },
+  "multisig": {
+    "kind": "multisig",
+    "script": "witness_script",
+    "descriptor": "wsh(sortedmulti(2,xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/0/*,xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw/0/*,xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ/0/*))",
+    "policy": "thresh(2,pk(Key A),pk(Key B),pk(Key C))",
+    "keys": [
+      {
+        "id": "k0",
+        "label": "Key A",
+        "fingerprint": "3442193e",
+        "origin_path": null,
+        "key_short": "xpub661M…GMcet8"
+      },
+      {
+        "id": "k1",
+        "label": "Key B",
+        "fingerprint": "5c1bd648",
+        "origin_path": null,
+        "key_short": "xpub68Gm…vgGDnw"
+      },
+      {
+        "id": "k2",
+        "label": "Key C",
+        "fingerprint": "bef5a2f9",
+        "origin_path": null,
+        "key_short": "xpub6ASu…puCkwQ"
+      }
+    ],
+    "branches": [
+      {
+        "id": "b0",
+        "role": "primary",
+        "label": "Primary",
+        "summary": "Any 2 of 3 keys",
+        "condition": {
+          "kind": "thresh",
+          "k": 2,
+          "n": 3,
+          "items": [
+            {"kind": "key", "key_id": "k0"},
+            {"kind": "key", "key_id": "k1"},
+            {"kind": "key", "key_id": "k2"}
+          ]
+        },
+        "timelocks": [],
+        "state": {"kind": "spendable_now"},
+        "spendable_now": true,
+        "tone": "confirmed"
+      }
+    ],
+    "tip_height": 800000,
+    "computed_at": 1750000000,
+    "time_basis": "wall_clock",
+    "coins": 1,
+    "has_timelocks": false
+  },
+  "single_key": {
+    "kind": "single_key",
+    "script": "segwit",
+    "descriptor": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)",
+    "policy": "pk(Key A)",
+    "keys": [
+      {
+        "id": "k0",
+        "label": "Key A",
+        "fingerprint": "9a6a2580",
+        "origin_path": "m/84'/1'/0'",
+        "key_short": "tpubDDnG…so9Kks"
+      }
+    ],
+    "branches": [
+      {
+        "id": "b0",
+        "role": "primary",
+        "label": "Primary",
+        "summary": "Key A",
+        "condition": {"kind": "key", "key_id": "k0"},
+        "timelocks": [],
+        "state": {"kind": "spendable_now"},
+        "spendable_now": true,
+        "tone": "confirmed"
+      }
+    ],
+    "tip_height": 800000,
+    "computed_at": 1750000000,
+    "time_basis": "wall_clock",
+    "coins": 0,
+    "has_timelocks": false
+  },
+  "never_synced": {
+    "kind": "miniscript",
+    "script": "witness_script",
+    "descriptor": "wsh(or_d(pk(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/0/*),or_i(and_v(v:pkh(xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw/0/*),after(1899979200)),and_v(v:pkh(xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ/0/*),after(801432)))))",
+    "policy": "or(pk(Key A),and(pk(Key B),after(1899979200)),and(pk(Key C),after(801432)))",
+    "keys": [
+      {
+        "id": "k0",
+        "label": "Key A",
+        "fingerprint": "3442193e",
+        "origin_path": null,
+        "key_short": "xpub661M…GMcet8"
+      },
+      {
+        "id": "k1",
+        "label": "Key B",
+        "fingerprint": "5c1bd648",
+        "origin_path": null,
+        "key_short": "xpub68Gm…vgGDnw"
+      },
+      {
+        "id": "k2",
+        "label": "Key C",
+        "fingerprint": "bef5a2f9",
+        "origin_path": null,
+        "key_short": "xpub6ASu…puCkwQ"
+      }
+    ],
+    "branches": [
+      {
+        "id": "b0",
+        "role": "primary",
+        "label": "Primary",
+        "summary": "Key A",
+        "condition": {"kind": "key", "key_id": "k0"},
+        "timelocks": [],
+        "state": {"kind": "spendable_now"},
+        "spendable_now": true,
+        "tone": "confirmed"
+      },
+      {
+        "id": "b1",
+        "role": "recovery",
+        "label": "Recovery",
+        "summary": "Key B after 2030-03-17",
+        "condition": {
+          "kind": "thresh",
+          "k": 2,
+          "n": 2,
+          "items": [
+            {"kind": "key", "key_id": "k1"},
+            {"kind": "after", "lock": {"kind": "time", "unix": 1899979200}}
+          ]
+        },
+        "timelocks": [
+          {
+            "lock": {
+              "kind": "absolute",
+              "lock": {"kind": "time", "unix": 1899979200}
+            },
+            "required": true,
+            "state": {
+              "kind": "locked",
+              "until": {
+                "remaining_blocks": null,
+                "remaining_seconds": 149979200,
+                "unlocks_at_unix": 1899979200
+              }
+            }
+          }
+        ],
+        "state": {
+          "kind": "locked",
+          "until": {
+            "remaining_blocks": null,
+            "remaining_seconds": 149979200,
+            "unlocks_at_unix": 1899979200
+          }
+        },
+        "spendable_now": false,
+        "tone": "neutral"
+      },
+      {
+        "id": "b2",
+        "role": "emergency",
+        "label": "Emergency",
+        "summary": "Key C after block 801,432",
+        "condition": {
+          "kind": "thresh",
+          "k": 2,
+          "n": 2,
+          "items": [
+            {"kind": "key", "key_id": "k2"},
+            {"kind": "after", "lock": {"kind": "height", "height": 801432}}
+          ]
+        },
+        "timelocks": [
+          {
+            "lock": {
+              "kind": "absolute",
+              "lock": {"kind": "height", "height": 801432}
+            },
+            "required": true,
+            "state": {
+              "kind": "locked",
+              "until": {
+                "remaining_blocks": null,
+                "remaining_seconds": null,
+                "unlocks_at_unix": null
+              }
+            }
+          }
+        ],
+        "state": {
+          "kind": "locked",
+          "until": {
+            "remaining_blocks": null,
+            "remaining_seconds": null,
+            "unlocks_at_unix": null
+          }
+        },
+        "spendable_now": false,
+        "tone": "neutral"
+      }
+    ],
+    "tip_height": null,
+    "computed_at": 1750000000,
+    "time_basis": "wall_clock",
+    "coins": 0,
+    "has_timelocks": true
+  },
+  "address": {
+    "kind": "address",
+    "script": "segwit",
+    "descriptor": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "policy": "address",
+    "keys": [],
+    "branches": [],
+    "tip_height": 800000,
+    "computed_at": 1750000000,
+    "time_basis": "wall_clock",
+    "coins": 1,
+    "has_timelocks": false
+  }
+}

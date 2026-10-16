@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use super::*;
+use crate::prefs::Unit;
 use crate::store::VaultKey;
 use crate::testkit::{
     ADDRESS, ADDRESS_SCRIPT, FakeElectrum, FakeMempool, esplora_payment, nowhere, transaction,
@@ -1597,4 +1598,78 @@ fn a_pushed_change_does_not_narrow_a_catch_up() {
         named.reach(),
         Reach::Scripts(vec![ScriptBuf::from_bytes(vec![0x00]), script])
     );
+}
+
+/// The budget of the notifications is the process's, not a caller's:
+/// the open app, the live watch and a background job of one process
+/// draw on the same twenty a minute, and the test notification with
+/// them.
+#[test]
+fn every_caller_draws_on_one_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = WalletManager::open(dir.path(), key()).unwrap();
+    let caller = manager.clone();
+    let context = notice::Context {
+        names: HashMap::new(),
+        unit: Unit::Btc,
+        masked: false,
+        details: true,
+    };
+    let mut posted = Vec::new();
+    for i in 0..30 {
+        let tx = LiveTx {
+            wallet_id: format!("w{i}"),
+            txid: txid(i),
+            net_sats: 1_000,
+            stage: TxStage::Mempool,
+            replaces: None,
+        };
+        let held: notice::Held = std::iter::once(tx).collect();
+        let by = if i % 2 == 0 { &manager } else { &caller };
+        posted.extend(by.notices(&format!("w{i}"), &held, &context));
+    }
+    assert_eq!(posted.len(), notice::BUDGET as usize);
+    assert_eq!(
+        posted.last().map(|notice| notice.body.as_str()),
+        Some("More transactions are coming in. Open Gerfaut to see them.")
+    );
+    assert_eq!(manager.test_notice(), None);
+}
+
+/// A batch of several wallets comes out wallet by wallet, each under its
+/// own name, and the test notification says what it is.
+#[test]
+fn a_batch_of_several_wallets_is_said_under_each_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = WalletManager::open(dir.path(), key()).unwrap();
+    let test = manager.test_notice().expect("the budget is untouched");
+    assert_eq!(test.title, "Gerfaut");
+    assert_eq!(test.id, None);
+    let tx = |wallet_id: &str, net_sats: i64| LiveTx {
+        wallet_id: wallet_id.to_owned(),
+        txid: txid(1),
+        net_sats,
+        stage: TxStage::Mempool,
+        replaces: None,
+    };
+    let context = notice::Context {
+        names: HashMap::from([
+            ("w1".to_owned(), "Spending".to_owned()),
+            ("w2".to_owned(), "Cold storage".to_owned()),
+        ]),
+        unit: Unit::Btc,
+        masked: false,
+        details: true,
+    };
+    let said = manager.notices_of([tx("w1", -50_000), tx("w2", 50_000)], &context);
+    assert_eq!(
+        said.iter()
+            .map(|notice| (notice.title.as_str(), notice.body.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("Spending", "0.00050000 BTC left this wallet · pending"),
+            ("Cold storage", "Received 0.00050000 BTC · pending"),
+        ]
+    );
+    assert_ne!(said[0].id, said[1].id);
 }
