@@ -38,7 +38,9 @@ pub struct Preferences {
     pub masked: bool,
     /// The fiat value beside every amount. Off by default: a price is a
     /// request to a third party, which learns that a bitcoin wallet
-    /// opened here just now, and nothing is asked until this says yes.
+    /// opened here just now, and the screens ask for none until this
+    /// says yes. A home screen widget placed for the price is an opt-in
+    /// of its own.
     pub fiat: bool,
     /// The currency of the fiat value. The euro by default.
     pub fiat_currency: FiatCurrency,

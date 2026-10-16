@@ -373,8 +373,8 @@ pub(crate) fn check_history(
 
 /// Fetches the current BTC price from one source, through `proxy` when
 /// the manager resolved one. The source must quote the currency
-/// ([`PriceSource::supports_currency`]); the settings screens only
-/// offer pairs that exist.
+/// ([`PriceSource::supports_currency`]); the preferences never hold a
+/// pair that does not.
 pub(crate) async fn fetch_price(
     source: PriceSource,
     currency: FiatCurrency,
