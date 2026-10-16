@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -37,3 +38,21 @@ jobs:
           key: embedded-tor
       - name: Lint with the Tor client built in
         run: cargo clippy --all-targets --features embedded-tor -- -D warnings
+
+  # The code behind #[cfg(windows)], which no Linux job compiles: the
+  # desktop ships it. ring, secp256k1-sys and aws-lc-sys compile C for
+  # the target, so a check from Linux would need a MinGW toolchain;
+  # this runs on Windows itself, for the MSVC target the desktop builds.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows
+      - name: Lint for Windows
+        run: cargo clippy --all-targets -- -D warnings
