@@ -3,7 +3,7 @@
 
 use std::str::FromStr;
 
-use bdk_wallet::bitcoin::{Address, Amount, OutPoint, TxOut};
+use bdk_wallet::bitcoin::{Address, Amount, OutPoint, TxOut, Txid};
 
 use crate::broadcast::{
     self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, SpentBy, TxPreview, WalletRef,
@@ -67,6 +67,9 @@ impl WalletManager {
                     WalletKind::Descriptors { .. } => {
                         let engine = ensure_engine(&mut state, &id)?;
                         tip_height = tip_height.max(Some(views::tip_height(engine)));
+                        // The coins of this wallet already spent, placed
+                        // all at once below: one reading of the graph.
+                        let mut spent_here: Vec<usize> = Vec::new();
                         for (i, outpoint) in outpoints.iter().enumerate() {
                             if let Some(utxo) = engine.get_utxo(*outpoint) {
                                 input_facts[i].prevout = Some(utxo.txout.clone());
@@ -80,7 +83,14 @@ impl WalletManager {
                                 input_facts[i].prevout = Some(txout.clone());
                                 input_facts[i].wallet = Some(wallet_ref.clone());
                                 input_facts[i].spent = Some(true);
-                                input_facts[i].spent_by = spender_of(engine, *outpoint);
+                                spent_here.push(i);
+                            }
+                        }
+                        if !spent_here.is_empty() {
+                            let spent: Vec<OutPoint> =
+                                spent_here.iter().map(|&i| outpoints[i]).collect();
+                            for (&i, by) in spent_here.iter().zip(spenders_of(engine, &spent)) {
+                                input_facts[i].spent_by = by;
                             }
                         }
                         for (i, output) in decoded.tx.output.iter().enumerate() {
@@ -293,20 +303,39 @@ impl WalletManager {
     }
 }
 
-/// The transaction that spends `outpoint` in the wallet's own view: the
-/// one its engine holds as canonical, in a block or still waiting.
-/// `None` when it holds none, only spends it saw replaced.
-fn spender_of(engine: &bdk_wallet::Wallet, outpoint: OutPoint) -> Option<SpentBy> {
-    engine
-        .tx_graph()
-        .outspends(outpoint)
+/// The transactions that spend `outpoints` in the wallet's own view: for
+/// each, the one its engine holds as canonical, in a block or still
+/// waiting, or `None` when it holds none, only spends it saw replaced.
+/// The graph is made canonical once for all of them, not once per
+/// candidate: this runs under the manager's lock.
+fn spenders_of(engine: &bdk_wallet::Wallet, outpoints: &[OutPoint]) -> Vec<Option<SpentBy>> {
+    let graph = engine.tx_graph();
+    let candidates: std::collections::HashSet<Txid> = outpoints
         .iter()
-        .find_map(|txid| {
-            engine.get_tx(*txid).map(|wtx| SpentBy {
-                txid: *txid,
-                confirmed: wtx.chain_position.is_confirmed(),
+        .flat_map(|outpoint| graph.outspends(*outpoint).iter().copied())
+        .collect();
+    // A spend of a coin of the wallet is one of its own transactions:
+    // the canonical ones, each with where it stands.
+    let standing: std::collections::HashMap<Txid, bool> = if candidates.is_empty() {
+        Default::default()
+    } else {
+        engine
+            .transactions()
+            .filter(|wtx| candidates.contains(&wtx.tx_node.txid))
+            .map(|wtx| (wtx.tx_node.txid, wtx.chain_position.is_confirmed()))
+            .collect()
+    };
+    outpoints
+        .iter()
+        .map(|outpoint| {
+            graph.outspends(*outpoint).iter().find_map(|txid| {
+                standing.get(txid).map(|&confirmed| SpentBy {
+                    txid: *txid,
+                    confirmed,
+                })
             })
         })
+        .collect()
 }
 
 /// Every node said the same thing: say it once, with the first host.
