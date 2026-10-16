@@ -1,5 +1,6 @@
 //! Transactions handed in by the user: what one does before anything
-//! leaves the device, sending it, and where it stands once sent.
+//! leaves the device, sending it, the last ones sent, and where each
+//! stands.
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -9,7 +10,8 @@ use bdk_wallet::bitcoin::{Address, Amount, OutPoint, Transaction, TxOut, Txid};
 use bdk_wallet::chain::CanonicalizationParams;
 
 use crate::broadcast::{
-    self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, SpentBy, TxPreview, WalletRef,
+    self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, RecentBroadcast, SpentBy,
+    TxPreview, WalletRef,
 };
 use crate::chain;
 use crate::error::{CoreError, CoreResult};
@@ -237,7 +239,8 @@ impl WalletManager {
     /// Hands a signed transaction to the network through the backend
     /// configured for it. Every endpoint is tried in turn; the node's
     /// own refusal (a missing signature, a spent input, a fee below the
-    /// floor) is returned verbatim.
+    /// floor) is returned verbatim. A transaction the network took is
+    /// kept among the [`Self::recent_broadcasts`].
     pub async fn broadcast_transaction(
         &self,
         network: Network,
@@ -257,16 +260,77 @@ impl WalletManager {
         for endpoint in &endpoints {
             match chain::broadcast(endpoint, &decoded.tx, proxy.as_deref()).await {
                 Ok(()) => {
-                    return Ok(BroadcastReport {
+                    let report = BroadcastReport {
                         txid: decoded.tx.compute_txid().to_string(),
                         backend: endpoint.label(),
                         at: now_secs(),
-                    });
+                    };
+                    self.remember_broadcast(network, &decoded.tx, &report).await;
+                    return Ok(report);
                 }
                 Err(detail) => refusals.push((endpoint.label(), detail)),
             }
         }
         Err(broadcast_failure(refusals))
+    }
+
+    /// Keeps a transaction the network just took at the head of the
+    /// recent broadcasts. Written in place, then saved: the transaction
+    /// is on the network whatever the disk says, so a save that fails
+    /// costs the next launch its record, never this broadcast its
+    /// answer, and the next save that goes through writes it.
+    async fn remember_broadcast(
+        &self,
+        network: Network,
+        tx: &Transaction,
+        report: &BroadcastReport,
+    ) {
+        let mut state = self.state.lock().await;
+        state.payload.remember_broadcast(RecentBroadcast {
+            txid: report.txid.clone(),
+            network,
+            hex: bdk_wallet::bitcoin::consensus::encode::serialize_hex(tx),
+            backend: report.backend.clone(),
+            at: report.at,
+        });
+        if let Err(error) = state.vault.save(&state.payload) {
+            log::warn!("a broadcast could not be saved among the recent ones: {error}");
+        }
+    }
+
+    /// The last transactions this app broadcast on `network`, newest
+    /// first, as the vault keeps them across restarts. Nothing is asked
+    /// of the backend here: where each stands is
+    /// [`Self::transaction_status`], asked when the app wants to know.
+    pub async fn recent_broadcasts(&self, network: Network) -> Vec<RecentBroadcast> {
+        self.state
+            .lock()
+            .await
+            .payload
+            .broadcasts
+            .iter()
+            .filter(|sent| sent.network == network)
+            .cloned()
+            .collect()
+    }
+
+    /// Drops the vault's record of a broadcast, with no way back. The
+    /// transaction itself is on the network and untouched. A txid the
+    /// vault does not hold is no error: what was asked is already so.
+    pub async fn forget_broadcast(&self, txid: &str) -> CoreResult<()> {
+        let mut state = self.state.lock().await;
+        if !state
+            .payload
+            .broadcasts
+            .iter()
+            .any(|sent| sent.txid == txid)
+        {
+            return Ok(());
+        }
+        state.commit(|payload| {
+            payload.broadcasts.retain(|sent| sent.txid != txid);
+            Ok(())
+        })
     }
 
     /// Where a broadcast transaction stands now. `hex` is the transaction

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::broadcast::{RECENT_BROADCASTS, RecentBroadcast};
 use crate::chain::BackendConfig;
 use crate::chain::tor::TorSettings;
 use crate::error::VaultError;
@@ -238,6 +239,14 @@ pub struct VaultPayload {
     /// from vaults written before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) vanishing: Vec<Vanishing>,
+    /// The transactions this app broadcast, newest first, one per txid
+    /// and [`RECENT_BROADCASTS`] at most. Absent while there are none,
+    /// and from vaults written before. The version stays as it was: a
+    /// build that predates it reads past it and drops it at its next
+    /// save, which costs a list of transactions already on the network,
+    /// not the vault itself to that build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) broadcasts: Vec<RecentBroadcast>,
 }
 
 impl Default for VaultPayload {
@@ -249,7 +258,19 @@ impl Default for VaultPayload {
             announced: Vec::new(),
             unclaimed: Vec::new(),
             vanishing: Vec::new(),
+            broadcasts: Vec::new(),
         }
+    }
+}
+
+impl VaultPayload {
+    /// Puts a transaction just sent at the head of the recent
+    /// broadcasts, in place of an earlier record of the same txid, and
+    /// lets the oldest go past [`RECENT_BROADCASTS`].
+    pub(crate) fn remember_broadcast(&mut self, sent: RecentBroadcast) {
+        self.broadcasts.retain(|kept| kept.txid != sent.txid);
+        self.broadcasts.insert(0, sent);
+        self.broadcasts.truncate(RECENT_BROADCASTS);
     }
 }
 
@@ -959,6 +980,44 @@ mod tests {
         assert!(still_there);
         vault.save(&payload).unwrap();
         assert!(!holds_premium(&path));
+    }
+
+    /// A sent transaction as an app kept it: `n` tells two apart.
+    fn sent(n: u8, network: Network) -> RecentBroadcast {
+        use crate::testkit::{nowhere, script, transaction};
+        let tx = transaction(&[nowhere(n, 0)], &[(&script(n), 50_000)]);
+        RecentBroadcast {
+            txid: tx.compute_txid().to_string(),
+            network,
+            hex: bdk_wallet::bitcoin::consensus::encode::serialize_hex(&tx),
+            backend: "mempool.space".to_owned(),
+            at: 1_790_000_000 + u64::from(n),
+        }
+    }
+
+    /// The last ten broadcasts, every network together, newest first,
+    /// and a transaction sent again is moved up rather than listed twice.
+    #[test]
+    fn the_recent_broadcasts_are_the_last_ten() {
+        let mut payload = VaultPayload::default();
+        for n in 1..=11 {
+            let network = if n % 2 == 0 {
+                Network::Signet
+            } else {
+                Network::Mainnet
+            };
+            payload.remember_broadcast(sent(n, network));
+        }
+        let order = |payload: &VaultPayload| -> Vec<u64> {
+            payload
+                .broadcasts
+                .iter()
+                .map(|kept| kept.at - 1_790_000_000)
+                .collect()
+        };
+        assert_eq!(order(&payload), [11, 10, 9, 8, 7, 6, 5, 4, 3, 2]);
+        payload.remember_broadcast(sent(5, Network::Mainnet));
+        assert_eq!(order(&payload), [5, 11, 10, 9, 8, 7, 6, 4, 3, 2]);
     }
 
     #[test]
