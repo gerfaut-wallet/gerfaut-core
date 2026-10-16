@@ -72,16 +72,24 @@ impl Default for Preferences {
 
 /// A change to some of the [`Preferences`]: a field left out keeps its
 /// value. One field at a time is the usual change, so that two made in
-/// a row never undo each other.
+/// a row never undo each other. Written the way the apps send it, a
+/// field that keeps its value left out rather than null.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PreferencesChange {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<Unit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub masked: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fiat: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fiat_currency: Option<FiatCurrency>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub price_source: Option<PriceSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub notify_new_tx: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub explorer_ack: Option<bool>,
 }
 
