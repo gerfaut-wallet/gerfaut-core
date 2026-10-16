@@ -333,6 +333,11 @@ pub struct DecodedInput {
     /// entry nothing pins. The transaction is the one read; the entry
     /// stands in only when the transaction is absent.
     pub prevout: Option<TxOut>,
+    /// Whether `prevout` is proven: read in the previous transaction,
+    /// whose txid the outpoint commits to, so it is the coin as surely as
+    /// a wallet's or a backend's word. A witness entry alone proves
+    /// nothing.
+    pub prevout_proven: bool,
     /// The witness entry, kept only when the same input also carries
     /// the previous transaction and the two disagree. Never the amount
     /// shown: what the PSBT's author declared, for the caution that
@@ -405,6 +410,7 @@ pub fn decode_bytes_as_transaction(bytes: &[u8]) -> CoreResult<DecodedTx> {
         .map(|input| DecodedInput {
             signed: !input.script_sig.is_empty() || !input.witness.is_empty(),
             prevout: None,
+            prevout_proven: false,
             disputed_witness_utxo: None,
             loose_sighash: loose_sighash_in(&input.script_sig, &input.witness),
         })
@@ -524,6 +530,7 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
             (Some(known), Some(declared)) if known != declared => Some(declared.clone()),
             _ => None,
         };
+        let prevout_proven = from_previous.is_some();
         let prevout = from_previous.or_else(|| input.witness_utxo.clone());
         let no_witness = Witness::new();
         let loose_sighash = loose_sighash_in(
@@ -534,6 +541,7 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
         inputs.push(DecodedInput {
             signed: final_present && !unfinished.contains(&index),
             prevout,
+            prevout_proven,
             disputed_witness_utxo,
             loose_sighash,
         });
@@ -865,11 +873,13 @@ pub fn build_preview(
     // outputs pay more than the inputs bring.
     let overspends =
         values_known && !outputs_impossible && !inputs_impossible && fee_sats.is_none();
-    // That is a sure refusal only on amounts a watched wallet or a
-    // backend stood behind. A PSBT's word about the coin it spends may be
-    // wrong, and the node goes by the coin, not by the word.
-    let vouched =
-        (0..inputs.len()).all(|i| input_facts.get(i).is_some_and(|f| f.prevout.is_some()));
+    // That is a sure refusal only on amounts proven, input by input: by a
+    // watched wallet or a backend, or by the previous transaction a PSBT
+    // carries, whose txid the outpoint commits to. A witness entry alone
+    // may be wrong, and the node goes by the coin, not by the word.
+    let vouched = (0..inputs.len()).all(|i| {
+        input_facts.get(i).is_some_and(|f| f.prevout.is_some()) || decoded.inputs[i].prevout_proven
+    });
     match (fee_sats, fee_rate_sat_vb, in_total) {
         // No block takes it, whatever the inputs bring.
         (None, _, _) if outputs_impossible => warnings.push(TxWarning::refused(
@@ -1704,12 +1714,49 @@ mod tests {
     /// worth `declared` and pays `paid`: the coins' values are the PSBT's
     /// word and nothing else.
     fn declared_psbt(declared: &[u64], paid: &[u64]) -> DecodedTx {
+        let coins: Vec<(u64, bool)> = declared.iter().map(|&sats| (sats, false)).collect();
+        psbt_spending(&coins, paid)
+    }
+
+    /// A finalized PSBT spending one coin per `(sats, proven)` and paying
+    /// `paid`. A proven coin comes with the previous transaction that
+    /// pays it, which its outpoint names; any other with a witness entry
+    /// alone, nothing behind it.
+    fn psbt_spending(coins: &[(u64, bool)], paid: &[u64]) -> DecodedTx {
+        let previous: Vec<Option<Transaction>> = coins
+            .iter()
+            .enumerate()
+            .map(|(n, &(sats, proven))| {
+                proven.then(|| Transaction {
+                    version: transaction::Version::TWO,
+                    lock_time: absolute::LockTime::ZERO,
+                    input: vec![TxIn {
+                        previous_output: OutPoint::new(
+                            Txid::from_byte_array([0xa0 + n as u8; 32]),
+                            0,
+                        ),
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::MAX,
+                        witness: Witness::new(),
+                    }],
+                    output: vec![TxOut {
+                        value: Amount::from_sat(sats),
+                        script_pubkey: p2wpkh(0x33),
+                    }],
+                })
+            })
+            .collect();
         let tx = Transaction {
             version: transaction::Version::TWO,
             lock_time: absolute::LockTime::ZERO,
-            input: (0..declared.len())
-                .map(|n| TxIn {
-                    previous_output: OutPoint::new(Txid::from_byte_array([n as u8 + 1; 32]), 0),
+            input: previous
+                .iter()
+                .enumerate()
+                .map(|(n, prev)| TxIn {
+                    previous_output: match prev {
+                        Some(prev) => OutPoint::new(prev.compute_txid(), 0),
+                        None => OutPoint::new(Txid::from_byte_array([n as u8 + 1; 32]), 0),
+                    },
                     script_sig: ScriptBuf::new(),
                     sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                     witness: Witness::new(),
@@ -1724,14 +1771,19 @@ mod tests {
                 .collect(),
         };
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
-        for (input, &sats) in psbt.inputs.iter_mut().zip(declared) {
+        for ((input, &(sats, _)), prev) in psbt.inputs.iter_mut().zip(coins).zip(previous) {
             let mut witness = Witness::new();
             witness.push([0x30; 71]);
             witness.push([0x02; 33]);
-            input.witness_utxo = Some(TxOut {
-                value: Amount::from_sat(sats),
-                script_pubkey: p2wpkh(0x33),
-            });
+            match prev {
+                Some(prev) => input.non_witness_utxo = Some(prev),
+                None => {
+                    input.witness_utxo = Some(TxOut {
+                        value: Amount::from_sat(sats),
+                        script_pubkey: p2wpkh(0x33),
+                    })
+                }
+            }
             input.final_script_witness = Some(witness);
         }
         decode_transaction(&data_encoding::BASE64.encode(&psbt.serialize())).unwrap()
@@ -1777,6 +1829,77 @@ mod tests {
         assert!(preview.ready);
         assert_eq!(preview.readiness, TxReadiness::Ready);
         assert!(preview.hex.is_some());
+    }
+
+    /// The previous transaction a PSBT carries proves the coin: its txid
+    /// is what the outpoint names. Outputs over a coin proven so are a
+    /// refusal, with no backend to ask.
+    #[test]
+    fn a_previous_transaction_proves_an_overspend() {
+        let decoded = psbt_spending(&[(1_000, true)], &[90_000]);
+        assert!(decoded.inputs[0].prevout_proven);
+        let preview = build_preview(
+            &decoded,
+            Network::Signet,
+            &nobody_answered(1),
+            &[],
+            Some(100),
+            0,
+        );
+        let fee = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::FeeUnknown)
+            .unwrap();
+        assert!(fee.blocking, "{}", fee.message);
+        assert_eq!(preview.readiness, TxReadiness::Refused);
+        assert!(preview.hex.is_none());
+    }
+
+    /// One coin proven, the other only declared: the overspend rests on
+    /// the declared one too, so it is said and left to the node.
+    #[test]
+    fn an_overspend_half_declared_is_left_to_the_node() {
+        let decoded = psbt_spending(&[(1_000, true), (1_000, false)], &[90_000]);
+        assert!(decoded.inputs[0].prevout_proven);
+        assert!(!decoded.inputs[1].prevout_proven);
+        let preview = build_preview(
+            &decoded,
+            Network::Signet,
+            &nobody_answered(2),
+            &[],
+            Some(100),
+            0,
+        );
+        let fee = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::FeeUnknown)
+            .unwrap();
+        assert!(!fee.blocking, "{}", fee.message);
+        assert!(
+            fee.message
+                .contains("by the amounts this transaction declares"),
+            "{}",
+            fee.message
+        );
+        assert_eq!(preview.readiness, TxReadiness::Ready);
+        assert!(preview.hex.is_some());
+
+        // A backend that knows the declared coin settles it: then every
+        // amount is proven, and the overspend is a refusal.
+        let mut facts = nobody_answered(2);
+        facts[1] = InputFacts {
+            prevout: Some(TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: p2wpkh(0x33),
+            }),
+            spent: Some(false),
+            ..Default::default()
+        };
+        let settled = build_preview(&decoded, Network::Signet, &facts, &[], Some(100), 0);
+        assert_eq!(settled.readiness, TxReadiness::Refused);
+        assert!(settled.hex.is_none());
     }
 
     /// Coins declared at amounts whose sum overflows are no amounts at
