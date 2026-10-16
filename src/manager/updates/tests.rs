@@ -332,6 +332,36 @@ async fn a_day_without_the_tor_it_needs_is_not_spent() {
     assert_eq!(status.announce.as_deref(), Some("0.2.0"));
 }
 
+/// The check a session makes waits for a Tor that already runs: with
+/// the built-in client not started, nothing goes out, the day is not
+/// spent, and the client is still not started afterwards. Starting it
+/// is for a sync or the live watch. Built with `embedded-tor`, the one
+/// build where a session could start it.
+#[cfg(feature = "embedded-tor")]
+#[tokio::test]
+async fn a_session_never_starts_the_built_in_tor() {
+    let releases = Releases::start("v0.2.0").await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = opened_yesterday(dir.path(), &releases).await;
+    through_tor(&manager, closed_port().await).await;
+    manager
+        .set_tor_settings(TorSettings {
+            mode: TorMode::Embedded,
+            socks_proxy: None,
+        })
+        .await
+        .unwrap();
+
+    let session = releases.session(&manager, "0.1.0", NOW);
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), session)
+        .await
+        .expect("no bootstrap is waited for");
+    assert!(status.tor_unavailable);
+    assert_eq!(releases.visits(), 0);
+    let tor = manager.tor_status().await;
+    assert!(!tor.running && tor.error.is_none(), "{tor:?}");
+}
+
 /// An onion backend on any network, even one that is not shown now,
 /// sends the check through the Tor proxy, by name.
 #[tokio::test]

@@ -220,6 +220,34 @@ pub async fn resolve(settings: &TorSettings, data_dir: &Path) -> CoreResult<TorR
     Ok(route)
 }
 
+/// [`resolve`] without starting anything: the system proxy where the
+/// settings let it be probed and it answers, the embedded client only
+/// once something else brought it up. For a request the app makes on
+/// its own, which waits for a sync or the live watch to start Tor
+/// rather than start it for itself: a bootstrap takes up to a minute
+/// and a half, and the client then runs for the life of the process.
+pub async fn resolve_running(settings: &TorSettings) -> CoreResult<TorRoute> {
+    #[cfg(feature = "embedded-tor")]
+    let embedded = {
+        let running = embedded::running_access();
+        Some(async move || already_running(running))
+    };
+    #[cfg(not(feature = "embedded-tor"))]
+    let embedded = None::<NoEmbedded>;
+    let route = resolve_with(settings, TRUST_LOOPBACK_SOCKS, probe, embedded).await?;
+    if let Ok(mut last) = LAST_ROUTE.lock() {
+        *last = Some(route.clone());
+    }
+    Ok(route)
+}
+
+/// What a starter that starts nothing hands back: the proxy of the
+/// embedded client when it runs, a Tor error when it does not.
+#[cfg_attr(not(feature = "embedded-tor"), allow(dead_code))]
+fn already_running(access: Option<socks::Access>) -> CoreResult<socks::Access> {
+    access.ok_or_else(|| CoreError::Tor("the built-in Tor is not running yet".to_owned()))
+}
+
 /// The type of a starter this build does not have.
 #[cfg(not(feature = "embedded-tor"))]
 type NoEmbedded = fn() -> std::future::Ready<CoreResult<socks::Access>>;
@@ -701,6 +729,52 @@ mod tests {
             r#"{"mode":"embedded","socks_proxy":"127.0.0.1:9150"}"#
         );
         assert_eq!(serde_json::from_str::<TorSettings>(&json).unwrap(), chosen);
+    }
+
+    /// What starts nothing takes the embedded client only once it runs,
+    /// in every mode that would otherwise start it, and still takes a
+    /// system proxy that answers where the settings let it be probed.
+    #[tokio::test]
+    async fn a_route_that_starts_nothing_takes_a_running_tor_only() {
+        let access = || socks::Access {
+            address: "127.0.0.1:1".to_owned(),
+            credentials: socks::Credentials::new("user", "pass"),
+        };
+        for (mode, trusted) in [
+            (TorMode::Auto, false),
+            (TorMode::Auto, true),
+            (TorMode::Embedded, false),
+            (TorMode::Embedded, true),
+        ] {
+            let refused = resolve_with(
+                &settings(mode, None),
+                trusted,
+                async |_: &str| false,
+                Some(async || already_running(None)),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(refused, CoreError::Tor(_)), "{mode:?}: {refused}");
+            let route = resolve_with(
+                &settings(mode, None),
+                trusted,
+                async |_: &str| false,
+                Some(async || already_running(Some(access()))),
+            )
+            .await
+            .unwrap();
+            assert_eq!(route.via, TorVia::Embedded, "{mode:?}");
+            assert_eq!(route.socks, "127.0.0.1:1");
+        }
+        let system = resolve_with(
+            &settings(TorMode::Auto, Some("127.0.0.1:9150")),
+            true,
+            async |address: &str| address == "127.0.0.1:9150",
+            Some(async || already_running(None)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(system.via, TorVia::System);
     }
 
     #[tokio::test]

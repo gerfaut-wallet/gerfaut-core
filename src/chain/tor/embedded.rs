@@ -47,6 +47,13 @@ pub(super) async fn socks_access(data_dir: &Path) -> CoreResult<socks::Access> {
         .map(|embedded| embedded.access.clone())
 }
 
+/// How to reach the client's proxy when it already runs; `None` before
+/// it was started, and while a start is still on its way. Never starts
+/// it.
+pub(super) fn running_access() -> Option<socks::Access> {
+    CLIENT.get().map(|embedded| embedded.access.clone())
+}
+
 async fn start(data_dir: &Path) -> CoreResult<Embedded> {
     update(|progress| {
         *progress = Progress {

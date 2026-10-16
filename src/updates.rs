@@ -42,7 +42,9 @@ pub struct UpdateStatus {
     /// offers to get.
     pub available: Option<String>,
     /// The last check that was to go out did not, because Tor is needed
-    /// and could not be had. The next check that goes out clears it.
+    /// and could not be had: for the check a session makes, because no
+    /// Tor was running, since that one never starts it. The next check
+    /// that goes out clears it.
     pub tor_unavailable: bool,
 }
 

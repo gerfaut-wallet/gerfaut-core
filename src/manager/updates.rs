@@ -6,8 +6,10 @@
 //!
 //! The request takes the route the syncs take (see `settings.rs`):
 //! through Tor when a backend is an onion address, and not at all when
-//! Tor cannot be had. Whether a session is open is the app's word: it
-//! never says so behind its lock, nor while it is disguised.
+//! Tor cannot be had. The check a session makes never starts Tor for
+//! itself: it waits for a Tor that already runs. Whether a session is
+//! open is the app's word: it never says so behind its lock, nor while
+//! it is disguised.
 
 use crate::error::{CoreError, CoreResult};
 use crate::now_secs;
@@ -35,9 +37,14 @@ impl WalletManager {
     ///
     /// It never fails. A check that goes wrong is a day with nothing
     /// new to say, and it counts: "once a day" holds whatever the
-    /// network does. A day Tor is needed and cannot be had, nothing is
-    /// sent and the day does not count: the next session asks again,
-    /// and the status says why nothing was asked.
+    /// network does. When Tor is needed, the check goes through a Tor
+    /// that already runs, the system's or the built-in client once a
+    /// sync or the live watch started it, and never starts one: an app
+    /// says a session is open at every return to the screen, and a
+    /// bootstrap for each would take up to a minute and a half, then
+    /// keep the client running. Without that Tor nothing is sent and
+    /// the day does not count: the next session asks again, and the
+    /// status says why nothing was asked.
     pub async fn update_session(&self, repo: &str, current_version: &str) -> UpdateStatus {
         self.update_session_at(GITHUB_API, repo, current_version, now_secs())
             .await
@@ -70,8 +77,8 @@ impl WalletManager {
     /// The check a session found due.
     async fn check_on_its_own(&self, api: &str, repo: &str, now: u64) {
         // Tor first, before the day is spent: the proxy is only ever
-        // needed for Tor, and when it cannot be had nothing goes out.
-        let Ok(proxy) = self.beside_syncs_proxy().await else {
+        // needed for Tor, and when none runs nothing goes out.
+        let Ok(proxy) = self.running_beside_syncs_proxy().await else {
             self.note_update(|record| record.tor_unavailable = true)
                 .await;
             return;
