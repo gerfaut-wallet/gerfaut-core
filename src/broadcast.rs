@@ -21,7 +21,7 @@ use bdk_wallet::bitcoin::script::Instruction;
 use bdk_wallet::bitcoin::secp256k1::Secp256k1;
 use bdk_wallet::bitcoin::sighash::{EcdsaSighashType, TapSighashType};
 use bdk_wallet::bitcoin::{
-    Address, OutPoint, Psbt, Script, ScriptBuf, Transaction, TxIn, TxOut, Witness,
+    Address, OutPoint, Psbt, Script, ScriptBuf, Transaction, TxIn, TxOut, Txid, Witness,
 };
 use bdk_wallet::miniscript::psbt::PsbtExt;
 use serde::{Deserialize, Serialize};
@@ -104,8 +104,10 @@ pub struct TxOutputPreview {
     pub change: bool,
 }
 
-/// A caution the person should read before broadcasting. Never blocks:
-/// the transaction is theirs, the preview only makes it legible.
+/// A caution the person should read before broadcasting. The
+/// transaction is theirs and the preview only makes it legible: a
+/// caution blocks the send only when the network is sure to refuse
+/// the transaction as it stands (see [`TxWarning::blocking`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TxWarningKind {
@@ -120,12 +122,15 @@ pub enum TxWarningKind {
     /// An input was not found on this network.
     InputUnknown,
     /// An input was already spent, by this transaction or another.
+    /// Blocks once the spend is in a block; one still waiting in the
+    /// mempool may be what this transaction replaces.
     InputSpent,
     /// The PSBT declares a coin other than the one the wallet or the
     /// backend holds at that outpoint, or other than the one its own
     /// previous transaction pays: another value, another script.
     InputMismatch,
-    /// The fee could not be computed: an input's value is unknown.
+    /// The fee could not be computed: an input's value is unknown, or
+    /// the outputs pay more than the inputs bring, which blocks.
     FeeUnknown,
     /// An output below the dust threshold.
     DustOutput,
@@ -193,6 +198,16 @@ pub struct TxWarning {
     /// so a screen never has to decide, and a kind added later cannot
     /// fall through a hand-written table into an untoned panel.
     pub severity: TxSeverity,
+    /// Whether the network is sure to refuse the transaction while this
+    /// holds: a signature missing, a coin already spent in a block, the
+    /// outputs paying more than the inputs bring. A preview with one is
+    /// not ready, so neither application can send it, and neither says
+    /// it is ready. Never set on a node's policy (dust), on what a
+    /// backend could not say, or on a time lock read against a tip the
+    /// device may not have caught up with: a send the node refuses
+    /// costs a message, a send wrongly held back costs the send.
+    #[serde(default)]
+    pub blocking: bool,
 }
 
 impl TxWarning {
@@ -201,6 +216,15 @@ impl TxWarning {
             severity: kind.severity(),
             kind,
             message: message.into(),
+            blocking: false,
+        }
+    }
+
+    /// A caution the network is sure to refuse the transaction over.
+    fn refused(kind: TxWarningKind, message: impl Into<String>) -> Self {
+        TxWarning {
+            blocking: true,
+            ..TxWarning::new(kind, message)
         }
     }
 }
@@ -228,11 +252,14 @@ pub struct TxPreview {
     pub locktime: u32,
     /// Whether the transaction signals replaceability (BIP-125).
     pub rbf: bool,
-    /// Whether every input is signed and the transaction can be sent.
+    /// Whether the transaction can be sent: every input is signed, and
+    /// no caution says the network is sure to refuse it
+    /// ([`TxWarning::blocking`]).
     pub ready: bool,
     pub warnings: Vec<TxWarning>,
     /// The transaction as the network takes it, hex. Present only when
-    /// ready: an unsigned transaction has nothing to broadcast.
+    /// ready: an unsigned transaction, or one the network is sure to
+    /// refuse, has nothing to broadcast.
     pub hex: Option<String>,
 }
 
@@ -604,6 +631,9 @@ pub struct InputFacts {
     pub wallet: Option<WalletRef>,
     /// Whether the backend says the coin is already spent.
     pub spent: Option<bool>,
+    /// The transaction that spends it, when it is spent and the wallet
+    /// or the backend named it.
+    pub spent_by: Option<SpentBy>,
     /// Whether the backend was asked and did not know the outpoint.
     pub unknown: bool,
     /// Whether nothing could be asked at all: every endpoint tried
@@ -611,6 +641,18 @@ pub struct InputFacts {
     /// which is a backend's answer; this is the absence of one, and it
     /// leaves the PSBT's own declaration unconfronted.
     pub unchecked: bool,
+}
+
+/// The transaction that already spends a coin, as a watched wallet or
+/// the backend named it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpentBy {
+    pub txid: Txid,
+    /// Whether it is in a block. One in a block settles the coin, and
+    /// every node refuses another spend of it; one still waiting in the
+    /// mempool can be replaced, and the transaction previewed may be
+    /// the replacement.
+    pub confirmed: bool,
 }
 
 /// What the manager learned about an output beyond the script.
@@ -693,10 +735,11 @@ pub fn build_preview(
     let vsize = tx.vsize() as u64;
     let fee_rate_sat_vb = fee_sats.map(|fee| fee as f64 / vsize as f64);
 
+    let txid = tx.compute_txid();
     let mut warnings = Vec::new();
     let unsigned = inputs.iter().filter(|i| !i.signed).count();
     if unsigned > 0 {
-        warnings.push(TxWarning::new(
+        warnings.push(TxWarning::refused(
             TxWarningKind::Unsigned,
             format!(
                 "{unsigned} of {} inputs carry no signature: the network will refuse this \
@@ -786,20 +829,15 @@ pub fn build_preview(
                 ),
             ));
         } else if facts.spent == Some(true) {
-            warnings.push(TxWarning::new(
-                TxWarningKind::InputSpent,
-                format!(
-                    "Input {i} is already spent. Either this transaction was broadcast \
-                     before, or another one took the coin."
-                ),
-            ));
+            warnings.push(spent_caution(i, txid, facts.spent_by));
         }
     }
     // Every input's value known and the sum fine, and still no fee:
     // the outputs pay more than the inputs bring.
     let overspends = inputs.iter().all(|i| i.value_sats.is_some()) && fee_sats.is_none();
     match (fee_sats, fee_rate_sat_vb, in_total) {
-        (None, _, _) if overspends => warnings.push(TxWarning::new(
+        // No block takes it, whichever node it reaches.
+        (None, _, _) if overspends => warnings.push(TxWarning::refused(
             TxWarningKind::FeeUnknown,
             "The outputs pay more than the inputs bring: the network will refuse this \
              transaction."
@@ -881,9 +919,11 @@ pub fn build_preview(
         ));
     }
 
-    let ready = decoded.ready;
+    // A transaction the network is sure to refuse is not one to call
+    // ready next to the caution that says so.
+    let ready = decoded.ready && !warnings.iter().any(|w| w.blocking);
     TxPreview {
-        txid: tx.compute_txid().to_string(),
+        txid: txid.to_string(),
         source: decoded.source,
         network,
         inputs,
@@ -899,6 +939,53 @@ pub fn build_preview(
         ready,
         warnings,
         hex: ready.then(|| encode::serialize_hex(tx)),
+    }
+}
+
+/// The caution for input `index`, already spent. It blocks only once
+/// the spend is in a block: every node then refuses another spend of
+/// the coin. A spend still waiting in the mempool may be this very
+/// transaction, which a node takes again without complaint, or one
+/// this transaction replaces with a higher fee; the node decides.
+fn spent_caution(index: usize, txid: Txid, spent_by: Option<SpentBy>) -> TxWarning {
+    let kind = TxWarningKind::InputSpent;
+    match spent_by {
+        Some(by) if by.confirmed && by.txid == txid => TxWarning::refused(
+            kind,
+            format!(
+                "Input {index} is already spent by this same transaction, which is already \
+                 in a block. There is nothing left to broadcast."
+            ),
+        ),
+        Some(by) if by.confirmed => TxWarning::refused(
+            kind,
+            format!(
+                "Input {index} is already spent by another transaction, which is in a \
+                 block. The network will refuse this one."
+            ),
+        ),
+        Some(by) if by.txid == txid => TxWarning::new(
+            kind,
+            format!(
+                "Input {index} is already spent by this same transaction, which is waiting \
+                 in the mempool: it was broadcast before."
+            ),
+        ),
+        Some(_) => TxWarning::new(
+            kind,
+            format!(
+                "Input {index} is already spent by another transaction waiting in the \
+                 mempool. The network takes this one only as a replacement paying a higher \
+                 fee."
+            ),
+        ),
+        None => TxWarning::new(
+            kind,
+            format!(
+                "Input {index} is already spent. Either this transaction was broadcast \
+                 before, or another one took the coin."
+            ),
+        ),
     }
 }
 
@@ -1332,6 +1419,7 @@ mod tests {
                 name: "Cold storage".into(),
             }),
             spent: Some(false),
+            spent_by: None,
             unknown: false,
             unchecked: false,
         }];
@@ -1370,6 +1458,7 @@ mod tests {
             }),
             wallet: None,
             spent: Some(true),
+            spent_by: None,
             unknown: false,
             unchecked: false,
         }];
@@ -1398,6 +1487,172 @@ mod tests {
         let kinds: Vec<TxWarningKind> = unknown.warnings.into_iter().map(|w| w.kind).collect();
         assert!(kinds.contains(&TxWarningKind::InputUnknown));
         assert!(kinds.contains(&TxWarningKind::FeeUnknown));
+    }
+
+    /// The coin of [`signed_tx`], worth 100 000 sats, already spent by
+    /// `spent_by`.
+    fn spent_coin(spent_by: Option<SpentBy>) -> Vec<InputFacts> {
+        vec![InputFacts {
+            prevout: Some(TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: p2wpkh(0x33),
+            }),
+            spent: Some(true),
+            spent_by,
+            ..Default::default()
+        }]
+    }
+
+    /// A coin spent in a block is settled: every node refuses another
+    /// spend of it, so the preview cannot call the transaction ready
+    /// beside the caution that says so, nor hand the apps its hex.
+    #[test]
+    fn a_coin_spent_in_a_block_blocks_the_send() {
+        let tx = signed_tx();
+        let decoded = decode_transaction(&encode::serialize_hex(&tx)).unwrap();
+        let other = Txid::from_byte_array([0x77; 32]);
+        for (spender, says) in [
+            (other, "by another transaction, which is in a block"),
+            (
+                tx.compute_txid(),
+                "by this same transaction, which is already in a block",
+            ),
+        ] {
+            let facts = spent_coin(Some(SpentBy {
+                txid: spender,
+                confirmed: true,
+            }));
+            let preview = build_preview(&decoded, Network::Signet, &facts, &[], Some(100), 0);
+            assert!(!preview.ready, "{says}");
+            assert!(preview.hex.is_none(), "{says}");
+            let spent = preview
+                .warnings
+                .iter()
+                .find(|w| w.kind == TxWarningKind::InputSpent)
+                .expect("the spent coin is named");
+            assert!(spent.blocking);
+            assert_eq!(spent.severity, TxSeverity::Alert);
+            assert!(spent.message.contains(says), "{}", spent.message);
+        }
+    }
+
+    /// A spend still waiting in the mempool is not the last word: this
+    /// transaction may replace it with a higher fee, or be it, sent
+    /// again. The node decides; the caution stays, red, and Broadcast
+    /// stays on. So does a spend nobody could place.
+    #[test]
+    fn a_coin_spent_in_the_mempool_leaves_the_send_to_the_node() {
+        let tx = signed_tx();
+        let decoded = decode_transaction(&encode::serialize_hex(&tx)).unwrap();
+        for (spent_by, says) in [
+            (
+                Some(SpentBy {
+                    txid: Txid::from_byte_array([0x77; 32]),
+                    confirmed: false,
+                }),
+                "only as a replacement paying a higher fee",
+            ),
+            (
+                Some(SpentBy {
+                    txid: tx.compute_txid(),
+                    confirmed: false,
+                }),
+                "by this same transaction, which is waiting in the mempool",
+            ),
+            (None, "Either this transaction was broadcast before"),
+        ] {
+            let preview = build_preview(
+                &decoded,
+                Network::Signet,
+                &spent_coin(spent_by),
+                &[],
+                Some(100),
+                0,
+            );
+            assert!(preview.ready, "{says}");
+            assert!(preview.hex.is_some(), "{says}");
+            let spent = preview
+                .warnings
+                .iter()
+                .find(|w| w.kind == TxWarningKind::InputSpent)
+                .expect("the spent coin is still named");
+            assert!(!spent.blocking, "{says}");
+            assert_eq!(spent.severity, TxSeverity::Alert);
+            assert!(spent.message.contains(says), "{}", spent.message);
+        }
+    }
+
+    /// Outputs worth more than the inputs: no block takes that, whichever
+    /// node it reaches.
+    #[test]
+    fn outputs_over_the_inputs_block_the_send() {
+        let decoded = decode_transaction(&encode::serialize_hex(&signed_tx())).unwrap();
+        let facts = vec![InputFacts {
+            prevout: Some(TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: p2wpkh(0x33),
+            }),
+            spent: Some(false),
+            ..Default::default()
+        }];
+        let preview = build_preview(&decoded, Network::Signet, &facts, &[], Some(100), 0);
+        assert!(!preview.ready);
+        assert!(preview.hex.is_none());
+        let fee = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::FeeUnknown)
+            .unwrap();
+        assert!(fee.blocking);
+        assert!(fee.message.contains("the network will refuse"));
+    }
+
+    /// Red is not a refusal. A fee that hurts, a time lock read against
+    /// a tip that may lag the signer's (wallets set the lock time to the
+    /// tip they saw, against fee sniping), dust some nodes relay, a coin
+    /// no backend knew: worth reading, all of them, and the node is
+    /// still the one to say no.
+    #[test]
+    fn a_caution_that_is_not_a_sure_refusal_never_blocks() {
+        let mut tx = signed_tx();
+        tx.lock_time = absolute::LockTime::from_height(1_000).unwrap();
+        tx.output[1].value = Amount::from_sat(300);
+        let decoded = decode_transaction(&encode::serialize_hex(&tx)).unwrap();
+        let facts = vec![InputFacts {
+            prevout: Some(TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: p2wpkh(0x33),
+            }),
+            spent: Some(false),
+            ..Default::default()
+        }];
+        let preview = build_preview(&decoded, Network::Signet, &facts, &[], Some(900), 0);
+        let kinds: Vec<TxWarningKind> = preview.warnings.iter().map(|w| w.kind).collect();
+        for kind in [
+            TxWarningKind::Locked,
+            TxWarningKind::DustOutput,
+            TxWarningKind::HighFeeRate,
+            TxWarningKind::HighFeeShare,
+        ] {
+            assert!(kinds.contains(&kind), "{kind:?} in {kinds:?}");
+        }
+        assert!(preview.warnings.iter().all(|w| !w.blocking), "{kinds:?}");
+        assert!(preview.ready);
+        assert!(preview.hex.is_some());
+
+        let unknown = build_preview(
+            &decoded,
+            Network::Signet,
+            &[InputFacts {
+                unknown: true,
+                ..Default::default()
+            }],
+            &[],
+            Some(1_000),
+            0,
+        );
+        assert!(unknown.ready);
+        assert!(unknown.warnings.iter().all(|w| !w.blocking));
     }
 
     #[test]
@@ -1537,6 +1792,7 @@ mod tests {
                 name: "Cold storage".into(),
             }),
             spent: Some(false),
+            spent_by: None,
             unknown: false,
             unchecked: false,
         }]
@@ -1709,6 +1965,7 @@ mod tests {
             }),
             wallet: None,
             spent: Some(false),
+            spent_by: None,
             unknown: false,
             unchecked: false,
         }];

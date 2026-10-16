@@ -51,8 +51,13 @@ pub(crate) struct Utxo {
     pub value: u64,
 }
 
-/// Whether an output is spent.
+/// Whether an output is spent, and when it is, by which transaction
+/// and where that one stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub(crate) struct OutputStatus {
     pub spent: bool,
+    #[serde(default)]
+    pub txid: Option<Txid>,
+    #[serde(default)]
+    pub status: Option<TxStatus>,
 }

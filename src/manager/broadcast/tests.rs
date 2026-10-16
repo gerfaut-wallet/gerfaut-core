@@ -22,6 +22,16 @@ enum Unknown {
 /// nothing else. What a real backend would answer about a coin the
 /// vault does not hold.
 async fn esplora_knowing(tx: bdk_wallet::bitcoin::Transaction, unknown: Unknown) -> String {
+    esplora_answering(tx, unknown, r#"{"spent":false}"#.to_owned()).await
+}
+
+/// The same Esplora, answering `outspend` about the first output of the
+/// transaction it knows: Esplora's own body for `/outspend/0`.
+async fn esplora_answering(
+    tx: bdk_wallet::bitcoin::Transaction,
+    unknown: Unknown,
+    outspend: String,
+) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -38,7 +48,7 @@ async fn esplora_knowing(tx: bdk_wallet::bitcoin::Transaction, unknown: Unknown)
             let answer: Option<(&str, &str, Vec<u8>)> = if path == format!("/api/tx/{txid}/raw") {
                 Some(("200 OK", "application/octet-stream", raw.clone()))
             } else if path == format!("/api/tx/{txid}/outspend/0") {
-                Some(("200 OK", "application/json", br#"{"spent":false}"#.to_vec()))
+                Some(("200 OK", "application/json", outspend.clone().into_bytes()))
             } else {
                 match unknown {
                     Unknown::NotFound => {
@@ -338,4 +348,188 @@ async fn a_backend_that_stops_answering_confirms_nothing_about_the_rest() {
     // preview no longer passes either off as established.
     assert_eq!(preview.inputs[1].value_sats, Some(CLAIMED));
     assert_eq!(preview.fee_sats, Some(200));
+}
+
+/// A coin worth 50 000 sats to the first address of the watched
+/// descriptor wallet, already spent by a transaction paying someone
+/// else, the two in a block when `mined`, in the mempool otherwise.
+/// Returns the manager, the coin's funding transaction and its spender.
+async fn wallet_coin_spent(
+    dir: &std::path::Path,
+    mined: bool,
+) -> (
+    WalletManager,
+    bdk_wallet::bitcoin::Transaction,
+    bdk_wallet::bitcoin::Transaction,
+) {
+    use crate::manager::tests::support::seeded;
+    use crate::testkit::{nowhere, script, transaction};
+    use bdk_wallet::bitcoin::hashes::Hash;
+    use bdk_wallet::bitcoin::{BlockHash, OutPoint};
+    use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+
+    let (manager, cold, _) = seeded(dir).await;
+    let (funding, spender) = {
+        let mut state = manager.state.lock().await;
+        let engine = ensure_engine(&mut state, &cold.id).unwrap();
+        let ours = engine
+            .reveal_next_address(bdk_wallet::KeychainKind::External)
+            .script_pubkey()
+            .to_hex_string();
+        let funding = transaction(&[nowhere(1, 0)], &[(ours.as_str(), 50_000)]);
+        let spender = transaction(
+            &[OutPoint::new(funding.compute_txid(), 0)],
+            &[(script(9).as_str(), 49_000)],
+        );
+        engine.apply_unconfirmed_txs([(funding.clone(), 100), (spender.clone(), 200)]);
+        if mined {
+            let block = BlockId {
+                height: 10,
+                hash: BlockHash::from_byte_array([1; 32]),
+            };
+            let mut update = bdk_wallet::Update {
+                chain: Some(engine.latest_checkpoint().push(block).unwrap()),
+                ..Default::default()
+            };
+            for tx in [&funding, &spender] {
+                update.tx_update.anchors.insert((
+                    ConfirmationBlockTime {
+                        block_id: block,
+                        confirmation_time: 1_700_000_000,
+                    },
+                    tx.compute_txid(),
+                ));
+            }
+            engine.apply_update(update).unwrap();
+        }
+        (funding, spender)
+    };
+    (manager, funding, spender)
+}
+
+/// `tx` with a witness on every input: signed, as far as a preview
+/// reads it. The txid does not move.
+fn witnessed(mut tx: bdk_wallet::bitcoin::Transaction) -> String {
+    use bdk_wallet::bitcoin::Witness;
+    for input in &mut tx.input {
+        let mut witness = Witness::new();
+        witness.push([0x30; 71]);
+        witness.push([0x02; 33]);
+        input.witness = witness;
+    }
+    bdk_wallet::bitcoin::consensus::encode::serialize_hex(&tx)
+}
+
+/// The rehearsal of 0.1.0: a transaction of the watched wallet, long
+/// confirmed, pasted again. Its coin is spent in a block, by itself
+/// or by another, and the preview said "Ready to broadcast" beside the
+/// red line saying so. The wallet's own view now places the spend, and
+/// a spend in a block blocks the send.
+#[tokio::test]
+async fn a_watched_coin_spent_in_a_block_blocks_the_send() {
+    use crate::broadcast::TxWarningKind;
+    use crate::testkit::script;
+    use bdk_wallet::bitcoin::OutPoint;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, funding, spender) = wallet_coin_spent(dir.path(), true).await;
+    let rival = crate::testkit::transaction(
+        &[OutPoint::new(funding.compute_txid(), 0)],
+        &[(script(8).as_str(), 48_000)],
+    );
+    for (pasted, says) in [
+        (
+            spender,
+            "this same transaction, which is already in a block",
+        ),
+        (rival, "another transaction, which is in a block"),
+    ] {
+        let preview = manager
+            .preview_transaction(&witnessed(pasted), Network::Signet)
+            .await
+            .unwrap();
+        let spent = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InputSpent)
+            .expect("the spent coin is named");
+        assert!(spent.message.contains(says), "{}", spent.message);
+        assert!(spent.blocking);
+        assert!(!preview.ready);
+        assert!(preview.hex.is_none());
+    }
+}
+
+/// The same coin spent by a transaction still in the mempool: pasting
+/// that transaction again, or one that replaces it, is the node's
+/// call. Broadcast stays on.
+#[tokio::test]
+async fn a_watched_coin_spent_in_the_mempool_leaves_the_send_to_the_node() {
+    use crate::broadcast::TxWarningKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, _, spender) = wallet_coin_spent(dir.path(), false).await;
+    let preview = manager
+        .preview_transaction(&witnessed(spender), Network::Signet)
+        .await
+        .unwrap();
+    let spent = preview
+        .warnings
+        .iter()
+        .find(|w| w.kind == TxWarningKind::InputSpent)
+        .expect("the spent coin is named");
+    assert!(
+        spent.message.contains("waiting in the mempool"),
+        "{}",
+        spent.message
+    );
+    assert!(!spent.blocking);
+    assert!(preview.ready);
+    assert!(preview.hex.is_some());
+}
+
+/// A coin no watched wallet holds: the backend's `outspend` says who
+/// spent it and whether that is in a block, and the preview goes by
+/// it the way it goes by the wallet.
+#[tokio::test]
+async fn the_backend_places_a_spend_the_vault_does_not_know() {
+    use crate::broadcast::TxWarningKind;
+    use crate::testkit::{nowhere, script, transaction};
+    use bdk_wallet::bitcoin::OutPoint;
+
+    let funding = transaction(&[nowhere(1, 0)], &[(script(3).as_str(), 50_000)]);
+    let pasted = transaction(
+        &[OutPoint::new(funding.compute_txid(), 0)],
+        &[(script(9).as_str(), 49_000)],
+    );
+    let other = "77".repeat(32);
+    for (confirmed, blocks) in [(true, true), (false, false)] {
+        let outspend = format!(
+            r#"{{"spent":true,"txid":"{other}","vin":0,"status":{{"confirmed":{confirmed}}}}}"#
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        manager
+            .set_backend(
+                Network::Regtest,
+                BackendConfig::CustomEsplora {
+                    url: esplora_answering(funding.clone(), Unknown::NotFound, outspend).await,
+                    own_node: false,
+                },
+            )
+            .await
+            .unwrap();
+        let preview = manager
+            .preview_transaction(&witnessed(pasted.clone()), Network::Regtest)
+            .await
+            .unwrap();
+        let spent = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InputSpent)
+            .expect("the backend's answer is named");
+        assert_eq!(spent.blocking, blocks, "{}", spent.message);
+        assert_eq!(preview.ready, !blocks);
+        assert_eq!(preview.inputs[0].value_sats, Some(50_000));
+    }
 }

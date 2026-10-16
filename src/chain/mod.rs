@@ -833,6 +833,8 @@ pub(crate) struct PrevoutFacts {
     pub txout: Option<TxOut>,
     /// `None` when the endpoint cannot say (Electrum).
     pub spent: Option<bool>,
+    /// The transaction that spends it, when the endpoint names it.
+    pub spent_by: Option<crate::broadcast::SpentBy>,
 }
 
 pub(crate) async fn fetch_prevout(
@@ -847,11 +849,16 @@ pub(crate) async fn fetch_prevout(
             Ok(PrevoutFacts {
                 txout: facts.txout,
                 spent: facts.spent,
+                spent_by: facts.spent_by,
             })
         }
         Endpoint::Electrum(target) => {
             let txout = electrum::fetch_prevout(target, outpoint, proxy).await?;
-            Ok(PrevoutFacts { txout, spent: None })
+            Ok(PrevoutFacts {
+                txout,
+                spent: None,
+                spent_by: None,
+            })
         }
     }
 }

@@ -3,10 +3,10 @@
 
 use std::str::FromStr;
 
-use bdk_wallet::bitcoin::{Address, Amount, TxOut};
+use bdk_wallet::bitcoin::{Address, Amount, OutPoint, TxOut};
 
 use crate::broadcast::{
-    self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, TxPreview, WalletRef,
+    self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, SpentBy, TxPreview, WalletRef,
 };
 use crate::chain;
 use crate::error::{CoreError, CoreResult};
@@ -80,6 +80,7 @@ impl WalletManager {
                                 input_facts[i].prevout = Some(txout.clone());
                                 input_facts[i].wallet = Some(wallet_ref.clone());
                                 input_facts[i].spent = Some(true);
+                                input_facts[i].spent_by = spender_of(engine, *outpoint);
                             }
                         }
                         for (i, output) in decoded.tx.output.iter().enumerate() {
@@ -173,6 +174,7 @@ impl WalletManager {
                             }
                             if facts.spent.is_none() {
                                 facts.spent = chain_facts.spent;
+                                facts.spent_by = chain_facts.spent_by;
                             }
                         }
                         // This one has stopped answering — throttled,
@@ -289,6 +291,22 @@ impl WalletManager {
         }
         Err(sync_failure(&endpoints, attempts))
     }
+}
+
+/// The transaction that spends `outpoint` in the wallet's own view: the
+/// one its engine holds as canonical, in a block or still waiting.
+/// `None` when it holds none, only spends it saw replaced.
+fn spender_of(engine: &bdk_wallet::Wallet, outpoint: OutPoint) -> Option<SpentBy> {
+    engine
+        .tx_graph()
+        .outspends(outpoint)
+        .iter()
+        .find_map(|txid| {
+            engine.get_tx(*txid).map(|wtx| SpentBy {
+                txid: *txid,
+                confirmed: wtx.chain_position.is_confirmed(),
+            })
+        })
 }
 
 /// Every node said the same thing: say it once, with the first host.
