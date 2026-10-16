@@ -84,17 +84,6 @@ pub struct Context {
     pub details: bool,
 }
 
-impl Default for Context {
-    fn default() -> Self {
-        Context {
-            names: HashMap::new(),
-            unit: Unit::Btc,
-            masked: false,
-            details: true,
-        }
-    }
-}
-
 /// Which flood budget a notification draws on. A payment that is no
 /// longer coming has one of its own, so a burst of new transactions
 /// can never silence it.
@@ -499,7 +488,9 @@ mod tests {
     fn context() -> Context {
         Context {
             names: HashMap::from([("w1".to_owned(), "Cold storage".to_owned())]),
-            ..Context::default()
+            unit: Unit::Btc,
+            masked: false,
+            details: true,
         }
     }
 
@@ -845,10 +836,7 @@ mod tests {
         );
         // A wallet nobody can name falls back on the app.
         let held: Held = [tx("a", 1, TxStage::Mempool)].into_iter().collect();
-        assert_eq!(
-            compose("unknown", &held, &Context::default())[0].title,
-            "Gerfaut"
-        );
+        assert_eq!(compose("unknown", &held, &context())[0].title, "Gerfaut");
     }
 
     /// A control character is a space, never a joint between two words:

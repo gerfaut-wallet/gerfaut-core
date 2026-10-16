@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use super::*;
+use crate::prefs::Unit;
 use crate::store::VaultKey;
 use crate::testkit::{
     ADDRESS, ADDRESS_SCRIPT, FakeElectrum, FakeMempool, esplora_payment, nowhere, transaction,
@@ -1608,7 +1609,12 @@ fn every_caller_draws_on_one_budget() {
     let dir = tempfile::tempdir().unwrap();
     let manager = WalletManager::open(dir.path(), key()).unwrap();
     let caller = manager.clone();
-    let context = notice::Context::default();
+    let context = notice::Context {
+        names: HashMap::new(),
+        unit: Unit::Btc,
+        masked: false,
+        details: true,
+    };
     let mut posted = Vec::new();
     for i in 0..30 {
         let tx = LiveTx {
@@ -1651,7 +1657,9 @@ fn a_batch_of_several_wallets_is_said_under_each_name() {
             ("w1".to_owned(), "Spending".to_owned()),
             ("w2".to_owned(), "Cold storage".to_owned()),
         ]),
-        ..notice::Context::default()
+        unit: Unit::Btc,
+        masked: false,
+        details: true,
     };
     let said = manager.notices_of([tx("w1", -50_000), tx("w2", 50_000)], &context);
     assert_eq!(

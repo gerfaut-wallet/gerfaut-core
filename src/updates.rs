@@ -105,14 +105,27 @@ pub(crate) const CHECK_EVERY: u64 = 24 * 60 * 60;
 impl UpdateRecord {
     /// Whether the app should check on its own at `now`, unix seconds:
     /// the setting is on, a day has gone by since the first session, and
-    /// another since the last check. A time from the future is a clock
-    /// that was moved, not a recent event, and holds nothing back.
+    /// another since the last check. A last check from the future is a
+    /// clock that was moved back, and holds nothing back. A first
+    /// session from the future is a clock that was ahead at the first
+    /// launch, then set right: it holds the check back until the next
+    /// session brings it to now ([`Self::session_at`]), so the first day
+    /// still asks nothing.
     pub(crate) fn due(&self, now: u64) -> bool {
         let recent = |at: Option<u64>| at.is_some_and(|at| at <= now && now - at < CHECK_EVERY);
-        self.automatic
-            && self.first_session_at.is_some()
-            && !recent(self.first_session_at)
-            && !recent(self.checked_at)
+        let first_day = self
+            .first_session_at
+            .is_none_or(|at| at > now || now - at < CHECK_EVERY);
+        self.automatic && !first_day && !recent(self.checked_at)
+    }
+
+    /// A session opened at `now`: the first one starts the day that
+    /// asks nothing, and a first session from the future comes back to
+    /// now.
+    pub(crate) fn session_at(&mut self, now: u64) {
+        if self.first_session_at.is_none_or(|at| at > now) {
+            self.first_session_at = Some(now);
+        }
     }
 
     /// What to say to someone running `running`. A running version that
@@ -492,6 +505,29 @@ mod tests {
         assert!(!first.due(NOW));
         assert!(!first.due(NOW + DAY - 1));
         assert!(first.due(NOW + DAY));
+    }
+
+    /// A clock a year ahead at the first launch, then set right: the
+    /// first day still asks nothing, counted from the session that saw
+    /// the right time.
+    #[test]
+    fn a_first_session_from_the_future_comes_back_to_now() {
+        let mut record = UpdateRecord::default();
+        record.session_at(NOW + 365 * DAY);
+        assert!(
+            !record.due(NOW),
+            "a first session ahead holds the check back"
+        );
+        record.session_at(NOW);
+        assert_eq!(record.first_session_at, Some(NOW));
+        assert!(!record.due(NOW + DAY - 1));
+        assert!(record.due(NOW + DAY));
+        record.session_at(NOW + 2 * DAY);
+        assert_eq!(
+            record.first_session_at,
+            Some(NOW),
+            "a later session moves nothing"
+        );
     }
 
     #[test]

@@ -332,10 +332,13 @@ struct Recorded {
     preferences: Option<serde::de::IgnoredAny>,
 }
 
-/// The app preferences earlier builds kept for that account, under keys
-/// that start with this: the ntfy topic of each of its channels among
-/// them. Nothing reads them any more, and they leave with the account.
-const RETIRED_PREFS: &str = "premium.";
+/// The app preferences earlier builds kept under keys that start with
+/// these, which nothing reads any more and which leave the vault at the
+/// open: the ones kept for that account, the ntfy topic of each of its
+/// channels among them, and the ones the desktop (`update.`) and Android
+/// (`updates.`) kept for the update check, which the vault now keeps in
+/// a record of its own.
+const RETIRED_PREFS: [&str; 3] = ["premium.", "update.", "updates."];
 
 /// The app preference the recent broadcasts were kept under, as a JSON
 /// list, before the vault kept them: see
@@ -461,7 +464,7 @@ impl Vault {
         }
         let prefs = &mut payload.settings.app_prefs;
         let before = prefs.len();
-        prefs.retain(|key, _| !key.starts_with(RETIRED_PREFS));
+        prefs.retain(|key, _| !RETIRED_PREFS.iter().any(|retired| key.starts_with(retired)));
         let retired = retired || prefs.len() < before;
         // Taken in once: the vault written back without the preference
         // is one no later open reads it from.
@@ -1021,6 +1024,48 @@ mod tests {
         assert_eq!(payload.settings.app_prefs.len(), 2);
     }
 
+    /// What both apps kept for the update check among the app
+    /// preferences, before the vault had a record of it, leaves the file
+    /// at the open, and a preference that only looks like one stays.
+    #[test]
+    fn a_vault_with_update_preferences_opens_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let mut stored: serde_json::Value = serde_json::from_str(VAULT_WITH_PREMIUM).unwrap();
+        let settings = stored["settings"].as_object_mut().unwrap();
+        settings.remove("premium");
+        let prefs = &mut settings["app_prefs"];
+        prefs
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| key == "desktop.theme");
+        prefs["update.auto"] = "0".into();
+        prefs["update.checked_at"] = "1790000000".into();
+        prefs["update.dismissed"] = "0.2.0".into();
+        prefs["updates.auto"] = "1".into();
+        prefs["updates.latest"] = "9.9.9".into();
+        prefs["updated.note"] = "kept".into();
+        let sealed = cipher::seal(stored.to_string().as_bytes(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
+        let kept = serde_json::json!({"desktop.theme": "dark", "updated.note": "kept"});
+        assert_eq!(
+            serde_json::to_value(&payload.settings.app_prefs).unwrap(),
+            kept
+        );
+        // Gone from the file at the open, before any change is saved.
+        let written = |path: &Path| -> serde_json::Value {
+            let plaintext = cipher::unseal(&std::fs::read(path).unwrap(), &key()).unwrap();
+            serde_json::from_slice(&plaintext).unwrap()
+        };
+        assert_eq!(written(&path)["settings"]["app_prefs"], kept);
+        assert_eq!(payload.updates, UpdateRecord::default());
+        drop(vault);
+        let (_, reloaded) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(reloaded.settings.app_prefs, payload.settings.app_prefs);
+    }
+
     /// A vault with a Premium account that cannot be written back at the
     /// open, in a directory that takes no new file, opens all the same,
     /// and the account waits for a save that can be made.
@@ -1537,13 +1582,13 @@ mod tests {
                 .collect()
         };
         // The recent broadcasts left with the shared preferences: the
-        // vault keeps them in a record of their own too.
+        // vault keeps them in a record of their own too, and the update
+        // check as well.
         let app_alone = own(&[
             ("desktop.sidebar", "collapsed"),
             ("desktop.theme", "dark"),
             ("home.price_range", "year"),
             ("onboarding.seen", "1"),
-            ("update.auto", "0"),
         ]);
 
         let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
