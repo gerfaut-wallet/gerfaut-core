@@ -261,7 +261,9 @@ pub struct TxPreview {
     pub network: Network,
     pub inputs: Vec<TxInputPreview>,
     pub outputs: Vec<TxOutputPreview>,
-    /// Fee in satoshis, when every input's value is known.
+    /// Fee in satoshis, when every input's value is known, no amount is
+    /// past all the bitcoin there will ever be, and the outputs pay no
+    /// more than the inputs bring.
     pub fee_sats: Option<u64>,
     pub fee_rate_sat_vb: Option<f64>,
     /// Whether a value shown for an input is only what the transaction
