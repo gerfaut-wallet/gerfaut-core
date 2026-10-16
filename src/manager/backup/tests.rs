@@ -582,6 +582,20 @@ async fn backup_needs_its_password_and_scans_as_a_qr() {
         "{wrong}"
     );
     assert_eq!(wrong.code(), crate::error::ErrorCode::WrongKey);
+    // Too short to have sealed any backup: wrong, and said as such by
+    // both calls, never as the rule a new backup's password follows.
+    for short in [
+        target
+            .preview_backup(&bundle.data, "short")
+            .await
+            .unwrap_err(),
+        target
+            .import_backup(&bundle.data, "short", &ImportChoices::default())
+            .await
+            .unwrap_err(),
+    ] {
+        assert_eq!(short.code(), crate::error::ErrorCode::WrongKey, "{short}");
+    }
     // Neither call takes a file that is not a backup for a password
     // that is wrong.
     for refused in [

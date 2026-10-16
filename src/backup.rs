@@ -195,24 +195,27 @@ fn unreadable(detail: impl Into<String>) -> CoreError {
     CoreError::UnreadableBackup(detail.into())
 }
 
-/// The key a password derives to, after the checks both sides share.
-///
-/// The password is trimmed first: a stray space typed on one device
-/// must not lock the other one out.
-fn password_key(password: &str) -> CoreResult<VaultKey> {
-    let password = password.trim();
-    if password.chars().count() < MIN_PASSWORD_CHARS {
+/// The key a password derives to. Trimmed, on both sides: a stray
+/// space typed on one device must not lock the other one out.
+fn password_key(password: &str) -> VaultKey {
+    VaultKey::Password(password.trim().to_owned())
+}
+
+/// The key a new backup is sealed under: one of at least
+/// [`MIN_PASSWORD_CHARS`], once trimmed.
+fn sealing_key(password: &str) -> CoreResult<VaultKey> {
+    if password.trim().chars().count() < MIN_PASSWORD_CHARS {
         return Err(CoreError::InvalidInput {
             kind: "backup password",
             detail: format!("at least {MIN_PASSWORD_CHARS} characters"),
         });
     }
-    Ok(VaultKey::Password(password.to_owned()))
+    Ok(password_key(password))
 }
 
 /// Serializes, compresses and seals a payload under a password.
 pub fn seal(payload: &BackupPayload, password: &str) -> CoreResult<Vec<u8>> {
-    let key = password_key(password)?;
+    let key = sealing_key(password)?;
     let json = serde_json::to_vec(payload)
         .map_err(|e| CoreError::Internal(format!("backup serialization failed: {e}")))?;
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
@@ -239,8 +242,13 @@ fn newer_gerfaut(unknown: &str) -> CoreError {
 /// password opens but that holds no wallet list, is unreadable; a file
 /// written by a newer Gerfaut, at any layer of its format, is refused
 /// by name rather than half-read or blamed on the password.
+///
+/// A password too short to seal a backup is held to no rule here: no
+/// backup opens with it, so it is a wrong password, said as one once
+/// the file is known for a backup, and never a length rule told to
+/// someone who is only trying to get their wallets back.
 pub fn open(bytes: &[u8], password: &str) -> CoreResult<BackupPayload> {
-    let key = password_key(password)?;
+    let key = password_key(password);
     let compressed =
         cipher::unseal_with(BACKUP_MAGIC, bytes, &key).map_err(|error| match error {
             VaultError::UnsupportedVersion(version) => {
@@ -477,13 +485,30 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    /// A password shorter than any backup is sealed under can only be
+    /// wrong: it fails as a wrong password does, the empty one
+    /// included, and a file that is not a backup still says so first.
+    #[test]
+    fn a_short_password_opens_nothing_and_is_a_wrong_one() {
         let sealed = seal(&payload(), PASSWORD).unwrap();
+        for short in ["short", "  1234567 ", ""] {
+            assert!(
+                matches!(
+                    open(&sealed, short),
+                    Err(CoreError::Vault(VaultError::WrongKeyOrCorrupted))
+                ),
+                "{short:?}"
+            );
+        }
+        assert_eq!(
+            open(&sealed, "short").unwrap_err().code(),
+            ErrorCode::WrongKey
+        );
         assert!(matches!(
-            open(&sealed, "short"),
-            Err(CoreError::InvalidInput {
-                kind: "backup password",
-                ..
-            })
+            open(b"not a backup at all, only text", "short"),
+            Err(CoreError::UnreadableBackup(_))
         ));
     }
 
@@ -846,7 +871,7 @@ mod tests {
             bomb.len()
         );
 
-        let key = password_key(PASSWORD).unwrap();
+        let key = password_key(PASSWORD);
         let sealed = cipher::seal_with(BACKUP_MAGIC, &bomb, &key).unwrap();
         let refused = open(&sealed, PASSWORD).unwrap_err();
         assert!(
