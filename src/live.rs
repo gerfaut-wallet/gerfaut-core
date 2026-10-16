@@ -45,6 +45,10 @@
 //!   pinned wallets come first
 //!   ([`WalletManager::set_wallet_live_pinned`]), then those holding
 //!   coins.
+//! - What to say about a transaction is composed here too, the same on
+//!   every platform: [`WalletManager::notices`] turns what was claimed
+//!   into notifications ready to post, within a budget of twenty a
+//!   minute for the whole process ([`notice`]).
 //! - Stop the watch before the vault locks.
 //!
 //! # At exit
@@ -66,7 +70,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc, watch};
@@ -88,6 +92,7 @@ use crate::watch::{
 };
 
 pub(crate) mod news;
+pub mod notice;
 #[cfg(test)]
 mod tests;
 
@@ -668,6 +673,62 @@ impl WalletManager {
     ///   what it gets, or all of it is said the day they are turned on.
     pub async fn claim_announcements(&self, report: &SyncReport) -> CoreResult<Vec<LiveTx>> {
         self.claim_news(&report.wallet_id, usize::MAX).await
+    }
+
+    /// What one sync of one wallet amounts to, as notifications ready to
+    /// post: [`notice::compose`], within the budget the process keeps for
+    /// every caller, twenty a minute and twenty more for the payments no
+    /// longer coming. The last one a budget lets through in a minute says
+    /// that more is waiting; past it, nothing until the minute is over.
+    ///
+    /// # Contract for a host
+    ///
+    /// - Post what comes back, in order, as it is: the title, the text,
+    ///   and, where the system lets one notification replace another,
+    ///   the id, which names the payment. A notice without one is a line
+    ///   that counts or sums up, and takes no payment's place.
+    /// - Read the context at the moment of posting: a name changed, a
+    ///   mask raised or a lock drawn since the sync began all count.
+    /// - Ask only for what you post: what comes back has been counted.
+    ///   With the alerts off or the app disguised, drop what you claimed
+    ///   and ask for nothing.
+    pub fn notices(
+        &self,
+        wallet_id: &str,
+        held: &notice::Held,
+        context: &notice::Context,
+    ) -> Vec<notice::Notice> {
+        let composed = notice::compose(wallet_id, held, context);
+        notice::within_budget(&mut self.budgets(), composed, Instant::now())
+    }
+
+    /// [`Self::notices`] for a batch of any wallets, as
+    /// [`Self::claim_announcements`] or the live events hand them: wallet
+    /// by wallet, in the order each one first appears.
+    pub fn notices_of(
+        &self,
+        txs: impl IntoIterator<Item = LiveTx>,
+        context: &notice::Context,
+    ) -> Vec<notice::Notice> {
+        notice::by_wallet(txs)
+            .into_iter()
+            .flat_map(|(wallet_id, held)| self.notices(&wallet_id, &held, context))
+            .collect()
+    }
+
+    /// The notification that shows the person what an alert looks like,
+    /// drawn on the budget of the transactions: a screen gone wrong
+    /// cannot flood with it. `None` from the minute's twentieth on, the
+    /// one a budget keeps for the line that says more is waiting.
+    pub fn test_notice(&self) -> Option<notice::Notice> {
+        let allowance = self.budgets().transactions.allow(Instant::now());
+        (allowance == notice::Allowance::Post).then(notice::test_notice)
+    }
+
+    fn budgets(&self) -> std::sync::MutexGuard<'_, notice::Budgets> {
+        self.notice_budgets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Takes up to `max` pieces of the news waiting for a wallet.
