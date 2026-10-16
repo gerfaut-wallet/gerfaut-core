@@ -1132,6 +1132,32 @@ impl WalletManager {
         watch.serving().or_else(|| watch.held())
     }
 
+    /// [`Self::live_server`], for a sync of a wallet of `network` that
+    /// names no server, once the watch of that network is through its
+    /// first pass over its servers ([`LiveWatch::first_pass`]). Before
+    /// its first session the watch names no server, and a sync would go
+    /// to the first of its own order: under the automatic backend, the
+    /// head of the rotation, an operator other than the watch's, which
+    /// would see every address of the wallet each time the app opens,
+    /// the opening sync and the watch racing from the same start. A
+    /// backend that names a single server leaves the sync no other, and
+    /// the sync does not wait.
+    pub(crate) async fn live_server_after_first_pass(
+        &self,
+        network: Network,
+        choice: bool,
+    ) -> Option<(Network, Endpoint)> {
+        let first_pass = {
+            let slot = self.live_slot();
+            let running = slot.as_ref()?;
+            (choice && running.config.network == network).then(|| running.watch.first_pass())
+        };
+        if let Some(first_pass) = first_pass {
+            first_pass.await;
+        }
+        self.live_server()
+    }
+
     /// The sync a change asked for, run under one of the permits once
     /// `hold` has passed: of the scripts that moved when the watch named
     /// them, on the server the watch listens to first, which holds what

@@ -243,6 +243,7 @@ fn timings() -> crate::watch::Timings {
         refused: Duration::from_millis(600),
         limit_kept: Duration::from_secs(3600),
         zero_limit_kept: Duration::from_secs(3600),
+        first_session: Duration::from_secs(5),
     }
 }
 
@@ -891,10 +892,53 @@ async fn a_sync_goes_first_to_the_server_the_watch_talks_to() {
     manager.live_stop().await;
 }
 
+/// The sync the app runs as it opens races the watch that starts with
+/// it: it waits for the watch's first session, then goes to its server,
+/// not to the head of the rotation, so that opening the app shows the
+/// wallets to one operator only.
+#[tokio::test]
+async fn the_opening_sync_waits_for_the_first_session() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let live = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) = automatic(dir.path(), &rotation, &[&live]).await;
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    live.state.lock().unwrap().gate = Some(("server.version", gate.clone()));
+
+    let _events = manager.live_start_with(Some(timings())).await.unwrap();
+    let opening = {
+        let manager = manager.clone();
+        let wallet = wallet.clone();
+        tokio::spawn(async move { manager.sync_wallet(&wallet).await })
+    };
+    let started = std::time::Instant::now();
+    while !live.was_asked("server.version") {
+        assert!(
+            started.elapsed() < WAIT,
+            "the watch never reached its server"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !opening.is_finished(),
+        "the sync went out before the watch's first session"
+    );
+    gate.add_permits(100);
+    opening.await.unwrap().unwrap();
+    assert_eq!(
+        answered_by(&manager, &wallet).await,
+        Some(format!("electrum 127.0.0.1 {}", live.address.port()))
+    );
+    manager.live_stop().await;
+}
+
 /// A watch that has no session yet, its first server refused and the
 /// next one not answering, sends no sync to either: a server the watch
 /// could not reach, such as one on a port the network drops, would make
-/// every sync wait on it before the next. The syncs keep to their order.
+/// every sync wait on it before the next. The sync waits for the
+/// watch's first session no longer than [`Timings::first_session`],
+/// then keeps to its order.
 #[tokio::test]
 async fn a_sync_never_goes_first_where_the_watch_failed() {
     let rotation = FakeMempool::start(false, 0).await;
@@ -909,6 +953,7 @@ async fn a_sync_never_goes_first_where_the_watch_failed() {
     let pace = crate::watch::Timings {
         connect: Duration::from_secs(60),
         refused: Duration::from_secs(3600),
+        first_session: Duration::from_millis(300),
         ..timings()
     };
     let _events = manager.live_start_with(Some(pace)).await.unwrap();

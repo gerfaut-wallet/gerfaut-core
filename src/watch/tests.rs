@@ -38,6 +38,7 @@ fn timings() -> Timings {
         refused: Duration::from_millis(600),
         limit_kept: Duration::from_secs(3600),
         zero_limit_kept: Duration::from_secs(3600),
+        first_session: Duration::from_secs(5),
     }
 }
 

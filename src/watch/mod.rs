@@ -612,6 +612,9 @@ pub(crate) struct Timings {
     /// The same for a server that took none, which leaves the watch
     /// nothing to push: kept a shorter while.
     pub zero_limit_kept: Duration,
+    /// For the live alerts too: the longest a sync waits for the watch's
+    /// first session, see [`LiveWatch::first_pass`].
+    pub first_session: Duration,
 }
 
 impl Timings {
@@ -644,6 +647,7 @@ impl Timings {
             refused: Duration::from_secs(15 * 60),
             limit_kept: Duration::from_secs(24 * 60 * 60),
             zero_limit_kept: Duration::from_secs(60 * 60),
+            first_session: Duration::from_secs(20),
         }
     }
 }
@@ -665,6 +669,11 @@ pub struct LiveWatch {
     /// The server of the last session, while the watch still counts on
     /// it: see [`LiveWatch::held`].
     held: watch::Receiver<Option<(Network, Endpoint)>>,
+    /// Set once the first pass over the servers is over: see
+    /// [`LiveWatch::first_pass`].
+    settled: watch::Receiver<bool>,
+    /// [`Timings::first_session`].
+    first_session: Duration,
     /// Set once to stop the watcher, whatever it is waiting on.
     halt: watch::Sender<bool>,
 }
@@ -712,9 +721,12 @@ impl LiveWatch {
         let (status_tx, status) = watch::channel(WatchStatus::default());
         let (serving_tx, serving) = watch::channel(None);
         let (held_tx, held) = watch::channel(None);
+        let (settled_tx, settled) = watch::channel(false);
+        let first_session = timings.first_session;
         let mut hub = Hub {
             serving: serving_tx,
             held: held_tx,
+            settled: settled_tx,
             config,
             timings,
             watched: Watched::default(),
@@ -745,6 +757,8 @@ impl LiveWatch {
                 status,
                 serving,
                 held,
+                settled,
+                first_session,
                 halt,
             },
             WatchEvents { events },
@@ -803,6 +817,20 @@ impl LiveWatch {
             return None;
         }
         self.held.borrow().clone()
+    }
+
+    /// Waits for the end of the watch's first pass over its servers: a
+    /// session open, none to be had from any of them, nothing to watch,
+    /// or the watch stopped; [`Timings::first_session`] at most, so that
+    /// a server that does not answer holds nothing back for longer.
+    /// Returns at once ever after. Owns what it waits on: the handle may
+    /// go while it waits.
+    pub(crate) fn first_pass(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut settled = self.settled.clone();
+        let budget = self.first_session;
+        async move {
+            let _ = tokio::time::timeout(budget, settled.wait_for(|settled| *settled)).await;
+        }
     }
 
     /// Stops the watcher and closes its connection, at once: the task
@@ -1248,6 +1276,8 @@ pub(crate) struct Hub {
     serving: watch::Sender<Option<(Network, Endpoint)>>,
     /// See [`LiveWatch::held`].
     held: watch::Sender<Option<(Network, Endpoint)>>,
+    /// See [`LiveWatch::first_pass`].
+    settled: watch::Sender<bool>,
     debounce: Debouncer,
     tip: Option<u32>,
     /// Every wallet was reported once under this configuration, when
@@ -1365,6 +1395,7 @@ impl Hub {
     /// Notes the server a session is open with, or that none is.
     pub fn serve(&mut self, endpoint: Option<&Endpoint>) {
         if let Some(endpoint) = endpoint {
+            self.settle();
             self.heard_by = Some(endpoint.clone());
             let held = Some((self.config.network, endpoint.clone()));
             self.held.send_if_modified(|was| {
@@ -1569,6 +1600,13 @@ impl Hub {
         self.heard_by = None;
         self.held.send_replace(None);
         self.debounce = Debouncer::default();
+    }
+
+    /// The first pass over the servers is over: see
+    /// [`LiveWatch::first_pass`].
+    fn settle(&self) {
+        self.settled
+            .send_if_modified(|settled| !std::mem::replace(settled, true));
     }
 
     /// The watch could not open a session with this server, or leaves
@@ -1779,6 +1817,8 @@ async fn supervise(hub: &mut Hub) {
     let mut no_push: Option<Instant> = None;
     loop {
         if hub.watched.entries.is_empty() {
+            // No session is coming: nothing waits for one.
+            hub.settle();
             hub.serve(None);
             hub.set_status(|status| *status = WatchStatus::default());
             match hub.idle(None).await {
@@ -1825,6 +1865,9 @@ async fn supervise(hub: &mut Hub) {
                 else {
                     continue;
                 };
+                // Every server was tried, or the session lost: a sync
+                // that waited for one goes its own way now.
+                hub.settle();
                 hub.serve(None);
                 hub.set_status(|status| {
                     if !established {
