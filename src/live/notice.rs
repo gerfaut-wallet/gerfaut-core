@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use super::LiveTx;
 use crate::format::{format_btc, group_thousands};
+use crate::prefs::Unit;
 use crate::store::TxStage;
 
 /// Transactions said one by one for a wallet in one sync; the rest are
@@ -56,21 +57,13 @@ const MAX_DROPPED_HELD: usize = 64;
 pub(crate) const BUDGET: u32 = 20;
 pub(crate) const BUDGET_WINDOW: Duration = Duration::from_secs(60);
 
-/// The unit amounts are shown in, as the display setting has it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Unit {
-    #[default]
-    Btc,
-    Sats,
-}
-
 /// Everything the text depends on besides the transactions: what the
 /// app lets a notification say, read at the moment of posting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Context {
     /// The name of each wallet, by id.
     pub names: HashMap<String, String>,
+    /// The unit of the shared preferences.
     pub unit: Unit,
     /// Balances are masked: no amount.
     pub masked: bool,
