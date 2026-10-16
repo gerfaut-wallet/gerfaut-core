@@ -41,6 +41,16 @@ const MAX_TITLE_CHARS: usize = 64;
 /// The title of a notification that must not name a wallet.
 pub const APP_TITLE: &str = "Gerfaut";
 
+/// What the last notification a budget lets through in a minute says,
+/// for the transactions: no wallet, no amount, no payment, only that
+/// more is waiting in the app. An app that cannot ask the core at all
+/// posts the same words, under [`APP_TITLE`].
+pub const MORE_TRANSACTIONS: &str = "More transactions are coming in. Open Gerfaut to see them.";
+
+/// [`MORE_TRANSACTIONS`] for the payments no longer coming.
+pub const MORE_DROPPED: &str =
+    "More pending payments are no longer coming. Open Gerfaut to see them.";
+
 /// Payments no longer coming held for one sync. Far above what a real
 /// wallet sees; the rest are counted in a line that says the same.
 const MAX_DROPPED_HELD: usize = 64;
@@ -447,14 +457,8 @@ pub(crate) fn within_budget(
     let mut out = Vec::new();
     for notice in notices {
         let (budget, last_call) = match notice.kind {
-            NoticeKind::Transaction => (
-                &mut budgets.transactions,
-                "More transactions are coming in. Open Gerfaut to see them.",
-            ),
-            NoticeKind::Dropped => (
-                &mut budgets.dropped,
-                "More pending payments are no longer coming. Open Gerfaut to see them.",
-            ),
+            NoticeKind::Transaction => (&mut budgets.transactions, MORE_TRANSACTIONS),
+            NoticeKind::Dropped => (&mut budgets.dropped, MORE_DROPPED),
         };
         match budget.allow(now) {
             Allowance::Post => out.push(notice),
