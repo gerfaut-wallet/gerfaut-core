@@ -9,8 +9,9 @@
 //! and the wallet's coins. Pure: no I/O and no engine; the manager
 //! hands it what it needs.
 //!
-//! Each branch comes with the tone its state is shown in, so that the
-//! applications only have to word it.
+//! The branches come out in the order a person reads them, each with
+//! the tone its state is shown in, so that the applications only have
+//! to word them.
 //!
 //! A branch is read through its thresholds. A threshold is met with the
 //! k-th soonest of its items, so an "and" waits for its last lock, an
@@ -325,7 +326,9 @@ impl BranchState {
 /// One way to spend: a top-level alternative of the policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyBranch {
-    /// Stable within the snapshot: `b0`, `b1`, ...
+    /// The branch's place in the policy as written, stable within the
+    /// snapshot: `b0`, `b1`, ... The snapshot lists the branches in
+    /// reading order, which need not be that one.
     pub id: String,
     pub role: BranchRole,
     /// `Primary`, `Recovery`, `Emergency`, `Primary B`, `Recovery 3`...
@@ -355,6 +358,10 @@ pub struct PolicySnapshot {
     /// keys: `or(pk(Key A),and(pk(Key B),older(52560)))`.
     pub policy: String,
     pub keys: Vec<PolicyKey>,
+    /// The ways to spend in reading order: the primary paths, then the
+    /// recovery, the emergency and the other ones, each from the
+    /// nearest to the farthest, and as the policy writes them where
+    /// that settles nothing.
     pub branches: Vec<PolicyBranch>,
     /// The tip the height locks were measured against; `None` before
     /// the first sync, when they cannot be.
@@ -402,22 +409,31 @@ pub fn analyze(input: PolicyInput<'_>) -> CoreResult<PolicySnapshot> {
         .map(|branch| draft(&branch, &book, &input.coins, &clock))
         .collect::<CoreResult<Vec<Draft>>>()?;
     let roles = assign_roles(&drafts);
-    let branches: Vec<PolicyBranch> = drafts
+    let mut placed: Vec<((u8, u64), PolicyBranch)> = drafts
         .into_iter()
         .zip(roles)
         .enumerate()
-        .map(|(index, (draft, (role, label)))| PolicyBranch {
-            id: format!("b{index}"),
-            role,
-            label,
-            summary: summary(&draft.condition, &book),
-            spendable_now: matches!(draft.state, BranchState::SpendableNow),
-            tone: draft.state.tone(),
-            condition: draft.condition,
-            timelocks: draft.timelocks,
-            state: draft.state,
+        .map(|(index, (draft, (role, label)))| {
+            // The roles were handed out by the same distance: a branch
+            // no lock holds back is as near as can be.
+            let place = (role.reading_rank(), draft.distance.unwrap_or(0));
+            let branch = PolicyBranch {
+                id: format!("b{index}"),
+                role,
+                label,
+                summary: summary(&draft.condition, &book),
+                spendable_now: matches!(draft.state, BranchState::SpendableNow),
+                tone: draft.state.tone(),
+                condition: draft.condition,
+                timelocks: draft.timelocks,
+                state: draft.state,
+            };
+            (place, branch)
         })
         .collect();
+    // Stable: branches that tie stay in the order the policy writes them.
+    placed.sort_by_key(|(place, _)| *place);
+    let branches: Vec<PolicyBranch> = placed.into_iter().map(|(_, branch)| branch).collect();
 
     Ok(PolicySnapshot {
         kind: kind_of(&policy),
@@ -1402,6 +1418,19 @@ fn assign_roles(drafts: &[Draft]) -> Vec<(BranchRole, String)> {
         .collect()
 }
 
+impl BranchRole {
+    /// Where a role reads on the page: the everyday path first, then
+    /// the others in the order they come into play.
+    fn reading_rank(self) -> u8 {
+        match self {
+            BranchRole::Primary => 0,
+            BranchRole::Recovery => 1,
+            BranchRole::Emergency => 2,
+            BranchRole::Other => 3,
+        }
+    }
+}
+
 /// `Primary`, then `Primary B`, `Primary C`...
 fn lettered(base: &str, index: usize) -> String {
     if index == 0 {
@@ -1993,26 +2022,27 @@ mod tests {
 
     #[test]
     fn timed_branches_rank_by_duration() {
-        // Written longest first: the ranking must not follow the text.
+        // Written longest first: neither the ranking nor the order may
+        // follow the text. The ids still say where the policy has them.
         let descriptor = format!(
             "wsh(or_d(pk({A}/0/*),or_i(and_v(v:pkh({B}/0/*),older(52560)),and_v(v:pkh({C}/0/*),older(4320)))))"
         );
         let snapshot = wsh(&descriptor, Vec::new());
-        let roles: Vec<(BranchRole, &str)> = snapshot
+        let roles: Vec<(&str, BranchRole, &str)> = snapshot
             .branches
             .iter()
-            .map(|b| (b.role, b.label.as_str()))
+            .map(|b| (b.id.as_str(), b.role, b.label.as_str()))
             .collect();
         assert_eq!(
             roles,
             vec![
-                (BranchRole::Primary, "Primary"),
-                (BranchRole::Emergency, "Emergency"),
-                (BranchRole::Recovery, "Recovery"),
+                ("b0", BranchRole::Primary, "Primary"),
+                ("b2", BranchRole::Recovery, "Recovery"),
+                ("b1", BranchRole::Emergency, "Emergency"),
             ]
         );
         assert_eq!(
-            snapshot.branches[2].summary,
+            snapshot.branches[1].summary,
             "Key C, once a coin has waited 4,320 blocks"
         );
     }
@@ -2049,18 +2079,126 @@ mod tests {
             roles,
             vec![
                 (
-                    BranchRole::Recovery,
-                    "Recovery",
-                    "Key A, once a coin has waited 52,560 blocks"
-                ),
-                (
                     BranchRole::Primary,
                     "Primary",
                     "Key B, once a coin has waited 4,320 blocks"
                 ),
+                (
+                    BranchRole::Recovery,
+                    "Recovery",
+                    "Key A, once a coin has waited 52,560 blocks"
+                ),
             ]
         );
-        assert!(!snapshot.branches[1].spendable_now, "primary, yet it waits");
+        assert!(!snapshot.branches[0].spendable_now, "primary, yet it waits");
+    }
+
+    /// Several recovery paths, written farthest first: the snapshot
+    /// lists them as a person reads them, each with the tone of where
+    /// it stands.
+    #[test]
+    fn several_recovery_paths_come_in_reading_order() {
+        let descriptor = format!(
+            "wsh(or_d(multi(2,{A}/0/*,{B}/0/*),or_i(and_v(v:pkh({C}/0/*),older(52560)),or_i(and_v(v:pkh({D}/0/*),older(26280)),and_v(v:multi(2,{C}/1/*,{D}/1/*),older(4320))))))"
+        );
+        let snapshot = wsh(
+            &descriptor,
+            vec![
+                // Waited 60,001 blocks: past every lock.
+                coin("aa:0", Some(740_000), None),
+                // Waited 4,001 blocks: 319 to go on the nearest lock.
+                coin("bb:0", Some(796_000), None),
+                // Not in a block yet.
+                coin("cc:0", None, None),
+            ],
+        );
+        let read: Vec<(&str, BranchRole, &str, BranchTone)> = snapshot
+            .branches
+            .iter()
+            .map(|b| (b.id.as_str(), b.role, b.label.as_str(), b.tone))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                ("b0", BranchRole::Primary, "Primary", BranchTone::Confirmed),
+                ("b3", BranchRole::Recovery, "Recovery", BranchTone::Pending),
+                (
+                    "b2",
+                    BranchRole::Emergency,
+                    "Emergency",
+                    BranchTone::Neutral
+                ),
+                ("b1", BranchRole::Other, "Recovery 3", BranchTone::Neutral),
+            ]
+        );
+        let per_coin = |left: u32| BranchState::PerCoin {
+            unlocked: 1,
+            waiting: 1,
+            locked: 1,
+            next: Some(Remaining::blocks(left, NOW)),
+        };
+        let states: Vec<(&str, &BranchState)> = snapshot
+            .branches
+            .iter()
+            .map(|b| (b.summary.as_str(), &b.state))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                ("Keys A and B", &BranchState::SpendableNow),
+                (
+                    "Keys C and D, once a coin has waited 4,320 blocks",
+                    &per_coin(319)
+                ),
+                (
+                    "Key D, once a coin has waited 26,280 blocks",
+                    &per_coin(22_279)
+                ),
+                (
+                    "Key C, once a coin has waited 52,560 blocks",
+                    &per_coin(48_559)
+                ),
+            ]
+        );
+    }
+
+    /// Absolute locks read nearest first too, a date and a height alike:
+    /// a height ten days off before a date years away.
+    #[test]
+    fn absolute_locks_come_nearest_first() {
+        let descriptor = format!(
+            "wsh(or_d(pk({A}/0/*),or_i(and_v(v:pkh({B}/0/*),after(1899979200)),and_v(v:pkh({C}/0/*),after(801432)))))"
+        );
+        let snapshot = wsh(&descriptor, vec![coin("aa:0", Some(799_000), None)]);
+        let read: Vec<(&str, &str, &str, BranchTone)> = snapshot
+            .branches
+            .iter()
+            .map(|b| (b.id.as_str(), b.label.as_str(), b.summary.as_str(), b.tone))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                ("b0", "Primary", "Key A", BranchTone::Confirmed),
+                (
+                    "b2",
+                    "Recovery",
+                    "Key C after block 801,432",
+                    BranchTone::Pending
+                ),
+                (
+                    "b1",
+                    "Emergency",
+                    "Key B after 2030-03-17",
+                    BranchTone::Neutral
+                ),
+            ]
+        );
+        assert_eq!(
+            snapshot.branches[1].state,
+            BranchState::Locked {
+                until: Remaining::blocks(1_432, NOW)
+            }
+        );
     }
 
     /// A branch turns pending under thirty days, not at them, whatever
@@ -2840,7 +2978,7 @@ mod tests {
             "wsh(or_i(and_v(v:pk({A}/0/*),older(100)),thresh(2,pk({B}/0/*),s:pk({C}/0/*),s:pk({D}/0/*))))"
         );
         let snapshot = wsh(&descriptor, Vec::new());
-        assert_eq!(snapshot.branches[1].summary, "Any 2 of 3 keys");
+        assert_eq!(snapshot.branches[0].summary, "Any 2 of 3 keys");
     }
 
     #[test]
