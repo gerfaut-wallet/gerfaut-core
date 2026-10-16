@@ -178,6 +178,24 @@ impl WatchLimits {
     }
 }
 
+/// The two sets of limits the "This is my node" setting chooses
+/// between, for the words under it: an app names them from here and
+/// never keeps a copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchLimitsChoice {
+    /// On any server: [`WatchLimits::DEFAULT`].
+    pub any: WatchLimits,
+    /// On the user's own node: [`WatchLimits::OWN_NODE`].
+    pub own_node: WatchLimits,
+}
+
+impl WatchLimitsChoice {
+    pub const CURRENT: WatchLimitsChoice = WatchLimitsChoice {
+        any: WatchLimits::DEFAULT,
+        own_node: WatchLimits::OWN_NODE,
+    };
+}
+
 /// Everything the watcher needs to reach the backend, and nothing of
 /// the vault: a copy of four settings and the data directory, where
 /// the embedded Tor client keeps its state.

@@ -2014,6 +2014,11 @@ fn the_users_own_node_lifts_what_a_watch_takes() {
     assert_eq!(WatchLimits::of(&own(false)), WatchLimits::DEFAULT);
     assert_eq!(WatchLimits::of(&own(true)), WatchLimits::OWN_NODE);
     assert_eq!(WatchLimits::OWN_NODE.total, 20_000);
+    // What the words of the setting are drawn from.
+    assert_eq!(
+        serde_json::to_string(&WatchLimitsChoice::CURRENT).unwrap(),
+        r#"{"any":{"per_wallet":200,"total":2000},"own_node":{"per_wallet":20000,"total":20000}}"#
+    );
 
     let large = || vec![numbered("large", 0, 5_000)];
     let anywhere = Watched::new(large(), WatchLimits::DEFAULT);
