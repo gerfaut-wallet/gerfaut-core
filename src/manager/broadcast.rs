@@ -70,14 +70,13 @@ impl WalletManager {
                     WalletKind::Descriptors { .. } => {
                         let engine = ensure_engine(&mut state, &id)?;
                         tip_height = tip_height.max(Some(views::tip_height(engine)));
-                        let canonical = canonical_view(engine, &outpoints);
-                        for (i, outpoint) in outpoints.iter().enumerate() {
-                            let Some(txout) = coin_of(engine, &canonical, *outpoint) else {
-                                continue;
-                            };
+                        let coins = wallet_coins(engine, &outpoints);
+                        for (i, coin) in coins.into_iter().enumerate() {
                             // A coin of this wallet: unspent, or spent by the one
                             // transaction it holds as canonical.
-                            let spender = spender_in(engine, &canonical, *outpoint);
+                            let Some((txout, spender)) = coin else {
+                                continue;
+                            };
                             input_facts[i].prevout = Some(txout);
                             input_facts[i].wallet = Some(wallet_ref.clone());
                             input_facts[i].spent = Some(spender.is_some());
@@ -293,24 +292,36 @@ impl WalletManager {
     }
 }
 
-/// Canonical transactions of a wallet by txid, each with whether it is in
-/// a block.
-type CanonicalView = HashMap<Txid, (Arc<Transaction>, bool)>;
-
-/// What the wallet holds as canonical about `outpoints`: the transactions
-/// that fund them and those that spend them, each with whether it is in a
-/// block. The graph is made canonical once per wallet and per preview,
-/// not once per question: this runs under the manager's lock.
-fn canonical_view(engine: &bdk_wallet::Wallet, outpoints: &[OutPoint]) -> CanonicalView {
+/// For each outpoint, the coin of the wallet it names and the transaction
+/// that spends it, as the wallet holds them canonical; `None` where it
+/// names no coin of the wallet. This runs under the manager's lock: a
+/// wallet that holds none of the transactions the outpoints come from is
+/// passed over without making its graph canonical, and one that holds
+/// some has it made canonical once, its spends read once.
+fn wallet_coins(
+    engine: &bdk_wallet::Wallet,
+    outpoints: &[OutPoint],
+) -> Vec<Option<(TxOut, Option<SpentBy>)>> {
     let graph = engine.tx_graph();
+    if outpoints
+        .iter()
+        .all(|outpoint| graph.get_tx(outpoint.txid).is_none())
+    {
+        return vec![None; outpoints.len()];
+    }
+    let spends: Vec<Vec<Txid>> = outpoints
+        .iter()
+        .map(|outpoint| graph.outspends(*outpoint).iter().copied().collect())
+        .collect();
     let wanted: HashSet<Txid> = outpoints
         .iter()
-        .flat_map(|outpoint| {
-            std::iter::once(outpoint.txid).chain(graph.outspends(*outpoint).iter().copied())
-        })
+        .map(|outpoint| outpoint.txid)
+        .chain(spends.iter().flatten().copied())
         .collect();
     let chain = engine.local_chain();
-    graph
+    // Each wanted transaction the wallet holds as canonical, with whether
+    // it is in a block.
+    let canonical: HashMap<Txid, (Arc<Transaction>, bool)> = graph
         .list_canonical_txs(
             chain,
             chain.tip().block_id(),
@@ -323,40 +334,26 @@ fn canonical_view(engine: &bdk_wallet::Wallet, outpoints: &[OutPoint]) -> Canoni
                 (ctx.tx_node.tx.clone(), ctx.chain_position.is_confirmed()),
             )
         })
-        .collect()
-}
-
-/// The output `outpoint` names, when its transaction is canonical in
-/// the wallet's view and the output is one of the wallet's.
-fn coin_of(
-    engine: &bdk_wallet::Wallet,
-    canonical: &CanonicalView,
-    outpoint: OutPoint,
-) -> Option<TxOut> {
-    let (funding, _) = canonical.get(&outpoint.txid)?;
-    let txout = funding.output.get(outpoint.vout as usize)?;
-    engine
-        .is_mine(txout.script_pubkey.clone())
-        .then(|| txout.clone())
-}
-
-/// The transaction that spends `outpoint` in the wallet's view, if any:
-/// at most one is canonical.
-fn spender_in(
-    engine: &bdk_wallet::Wallet,
-    canonical: &CanonicalView,
-    outpoint: OutPoint,
-) -> Option<SpentBy> {
-    engine
-        .tx_graph()
-        .outspends(outpoint)
+        .collect();
+    outpoints
         .iter()
-        .find_map(|txid| {
-            canonical.get(txid).map(|&(_, confirmed)| SpentBy {
-                txid: *txid,
-                confirmed,
-            })
+        .zip(&spends)
+        .map(|(outpoint, spenders)| {
+            let (funding, _) = canonical.get(&outpoint.txid)?;
+            let txout = funding.output.get(outpoint.vout as usize)?;
+            if !engine.is_mine(txout.script_pubkey.clone()) {
+                return None;
+            }
+            // At most one spend is canonical.
+            let spender = spenders.iter().find_map(|txid| {
+                canonical.get(txid).map(|&(_, confirmed)| SpentBy {
+                    txid: *txid,
+                    confirmed,
+                })
+            });
+            Some((txout.clone(), spender))
         })
+        .collect()
 }
 
 /// Every node said the same thing: say it once, with the first host.
