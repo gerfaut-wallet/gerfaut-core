@@ -19,6 +19,7 @@ pub mod live;
 pub mod lock;
 pub mod manager;
 pub mod network;
+pub mod prefs;
 pub mod price;
 pub mod store;
 #[cfg(test)]

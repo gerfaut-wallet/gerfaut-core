@@ -14,6 +14,7 @@ use crate::chain::tor::{TorMode, TorSettings, socks};
 use crate::error::CoreError;
 use crate::manager::tests::support::{closed_port, manager};
 use crate::network::Network;
+use crate::prefs::PreferencesChange;
 use crate::price::{FiatCurrency, PriceRange, PriceSource};
 
 const ONION: &str = "tcp://gerfautexample000000000000000000000000000000000000000.onion:50001";
@@ -106,6 +107,18 @@ async fn without_an_onion_backend_the_price_goes_straight() {
     assert_eq!(manager.beside_syncs_proxy().await.unwrap(), None);
 }
 
+/// Prices in `currency` from `source`: what a price follows.
+async fn price_by(manager: &crate::WalletManager, source: PriceSource, currency: FiatCurrency) {
+    manager
+        .set_preferences(PreferencesChange {
+            fiat_currency: Some(currency),
+            price_source: Some(source),
+            ..PreferencesChange::default()
+        })
+        .await
+        .unwrap();
+}
+
 /// An onion backend on any network, even one that is not on screen,
 /// sends every price request through the Tor proxy, by name.
 #[tokio::test]
@@ -116,14 +129,13 @@ async fn with_an_onion_backend_the_price_goes_through_tor() {
     assert!(manager.uses_tor().await);
 
     for source in PriceSource::ALL {
-        let error = manager
-            .fetch_price(source, FiatCurrency::Usd)
-            .await
-            .unwrap_err();
+        price_by(&manager, source, FiatCurrency::Usd).await;
+        let error = manager.fetch_price().await.unwrap_err();
         assert!(is_price_failure(&error), "{source:?}: {error}");
     }
+    price_by(&manager, PriceSource::Kraken, FiatCurrency::Usd).await;
     let error = manager
-        .fetch_price_history(PriceSource::Kraken, FiatCurrency::Usd, PriceRange::Year)
+        .fetch_price_history(PriceRange::Year)
         .await
         .unwrap_err();
     assert!(is_price_failure(&error), "{error}");
@@ -145,15 +157,13 @@ async fn with_an_onion_backend_the_price_goes_through_tor() {
 async fn without_the_tor_it_needs_no_price_goes() {
     let dir = tempfile::tempdir().unwrap();
     let manager = onion_manager(dir.path(), closed_port().await).await;
+    price_by(&manager, PriceSource::Coingecko, FiatCurrency::Eur).await;
 
     let started = Instant::now();
-    let refused = manager
-        .fetch_price(PriceSource::Coingecko, FiatCurrency::Eur)
-        .await
-        .unwrap_err();
+    let refused = manager.fetch_price().await.unwrap_err();
     assert!(matches!(refused, CoreError::Tor(_)), "{refused}");
     let refused = manager
-        .fetch_price_history(PriceSource::Coingecko, FiatCurrency::Eur, PriceRange::Week)
+        .fetch_price_history(PriceRange::Week)
         .await
         .unwrap_err();
     assert!(matches!(refused, CoreError::Tor(_)), "{refused}");
@@ -163,26 +173,40 @@ async fn without_the_tor_it_needs_no_price_goes() {
     );
 }
 
-/// A pair the source cannot serve is refused before a route is
-/// resolved: no Tor started for a request that would not go anyway.
+/// The price follows the preferences: a currency only CoinGecko quotes
+/// is asked of CoinGecko, whichever source was picked before it.
 #[tokio::test]
-async fn an_unserved_pair_is_refused_before_any_route() {
+async fn the_price_follows_the_preferences() {
     let (proxy, asked) = refusing_tor().await;
     let dir = tempfile::tempdir().unwrap();
     let manager = onion_manager(dir.path(), proxy).await;
+    price_by(&manager, PriceSource::Kraken, FiatCurrency::Usd).await;
+    manager
+        .set_preferences(PreferencesChange {
+            fiat_currency: Some(FiatCurrency::Ngn),
+            ..PreferencesChange::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(is_price_failure(&manager.fetch_price().await.unwrap_err()));
+    assert_eq!(
+        *asked.lock().unwrap(),
+        vec![("api.coingecko.com".to_owned(), 443)]
+    );
+}
+
+/// A range the source cannot serve is refused before a route is
+/// resolved: no Tor started for a request that would not go anyway.
+#[tokio::test]
+async fn an_unserved_range_is_refused_before_any_route() {
+    let (proxy, asked) = refusing_tor().await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = onion_manager(dir.path(), proxy).await;
+    price_by(&manager, PriceSource::MempoolSpace, FiatCurrency::Usd).await;
 
     let error = manager
-        .fetch_price(PriceSource::Kraken, FiatCurrency::Inr)
-        .await
-        .unwrap_err();
-    assert!(is_price_failure(&error), "{error}");
-    assert!(error.to_string().contains("INR"), "{error}");
-    let error = manager
-        .fetch_price_history(
-            PriceSource::MempoolSpace,
-            FiatCurrency::Usd,
-            PriceRange::Day,
-        )
+        .fetch_price_history(PriceRange::Day)
         .await
         .unwrap_err();
     assert!(is_price_failure(&error), "{error}");

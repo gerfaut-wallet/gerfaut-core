@@ -900,7 +900,7 @@ async fn a_broadcast_kept_where_no_save_goes_through_is_still_answered() {
 
     manager.state.lock().await.vault.fail_saves(false);
     manager
-        .set_app_pref("display.unit".to_owned(), "sats".to_owned())
+        .set_app_pref("desktop.theme".to_owned(), "dark".to_owned())
         .await
         .unwrap();
     drop(manager);
