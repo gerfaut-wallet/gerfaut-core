@@ -1059,18 +1059,36 @@ pub(crate) async fn fetch_prevout(
     // Named only when the server says both who spends it and where that
     // stands: a spend whose standing is unknown is not taken for one
     // in a block.
-    let spent_by = status.and_then(|status| match (status.spent, status.txid, status.status) {
-        (true, Some(txid), Some(standing)) => Some(crate::broadcast::SpentBy {
-            txid,
-            confirmed: standing.confirmed,
-        }),
-        _ => None,
-    });
+    let spent_by =
+        match status.and_then(|status| match (status.spent, status.txid, status.status) {
+            (true, Some(txid), Some(standing)) => Some((txid, standing.confirmed)),
+            _ => None,
+        }) {
+            // A spend in a block holds the broadcast back: the server shows
+            // the transaction that makes it, and it has to spend this coin.
+            // One in the mempool holds nothing back, and costs no request.
+            Some((txid, confirmed)) => Some(crate::broadcast::SpentBy {
+                txid,
+                confirmed,
+                verified: confirmed && shows_spend(client, txid, outpoint).await,
+            }),
+            None => None,
+        };
     Ok(PrevoutFacts {
         txout,
         spent,
         spent_by,
     })
+}
+
+/// Whether the server hands over the transaction `txid`, as that txid
+/// commits to it, with `outpoint` among its inputs. Anything else, a
+/// server that cannot show it included, is no proof of the spend.
+async fn shows_spend(client: &Client, txid: Txid, outpoint: OutPoint) -> bool {
+    match client.tx(&txid).await {
+        Ok(Some(tx)) => crate::chain::spends(&tx, txid, outpoint),
+        _ => false,
+    }
 }
 
 /// Where a transaction stands: unknown, in the mempool, or at a height.

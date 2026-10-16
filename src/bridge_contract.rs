@@ -1924,6 +1924,22 @@ fn previews() -> Vec<(&'static str, TxPreview)> {
                     spent_by: Some(broadcast::SpentBy {
                         txid: Txid::from_str(&txid("earlier")).expect("a txid"),
                         confirmed: true,
+                        verified: true,
+                    }),
+                    ..mine.clone()
+                },
+            ),
+        ),
+        (
+            "in_mempool",
+            preview(
+                spend(true),
+                InputFacts {
+                    spent: Some(true),
+                    spent_by: Some(broadcast::SpentBy {
+                        txid: spend(true).tx.compute_txid(),
+                        confirmed: false,
+                        verified: true,
                     }),
                     ..mine
                 },
@@ -1937,6 +1953,7 @@ fn broadcasts() -> Vec<Fixture> {
     let ready = previews[0].1.clone();
     let unsigned = previews[1].1.clone();
     let refused = previews[2].1.clone();
+    let in_mempool = previews[3].1.clone();
     let mut warnings: Vec<(String, TxWarning)> = Vec::new();
     for (_, preview) in &previews {
         for warning in &preview.warnings {
@@ -2011,6 +2028,7 @@ fn broadcasts() -> Vec<Fixture> {
                 Locked,
                 InputUnknown,
                 InputSpent,
+                InMempool,
                 InputMismatch,
                 FeeUnknown,
                 DustOutput,
@@ -2026,6 +2044,7 @@ fn broadcasts() -> Vec<Fixture> {
                 Ready,
                 Refused,
                 Unsigned,
+                InMempool,
             }),
         ),
         variants(
@@ -2042,6 +2061,7 @@ fn broadcasts() -> Vec<Fixture> {
                 ("ready", ready.clone()),
                 ("unsigned_psbt", unsigned),
                 ("refused", refused),
+                ("in_mempool", in_mempool),
             ],
         ),
         fixture(

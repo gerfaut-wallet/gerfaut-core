@@ -33,6 +33,17 @@ async fn esplora_answering(
     unknown: Unknown,
     outspend: String,
 ) -> String {
+    esplora_serving(tx, Vec::new(), unknown, outspend).await
+}
+
+/// The same Esplora, which also hands over `also` when asked for them:
+/// the transaction its `outspend` names, for one.
+async fn esplora_serving(
+    tx: bdk_wallet::bitcoin::Transaction,
+    also: Vec<bdk_wallet::bitcoin::Transaction>,
+    unknown: Unknown,
+    outspend: String,
+) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -40,6 +51,15 @@ async fn esplora_answering(
     let address = listener.local_addr().unwrap();
     let txid = tx.compute_txid().to_string();
     let raw = bdk_wallet::bitcoin::consensus::serialize(&tx);
+    let others: Vec<(String, Vec<u8>)> = also
+        .iter()
+        .map(|other| {
+            (
+                format!("/api/tx/{}/raw", other.compute_txid()),
+                bdk_wallet::bitcoin::consensus::serialize(other),
+            )
+        })
+        .collect();
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let mut buf = vec![0u8; 4096];
@@ -50,6 +70,8 @@ async fn esplora_answering(
                 Some(("200 OK", "application/octet-stream", raw.clone()))
             } else if path == format!("/api/tx/{txid}/outspend/0") {
                 Some(("200 OK", "application/json", outspend.clone().into_bytes()))
+            } else if let Some((_, bytes)) = others.iter().find(|(route, _)| route == path) {
+                Some(("200 OK", "application/octet-stream", bytes.clone()))
             } else {
                 match unknown {
                     Unknown::NotFound => {
@@ -461,17 +483,46 @@ async fn a_watched_coin_spent_in_a_block_blocks_the_send() {
     }
 }
 
-/// The same coin spent by a transaction still in the mempool: pasting
-/// that transaction again, or one that replaces it, is the node's
-/// call. Broadcast stays on.
+/// The same coin spent by a transaction still in the mempool. Pasting
+/// that very transaction again is harmless, and the preview says it is
+/// already waiting, in amber; one that would replace it is the node's
+/// call. Broadcast stays on for both.
 #[tokio::test]
 async fn a_watched_coin_spent_in_the_mempool_leaves_the_send_to_the_node() {
-    use crate::broadcast::TxWarningKind;
+    use crate::broadcast::{TxReadiness, TxSeverity, TxWarningKind};
+    use crate::testkit::script;
+    use bdk_wallet::bitcoin::OutPoint;
 
     let dir = tempfile::tempdir().unwrap();
-    let (manager, _, spender) = wallet_coin_spent(dir.path(), false).await;
-    let preview = manager
+    let (manager, funding, spender) = wallet_coin_spent(dir.path(), false).await;
+    let again = manager
         .preview_transaction(&witnessed(spender), Network::Signet)
+        .await
+        .unwrap();
+    assert_eq!(again.readiness, TxReadiness::InMempool);
+    assert!(again.ready);
+    assert!(again.hex.is_some());
+    assert!(
+        !again
+            .warnings
+            .iter()
+            .any(|w| w.kind == TxWarningKind::InputSpent),
+        "{:?}",
+        again.warnings
+    );
+    let waiting = again
+        .warnings
+        .iter()
+        .find(|w| w.kind == TxWarningKind::InMempool)
+        .expect("the preview says it is already out");
+    assert_eq!(waiting.severity, TxSeverity::Info);
+
+    let replacement = crate::testkit::transaction(
+        &[OutPoint::new(funding.compute_txid(), 0)],
+        &[(script(8).as_str(), 48_000)],
+    );
+    let preview = manager
+        .preview_transaction(&witnessed(replacement), Network::Signet)
         .await
         .unwrap();
     let spent = preview
@@ -485,13 +536,15 @@ async fn a_watched_coin_spent_in_the_mempool_leaves_the_send_to_the_node() {
         spent.message
     );
     assert!(!spent.blocking);
-    assert!(preview.ready);
+    assert_eq!(preview.readiness, TxReadiness::Ready);
     assert!(preview.hex.is_some());
 }
 
 /// A coin no watched wallet holds: the backend's `outspend` says who
-/// spent it and whether that is in a block, and the preview goes by
-/// it the way it goes by the wallet.
+/// spent it and whether that is in a block. A spend in a block holds the
+/// send back once the backend shows the transaction that makes it, and
+/// it spends this coin; its word alone is a caution. One in the mempool
+/// never holds it back.
 #[tokio::test]
 async fn the_backend_places_a_spend_the_vault_does_not_know() {
     use crate::broadcast::TxWarningKind;
@@ -499,14 +552,21 @@ async fn the_backend_places_a_spend_the_vault_does_not_know() {
     use bdk_wallet::bitcoin::OutPoint;
 
     let funding = transaction(&[nowhere(1, 0)], &[(script(3).as_str(), 50_000)]);
-    let pasted = transaction(
-        &[OutPoint::new(funding.compute_txid(), 0)],
-        &[(script(9).as_str(), 49_000)],
-    );
-    let other = "77".repeat(32);
-    for (confirmed, blocks) in [(true, true), (false, false)] {
+    let coin = OutPoint::new(funding.compute_txid(), 0);
+    let pasted = transaction(&[coin], &[(script(9).as_str(), 49_000)]);
+    let rival = transaction(&[coin], &[(script(8).as_str(), 48_000)]);
+    // A transaction that spends something else, which a lying backend
+    // could name in its place.
+    let unrelated = transaction(&[nowhere(2, 0)], &[(script(8).as_str(), 48_000)]);
+    for (spender, served, confirmed, blocks) in [
+        (&rival, true, true, true),
+        (&rival, false, true, false),
+        (&unrelated, true, true, false),
+        (&rival, true, false, false),
+    ] {
         let outspend = format!(
-            r#"{{"spent":true,"txid":"{other}","vin":0,"status":{{"confirmed":{confirmed}}}}}"#
+            r#"{{"spent":true,"txid":"{}","vin":0,"status":{{"confirmed":{confirmed}}}}}"#,
+            spender.compute_txid()
         );
         let dir = tempfile::tempdir().unwrap();
         let manager = manager(dir.path()).await;
@@ -514,7 +574,17 @@ async fn the_backend_places_a_spend_the_vault_does_not_know() {
             .set_backend(
                 Network::Regtest,
                 BackendConfig::CustomEsplora {
-                    url: esplora_answering(funding.clone(), Unknown::NotFound, outspend).await,
+                    url: esplora_serving(
+                        funding.clone(),
+                        if served {
+                            vec![spender.clone()]
+                        } else {
+                            Vec::new()
+                        },
+                        Unknown::NotFound,
+                        outspend,
+                    )
+                    .await,
                     own_node: false,
                 },
             )
@@ -529,8 +599,9 @@ async fn the_backend_places_a_spend_the_vault_does_not_know() {
             .iter()
             .find(|w| w.kind == TxWarningKind::InputSpent)
             .expect("the backend's answer is named");
-        assert_eq!(spent.blocking, blocks, "{}", spent.message);
-        assert_eq!(preview.ready, !blocks);
+        let case = format!("served {served}, confirmed {confirmed}: {}", spent.message);
+        assert_eq!(spent.blocking, blocks, "{case}");
+        assert_eq!(preview.ready, !blocks, "{case}");
         assert_eq!(preview.inputs[0].value_sats, Some(50_000));
     }
 }
@@ -666,13 +737,15 @@ async fn a_contradicted_listing_sends_the_coin_to_the_backend() {
     let coin = OutPoint::new(funding.compute_txid(), 0);
     let dir = tempfile::tempdir().unwrap();
     let (manager, _) = listed_coin(dir.path(), 1_000, coin).await;
-    let other = "77".repeat(32);
+    let spender = transaction(&[coin], &[(crate::testkit::script(8).as_str(), 99_000)]);
+    let other = spender.compute_txid();
     manager
         .set_backend(
             Network::Signet,
             BackendConfig::CustomEsplora {
-                url: esplora_answering(
+                url: esplora_serving(
                     funding.clone(),
+                    vec![spender],
                     Unknown::NotFound,
                     format!(
                         r#"{{"spent":true,"txid":"{other}","vin":0,"status":{{"confirmed":true}}}}"#
@@ -717,6 +790,106 @@ async fn a_contradicted_listing_sends_the_coin_to_the_backend() {
         .expect("the backend's answer about the coin");
     assert!(spent.blocking);
     assert_eq!(preview.readiness, TxReadiness::Refused);
+}
+
+/// A coin no watched wallet holds, behind an Electrum server: the coins
+/// of its script say whether it is still there, and its history holds
+/// the transaction that spends it, read and checked. Only a spend seen
+/// so, in a block, holds the send back.
+#[tokio::test]
+async fn electrum_says_whether_a_coin_is_spent() {
+    use crate::broadcast::{TxReadiness, TxWarningKind};
+    use crate::testkit::{FakeElectrum, nowhere, script, transaction};
+    use bdk_wallet::bitcoin::OutPoint;
+
+    let funding = transaction(&[nowhere(1, 0)], &[(script(3).as_str(), 50_000)]);
+    let funded = funding.compute_txid();
+    let coin = OutPoint::new(funded, 0);
+    let pasted = transaction(&[coin], &[(script(9).as_str(), 49_000)]);
+    let rival = transaction(&[coin], &[(script(8).as_str(), 48_000)]);
+    let unrelated = transaction(&[nowhere(2, 0)], &[(script(3).as_str(), 1_000)]);
+
+    /// What the server holds about the coin's script.
+    struct Case {
+        name: &'static str,
+        unspent: bool,
+        history: Vec<(bdk_wallet::bitcoin::Transaction, i64)>,
+        readiness: TxReadiness,
+        spent_blocks: Option<bool>,
+    }
+    let cases = [
+        Case {
+            name: "still among the script's coins",
+            unspent: true,
+            history: vec![],
+            readiness: TxReadiness::Ready,
+            spent_blocks: None,
+        },
+        Case {
+            name: "spent in a block by a transaction it shows",
+            unspent: false,
+            history: vec![(rival.clone(), 101)],
+            readiness: TxReadiness::Refused,
+            spent_blocks: Some(true),
+        },
+        Case {
+            name: "spent in the mempool by another",
+            unspent: false,
+            history: vec![(rival.clone(), 0)],
+            readiness: TxReadiness::Ready,
+            spent_blocks: Some(false),
+        },
+        Case {
+            name: "this very transaction waiting in the mempool",
+            unspent: false,
+            history: vec![(pasted.clone(), 0)],
+            readiness: TxReadiness::InMempool,
+            spent_blocks: None,
+        },
+        Case {
+            name: "gone from the coins, and nothing in the history spends it",
+            unspent: false,
+            history: vec![(unrelated.clone(), 101)],
+            readiness: TxReadiness::Ready,
+            spent_blocks: None,
+        },
+    ];
+    for case in cases {
+        let server = FakeElectrum::start().await;
+        server.add_tx(&funding);
+        for (tx, _) in &case.history {
+            server.add_tx(tx);
+        }
+        let mut history = vec![(funded, 100)];
+        history.extend(case.history.iter().map(|(tx, at)| (tx.compute_txid(), *at)));
+        server.set_history(&script(3), &history);
+        if case.unspent {
+            server.set_unspent(&script(3), &[(funded, 0, 100, 50_000)]);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        manager
+            .set_backend(Network::Regtest, server.backend())
+            .await
+            .unwrap();
+        let preview = manager
+            .preview_transaction(&witnessed(pasted.clone()), Network::Regtest)
+            .await
+            .unwrap();
+        assert_eq!(preview.readiness, case.readiness, "{}", case.name);
+        assert_eq!(preview.inputs[0].value_sats, Some(50_000), "{}", case.name);
+        let spent = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InputSpent);
+        assert_eq!(
+            spent.map(|w| w.blocking),
+            case.spent_blocks,
+            "{}: {:?}",
+            case.name,
+            preview.warnings
+        );
+    }
 }
 
 // --- recent broadcasts ---------------------------------------------------

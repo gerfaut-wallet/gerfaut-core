@@ -125,9 +125,13 @@ pub enum TxWarningKind {
     /// An input was not found on this network.
     InputUnknown,
     /// An input was already spent, by this transaction or another.
-    /// Blocks once the spend is in a block; one still waiting in the
+    /// Blocks once the spend is in a block and the transaction that
+    /// makes it was seen spending the coin; one still waiting in the
     /// mempool may be what this transaction replaces.
     InputSpent,
+    /// This very transaction is already waiting in the mempool: it was
+    /// broadcast before, and sending it again does no harm.
+    InMempool,
     /// The PSBT declares a coin other than the one the wallet or the
     /// backend holds at that outpoint, or other than the one its own
     /// previous transaction pays: another value, another script.
@@ -185,8 +189,10 @@ impl TxWarningKind {
             // Nothing here costs anything: an input the backend has not
             // indexed, a time lock, a fee that could not be computed, an
             // output under the dust threshold, a coin of a watched
-            // wallet being spent. All of them are worth reading.
+            // wallet being spent, a transaction the network already
+            // holds. All of them are worth reading.
             TxWarningKind::InputUnknown
+            | TxWarningKind::InMempool
             | TxWarningKind::Locked
             | TxWarningKind::FeeUnknown
             | TxWarningKind::DustOutput
@@ -205,8 +211,9 @@ pub struct TxWarning {
     /// fall through a hand-written table into an untoned panel.
     pub severity: TxSeverity,
     /// Whether the network is sure to refuse the transaction while this
-    /// holds: a signature missing, a coin already spent in a block,
-    /// outputs past all the bitcoin there will ever be, or outputs over
+    /// holds: a signature missing, a coin already spent in a block by a
+    /// transaction seen spending it, outputs past all the bitcoin there
+    /// will ever be, or outputs over
     /// inputs whose every amount is proven (by a watched wallet, the
     /// backend, or the previous transaction a PSBT carries). A preview
     /// with one is not ready, so neither application can send it, and
@@ -254,6 +261,9 @@ pub enum TxReadiness {
     Refused,
     /// Some inputs carry no signature, and that is all that holds it.
     Unsigned,
+    /// Signed, and already waiting in the mempool: it was broadcast
+    /// before. It can be sent again, which does no harm.
+    InMempool,
 }
 
 /// What the fee rate is measured on.
@@ -315,7 +325,8 @@ pub struct TxPreview {
     pub rbf: bool,
     /// Whether the transaction can be sent: every input is signed, and
     /// no caution says the network is sure to refuse it
-    /// ([`TxWarning::blocking`]). The same as `readiness` being ready.
+    /// ([`TxWarning::blocking`]). The same as `readiness` being ready or
+    /// in the mempool.
     pub ready: bool,
     /// Where it stands, in the words of the readiness pill.
     pub readiness: TxReadiness,
@@ -783,6 +794,12 @@ pub struct SpentBy {
     /// mempool can be replaced, and the transaction previewed may be
     /// the replacement.
     pub confirmed: bool,
+    /// Whether that transaction was seen spending the coin: held by the
+    /// watched wallet, or handed over by the backend, its txid checked,
+    /// with this coin among its inputs. A backend's word alone, one that
+    /// names a transaction it then cannot show, or one that spends
+    /// something else, is not enough to hold a broadcast back on.
+    pub verified: bool,
 }
 
 /// What the manager learned about an output beyond the script.
@@ -918,6 +935,7 @@ pub fn build_preview(
 
     let txid = tx.compute_txid();
     let mut warnings = Vec::new();
+    let mut in_mempool = false;
     let unsigned = inputs.iter().filter(|i| !i.signed).count();
     if unsigned > 0 {
         warnings.push(TxWarning::refused(
@@ -1055,9 +1073,28 @@ pub fn build_preview(
                      something confirmed."
                 ),
             ));
+        } else if facts
+            .spent_by
+            .is_some_and(|by| by.txid == txid && !by.confirmed)
+        {
+            // This very transaction, waiting: said once for the whole of
+            // it below, not coin by coin.
+            in_mempool = true;
         } else if facts.spent == Some(true) {
             warnings.push(spent_caution(i, txid, facts.spent_by));
         }
+    }
+    if in_mempool {
+        warnings.push(TxWarning::new(
+            TxWarningKind::InMempool,
+            if decoded.ready {
+                "This transaction is already waiting in the mempool: it was broadcast before. \
+                 Broadcasting it again does no harm."
+            } else {
+                "This transaction is already waiting in the mempool, signed: it was broadcast \
+                 before, and there is nothing left to send."
+            },
+        ));
     }
     // Every value known, every amount possible, and still no fee: the
     // outputs pay more than the inputs bring.
@@ -1194,10 +1231,12 @@ pub fn build_preview(
         TxReadiness::Refused
     } else if !decoded.ready {
         TxReadiness::Unsigned
+    } else if in_mempool {
+        TxReadiness::InMempool
     } else {
         TxReadiness::Ready
     };
-    let ready = readiness == TxReadiness::Ready;
+    let ready = matches!(readiness, TxReadiness::Ready | TxReadiness::InMempool);
     TxPreview {
         txid: txid.to_string(),
         source: decoded.source,
@@ -1266,13 +1305,23 @@ fn unsigned_count(unsigned: usize, total: usize) -> String {
 }
 
 /// The caution for input `index`, already spent. It blocks only once
-/// the spend is in a block: every node then refuses another spend of
-/// the coin. A spend still waiting in the mempool may be this very
-/// transaction, which a node takes again without complaint, or one
-/// this transaction replaces with a higher fee; the node decides.
+/// the spend is in a block, by a transaction seen spending the coin:
+/// every node then refuses another spend of it. A backend that only says
+/// so, naming a transaction it cannot show or one that spends something
+/// else, gets a caution and no say on the send. A spend still waiting in
+/// the mempool may be one this transaction replaces with a higher fee;
+/// the node decides. This very transaction waiting there is said apart.
 fn spent_caution(index: usize, txid: Txid, spent_by: Option<SpentBy>) -> TxWarning {
     let kind = TxWarningKind::InputSpent;
     match spent_by {
+        Some(by) if by.confirmed && !by.verified => TxWarning::new(
+            kind,
+            format!(
+                "The backend says input {index} is already spent in a block, but it could not \
+                 show a transaction that spends it. Broadcast stays available: if the backend \
+                 is right, the network will refuse this one."
+            ),
+        ),
         Some(by) if by.confirmed && by.txid == txid => TxWarning::refused(
             kind,
             format!(
@@ -1285,13 +1334,6 @@ fn spent_caution(index: usize, txid: Txid, spent_by: Option<SpentBy>) -> TxWarni
             format!(
                 "Input {index} is already spent by another transaction, which is in a \
                  block. The network will refuse this one."
-            ),
-        ),
-        Some(by) if by.txid == txid => TxWarning::new(
-            kind,
-            format!(
-                "Input {index} is already spent by this same transaction, which is waiting \
-                 in the mempool: it was broadcast before."
             ),
         ),
         Some(_) => TxWarning::new(
@@ -1335,6 +1377,7 @@ mod tests {
             (InputMismatch, TxSeverity::Alert),
             (UncommittedOutputs, TxSeverity::Alert),
             (InputUnknown, TxSeverity::Info),
+            (InMempool, TxSeverity::Info),
             (Locked, TxSeverity::Info),
             (FeeUnknown, TxSeverity::Info),
             (DustOutput, TxSeverity::Info),
@@ -1884,6 +1927,7 @@ mod tests {
             let facts = spent_coin(Some(SpentBy {
                 txid: spender,
                 confirmed: true,
+                verified: true,
             }));
             let preview = build_preview(&decoded, Network::Signet, &facts, &[], Some(100), 0);
             assert!(!preview.ready, "{says}");
@@ -1901,9 +1945,9 @@ mod tests {
     }
 
     /// A spend still waiting in the mempool is not the last word: this
-    /// transaction may replace it with a higher fee, or be it, sent
-    /// again. The node decides; the caution stays, red, and Broadcast
-    /// stays on. So does a spend nobody could place.
+    /// transaction may replace it with a higher fee. The node decides;
+    /// the caution stays, red, and Broadcast stays on. So does a spend
+    /// nobody could place.
     #[test]
     fn a_coin_spent_in_the_mempool_leaves_the_send_to_the_node() {
         let tx = signed_tx();
@@ -1913,15 +1957,9 @@ mod tests {
                 Some(SpentBy {
                     txid: Txid::from_byte_array([0x77; 32]),
                     confirmed: false,
+                    verified: true,
                 }),
                 "only as a replacement paying a higher fee",
-            ),
-            (
-                Some(SpentBy {
-                    txid: tx.compute_txid(),
-                    confirmed: false,
-                }),
-                "by this same transaction, which is waiting in the mempool",
             ),
             (None, "Either this transaction was broadcast before"),
         ] {
@@ -1934,6 +1972,7 @@ mod tests {
                 0,
             );
             assert!(preview.ready, "{says}");
+            assert_eq!(preview.readiness, TxReadiness::Ready, "{says}");
             assert!(preview.hex.is_some(), "{says}");
             let spent = preview
                 .warnings
@@ -1943,6 +1982,94 @@ mod tests {
             assert!(!spent.blocking, "{says}");
             assert_eq!(spent.severity, TxSeverity::Alert);
             assert!(spent.message.contains(says), "{}", spent.message);
+        }
+    }
+
+    /// This very transaction already waiting in the mempool: it was sent
+    /// before, and sending it again is harmless. No red, and no "Ready"
+    /// beside a caution that says it is already out: the pill says it is
+    /// waiting, one amber line says why, and Broadcast stays on.
+    #[test]
+    fn a_transaction_already_in_the_mempool_says_so_without_red() {
+        let tx = signed_tx();
+        let decoded = decode_transaction(&encode::serialize_hex(&tx)).unwrap();
+        // Whoever named it, the wallet or a backend's word alone: being
+        // told it is out already holds nothing back.
+        for verified in [true, false] {
+            let preview = build_preview(
+                &decoded,
+                Network::Signet,
+                &spent_coin(Some(SpentBy {
+                    txid: tx.compute_txid(),
+                    confirmed: false,
+                    verified,
+                })),
+                &[],
+                Some(100),
+                0,
+            );
+            assert_eq!(preview.readiness, TxReadiness::InMempool);
+            assert!(preview.ready);
+            assert!(preview.hex.is_some());
+            assert!(
+                preview
+                    .warnings
+                    .iter()
+                    .all(|w| w.severity == TxSeverity::Info && !w.blocking),
+                "{:?}",
+                preview.warnings
+            );
+            let waiting: Vec<&TxWarning> = preview
+                .warnings
+                .iter()
+                .filter(|w| w.kind == TxWarningKind::InMempool)
+                .collect();
+            assert_eq!(waiting.len(), 1, "said once for the whole transaction");
+            assert!(
+                waiting[0].message.contains("does no harm"),
+                "{}",
+                waiting[0].message
+            );
+        }
+    }
+
+    /// A backend that says a coin is spent in a block but cannot show the
+    /// transaction that spends it has only its word: a caution, and the
+    /// send stays the user's. One that shows it holds the send back.
+    #[test]
+    fn a_spend_in_a_block_blocks_only_once_seen() {
+        let tx = signed_tx();
+        let decoded = decode_transaction(&encode::serialize_hex(&tx)).unwrap();
+        for verified in [false, true] {
+            let preview = build_preview(
+                &decoded,
+                Network::Signet,
+                &spent_coin(Some(SpentBy {
+                    txid: Txid::from_byte_array([0x77; 32]),
+                    confirmed: true,
+                    verified,
+                })),
+                &[],
+                Some(100),
+                0,
+            );
+            let spent = preview
+                .warnings
+                .iter()
+                .find(|w| w.kind == TxWarningKind::InputSpent)
+                .expect("the backend's word is said either way");
+            assert_eq!(spent.blocking, verified, "{}", spent.message);
+            assert_eq!(preview.ready, !verified);
+            if verified {
+                assert_eq!(preview.readiness, TxReadiness::Refused);
+            } else {
+                assert_eq!(preview.readiness, TxReadiness::Ready);
+                assert!(
+                    spent.message.contains("could not show"),
+                    "{}",
+                    spent.message
+                );
+            }
         }
     }
 
@@ -2372,6 +2499,7 @@ mod tests {
         let spent_in_a_block = Some(SpentBy {
             txid: Txid::from_byte_array([0x77; 32]),
             confirmed: true,
+            verified: true,
         });
         let unsigned = decode_transaction(&encode::serialize_hex(&unsigned_tx())).unwrap();
         let both = build_preview(

@@ -853,10 +853,21 @@ pub(crate) fn output_at(tx: &Transaction, outpoint: OutPoint) -> Result<Option<T
     Ok(tx.output.get(outpoint.vout as usize).cloned())
 }
 
+/// Whether `tx`, which a server handed over as `txid`, is that
+/// transaction and spends `outpoint`: what makes a server's word that a
+/// coin is spent more than its word.
+pub(crate) fn spends(tx: &Transaction, txid: Txid, outpoint: OutPoint) -> bool {
+    tx.compute_txid() == txid
+        && tx
+            .input
+            .iter()
+            .any(|input| input.previous_output == outpoint)
+}
+
 /// What one endpoint knows about a coin about to be spent.
 pub(crate) struct PrevoutFacts {
     pub txout: Option<TxOut>,
-    /// `None` when the endpoint cannot say (Electrum).
+    /// `None` when the endpoint cannot say.
     pub spent: Option<bool>,
     /// The transaction that spends it, when the endpoint names it.
     pub spent_by: Option<crate::broadcast::SpentBy>,
@@ -877,14 +888,7 @@ pub(crate) async fn fetch_prevout(
                 spent_by: facts.spent_by,
             })
         }
-        Endpoint::Electrum(target) => {
-            let txout = electrum::fetch_prevout(target, outpoint, proxy).await?;
-            Ok(PrevoutFacts {
-                txout,
-                spent: None,
-                spent_by: None,
-            })
-        }
+        Endpoint::Electrum(target) => electrum::fetch_prevout(target, outpoint, proxy).await,
     }
 }
 

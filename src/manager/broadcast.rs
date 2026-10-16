@@ -437,11 +437,13 @@ fn wallet_coins(
             if !engine.is_mine(txout.script_pubkey.clone()) {
                 return None;
             }
-            // At most one spend is canonical.
+            // At most one spend is canonical. The wallet holds it, so it
+            // is seen spending the coin.
             let spender = spenders.iter().find_map(|txid| {
                 canonical.get(txid).map(|&(_, confirmed)| SpentBy {
                     txid: *txid,
                     confirmed,
+                    verified: true,
                 })
             });
             Some((txout.clone(), spender))

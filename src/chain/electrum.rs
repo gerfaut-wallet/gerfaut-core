@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, Txid};
 use electrum_client::raw_client::RawClient;
 use electrum_client::socks::Socks5Stream;
 use electrum_client::{self, ElectrumApi, Param};
@@ -632,27 +632,99 @@ fn broadcast_error(timeout: Duration, error: &electrum_client::Error) -> String 
     }
 }
 
-/// The output an input spends. Electrum has no "is it spent" call
-/// without the script's whole history, which is more than a preview
-/// needs: spent-ness stays unknown here and the node says so on
-/// broadcast.
+/// Transactions of a script's history read, at most, to find the one
+/// that spends a coin: an address used over and over has a history no
+/// preview should download, and past this the coin is said to be spent
+/// by a transaction the server did not show.
+const SPENDER_LOOKUPS: usize = 32;
+
+/// The output an input spends, and whether it is spent. Electrum has no
+/// "is it spent" call: the coins of the output's script say whether it
+/// is still there, and when it is not, the script's history holds the
+/// transaction that spends it, which is read, its txid checked, to see
+/// it does. The same server, about a script it already knows from the
+/// transaction it just served: nobody new learns anything.
 pub(crate) async fn fetch_prevout(
     target: &Target,
     outpoint: OutPoint,
     proxy: Option<&str>,
-) -> Result<Option<TxOut>, String> {
+) -> Result<crate::chain::PrevoutFacts, String> {
     let fail = failed(target);
-    run(
-        target,
-        proxy,
-        call_deadline(target),
-        move |client| match client.transaction_get(&outpoint.txid) {
-            Ok(tx) => crate::chain::output_at(&tx, outpoint),
-            Err(electrum_client::Error::Protocol(_)) => Ok(None),
-            Err(error) => Err(fail(error)),
-        },
-    )
+    run(target, proxy, call_deadline(target), move |client| {
+        let txout = match client.transaction_get(&outpoint.txid) {
+            Ok(tx) => crate::chain::output_at(&tx, outpoint)?,
+            Err(electrum_client::Error::Protocol(_)) => None,
+            Err(error) => return Err(fail(error)),
+        };
+        let (spent, spent_by) = match &txout {
+            Some(txout) => spent_status(client, outpoint, &txout.script_pubkey),
+            None => (None, None),
+        };
+        Ok(crate::chain::PrevoutFacts {
+            txout,
+            spent,
+            spent_by,
+        })
+    })
     .await
+}
+
+/// Whether the coin at `outpoint`, on `script`, is spent, and by what.
+/// Anything the server refuses or fails to say leaves the question open:
+/// the coin is then neither spent nor unspent, and nothing holds the
+/// broadcast back.
+fn spent_status(
+    client: &Connection,
+    outpoint: OutPoint,
+    script: &bdk_wallet::bitcoin::Script,
+) -> (Option<bool>, Option<crate::broadcast::SpentBy>) {
+    let Ok(coins) = client.script_list_unspent(script) else {
+        return (None, None);
+    };
+    if coins
+        .iter()
+        .any(|coin| coin.tx_hash == outpoint.txid && coin.tx_pos == outpoint.vout as usize)
+    {
+        return (Some(false), None);
+    }
+    let Ok(history) = client.script_get_history(script) else {
+        return (None, None);
+    };
+    // The newest first: a coin a preview finds spent is most often spent
+    // by the transaction pasted, just sent, or by the one it replaces.
+    let candidates: Vec<(Txid, i32)> = history
+        .iter()
+        .rev()
+        .filter(|entry| entry.tx_hash != outpoint.txid)
+        .map(|entry| (entry.tx_hash, entry.height))
+        .collect();
+    let read = candidates.len().min(SPENDER_LOOKUPS);
+    let Ok(txs) = client.batch_transaction_get(candidates[..read].iter().map(|(txid, _)| txid))
+    else {
+        return (None, None);
+    };
+    for (tx, (txid, height)) in txs.iter().zip(&candidates) {
+        if crate::chain::spends(tx, *txid, outpoint) {
+            return (
+                Some(true),
+                Some(crate::broadcast::SpentBy {
+                    txid: *txid,
+                    // 0 and -1 are the mempool, the latter with a parent
+                    // there too.
+                    confirmed: *height > 0,
+                    verified: true,
+                }),
+            );
+        }
+    }
+    if read < candidates.len() {
+        // Not among its coins, and a history too long to read through:
+        // spent, by a transaction this preview does not name.
+        return (Some(true), None);
+    }
+    // Not among its coins, and nothing in its history spends it: the two
+    // answers disagree, and neither is taken.
+    (None, None)
 }
 
 /// Where a transaction stands, read off the history of one of its
@@ -1100,6 +1172,7 @@ mod tests {
         let txout = fetch_prevout(&accepted, OutPoint::new(pizza, 0), None)
             .await
             .expect("an accepted certificate carries Electrum traffic")
+            .txout
             .expect("the server knows that transaction");
         assert_eq!(txout.value.to_sat(), 1_000_000_000_000);
 
