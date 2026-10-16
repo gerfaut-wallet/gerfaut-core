@@ -65,6 +65,9 @@ impl WalletManager {
     /// fingerprint to show when the user has to decide. Reads only: the
     /// settings screen asks, the user answers.
     pub async fn inspect_certificate(&self, url: &str) -> CoreResult<CertificateReport> {
+        // The address comes from the form before it is saved: a key or
+        // an address typed as its host is not looked up.
+        chain::connect::refuse_wallet_material(url)?;
         let host = chain::electrum::certificate_key(url);
         let pin = self
             .state

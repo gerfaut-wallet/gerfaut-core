@@ -334,3 +334,34 @@ async fn an_onion_backend_without_tor_fails_before_any_connection() {
         report.failures[0].message
     );
 }
+
+/// The settings screen asks for a server's certificate before it saves
+/// the address: a key or an address typed as its host is refused there
+/// too, and never looked up, nor stored.
+#[tokio::test]
+async fn a_certificate_is_not_asked_of_wallet_material() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let tpub = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
+    for url in [
+        format!("ssl://{tpub}:50002"),
+        "ssl://tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx:50002".to_owned(),
+        "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2:50002:s".to_owned(),
+    ] {
+        let error = manager.inspect_certificate(&url).await.unwrap_err();
+        assert!(
+            error.to_string().contains("not the name of a server"),
+            "{url}: {error}"
+        );
+        let refused = manager
+            .set_backend(
+                Network::Signet,
+                BackendConfig::CustomElectrum {
+                    url: url.clone(),
+                    own_node: false,
+                },
+            )
+            .await;
+        assert!(refused.is_err(), "{url}");
+    }
+}

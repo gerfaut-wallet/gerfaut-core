@@ -180,6 +180,7 @@ pub fn parse_backend(text: &str) -> CoreResult<ScannedBackend> {
             )));
         }
     }
+    refuse_wallet_material(text)?;
 
     if let Some((scheme, rest)) = text.split_once("://") {
         let rest = rest.trim_end_matches('/');
@@ -243,6 +244,57 @@ pub fn parse_backend(text: &str) -> CoreResult<ScannedBackend> {
         _ => !super::is_onion_host(&host),
     };
     Ok(electrum(host, port, tls))
+}
+
+/// Refuses a server address whose host is wallet material: a key or an
+/// address pasted into the host field of the settings form, which the
+/// form sends on behind `ssl://`, past the check on what the text
+/// starts with. Taken for a host name, it would go to the system's
+/// resolver in the clear the first time the server was tried. The host
+/// is read as typed, since a base58 key or address only reads as one in
+/// its own case, and as the URL parser reads it. A private key anywhere
+/// in the text is refused as such, unquoted.
+pub(crate) fn refuse_wallet_material(text: &str) -> CoreResult<()> {
+    crate::input::reject_private_material(text)?;
+    let canonical = super::host_of(text);
+    for host in std::iter::once(typed_host(text)).chain(canonical.as_deref()) {
+        if let Some(what) = wallet_material(host) {
+            return Err(reject(format!(
+                "the host is {what}, not the name of a server"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The host of a server address as it was typed: after the scheme and
+/// any userinfo, up to the port or the path. An IPv6 literal comes back
+/// as its opening bracket and first group, which is no wallet material.
+fn typed_host(text: &str) -> &str {
+    let text = text.trim();
+    let rest = text.split_once("://").map_or(text, |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    host.split(':').next().unwrap_or_default()
+}
+
+/// What a host is when it is wallet material rather than a name: a
+/// Bitcoin address, on any network and in either case bech32 allows,
+/// or an extended key. Both carry a checksum, so no server name passes
+/// for one.
+fn wallet_material(host: &str) -> Option<&'static str> {
+    use bdk_wallet::bitcoin::address::{Address, NetworkUnchecked};
+    use bdk_wallet::bitcoin::base58;
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.parse::<Address<NetworkUnchecked>>().is_ok() {
+        return Some("a Bitcoin address");
+    }
+    if base58::decode_check(host).is_ok_and(|data| data.len() == 78) {
+        return Some("an extended public key");
+    }
+    None
 }
 
 /// The form a custom backend address is stored in, read the way a
@@ -681,5 +733,54 @@ mod tests {
             ok("  ssl://host.example:50002\n").url,
             "ssl://host.example:50002"
         );
+    }
+
+    /// A key or an address pasted into the host field reaches the
+    /// parser behind the scheme the form puts in front of it, past the
+    /// check on what the text starts with. Taken for a host name, it
+    /// would go to the system's resolver. Whatever form the address
+    /// takes, it is refused, and stored in none.
+    #[test]
+    fn wallet_material_in_the_host_is_refused() {
+        use ScannedBackendKind::{Electrum, Esplora};
+        let tpub = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
+        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+        let segwit = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+        let legacy = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
+        let nested = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy";
+        let test = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+        for (kind, text) in [
+            (Electrum, format!("ssl://{tpub}:50002")),
+            (Electrum, format!("tcp://{xpub}:50001")),
+            (Electrum, format!("electrum://{xpub}.:50001")),
+            (Electrum, format!("ssl://{segwit}:50002")),
+            (Electrum, format!("ssl://{}:50002", segwit.to_uppercase())),
+            (Electrum, format!("{legacy}:50002:s")),
+            (Electrum, format!("{nested}:50001")),
+            (Electrum, format!("tls://{test}")),
+            (Esplora, format!("https://{test}/api")),
+            (Esplora, format!("https://user:pass@{nested}:3002/api")),
+            (Esplora, format!("http://{tpub}/api")),
+        ] {
+            let error = parse_backend(&text).unwrap_err().to_string();
+            assert!(
+                error.contains("not the name of a server"),
+                "{text}: {error}"
+            );
+            assert!(stored_form(kind, &text).is_err(), "{text}");
+            assert!(refuse_wallet_material(&text).is_err(), "{text}");
+        }
+        // A private key is refused as one, and never quoted back.
+        let tprv = "tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L";
+        let error = parse_backend(&format!("ssl://{tprv}:50002")).unwrap_err();
+        assert!(
+            matches!(error, CoreError::PrivateMaterialRejected),
+            "{error}"
+        );
+        // A server whose name merely starts like a key still reads.
+        assert_eq!(ok("ssl://xpub.example.org:50002").host, "xpub.example.org");
+        assert_eq!(ok("tcp://tpubnode.example:50001").host, "tpubnode.example");
+        assert_eq!(ok("https://bc1.example.org/api").host, "bc1.example.org");
+        assert_eq!(ok("[2001:db8::1]:50002").host, "2001:db8::1");
     }
 }
