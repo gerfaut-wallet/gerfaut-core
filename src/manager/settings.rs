@@ -308,6 +308,20 @@ impl WalletManager {
         Ok(Some(tor::resolve(&settings, &data_dir).await?.proxy()))
     }
 
+    /// [`Self::beside_syncs_proxy`] without starting Tor: a Tor that
+    /// already runs, or [`CoreError::Tor`]. For a request the app makes
+    /// on its own and that can wait for a sync or the live watch to
+    /// bring Tor up, the update check of a session: Android asks again
+    /// at every return to the screen and the desktop every hour, and
+    /// neither starts the built-in client for a check.
+    pub(super) async fn running_beside_syncs_proxy(&self) -> CoreResult<Option<String>> {
+        if !self.uses_tor().await {
+            return Ok(None);
+        }
+        let settings = self.state.lock().await.payload.settings.tor.clone();
+        Ok(Some(tor::resolve_running(&settings).await?.proxy()))
+    }
+
     /// Whether the backend of the active network is reached through
     /// Tor: the same question a sync asks, over the same endpoints.
     async fn backend_needs_tor(&self) -> bool {
