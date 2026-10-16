@@ -123,8 +123,10 @@ impl WalletManager {
                                     script_pubkey: script.clone(),
                                 });
                                 input_facts[i].wallet = Some(wallet_ref.clone());
-                                input_facts[i].spent = Some(false);
-                                // The server's figure, not a transaction.
+                                // The server's figure, not a transaction, and
+                                // as old as the last sync: the backend is
+                                // asked for the transaction and where the
+                                // coin stands now.
                                 input_facts[i].listed = true;
                             }
                         }
@@ -160,13 +162,14 @@ impl WalletManager {
         }
 
         // What only the chain knows, outside the lock: the coins the
-        // vault does not hold, and whether known coins are still
-        // unspent. One endpoint, the first that answers. A coin the
-        // PSBT describes is asked about all the same: its word is its
-        // author's, and the preview confronts it with the chain's.
+        // vault does not hold, whether known coins are still unspent,
+        // and the transactions behind a watched address's listing. One
+        // endpoint, the first that answers. A coin the PSBT describes is
+        // asked about all the same: its word is its author's, and the
+        // preview confronts it with the chain's.
         let needs_chain = input_facts
             .iter()
-            .any(|f| f.prevout.is_none() || f.spent.is_none());
+            .any(|f| f.prevout.is_none() || f.spent.is_none() || f.listed);
         // No backend for this network, or a Tor route that cannot be
         // opened, is no answer at all: the coins stay unchecked below,
         // the same as when every endpoint stopped answering. Without
@@ -196,9 +199,9 @@ impl WalletManager {
                     }
                     match chain::fetch_prevout(endpoint, outpoints[i], proxy.as_deref()).await {
                         Ok(chain_facts) => {
-                            if facts.prevout.is_none() {
+                            if facts.prevout.is_none() || facts.listed {
                                 match chain_facts.txout {
-                                    Some(txout) => facts.prevout = Some(txout),
+                                    Some(txout) => backed(facts, txout),
                                     None => facts.unknown = true,
                                 }
                             }
@@ -225,9 +228,11 @@ impl WalletManager {
         // fee, but it says which coin nobody stood behind: without
         // this, a backend that stopped answering, or no backend at all,
         // was indistinguishable from one that agreed.
+        // A listing nothing backed is in the same place: the server's
+        // figure from the last sync, its coin's standing unknown.
         if needs_chain {
             for facts in input_facts.iter_mut() {
-                if facts.prevout.is_none() && !facts.unknown {
+                if (facts.prevout.is_none() || facts.listed) && !facts.unknown {
                     facts.unchecked = true;
                 }
             }
@@ -449,6 +454,26 @@ fn wallet_coins(
             Some((txout.clone(), spender))
         })
         .collect()
+}
+
+/// A coin the backend handed over in its transaction, txid checked: the
+/// value and script it holds now stand for the coin. A watched address's
+/// listing it replaces is kept when the two differ, for the caution
+/// that says so, and the wallet keeps the coin only while it sits on
+/// the address listed.
+fn backed(facts: &mut InputFacts, txout: TxOut) {
+    if facts.listed {
+        facts.listed = false;
+        if let Some(listed) = facts.prevout.take().filter(|listed| *listed != txout) {
+            let wallet = if listed.script_pubkey == txout.script_pubkey {
+                facts.wallet.clone()
+            } else {
+                facts.wallet.take()
+            };
+            facts.contradicted_listing = wallet.map(|wallet| (wallet, listed));
+        }
+    }
+    facts.prevout = Some(txout);
 }
 
 /// Every node said the same thing: say it once, with the first host.

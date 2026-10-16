@@ -305,11 +305,16 @@ pub struct TxPreview {
     /// when there is a fee.
     pub fee_unknown_reason: Option<String>,
     /// Whether a value shown for an input is one nothing proves: a
-    /// witness entry the PSBT declares, or a watched address's listing,
-    /// with no wallet engine, no backend and no previous transaction
-    /// behind it. The inputs total and the fee rest on that word then,
-    /// and say so.
+    /// witness entry the PSBT declares, or a watched address's listing
+    /// the backend did not back with the transaction, with no wallet
+    /// engine and no previous transaction behind it. The inputs total
+    /// and the fee rest on that word then, and say so.
     pub amounts_declared: bool,
+    /// Whether one of those values is a watched address's listing, the
+    /// server's figure, rather than the PSBT's own word: what nothing
+    /// proves is then not only what the PSBT claims, and the mark on the
+    /// amounts says it neutrally.
+    pub amounts_listed: bool,
     /// Virtual size in vbytes, of the transaction as it is: before its
     /// signatures when some are missing.
     pub vsize: u64,
@@ -932,6 +937,14 @@ pub fn build_preview(
         .iter()
         .zip(&proven)
         .any(|(input, &proven)| input.value_sats.is_some() && !proven);
+    // The value shown for a coin the PSBT does not prove is the wallet's
+    // or the backend's first: a listing still standing is the server's.
+    let amounts_listed = (0..inputs.len()).any(|i| {
+        !proven[i]
+            && input_facts
+                .get(i)
+                .is_some_and(|f| f.listed && f.prevout.is_some())
+    });
 
     let txid = tx.compute_txid();
     let mut warnings = Vec::new();
@@ -1020,19 +1033,24 @@ pub fn build_preview(
             };
             warnings.push(TxWarning::new(TxWarningKind::InputMismatch, message));
         }
-        // A listing the previous transaction contradicts, set aside before
-        // the backend was asked.
+        // A listing a transaction contradicts: the previous one the PSBT
+        // carries, set aside before the backend was asked, or the one the
+        // backend handed over when asked about the coin.
         if let (Some((wallet, listed)), Some(proof)) = (
             &facts.contradicted_listing,
-            decoded.inputs.get(i).and_then(|d| d.prevout.as_ref()),
+            spent.get(i).and_then(Option::as_ref),
         ) {
+            let source = if decoded.inputs[i].prevout_proven {
+                "the previous transaction the PSBT carries"
+            } else {
+                "the transaction the backend holds"
+            };
             warnings.push(TxWarning::new(
                 TxWarningKind::InputMismatch,
                 format!(
                     "Input {i} is not what {} lists: its server lists this coin as {} sats on \
-                     {}, but the previous transaction the PSBT carries, the one this input \
-                     spends, pays {} sats to {}. The value shown and the fee go by that \
-                     transaction.",
+                     {}, but {source}, the one this input spends, pays {} sats to {}. The value \
+                     shown and the fee go by that transaction.",
                     wallet.name,
                     listed.value.to_sat(),
                     place(listed),
@@ -1059,6 +1077,21 @@ pub fn build_preview(
                     "Input {i} could not be checked: no backend answered about this coin. \
                      Its value is proven by the previous transaction the PSBT carries, the \
                      one this input spends; whether the coin is still there to spend is not."
+                ),
+            ));
+        } else if facts.unchecked
+            && facts.listed
+            && let Some(wallet) = &facts.wallet
+        {
+            // Nothing answered about a coin a watched address listed: the
+            // value shown is that listing, as old as the last sync.
+            warnings.push(TxWarning::new(
+                TxWarningKind::InputUnknown,
+                format!(
+                    "Input {i} could not be checked: no backend answered about this coin. Its \
+                     value here, and the fee, are what the server listed for {} at the last \
+                     sync, not something confirmed.",
+                    wallet.name
                 ),
             ));
         } else if facts.unchecked {
@@ -1248,6 +1281,7 @@ pub fn build_preview(
         fee_rate_basis,
         fee_unknown_reason,
         amounts_declared,
+        amounts_listed,
         vsize,
         weight: tx.weight().to_wu(),
         size: tx.total_size() as u64,
@@ -3416,5 +3450,55 @@ mod tests {
             .find(|w| w.kind == TxWarningKind::HighFeeRate)
             .expect("an estimate is close enough to say a rate is high");
         assert!(high.message.contains("once signed"), "{}", high.message);
+    }
+
+    // --- whose word an amount is ------------------------------------------
+
+    /// What a watched address's server listed, with nothing to back it:
+    /// unproven, as a PSBT's word is, but not the PSBT's. The preview says
+    /// whose figure it is, and a coin nobody answered about says so too.
+    #[test]
+    fn a_listing_is_unproven_but_not_the_psbts_word() {
+        let decoded = decode_transaction(&encode::serialize_hex(&signed_tx())).unwrap();
+        let listed = InputFacts {
+            prevout: Some(TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: p2wpkh(0x33),
+            }),
+            wallet: Some(WalletRef {
+                id: "w1".into(),
+                name: "Watch".into(),
+            }),
+            listed: true,
+            unchecked: true,
+            ..Default::default()
+        };
+        let preview = build_preview(&decoded, Network::Signet, &[listed], &[], Some(100), 0);
+        assert!(preview.amounts_declared);
+        assert!(preview.amounts_listed);
+        let unknown = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InputUnknown)
+            .expect("nobody checked the listing");
+        assert!(
+            unknown.message.contains("the server listed for Watch"),
+            "{}",
+            unknown.message
+        );
+        assert!(!unknown.message.contains("claims"), "{}", unknown.message);
+
+        // The PSBT's own word is still called that.
+        let declared = unsigned_psbt_on(p2wpkh(0x33), false);
+        let preview = build_preview(
+            &declared,
+            Network::Signet,
+            &nobody_answered(1),
+            &[],
+            Some(100),
+            0,
+        );
+        assert!(preview.amounts_declared);
+        assert!(!preview.amounts_listed);
     }
 }

@@ -678,17 +678,36 @@ fn psbt_spending_coin(
 
 /// A watched taproot address whose server lists a coin at 1 000 sats,
 /// and a PSBT that describes it, by a witness entry alone, as 100 000
-/// and pays 90 000 from it. The listing is no proof: it is shown, the
-/// outputs over it are said, and the transaction is not refused on it.
+/// and pays 90 000 from it. The backend that would show the transaction
+/// does not answer. The listing is no proof: it is shown, marked as the
+/// server's figure and not the PSBT's, the outputs over it are said, and
+/// the transaction is not refused on it.
 #[tokio::test]
 async fn a_listing_never_refuses_a_transaction() {
     use crate::broadcast::{TxReadiness, TxWarningKind};
+    use crate::testkit::{nowhere, script, transaction};
     use bdk_wallet::bitcoin::hashes::Hash;
     use bdk_wallet::bitcoin::{OutPoint, Txid};
 
     let coin = OutPoint::new(Txid::from_byte_array([0x55; 32]), 0);
     let dir = tempfile::tempdir().unwrap();
-    let (manager, script) = listed_coin(dir.path(), 1_000, coin).await;
+    let (manager, script_pubkey) = listed_coin(dir.path(), 1_000, coin).await;
+    let silent = esplora_knowing(
+        transaction(&[nowhere(1, 0)], &[(script(3).as_str(), 50_000)]),
+        Unknown::NoAnswer,
+    )
+    .await;
+    manager
+        .set_backend(
+            Network::Signet,
+            BackendConfig::CustomEsplora {
+                url: silent,
+                own_node: false,
+            },
+        )
+        .await
+        .unwrap();
+    let script = script_pubkey;
     let text = psbt_spending_coin(coin, 90_000, |input| {
         input.witness_utxo = Some(TxOut {
             value: Amount::from_sat(100_000),
@@ -701,6 +720,17 @@ async fn a_listing_never_refuses_a_transaction() {
         .unwrap();
     assert_eq!(preview.inputs[0].value_sats, Some(1_000));
     assert!(preview.amounts_declared);
+    assert!(preview.amounts_listed);
+    let unchecked = preview
+        .warnings
+        .iter()
+        .find(|w| w.kind == TxWarningKind::InputUnknown)
+        .expect("nobody backed the listing, and the preview says so");
+    assert!(
+        unchecked.message.contains("listed for Watch"),
+        "{}",
+        unchecked.message
+    );
     assert!(
         !preview.warnings.iter().any(|w| w.blocking),
         "{:?}",
@@ -790,6 +820,60 @@ async fn a_contradicted_listing_sends_the_coin_to_the_backend() {
         .expect("the backend's answer about the coin");
     assert!(spent.blocking);
     assert_eq!(preview.readiness, TxReadiness::Refused);
+}
+
+/// A watched address lists a coin; the backend hands over the
+/// transaction that pays it, whose txid it checked. The value shown is
+/// the transaction's from then on, proven: no mark, no caution when the
+/// two agree. A listing the transaction contradicts is said, and the
+/// coin keeps its wallet while it sits on the address listed.
+#[tokio::test]
+async fn the_backend_backs_a_listing_with_its_transaction() {
+    use crate::broadcast::TxWarningKind;
+    use crate::testkit::{nowhere, transaction};
+    use bdk_wallet::bitcoin::OutPoint;
+    use std::str::FromStr;
+
+    let script = bdk_wallet::bitcoin::Address::from_str(TAPROOT)
+        .unwrap()
+        .assume_checked()
+        .script_pubkey();
+    let funding = transaction(&[nowhere(1, 0)], &[(&script.to_hex_string(), 100_000)]);
+    let coin = OutPoint::new(funding.compute_txid(), 0);
+    for (listed, contradicted) in [(100_000, false), (1_000, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, _) = listed_coin(dir.path(), listed, coin).await;
+        manager
+            .set_backend(
+                Network::Signet,
+                BackendConfig::CustomEsplora {
+                    url: esplora_knowing(funding.clone(), Unknown::NotFound).await,
+                    own_node: false,
+                },
+            )
+            .await
+            .unwrap();
+        let preview = manager
+            .preview_transaction(&psbt_spending_coin(coin, 90_000, |_| {}), Network::Signet)
+            .await
+            .unwrap();
+        assert_eq!(preview.inputs[0].value_sats, Some(100_000));
+        assert_eq!(preview.fee_sats, Some(10_000));
+        assert!(!preview.amounts_declared, "the transaction proves it");
+        assert!(!preview.amounts_listed);
+        assert_eq!(
+            preview.inputs[0].wallet.as_ref().map(|w| w.name.as_str()),
+            Some("Watch")
+        );
+        let kinds: Vec<TxWarningKind> = preview.warnings.iter().map(|w| w.kind).collect();
+        assert!(!kinds.contains(&TxWarningKind::InputUnknown), "{kinds:?}");
+        assert_eq!(
+            kinds.contains(&TxWarningKind::InputMismatch),
+            contradicted,
+            "{:?}",
+            preview.warnings
+        );
+    }
 }
 
 /// A coin no watched wallet holds, behind an Electrum server: the coins
