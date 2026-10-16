@@ -420,11 +420,11 @@ fn witnessed(mut tx: bdk_wallet::bitcoin::Transaction) -> String {
     bdk_wallet::bitcoin::consensus::encode::serialize_hex(&tx)
 }
 
-/// The rehearsal of 0.1.0: a transaction of the watched wallet, long
-/// confirmed, pasted again. Its coin is spent in a block, by itself
-/// or by another, and the preview said "Ready to broadcast" beside the
-/// red line saying so. The wallet's own view now places the spend, and
-/// a spend in a block blocks the send.
+/// A transaction of the watched wallet, long confirmed, pasted again:
+/// its coin is spent in a block, by itself or by another. The preview
+/// used to say "Ready to broadcast" beside the red line saying so. The
+/// wallet's own view places the spend, and a spend in a block blocks
+/// the send.
 #[tokio::test]
 async fn a_watched_coin_spent_in_a_block_blocks_the_send() {
     use crate::broadcast::TxWarningKind;
