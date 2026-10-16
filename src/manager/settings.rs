@@ -268,33 +268,6 @@ impl WalletManager {
         })
     }
 
-    /// Asks GitHub for the latest release of `owner/repo` and compares
-    /// it with the running version: for the button, and for the check
-    /// the apps run on their own once a day. It takes the route the
-    /// syncs take. When [`Self::uses_tor`] says so it goes through the
-    /// Tor proxy a sync would resolve, and when that proxy cannot be
-    /// had it fails with [`CoreError::Tor`] before any request exists:
-    /// never a request in the clear. Anything else that goes wrong is
-    /// "could not check".
-    pub async fn check_update(
-        &self,
-        repo: &str,
-        current_version: &str,
-    ) -> CoreResult<crate::updates::UpdateCheck> {
-        self.check_update_at(crate::updates::GITHUB_API, repo, current_version)
-            .await
-    }
-
-    pub(crate) async fn check_update_at(
-        &self,
-        api: &str,
-        repo: &str,
-        current_version: &str,
-    ) -> CoreResult<crate::updates::UpdateCheck> {
-        let proxy = self.beside_syncs_proxy().await?;
-        crate::updates::check_update(api, repo, current_version, proxy.as_deref()).await
-    }
-
     /// The proxy for a request that is not a sync, the update check and
     /// the price among them: the Tor route a sync would resolve when
     /// [`Self::uses_tor`] says so, nothing otherwise. When Tor is
