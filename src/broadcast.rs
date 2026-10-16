@@ -341,10 +341,20 @@ pub struct RecentBroadcast {
     pub network: Network,
     /// The transaction as sent, hex: what a status check decodes.
     pub hex: String,
-    /// Host that accepted it.
+    /// Host that accepted it. Empty for one the Android app remembered
+    /// before the vault did, which did not keep it.
+    #[serde(default)]
     pub backend: String,
     /// Unix timestamp, seconds.
     pub at: u64,
+}
+
+impl RecentBroadcast {
+    /// Whether `hex` reads as a transaction whose txid is `txid`.
+    pub(crate) fn holds_together(&self) -> bool {
+        encode::deserialize_hex::<Transaction>(&self.hex)
+            .is_ok_and(|tx| tx.compute_txid().to_string() == self.txid)
+    }
 }
 
 /// A transaction decoded from any accepted form, before the chain is
