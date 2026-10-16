@@ -183,6 +183,9 @@ pub(crate) struct ElectrumState {
     pub asked: Vec<String>,
     /// Connections the client closed.
     pub closed: usize,
+    /// What the server says it runs, first in its answer to
+    /// `server.version`.
+    pub software: &'static str,
 }
 
 /// Heights past which the fake Electrum server makes a header up on the
@@ -244,6 +247,7 @@ impl FakeElectrum {
             state: Arc::new(Mutex::new(ElectrumState {
                 height: 100,
                 version: "1.4",
+                software: "fake 1.0",
                 ..Default::default()
             })),
         };
@@ -376,7 +380,7 @@ impl FakeElectrum {
         let param = request["params"][0].clone();
         let scripthash = param.as_str().unwrap_or_default().to_owned();
         let result = match method {
-            "server.version" => json!(["fake 1.0", state.version]),
+            "server.version" => json!([state.software, state.version]),
             "blockchain.headers.subscribe" => {
                 json!({ "height": state.height, "hex": state.header(state.height) })
             }

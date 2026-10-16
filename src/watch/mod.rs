@@ -75,7 +75,9 @@
 //!   some number on one connection, is not asked for them again under
 //!   the configuration: they are reported once, when refused, and left
 //!   to the regular syncs. The status counts them with what the watch
-//!   leaves out ([`WalletCoverage`]). That number is asked again a day
+//!   leaves out ([`WalletCoverage`]), and says which of the two left
+//!   them out and what would bring them in ([`LeftOut`]): the apps
+//!   phrase it and work nothing out. That number is asked again a day
 //!   after it was learned, an hour after when it is none: the session
 //!   open there ends, the next one asks for the whole list, and what
 //!   the server refuses again is not reported again. A number learned
@@ -343,12 +345,143 @@ pub struct WatchStatus {
     pub wallets: Vec<WalletCoverage>,
     /// What an Electrum server says it runs, the way it answers
     /// `server.version`: "ElectrumX 1.18.0", "Fulcrum 1.12.0" and the
-    /// like, so that on the user's own node, an app that sees scripts
-    /// left out can name the setting of that server which takes more.
+    /// like, from which [`Remedy::RaiseServerLimit`] names the setting
+    /// of the user's own node that takes more.
     /// `None` over the other transports. Kept to one short line, as any
     /// words of a server.
     #[serde(default)]
     pub server_software: Option<String>,
+    /// Why the watch leaves scripts to the regular syncs, and what would
+    /// let it hear them: present exactly when it runs and
+    /// `left_out_scripts` is not zero.
+    #[serde(default)]
+    pub left_out: Option<LeftOut>,
+}
+
+/// Why the watch leaves scripts to the regular syncs, the limits it
+/// keeps to, and the way out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeftOut {
+    pub reason: LeftOutReason,
+    /// What the watch takes under the backend in use.
+    pub limits: WatchLimits,
+    /// The backend is the user's own node, so `limits` are
+    /// [`WatchLimits::OWN_NODE`].
+    pub own_node: bool,
+    /// `None` when nothing the user can do takes more: the limits of
+    /// their own node reached, a server that turned scripts down one by
+    /// one, or one that sets no limit to raise.
+    pub remedy: Option<Remedy>,
+}
+
+/// What leaves the scripts out. The server, as soon as it refused any
+/// of them: on the user's own node that is the one thing its owner can
+/// change. Which wallets each reason touches, and how much,
+/// [`WalletCoverage::refused_scripts`] says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeftOutReason {
+    /// The limits of the watch, per wallet or in all.
+    LiveLimit,
+    /// The server refused some, past the most it takes on one
+    /// connection or one by one.
+    ServerRefused,
+}
+
+/// What lets the watch hear the scripts it leaves out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Remedy {
+    /// Watch through a node of the user's own and say so ("This is my
+    /// node"): the watch then takes `limits`.
+    OwnNode { limits: WatchLimits },
+    /// Raise the subscription limit of the user's own node: `settings`
+    /// are what its software calls it, empty with `server` when that
+    /// software is not one the watch knows.
+    RaiseServerLimit {
+        server: Option<ServerSoftware>,
+        settings: Vec<String>,
+    },
+}
+
+/// An Electrum server whose subscription limit the watch knows how to
+/// name, as it answers `server.version`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerSoftware {
+    /// `max_subs_per_ip`, 75,000 by default.
+    Fulcrum,
+    /// A cost per session rather than a count of subscriptions:
+    /// `COST_SOFT_LIMIT` and `COST_HARD_LIMIT`.
+    #[serde(rename = "electrumx")]
+    ElectrumX,
+    /// Blockstream's electrs, `electrs-esplora`:
+    /// `--electrum-subscription-limit`.
+    ElectrsEsplora,
+    /// mempool's electrs: `--electrum-max-subscriptions`.
+    MempoolElectrs,
+}
+
+impl Remedy {
+    /// What raises the limit of the user's own node, by what it says it
+    /// runs. electrs as its author publishes it (`electrs/0.10.9`) caps
+    /// nothing, so there is nothing to raise.
+    fn raise(software: Option<&str>) -> Option<Remedy> {
+        use ServerSoftware::*;
+        let name = software.unwrap_or_default().trim().to_ascii_lowercase();
+        let (server, settings): (_, &[&str]) = if name.starts_with("fulcrum") {
+            (Some(Fulcrum), &["max_subs_per_ip"])
+        } else if name.starts_with("electrumx") {
+            (Some(ElectrumX), &["COST_SOFT_LIMIT", "COST_HARD_LIMIT"])
+        } else if name.starts_with("electrs-esplora") {
+            (Some(ElectrsEsplora), &["--electrum-subscription-limit"])
+        } else if name.starts_with("mempool-electrs") {
+            (Some(MempoolElectrs), &["--electrum-max-subscriptions"])
+        } else if name.starts_with("electrs/") {
+            return None;
+        } else {
+            (None, &[])
+        };
+        Some(Remedy::RaiseServerLimit {
+            server,
+            settings: settings.iter().map(|&setting| setting.to_owned()).collect(),
+        })
+    }
+}
+
+impl LeftOut {
+    /// The verdict on what `coverage` leaves out under `backend`.
+    /// `past_server_limit` says the server's limit on one connection
+    /// left scripts out, the one refusal a setting of the server lifts;
+    /// `software` is what that server says it runs.
+    fn of(
+        coverage: &[WalletCoverage],
+        backend: &BackendConfig,
+        past_server_limit: bool,
+        software: Option<&str>,
+    ) -> LeftOut {
+        let own_node = backend.is_own_node();
+        let reason = if coverage.iter().any(|wallet| wallet.refused_scripts > 0) {
+            LeftOutReason::ServerRefused
+        } else {
+            LeftOutReason::LiveLimit
+        };
+        let remedy = if !own_node {
+            Some(Remedy::OwnNode {
+                limits: WatchLimits::OWN_NODE,
+            })
+        } else if past_server_limit {
+            Remedy::raise(software)
+        } else {
+            None
+        };
+        LeftOut {
+            reason,
+            limits: WatchLimits::of(backend),
+            own_node,
+            remedy,
+        }
+    }
 }
 
 /// How much of one wallet the live watch hears.
@@ -364,6 +497,11 @@ pub struct WalletCoverage {
     /// regular syncs: past the caps on the list, or refused by the
     /// server.
     pub left_out_scripts: u32,
+    /// Of those, the ones the server refused, one by one or past the
+    /// most it takes on one connection; the rest are past the limits of
+    /// the watch.
+    #[serde(default)]
+    pub refused_scripts: u32,
 }
 
 /// Whether a wallet is watched whole, in part, or only synced.
@@ -381,7 +519,12 @@ pub enum Coverage {
 }
 
 impl WalletCoverage {
-    fn of(wallet_id: String, watched_scripts: u32, left_out_scripts: u32) -> WalletCoverage {
+    fn of(
+        wallet_id: String,
+        watched_scripts: u32,
+        left_out_scripts: u32,
+        refused_scripts: u32,
+    ) -> WalletCoverage {
         let coverage = if watched_scripts == 0 {
             Coverage::SyncOnly
         } else if left_out_scripts == 0 {
@@ -394,6 +537,7 @@ impl WalletCoverage {
             coverage,
             watched_scripts,
             left_out_scripts,
+            refused_scripts,
         }
     }
 }
@@ -883,20 +1027,31 @@ impl Watched {
     }
 
     /// How much of each wallet is heard, in the order of the wallets:
-    /// see [`Self::heard`].
+    /// see [`Self::heard`]. What the list holds of a wallet and the
+    /// server does not hear is what it refused.
     pub fn coverage(&self, refusals: Option<&Refusals>) -> Vec<WalletCoverage> {
-        let mut heard = vec![0u32; self.wallets.len()];
-        for entry in self.heard(refusals) {
-            for &owner in &entry.owners {
-                heard[owner] = heard[owner].saturating_add(1);
+        let per_wallet = |entries: &mut dyn Iterator<Item = &Entry>| {
+            let mut counts = vec![0u32; self.wallets.len()];
+            for entry in entries {
+                for &owner in &entry.owners {
+                    counts[owner] = counts[owner].saturating_add(1);
+                }
             }
-        }
+            counts
+        };
+        let listed = per_wallet(&mut self.entries.iter());
+        let heard = per_wallet(&mut self.heard(refusals));
         self.wallets
             .iter()
-            .zip(heard)
+            .zip(heard.into_iter().zip(listed))
             .zip(&self.worth)
-            .map(|(((wallet_id, _), heard), worth)| {
-                WalletCoverage::of(wallet_id.clone(), heard, worth.saturating_sub(heard))
+            .map(|(((wallet_id, _), (heard, listed)), worth)| {
+                WalletCoverage::of(
+                    wallet_id.clone(),
+                    heard,
+                    worth.saturating_sub(heard),
+                    listed.saturating_sub(heard),
+                )
             })
             .collect()
     }
@@ -1132,6 +1287,17 @@ impl Hub {
             .iter()
             .filter(|wallet| wallet.left_out_scripts > 0)
             .count() as u32;
+        next.left_out = (next.left_out_scripts > 0).then(|| {
+            let past_server_limit = self
+                .heard_refusals()
+                .is_some_and(|refusals| self.watched.past_limit(refusals).next().is_some());
+            LeftOut::of(
+                &coverage,
+                &self.config.backend,
+                past_server_limit,
+                next.server_software.as_deref(),
+            )
+        });
         next.wallets = coverage;
         if *self.status.borrow() == next {
             return;
