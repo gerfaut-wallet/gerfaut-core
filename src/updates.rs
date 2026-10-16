@@ -66,21 +66,7 @@ pub(crate) async fn check_update(
     current_version: &str,
     proxy: Option<&str>,
 ) -> CoreResult<UpdateCheck> {
-    // A Tor circuit is slower to build than a connection is to open.
-    let budget = if proxy.is_some() { 60 } else { 15 };
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(budget))
-        .user_agent("gerfaut")
-        .redirect(crate::chain::redirects());
-    if let Some(proxy) = proxy {
-        let proxy = reqwest::Proxy::all(format!("socks5h://{proxy}"))
-            .map_err(|e| CoreError::Tor(format!("invalid Tor proxy address: {e}")))?;
-        builder = builder.proxy(proxy);
-    }
-    let client = builder
-        .build()
-        .map_err(|e| CoreError::Internal(format!("http client: {e}")))?;
-    let mut response = client
+    let mut response = client(proxy)?
         .get(format!("{api}/repos/{repo}/releases/latest"))
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -105,6 +91,25 @@ pub(crate) async fn check_update(
     read_release(&value, repo, current_version)
 }
 
+/// The client the check goes out with: through the Tor proxy when there
+/// is one, and through no other proxy at all.
+fn client(proxy: Option<&str>) -> CoreResult<reqwest::Client> {
+    // A Tor circuit is slower to build than a connection is to open.
+    let budget = if proxy.is_some() { 60 } else { 15 };
+    let mut builder = crate::chain::http_client()
+        .timeout(std::time::Duration::from_secs(budget))
+        .user_agent("gerfaut")
+        .redirect(crate::chain::redirects());
+    if let Some(proxy) = proxy {
+        let proxy = reqwest::Proxy::all(format!("socks5h://{proxy}"))
+            .map_err(|e| CoreError::Tor(format!("invalid Tor proxy address: {e}")))?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|e| CoreError::Internal(format!("http client: {e}")))
+}
+
 /// Largest answer read from the releases API: one release, its notes
 /// and its assets fit many times over.
 const MAX_ANSWER: usize = 1 << 20;
@@ -114,9 +119,9 @@ const MAX_ANSWER: usize = 1 << 20;
 const TAG_MAX: usize = 32;
 
 /// What the answer says, held to what a release of `repo` looks like.
-/// The page it links to is shown and opened by the apps, so it is kept
-/// only when it is one of that repository's release pages on GitHub,
-/// and replaced by the latest release page otherwise. A tag longer than
+/// The page it links to may be opened by an app, so it is kept only
+/// when it is one of that repository's release pages on GitHub, and
+/// replaced by the latest release page otherwise. A tag longer than
 /// any version is not one.
 fn read_release(
     value: &serde_json::Value,
@@ -133,17 +138,34 @@ fn read_release(
     let releases = format!("https://github.com/{repo}/releases/");
     let url = value["html_url"]
         .as_str()
-        .filter(|url| {
-            url.starts_with(&releases)
-                && url.len() <= releases.len() + 64
-                && url.chars().all(|c| c.is_ascii_graphic())
-        })
-        .map_or_else(|| format!("{releases}latest"), str::to_owned);
+        .filter(|url| url.len() <= releases.len() + 64 && url.chars().all(|c| c.is_ascii_graphic()))
+        .and_then(|url| release_page(url, repo))
+        .unwrap_or_else(|| format!("{releases}latest"));
     Ok(UpdateCheck {
         update_available: is_newer(&latest, current_version),
         latest,
         url,
     })
+}
+
+/// `url` the way a browser reads it, when that is a release page of
+/// `repo` on GitHub. Compared as text, the prefix let through what a
+/// browser reads elsewhere: `releases/../../someone/else` starts like
+/// a release page and opens another repository, and so do `%2e%2e` and
+/// `..\`. The URL parser resolves those as the browser does, and the
+/// page given back is that reading, not the text of the answer.
+fn release_page(url: &str, repo: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let releases = format!("/{repo}/releases/");
+    (parsed.scheme() == "https"
+        && parsed.host_str() == Some("github.com")
+        && parsed.port().is_none()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.path().starts_with(&releases))
+    .then(|| parsed.to_string())
 }
 
 fn check_error(detail: String) -> CoreError {
@@ -353,6 +375,16 @@ mod tests {
             "https://github.com/gerfaut-wallet/gerfaut-desktop/releases/tag/v0.2.0"
         );
         for url in [
+            "https://github.com/gerfaut-wallet/gerfaut-desktop/releases/../../someone/else",
+            "https://github.com/gerfaut-wallet/gerfaut-desktop/releases/%2e%2e/%2E%2E/someone/else",
+            "https://github.com/gerfaut-wallet/gerfaut-desktop/releases/.%2e/../someone/else",
+            "https://github.com/gerfaut-wallet/gerfaut-desktop/releases/..\\..\\someone/else",
+            "https://github.com/gerfaut-wallet/gerfaut-desktop/releases/./../../../someone",
+            "https://github.com/gerfaut-wallet/gerfaut-desktop/releases/tag/v0.2.0/../../../../x",
+            "https://github.com:8443/gerfaut-wallet/gerfaut-desktop/releases/tag/v0.2.0",
+            "https://someone@github.com/gerfaut-wallet/gerfaut-desktop/releases/tag/v0.2.0",
+            "http://github.com/gerfaut-wallet/gerfaut-desktop/releases/tag/v0.2.0",
+            "https://github.com/gerfaut-wallet/gerfaut-desktop/releases/tag/v0.2.0?go=elsewhere",
             "javascript:alert(1)",
             "https://evil.example/gerfaut-wallet/gerfaut-desktop/releases/",
             "https://github.com/someone-else/gerfaut-desktop/releases/tag/v0.2.0",
@@ -368,6 +400,16 @@ mod tests {
         assert!(read(&"9".repeat(33), "").is_err());
         assert!(read("", "").is_err());
         assert!(read("v1.0.0 <b>", "").is_err());
+    }
+
+    /// The check goes out straight, or through the Tor proxy, and never
+    /// through a proxy the environment names.
+    #[test]
+    fn a_check_takes_no_proxy_but_tor() {
+        assert!(!crate::chain::takes_a_proxy(&client(None).unwrap()));
+        assert!(crate::chain::takes_a_proxy(
+            &client(Some("127.0.0.1:9050")).unwrap()
+        ));
     }
 
     #[test]

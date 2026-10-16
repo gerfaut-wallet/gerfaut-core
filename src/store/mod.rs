@@ -300,7 +300,7 @@ impl Vault {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)?;
+            create_owner_only_dir(parent)?;
         }
         let lock = acquire_lock(&lock_path(&path))?;
         let vault = Vault {
@@ -494,13 +494,15 @@ fn lock_path(vault: &Path) -> PathBuf {
 /// is logged, and one copy of the app per data directory is then up to
 /// the user.
 fn acquire_lock(path: &Path) -> Result<Option<std::fs::File>, VaultError> {
-    let opened = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .or_else(|_| std::fs::File::open(path));
+    let opened = owner_only(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false),
+    )
+    .open(path)
+    .or_else(|_| std::fs::File::open(path));
     let file = match opened {
         Ok(file) => file,
         Err(error) => {
@@ -523,10 +525,8 @@ fn acquire_lock(path: &Path) -> Result<Option<std::fs::File>, VaultError> {
 fn write_then_swap(tmp: &Path, bytes: &[u8], target: &Path) -> std::io::Result<()> {
     {
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(tmp)?;
+        let mut file =
+            owner_only(std::fs::OpenOptions::new().write(true).create_new(true)).open(tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
@@ -578,6 +578,51 @@ fn rename_waiting(
 fn held_by_another(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::PermissionDenied
         || matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+/// `options`, set so that a file they create is its owner's alone on
+/// Unix: the one rule for every file Gerfaut writes about the wallets,
+/// the vault and its neighbours here, and the exports and backups an
+/// app saves where the person asks. The vault is sealed, but its size,
+/// its dates and the record of failed unlocks next to it are nobody
+/// else's business on a machine with several accounts, and an export
+/// is not sealed at all. A file that already exists keeps its mode.
+/// Windows has no mode to give: a file there takes the access list of
+/// its folder, which in the profile is already the user's alone.
+pub fn owner_only(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
+/// Creates `dir` so that only its owner may list or enter it on Unix,
+/// with whatever parents it lacks. The parents are created the usual
+/// way, since `~/.local/share` is not the app's to close, and a
+/// directory already there is left as it is: it may be one the user
+/// picked.
+pub(crate) fn create_owner_only_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
+        created => created,
+    }
 }
 
 #[cfg(test)]
@@ -1109,6 +1154,66 @@ mod tests {
         let opened = Vault::open_or_create(&path, key());
         mode(0o755);
         assert_eq!(opened.unwrap().1.settings.gap_limit, 42);
+    }
+
+    /// On Unix the vault, its lock and the directory created for them
+    /// are their owner's alone, and so is every later save, which
+    /// replaces the file with a new one.
+    #[cfg(unix)]
+    #[test]
+    fn the_vault_and_its_lock_are_their_owners_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("fresh").join("data");
+        let path = data.join("gerfaut.vault");
+        let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(mode(&data), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&data.join("gerfaut.vault.lock")), 0o600);
+        vault.save(&payload).unwrap();
+        assert_eq!(mode(&path), 0o600);
+
+        // A directory that was there already is not the vault's to
+        // close.
+        let mine = dir.path().join("mine");
+        std::fs::create_dir(&mine).unwrap();
+        std::fs::set_permissions(&mine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        drop(Vault::open_or_create(mine.join("gerfaut.vault"), key()).unwrap());
+        assert_eq!(mode(&mine), 0o755);
+        assert_eq!(mode(&mine.join("gerfaut.vault")), 0o600);
+    }
+
+    /// The rule the apps write their exports with: a file created is
+    /// its owner's alone, one that was there keeps the mode it had.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_created_owner_only_is_its_owners_alone() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let write = |path: &Path| {
+            owner_only(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true),
+            )
+            .open(path)
+            .unwrap()
+            .write_all(b"date,amount\n")
+            .unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("transactions.csv");
+        write(&fresh);
+        assert_eq!(mode(&fresh), 0o600);
+        let theirs = dir.path().join("shared.csv");
+        std::fs::write(&theirs, b"x").unwrap();
+        std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write(&theirs);
+        assert_eq!(mode(&theirs), 0o644);
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"date,amount\n");
     }
 
     /// A scanner that holds the file just written, or the vault, for a

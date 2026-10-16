@@ -201,7 +201,7 @@ pub struct PriceQuote {
 /// `socks5h` and not `socks5`: the proxy resolves the name, so a
 /// `.onion` host never reaches this machine's DNS resolver.
 pub(crate) fn client_through(proxy: Option<&str>) -> CoreResult<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::chain::http_client()
         .timeout(std::time::Duration::from_secs(if proxy.is_some() {
             60
         } else {
@@ -511,6 +511,16 @@ fn thin_series(points: Vec<PricePoint>, max: usize) -> Vec<PricePoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The price goes out straight, or through the Tor proxy, and never
+    /// through a proxy the environment names.
+    #[test]
+    fn a_price_takes_no_proxy_but_tor() {
+        assert!(!crate::chain::takes_a_proxy(&client_through(None).unwrap()));
+        assert!(crate::chain::takes_a_proxy(
+            &client_through(Some("127.0.0.1:9050")).unwrap()
+        ));
+    }
 
     #[test]
     fn serde_spellings_are_stable() {

@@ -486,6 +486,65 @@ async fn a_scanned_backup_never_doubles_a_wallet_already_watched() {
     assert_eq!(target.list_wallets(None).await.len(), 2);
 }
 
+/// A backup is a file anyone could have written: a wallet in it whose
+/// key takes a hardened step, which miniscript panics on when asked
+/// for an address, or whose descriptor nests past reason, is refused
+/// in words, and the restore leaves the vault as it was.
+#[tokio::test]
+async fn a_backup_wallet_the_parser_would_refuse_is_not_restored() {
+    let tpub = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
+    let wallet = |external: String| BackupWallet {
+        name: "Handed over".to_owned(),
+        network: Network::Signet,
+        kind: WalletKind::Descriptors {
+            external,
+            internal: None,
+            script: crate::input::ScriptKind::Segwit,
+        },
+        gap_limit: 20,
+        labels: Default::default(),
+        created_at: 1_755_000_000,
+        live_pinned: false,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    for (external, refusal) in [
+        (
+            format!("wpkh([9a6a2580/84'/1'/0']{tpub}/0h/*)"),
+            "key origin",
+        ),
+        (format!("wpkh({tpub}/0/*h)"), "key origin"),
+        (
+            format!("{}{tpub}/0/*{}", "sh(".repeat(150), ")".repeat(150)),
+            "nests deeper",
+        ),
+    ] {
+        let payload = BackupPayload {
+            version: BACKUP_VERSION,
+            created_at: 1_756_000_000,
+            wallets: vec![wallet(format!("wpkh({tpub}/0/*)")), wallet(external)],
+            backends: None,
+            electrum_certs: None,
+            gap_limit: None,
+        };
+        let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+        let preview = manager
+            .preview_backup(&text, BACKUP_PASSWORD)
+            .await
+            .unwrap();
+        assert_eq!(preview.wallets.len(), 2);
+        let error = manager
+            .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, CoreError::Descriptor(detail) if detail.contains(refusal)),
+            "{error}"
+        );
+        assert!(manager.list_wallets(None).await.is_empty());
+    }
+}
+
 #[tokio::test]
 async fn backup_needs_its_password_and_scans_as_a_qr() {
     let source_dir = tempfile::tempdir().unwrap();

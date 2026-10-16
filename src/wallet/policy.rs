@@ -26,7 +26,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use bdk_wallet::bitcoin::AddressType;
@@ -426,8 +425,7 @@ fn parse_descriptor(text: &str) -> CoreResult<Descriptor<DescriptorPublicKey>> {
         kind: "descriptor",
         detail,
     };
-    let descriptor = Descriptor::<DescriptorPublicKey>::from_str(text.trim())
-        .map_err(|e| invalid(e.to_string()))?;
+    let descriptor = crate::input::read_descriptor(text.trim())?;
     if !descriptor.is_multipath() {
         return Ok(descriptor);
     }
@@ -2276,6 +2274,30 @@ mod tests {
         let descriptor = format!("tr(03{UNSPENDABLE_INTERNAL_KEY},{{pk({B}/0/*),pk({C}/0/*)}})");
         let snapshot = analyze_with(&descriptor, ScriptKind::Taproot, Vec::new());
         assert_eq!(snapshot.keys.len(), 2);
+    }
+
+    /// The policy page reads a descriptor the way an import does: a
+    /// hardened step after a key, or nesting past reason, is refused
+    /// before miniscript is asked anything about it.
+    #[test]
+    fn the_policy_page_refuses_what_an_import_refuses() {
+        let refused = |descriptor: &str| {
+            analyze(PolicyInput {
+                external_descriptor: descriptor,
+                script: ScriptKind::WitnessScript,
+                coins: Vec::new(),
+                tip_height: Some(TIP),
+                now_unix: NOW,
+            })
+            .unwrap_err()
+            .to_string()
+        };
+        let error = refused(&format!("wsh(or_d(pk({A}/0/*),pk({B}/1h/*)))"));
+        assert!(error.contains("key origin"), "{error}");
+        let error = refused(&format!("wsh(pk({A}/0/*h))"));
+        assert!(error.contains("key origin"), "{error}");
+        let error = refused(&format!("{}pk({A}){}", "sh(".repeat(120), ")".repeat(120)));
+        assert!(error.contains("nests deeper"), "{error}");
     }
 
     /// The BIP 341 point as Liana writes the internal key of a taproot
