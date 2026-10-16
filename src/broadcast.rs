@@ -229,6 +229,23 @@ impl TxWarning {
     }
 }
 
+/// Where a transaction stands before it is sent: what the readiness pill
+/// of either application says, decided here once so neither screen has
+/// to work it out of the cautions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxReadiness {
+    /// Every input signed, and nothing the network is sure to refuse.
+    Ready,
+    /// The network is sure to refuse it for something a signature does
+    /// not fix: a coin spent in a block, outputs worth more than the
+    /// inputs. Said before a missing signature, since signing again
+    /// changes neither.
+    Refused,
+    /// Some inputs carry no signature, and that is all that holds it.
+    Unsigned,
+}
+
 /// Everything shown before broadcasting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TxPreview {
@@ -254,8 +271,10 @@ pub struct TxPreview {
     pub rbf: bool,
     /// Whether the transaction can be sent: every input is signed, and
     /// no caution says the network is sure to refuse it
-    /// ([`TxWarning::blocking`]).
+    /// ([`TxWarning::blocking`]). The same as `readiness` being ready.
     pub ready: bool,
+    /// Where it stands, in the words of the readiness pill.
+    pub readiness: TxReadiness,
     pub warnings: Vec<TxWarning>,
     /// The transaction as the network takes it, hex. Present only when
     /// ready: an unsigned transaction, or one the network is sure to
@@ -920,8 +939,19 @@ pub fn build_preview(
     }
 
     // A transaction the network is sure to refuse is not one to call
-    // ready next to the caution that says so.
-    let ready = decoded.ready && !warnings.iter().any(|w| w.blocking);
+    // ready next to the caution that says so. A refusal a signature does
+    // not fix is said before a missing signature.
+    let refused = warnings
+        .iter()
+        .any(|w| w.blocking && w.kind != TxWarningKind::Unsigned);
+    let readiness = if refused {
+        TxReadiness::Refused
+    } else if !decoded.ready || warnings.iter().any(|w| w.blocking) {
+        TxReadiness::Unsigned
+    } else {
+        TxReadiness::Ready
+    };
+    let ready = readiness == TxReadiness::Ready;
     TxPreview {
         txid: txid.to_string(),
         source: decoded.source,
@@ -937,6 +967,7 @@ pub fn build_preview(
         locktime,
         rbf: tx.is_explicitly_rbf(),
         ready,
+        readiness,
         warnings,
         hex: ready.then(|| encode::serialize_hex(tx)),
     }
@@ -1535,6 +1566,7 @@ mod tests {
             }));
             let preview = build_preview(&decoded, Network::Signet, &facts, &[], Some(100), 0);
             assert!(!preview.ready, "{says}");
+            assert_eq!(preview.readiness, TxReadiness::Refused, "{says}");
             assert!(preview.hex.is_none(), "{says}");
             let spent = preview
                 .warnings
@@ -1608,6 +1640,7 @@ mod tests {
         }];
         let preview = build_preview(&decoded, Network::Signet, &facts, &[], Some(100), 0);
         assert!(!preview.ready);
+        assert_eq!(preview.readiness, TxReadiness::Refused);
         assert!(preview.hex.is_none());
         let fee = preview
             .warnings
@@ -1616,6 +1649,32 @@ mod tests {
             .unwrap();
         assert!(fee.blocking);
         assert!(fee.message.contains("the network will refuse"));
+    }
+
+    /// The pill's state is the core's: refused before unsigned, since a
+    /// signature does not bring back a coin spent in a block.
+    #[test]
+    fn a_refusal_a_signature_does_not_fix_comes_first() {
+        let spent_in_a_block = Some(SpentBy {
+            txid: Txid::from_byte_array([0x77; 32]),
+            confirmed: true,
+        });
+        let unsigned = decode_transaction(&encode::serialize_hex(&unsigned_tx())).unwrap();
+        let both = build_preview(
+            &unsigned,
+            Network::Signet,
+            &spent_coin(spent_in_a_block),
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(both.readiness, TxReadiness::Refused);
+        let only_unsigned = build_preview(&unsigned, Network::Signet, &[], &[], Some(100), 0);
+        assert_eq!(only_unsigned.readiness, TxReadiness::Unsigned);
+        let signed = decode_transaction(&encode::serialize_hex(&signed_tx())).unwrap();
+        let ready = build_preview(&signed, Network::Signet, &[], &[], Some(100), 0);
+        assert_eq!(ready.readiness, TxReadiness::Ready);
+        assert!(ready.ready);
     }
 
     /// Red is not a refusal. A fee that hurts, a time lock read against
