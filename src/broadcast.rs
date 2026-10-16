@@ -816,6 +816,9 @@ pub struct OutputFacts {
 
 /// Builds the preview from the decoded transaction and the facts the
 /// manager gathered. Pure: everything network-bound happened before.
+/// `tip_height` is the height a height lock is judged against: the
+/// backend's at the time of the preview when it answered, since that is
+/// the node the transaction goes to.
 pub fn build_preview(
     decoded: &DecodedTx,
     network: Network,

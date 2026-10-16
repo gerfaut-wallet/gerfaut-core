@@ -976,6 +976,47 @@ async fn electrum_says_whether_a_coin_is_spent() {
     }
 }
 
+/// A height lock set at the signer's tip against fee sniping, and a
+/// device whose wallets synced a few blocks before: the lock is judged
+/// on the height the backend gives at the time of the preview, the node
+/// the transaction goes to, not on the wallets' last sync.
+#[tokio::test]
+async fn a_height_lock_is_judged_on_the_backends_tip() {
+    use crate::broadcast::TxWarningKind;
+    use crate::testkit::{FakeElectrum, nowhere, script, transaction};
+    use bdk_wallet::bitcoin::{OutPoint, absolute};
+
+    let funding = transaction(&[nowhere(1, 0)], &[(script(3).as_str(), 50_000)]);
+    let coin = OutPoint::new(funding.compute_txid(), 0);
+    let server = FakeElectrum::start().await;
+    server.add_tx(&funding);
+    server.set_unspent(&script(3), &[(funding.compute_txid(), 0, 90, 50_000)]);
+    server.state.lock().unwrap().height = 120;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    manager
+        .set_backend(Network::Regtest, server.backend())
+        .await
+        .unwrap();
+    for (lock, locked) in [(120, false), (121, true)] {
+        let mut pasted = transaction(&[coin], &[(script(9).as_str(), 49_000)]);
+        pasted.lock_time = absolute::LockTime::from_height(lock).unwrap();
+        let preview = manager
+            .preview_transaction(&witnessed(pasted), Network::Regtest)
+            .await
+            .unwrap();
+        assert_eq!(
+            preview
+                .warnings
+                .iter()
+                .any(|w| w.kind == TxWarningKind::Locked),
+            locked,
+            "lock {lock} at a tip of 120: {:?}",
+            preview.warnings
+        );
+    }
+}
+
 // --- recent broadcasts ---------------------------------------------------
 
 /// An Esplora on loopback that takes every transaction posted to it, or

@@ -892,6 +892,15 @@ pub(crate) async fn fetch_prevout(
     }
 }
 
+/// The height of the endpoint's tip: the one a time lock is judged
+/// against when the transaction reaches that node.
+pub(crate) async fn tip_height(endpoint: &Endpoint, proxy: Option<&str>) -> Result<u32, String> {
+    match endpoint {
+        Endpoint::Esplora(url) => esplora::client(url, proxy)?.height().await,
+        Endpoint::Electrum(target) => electrum::tip_height(target, proxy).await,
+    }
+}
+
 /// The output scripts of a transaction an Electrum server can be asked
 /// for it through, in the order they are tried: the ones a coin may sit
 /// on first, an OP_RETURN, whose history only says who else wrote one,

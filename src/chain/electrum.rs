@@ -727,6 +727,18 @@ fn spent_status(
     (None, None)
 }
 
+/// The height of the server's tip.
+pub(crate) async fn tip_height(target: &Target, proxy: Option<&str>) -> Result<u32, String> {
+    let fail = failed(target);
+    run(target, proxy, call_deadline(target), move |client| {
+        client
+            .block_headers_subscribe()
+            .map(|header| header.height as u32)
+            .map_err(fail)
+    })
+    .await
+}
+
 /// Where a transaction stands, read off the history of one of its
 /// output scripts, `scripts` in the order they are tried: height 0
 /// means mempool, a height means confirmed, absence means the server

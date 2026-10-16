@@ -38,7 +38,7 @@ impl WalletManager {
         let outpoints = broadcast::outpoints(&decoded);
 
         // Everything the vault knows, under the lock.
-        let (config, certs, mut input_facts, output_facts, tip_height) = {
+        let (config, certs, mut input_facts, output_facts, mut tip_height) = {
             let mut state = self.state.lock().await;
             let (config, certs) = state.chain_setup(network);
             let ids: Vec<(String, String, WalletKind)> = state
@@ -170,11 +170,20 @@ impl WalletManager {
         let needs_chain = input_facts
             .iter()
             .any(|f| f.prevout.is_none() || f.spent.is_none() || f.listed);
+        // A height lock is judged against the node the transaction goes
+        // to. A wallet's last sync can be blocks behind the lock a
+        // signer set at its own tip against fee sniping, so the backend
+        // is asked for its height whenever the wallets' would hold the
+        // transaction back, or no wallet has one.
+        let locktime = decoded.tx.lock_time;
+        let needs_tip = decoded.tx.is_lock_time_enabled()
+            && locktime.is_block_height()
+            && tip_height.is_none_or(|tip| locktime.to_consensus_u32() > tip);
         // No backend for this network, or a Tor route that cannot be
         // opened, is no answer at all: the coins stay unchecked below,
         // the same as when every endpoint stopped answering. Without
         // this the PSBT's word went through unconfronted and unmarked.
-        let route = if needs_chain {
+        let route = if needs_chain || needs_tip {
             match chain::endpoints(&config, network, &certs) {
                 Ok(endpoints) => match self.tor_proxy_for(&endpoints).await {
                     Ok(proxy) => Some((endpoints, proxy)),
@@ -220,6 +229,14 @@ impl WalletManager {
                 }
                 if input_facts.iter().all(settled) {
                     break;
+                }
+            }
+            if needs_tip {
+                for endpoint in &endpoints {
+                    if let Ok(height) = chain::tip_height(endpoint, proxy.as_deref()).await {
+                        tip_height = Some(height);
+                        break;
+                    }
                 }
             }
         }
