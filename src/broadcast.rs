@@ -30,6 +30,9 @@ use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
 use crate::wallet::tx_extras::{OpReturnData, op_return_of};
 
+mod signing;
+pub use signing::{Satisfaction, SigningHints};
+
 /// Largest input accepted, in characters: a fully signed transaction
 /// with hundreds of inputs fits many times over.
 const MAX_INPUT_LEN: usize = 4_000_000;
@@ -253,6 +256,22 @@ pub enum TxReadiness {
     Unsigned,
 }
 
+/// What the fee rate is measured on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeRateBasis {
+    /// The transaction as it will be sent: every input signed.
+    Exact,
+    /// The transaction once signed, each missing signature counted at
+    /// the most it can weigh: the rate it will pay, give or take a few
+    /// bytes, and never more.
+    Estimated,
+    /// The transaction as it is, some signatures missing and their
+    /// weight unknown: signatures only add weight, so the rate once
+    /// signed is this one at most.
+    UpperBound,
+}
+
 /// Everything shown before broadcasting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TxPreview {
@@ -265,7 +284,12 @@ pub struct TxPreview {
     /// past all the bitcoin there will ever be, and the outputs pay no
     /// more than the inputs bring.
     pub fee_sats: Option<u64>,
+    /// The fee over the virtual size the transaction has once signed:
+    /// see `fee_rate_basis` for how that size is known.
     pub fee_rate_sat_vb: Option<f64>,
+    /// Whether the rate is the one paid, an estimate of it before the
+    /// signatures are in, or the most it can be.
+    pub fee_rate_basis: FeeRateBasis,
     /// Why there is no fee, in the words of the caution that says it:
     /// what each application repeats where the send is decided. `None`
     /// when there is a fee.
@@ -276,7 +300,8 @@ pub struct TxPreview {
     /// behind it. The inputs total and the fee rest on that word then,
     /// and say so.
     pub amounts_declared: bool,
-    /// Virtual size in vbytes.
+    /// Virtual size in vbytes, of the transaction as it is: before its
+    /// signatures when some are missing.
     pub vsize: u64,
     /// Weight units.
     pub weight: u64,
@@ -396,6 +421,13 @@ pub struct DecodedInput {
     /// or without `ANYONECANPAY`, spelled that way. `None` when every
     /// signature found covers every output.
     pub loose_sighash: Option<String>,
+    /// What a PSBT input finalized on its own carries, when the rest of
+    /// the PSBT is not: the transaction read is then the unsigned
+    /// skeleton, which leaves it out, and the fee rate counts it back.
+    pub finalized: Option<Satisfaction>,
+    /// What the PSBT says about how the input will be signed, for the
+    /// weight its signatures will add.
+    pub hints: SigningHints,
 }
 
 /// Decodes a transaction from text: base64 PSBT, hex PSBT, hex raw
@@ -461,6 +493,8 @@ pub fn decode_bytes_as_transaction(bytes: &[u8]) -> CoreResult<DecodedTx> {
             prevout_proven: false,
             disputed_witness_utxo: None,
             loose_sighash: loose_sighash_in(&input.script_sig, &input.witness),
+            finalized: None,
+            hints: SigningHints::default(),
         })
         .collect::<Vec<_>>();
     let ready = inputs.iter().all(|input| input.signed);
@@ -586,12 +620,20 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
             input.final_script_witness.as_ref().unwrap_or(&no_witness),
         )
         .or_else(|| partial_loose[index].clone());
+        let signed = final_present && !unfinished.contains(&index);
         inputs.push(DecodedInput {
-            signed: final_present && !unfinished.contains(&index),
+            signed,
             prevout,
             prevout_proven,
             disputed_witness_utxo,
             loose_sighash,
+            finalized: signed.then(|| {
+                Satisfaction::of_final(
+                    input.final_script_sig.as_ref(),
+                    input.final_script_witness.as_ref(),
+                )
+            }),
+            hints: SigningHints::of_psbt_input(input),
         });
     }
     let ready = inputs.iter().all(|input| input.signed);
@@ -725,6 +767,10 @@ pub struct InputFacts {
     /// which is a backend's answer; this is the absence of one, and it
     /// leaves the PSBT's own declaration unconfronted.
     pub unchecked: bool,
+    /// What signing will add to this input, when the watched wallet that
+    /// holds the coin says it from its descriptor: the most its policy
+    /// can take.
+    pub satisfaction: Option<Satisfaction>,
 }
 
 /// The transaction that already spends a coin, as a watched wallet or
@@ -763,32 +809,37 @@ pub fn build_preview(
             .map(|a| a.to_string())
     };
 
+    // A coin the PSBT proves, read in the previous transaction its
+    // outpoint commits to, is the coin itself: nothing outweighs it,
+    // least of all a server's listing. Otherwise what the wallet or the
+    // backend holds at that outpoint comes first: the PSBT's own word
+    // about the coin it spends is its author's, and a finalized input is
+    // never checked against anything. The PSBT fills in only where
+    // neither knows it.
+    let spent: Vec<Option<TxOut>> = (0..tx.input.len())
+        .map(|i| {
+            if decoded.inputs[i].prevout_proven {
+                decoded.inputs[i].prevout.clone()
+            } else {
+                input_facts
+                    .get(i)
+                    .and_then(|f| f.prevout.clone())
+                    .or_else(|| decoded.inputs[i].prevout.clone())
+            }
+        })
+        .collect();
     let inputs: Vec<TxInputPreview> = tx
         .input
         .iter()
+        .zip(&spent)
         .enumerate()
-        .map(|(i, input)| {
-            let facts = input_facts.get(i).cloned().unwrap_or_default();
-            // A coin the PSBT proves, read in the previous transaction its
-            // outpoint commits to, is the coin itself: nothing outweighs
-            // it, least of all a server's listing. Otherwise what the
-            // wallet or the backend holds at that outpoint comes first:
-            // the PSBT's own word about the coin it spends is its
-            // author's, and a finalized input is never checked against
-            // anything. The PSBT fills in only where neither knows it.
-            let prevout = if decoded.inputs[i].prevout_proven {
-                decoded.inputs[i].prevout.clone()
-            } else {
-                facts.prevout.or_else(|| decoded.inputs[i].prevout.clone())
-            };
-            TxInputPreview {
-                txid: input.previous_output.txid.to_string(),
-                vout: input.previous_output.vout,
-                value_sats: prevout.as_ref().map(|p| p.value.to_sat()),
-                address: prevout.as_ref().and_then(|p| address_of(&p.script_pubkey)),
-                signed: decoded.inputs[i].signed,
-                wallet: facts.wallet,
-            }
+        .map(|(i, (input, prevout))| TxInputPreview {
+            txid: input.previous_output.txid.to_string(),
+            vout: input.previous_output.vout,
+            value_sats: prevout.as_ref().map(|p| p.value.to_sat()),
+            address: prevout.as_ref().and_then(|p| address_of(&p.script_pubkey)),
+            signed: decoded.inputs[i].signed,
+            wallet: input_facts.get(i).and_then(|f| f.wallet.clone()),
         })
         .collect();
 
@@ -830,7 +881,22 @@ pub fn build_preview(
         .filter(|_| !outputs_impossible && !inputs_impossible)
         .and_then(|(total, out)| total.checked_sub(out));
     let vsize = tx.vsize() as u64;
-    let fee_rate_sat_vb = fee_sats.map(|fee| fee as f64 / vsize as f64);
+    // The rate is paid on the transaction as it will be sent. Missing
+    // signatures are weight still to come: counted in when every input
+    // says what it will take, and otherwise the rate on the skeleton is
+    // the most it can be.
+    let (signed_vsize, fee_rate_basis) = if decoded.ready {
+        (vsize, FeeRateBasis::Exact)
+    } else {
+        match missing_signatures(decoded, input_facts, &spent) {
+            Some(missing) => (
+                signing::weight_once_signed(tx, &missing).to_vbytes_ceil(),
+                FeeRateBasis::Estimated,
+            ),
+            None => (vsize, FeeRateBasis::UpperBound),
+        }
+    };
+    let fee_rate_sat_vb = fee_sats.map(|fee| fee as f64 / signed_vsize as f64);
 
     // Whether each value shown is proven, input by input: by a wallet
     // engine or a backend, which read it in a transaction whose txid
@@ -1035,12 +1101,20 @@ pub fn build_preview(
                 .to_owned(),
         )),
         (Some(fee), Some(rate), Some(total)) => {
-            if rate > HIGH_FEE_RATE_SAT_VB {
+            // A rate read on a skeleton whose signatures weigh what nobody
+            // can tell is only a ceiling: too loose to call anything far
+            // above. The share of the inputs still speaks for the fee.
+            let measured = match fee_rate_basis {
+                FeeRateBasis::Exact => Some(format!("{rate:.0} sat/vB")),
+                FeeRateBasis::Estimated => Some(format!("about {rate:.0} sat/vB once signed")),
+                FeeRateBasis::UpperBound => None,
+            };
+            if let Some(measured) = measured.filter(|_| rate > HIGH_FEE_RATE_SAT_VB) {
                 warnings.push(TxWarning::new(
                     TxWarningKind::HighFeeRate,
                     format!(
-                        "The fee rate is {rate:.0} sat/vB, far above what the chain asks for. \
-                         A wrong unit in the signing software is the usual cause."
+                        "The fee rate is {measured}, far above what the chain asks for. A wrong \
+                         unit in the signing software is the usual cause."
                     ),
                 ));
             }
@@ -1132,6 +1206,7 @@ pub fn build_preview(
         outputs,
         fee_sats,
         fee_rate_sat_vb,
+        fee_rate_basis,
         fee_unknown_reason,
         amounts_declared,
         vsize,
@@ -1145,6 +1220,38 @@ pub fn build_preview(
         warnings,
         hex: ready.then(|| encode::serialize_hex(tx)),
     }
+}
+
+/// What each input still lacks before the transaction is the one the
+/// network takes: `None` for an input that carries it already, and no
+/// list at all when one input's lack cannot be told. A finalized input
+/// counts as it is; a watched wallet's coin, as its descriptor allows;
+/// any other, by its script and what the PSBT carries about it.
+fn missing_signatures(
+    decoded: &DecodedTx,
+    input_facts: &[InputFacts],
+    spent: &[Option<TxOut>],
+) -> Option<Vec<Option<Satisfaction>>> {
+    decoded
+        .tx
+        .input
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            if !input.script_sig.is_empty() || !input.witness.is_empty() {
+                return Some(None);
+            }
+            let described = &decoded.inputs[i];
+            if let Some(done) = described.finalized {
+                return Some(Some(done));
+            }
+            if let Some(policy) = input_facts.get(i).and_then(|f| f.satisfaction) {
+                return Some(Some(policy));
+            }
+            let coin = spent.get(i)?.as_ref()?;
+            signing::estimated(&coin.script_pubkey, &described.hints).map(Some)
+        })
+        .collect()
 }
 
 /// How many of the inputs carry no signature, in a sentence that agrees
@@ -1674,6 +1781,7 @@ mod tests {
             contradicted_listing: None,
             unknown: false,
             unchecked: false,
+            satisfaction: None,
         }];
         let preview = build_preview(
             &decoded,
@@ -1715,6 +1823,7 @@ mod tests {
             contradicted_listing: None,
             unknown: false,
             unchecked: false,
+            satisfaction: None,
         }];
         let preview = build_preview(&decoded, Network::Mainnet, &facts, &[], Some(100), 0);
         assert!(!preview.ready);
@@ -2499,6 +2608,7 @@ mod tests {
             contradicted_listing: None,
             unknown: false,
             unchecked: false,
+            satisfaction: None,
         }]
     }
 
@@ -2674,6 +2784,7 @@ mod tests {
             contradicted_listing: None,
             unknown: false,
             unchecked: false,
+            satisfaction: None,
         }];
         let preview = build_preview(&decoded, Network::Regtest, &from_chain, &[], Some(100), 0);
         let mismatch = preview
@@ -3052,5 +3163,130 @@ mod tests {
         assert!(!looks_like_transaction(
             &data_encoding::BASE64.encode(&psbt.serialize())
         ));
+    }
+
+    // --- the fee rate before the signatures ---------------------------------
+
+    /// [`unsigned_tx`] as a PSBT whose input declares a coin of 100 000
+    /// sats on `spk`: 1 000 sats of fee, or 90 000 with `burn`.
+    fn unsigned_psbt_on(spk: ScriptBuf, burn: bool) -> DecodedTx {
+        let mut tx = unsigned_tx();
+        if burn {
+            tx.output.truncate(1);
+            tx.output[0].value = Amount::from_sat(10_000);
+        }
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: spk,
+        });
+        decode_bytes_as_transaction(&psbt.serialize()).unwrap()
+    }
+
+    /// An unsigned PSBT pays its fee on the transaction it becomes: the
+    /// signature and the key of a P2WPKH input weigh about a third of the
+    /// skeleton, and the rate is read once they are in. The fee itself is
+    /// exact, signatures or not.
+    #[test]
+    fn an_unsigned_psbt_rates_its_fee_once_signed() {
+        let decoded = unsigned_psbt_on(p2wpkh(0x33), false);
+        let preview = build_preview(
+            &decoded,
+            Network::Signet,
+            &[InputFacts::default()],
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(preview.fee_rate_basis, FeeRateBasis::Estimated);
+        assert_eq!(preview.fee_sats, Some(1_000));
+        // The skeleton's own size is still what the technical facts show.
+        assert_eq!(preview.vsize, unsigned_tx().vsize() as u64);
+        let rate = preview.fee_rate_sat_vb.unwrap();
+        let once_signed = (1_000.0 / rate).round() as u64;
+        // The same transaction signed, its signature one byte short of
+        // the largest: the estimate is that size, or a byte over.
+        let real = signed_tx().vsize() as u64;
+        assert!(
+            once_signed >= real && once_signed <= real + 1,
+            "{once_signed} vB estimated, {real} vB signed"
+        );
+        assert!(rate < 1_000.0 / preview.vsize as f64);
+
+        // Signed, the rate is the one paid.
+        let signed = decode_transaction(&encode::serialize_hex(&signed_tx())).unwrap();
+        let exact = build_preview(
+            &signed,
+            Network::Signet,
+            &spent_coin(None)
+                .into_iter()
+                .map(|f| InputFacts {
+                    spent: Some(false),
+                    ..f
+                })
+                .collect::<Vec<_>>(),
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(exact.fee_rate_basis, FeeRateBasis::Exact);
+        assert_eq!(exact.fee_rate_sat_vb, Some(1_000.0 / real as f64));
+    }
+
+    /// A coin behind a script hash whose script the PSBT does not carry:
+    /// nothing tells what its signatures weigh. The rate on the skeleton
+    /// is then the most it can be, too loose a figure to call a high fee
+    /// rate on; the share of the inputs still speaks.
+    #[test]
+    fn a_rate_nobody_can_estimate_is_a_ceiling() {
+        let p2wsh = ScriptBuf::new_p2wsh(&bdk_wallet::bitcoin::WScriptHash::from_byte_array(
+            [0x55; 32],
+        ));
+        let decoded = unsigned_psbt_on(p2wsh.clone(), true);
+        let preview = build_preview(
+            &decoded,
+            Network::Signet,
+            &[InputFacts::default()],
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(preview.fee_rate_basis, FeeRateBasis::UpperBound);
+        assert_eq!(
+            preview.fee_rate_sat_vb,
+            Some(90_000.0 / preview.vsize as f64)
+        );
+        let kinds: Vec<TxWarningKind> = preview.warnings.iter().map(|w| w.kind).collect();
+        assert!(!kinds.contains(&TxWarningKind::HighFeeRate), "{kinds:?}");
+        assert!(kinds.contains(&TxWarningKind::HighFeeShare), "{kinds:?}");
+
+        // A watched wallet that holds the coin knows its policy: the
+        // most it can take to sign is counted, whatever the PSBT says.
+        let policy = Satisfaction {
+            weight: 200,
+            witness: true,
+        };
+        let watched = build_preview(
+            &decoded,
+            Network::Signet,
+            &[InputFacts {
+                satisfaction: Some(policy),
+                ..Default::default()
+            }],
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(watched.fee_rate_basis, FeeRateBasis::Estimated);
+        let skeleton = decoded.tx.weight().to_wu();
+        // Marker, flag and the empty witness count, then the policy's.
+        let once_signed = (skeleton + 3 + 200).div_ceil(4);
+        assert_eq!(watched.fee_rate_sat_vb, Some(90_000.0 / once_signed as f64));
+        let high = watched
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::HighFeeRate)
+            .expect("an estimate is close enough to say a rate is high");
+        assert!(high.message.contains("once signed"), "{}", high.message);
     }
 }

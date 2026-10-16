@@ -10,8 +10,8 @@ use bdk_wallet::bitcoin::{Address, Amount, OutPoint, Transaction, TxOut, Txid};
 use bdk_wallet::chain::CanonicalizationParams;
 
 use crate::broadcast::{
-    self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, RecentBroadcast, SpentBy,
-    TxPreview, WalletRef,
+    self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, RecentBroadcast, Satisfaction,
+    SpentBy, TxPreview, WalletRef,
 };
 use crate::chain;
 use crate::error::{CoreError, CoreResult};
@@ -79,6 +79,13 @@ impl WalletManager {
                             let Some((txout, spender)) = coin else {
                                 continue;
                             };
+                            // The most its policy can take to sign, whatever
+                            // the PSBT says.
+                            input_facts[i].satisfaction = engine
+                                .derivation_of_spk(txout.script_pubkey.clone())
+                                .and_then(|(keychain, _)| {
+                                    Satisfaction::of_descriptor(engine.public_descriptor(keychain))
+                                });
                             input_facts[i].prevout = Some(txout);
                             input_facts[i].wallet = Some(wallet_ref.clone());
                             input_facts[i].spent = Some(spender.is_some());

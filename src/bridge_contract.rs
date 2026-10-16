@@ -47,9 +47,9 @@ use crate::backup::{
     ImportChoices, ImportReport,
 };
 use crate::broadcast::{
-    self, BroadcastReport, BroadcastStatus, DecodedInput, DecodedTx, InputFacts, OutputFacts,
-    RecentBroadcast, TxOutputPreview, TxPreview, TxReadiness, TxSeverity, TxSource, TxWarning,
-    TxWarningKind, WalletRef,
+    self, BroadcastReport, BroadcastStatus, DecodedInput, DecodedTx, FeeRateBasis, InputFacts,
+    OutputFacts, RecentBroadcast, SigningHints, TxOutputPreview, TxPreview, TxReadiness,
+    TxSeverity, TxSource, TxWarning, TxWarningKind, WalletRef,
 };
 use crate::chain::connect::{ScannedBackendKind, parse_backend};
 use crate::chain::public::{PublicServer, ServerProtocol, public_servers};
@@ -1878,6 +1878,8 @@ fn spend(signed: bool) -> DecodedTx {
             prevout_proven: false,
             disputed_witness_utxo: None,
             loose_sighash: None,
+            finalized: None,
+            hints: SigningHints::default(),
         }],
         ready: signed,
     }
@@ -2024,6 +2026,14 @@ fn broadcasts() -> Vec<Fixture> {
                 Ready,
                 Refused,
                 Unsigned,
+            }),
+        ),
+        variants(
+            "FeeRateBasis",
+            every!(FeeRateBasis {
+                Exact,
+                Estimated,
+                UpperBound,
             }),
         ),
         fixture(
