@@ -989,9 +989,11 @@ pub fn build_preview(
     let refused = warnings
         .iter()
         .any(|w| w.blocking && w.kind != TxWarningKind::Unsigned);
+    // Past a refusal, the one caution left that blocks is a missing
+    // signature, which is what `decoded.ready` already says.
     let readiness = if refused {
         TxReadiness::Refused
-    } else if !decoded.ready || warnings.iter().any(|w| w.blocking) {
+    } else if !decoded.ready {
         TxReadiness::Unsigned
     } else {
         TxReadiness::Ready
