@@ -365,3 +365,120 @@ async fn a_certificate_is_not_asked_of_wallet_material() {
         assert!(refused.is_err(), "{url}");
     }
 }
+
+/// The preferences both apps keep are changed one field at a time, kept
+/// across a restart, and never left on a pair no source quotes.
+#[tokio::test]
+async fn the_shared_preferences_are_typed_and_persisted() {
+    use crate::prefs::{Preferences, PreferencesChange, Unit};
+    use crate::price::{FiatCurrency, PriceSource};
+
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    assert_eq!(manager.preferences().await, Preferences::default());
+
+    let stored = manager
+        .set_preferences(PreferencesChange {
+            unit: Some(Unit::Sats),
+            ..PreferencesChange::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored.unit, Unit::Sats);
+    let stored = manager
+        .set_preferences(PreferencesChange {
+            price_source: Some(PriceSource::Kraken),
+            masked: Some(true),
+            ..PreferencesChange::default()
+        })
+        .await
+        .unwrap();
+    // The first change stands: a change moves what it names alone.
+    assert_eq!(stored.unit, Unit::Sats);
+    assert!(stored.masked);
+
+    // The currency wins, the source follows, in what is stored and in
+    // what is answered.
+    let stored = manager
+        .set_preferences(PreferencesChange {
+            fiat_currency: Some(FiatCurrency::Brl),
+            ..PreferencesChange::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored.fiat_currency, FiatCurrency::Brl);
+    assert_eq!(stored.price_source, PriceSource::Coingecko);
+    assert_eq!(manager.preferences().await, stored);
+    assert_eq!(manager.settings().await.preferences, stored);
+
+    drop(manager);
+    let manager = WalletManager::open(dir.path(), key()).unwrap();
+    assert_eq!(manager.preferences().await, stored);
+}
+
+/// A key the shared preferences were once kept under is no app
+/// preference: written there, nothing would read it.
+#[tokio::test]
+async fn a_shared_preference_is_not_an_app_preference() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    for key in crate::prefs::LEGACY_KEYS {
+        let refused = manager
+            .set_app_pref(key.to_owned(), "1".to_owned())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, CoreError::InvalidInput { .. }),
+            "{key}: {refused}"
+        );
+    }
+    assert!(manager.settings().await.app_prefs.is_empty());
+    manager
+        .set_app_pref("desktop.theme".to_owned(), "dark".to_owned())
+        .await
+        .unwrap();
+}
+
+/// A backup carries none of the preferences, settings included: a
+/// restore leaves the ones of the device it lands on as they were.
+#[tokio::test]
+async fn a_backup_carries_no_preference() {
+    use crate::prefs::{Preferences, PreferencesChange, Unit};
+
+    let source_dir = tempfile::tempdir().unwrap();
+    let (source, _, _) = seeded(source_dir.path()).await;
+    source
+        .set_preferences(PreferencesChange {
+            unit: Some(Unit::Sats),
+            masked: Some(true),
+            fiat: Some(true),
+            ..PreferencesChange::default()
+        })
+        .await
+        .unwrap();
+    let bundle = source
+        .export_backup(
+            &BackupOptions {
+                wallet_ids: None,
+                include_settings: true,
+            },
+            BACKUP_PASSWORD,
+        )
+        .await
+        .unwrap();
+
+    let target_dir = tempfile::tempdir().unwrap();
+    let target = manager(target_dir.path()).await;
+    target
+        .import_backup(
+            &bundle.data,
+            BACKUP_PASSWORD,
+            &ImportChoices {
+                indexes: None,
+                apply_settings: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(target.preferences().await, Preferences::default());
+}

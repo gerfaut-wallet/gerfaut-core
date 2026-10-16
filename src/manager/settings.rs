@@ -1,5 +1,5 @@
 //! The settings: the backend of each network and the certificates
-//! accepted for it, the gap limit, the app's preferences, and Tor. A
+//! accepted for it, the gap limit, the preferences, and Tor. A
 //! sync, a broadcast, the update check and the price ask here whether
 //! they go through Tor, and by which proxy.
 
@@ -9,6 +9,7 @@ use crate::chain::tor::{self, TorRoute, TorSettings, TorStatus};
 use crate::chain::{self, BackendConfig, CertificateReport, CertificateStatus, Endpoint};
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
+use crate::prefs::{Preferences, PreferencesChange};
 use crate::store::Settings;
 
 use super::WalletManager;
@@ -166,12 +167,38 @@ impl WalletManager {
         result
     }
 
-    /// Stores one small app preference (theme, hidden balances, ...) in
-    /// the encrypted vault.
+    /// Stores one small preference of an app (theme, sidebar, ...) in
+    /// the encrypted vault. A key the shared preferences were once kept
+    /// under is refused: written there, nothing would read it, and the
+    /// app that wrote it would not know. Those go through
+    /// [`Self::set_preferences`].
     pub async fn set_app_pref(&self, key: String, value: String) -> CoreResult<()> {
+        if crate::prefs::LEGACY_KEYS.contains(&key.as_str()) {
+            return Err(CoreError::InvalidInput {
+                kind: "app preference",
+                detail: format!("`{key}` is one of the shared preferences"),
+            });
+        }
         self.state.lock().await.commit(|payload| {
             payload.settings.app_prefs.insert(key, value);
             Ok(())
+        })
+    }
+
+    /// The preferences both apps keep: see [`crate::prefs`].
+    pub async fn preferences(&self) -> Preferences {
+        self.state.lock().await.payload.settings.preferences
+    }
+
+    /// Changes some of the preferences both apps keep, and answers them
+    /// all as stored. The currency wins and the source follows: a pair
+    /// that no source quotes is never stored (see
+    /// [`Preferences::change`]).
+    pub async fn set_preferences(&self, change: PreferencesChange) -> CoreResult<Preferences> {
+        self.state.lock().await.commit(|payload| {
+            let preferences = &mut payload.settings.preferences;
+            *preferences = preferences.change(&change);
+            Ok(*preferences)
         })
     }
 
