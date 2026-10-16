@@ -28,6 +28,8 @@ pub enum ErrorCode {
     /// A recognized format, invalid in itself: a bad checksum, a
     /// malformed path, a QR code no wallet makes, a choice out of range.
     InvalidInput,
+    /// An animated QR code announces more parts than Gerfaut reads.
+    TooManyParts,
     /// The input belongs to another network than the one asked for.
     NetworkMismatch,
     /// No wallet of that id in the vault.
@@ -74,6 +76,7 @@ impl ErrorCode {
         ErrorCode::UnrecognizedInput,
         ErrorCode::PrivateMaterial,
         ErrorCode::InvalidInput,
+        ErrorCode::TooManyParts,
         ErrorCode::NetworkMismatch,
         ErrorCode::WalletNotFound,
         ErrorCode::DuplicateWallet,
@@ -96,6 +99,7 @@ impl ErrorCode {
             ErrorCode::UnrecognizedInput => "unrecognized_input",
             ErrorCode::PrivateMaterial => "private_material",
             ErrorCode::InvalidInput => "invalid_input",
+            ErrorCode::TooManyParts => "too_many_parts",
             ErrorCode::NetworkMismatch => "network_mismatch",
             ErrorCode::WalletNotFound => "wallet_not_found",
             ErrorCode::DuplicateWallet => "duplicate_wallet",
@@ -141,6 +145,12 @@ pub enum CoreError {
     /// (bad checksum, malformed derivation path, ...).
     #[error("invalid {kind}: {detail}")]
     InvalidInput { kind: &'static str, detail: String },
+
+    /// A multi-part UR announces more parts than the 5,000 Gerfaut
+    /// reads, the count it gives. Refused on the count alone, before
+    /// any part is decoded.
+    #[error("invalid qr: this QR code announces {0} parts, more than Gerfaut reads")]
+    TooManyParts(u32),
 
     /// The input belongs to a different network than the requested one.
     #[error("network mismatch: input is for {found}, expected {expected}")]
@@ -204,6 +214,7 @@ impl CoreError {
             CoreError::UnrecognizedInput(_) => ErrorCode::UnrecognizedInput,
             CoreError::PrivateMaterialRejected => ErrorCode::PrivateMaterial,
             CoreError::InvalidInput { .. } => ErrorCode::InvalidInput,
+            CoreError::TooManyParts(_) => ErrorCode::TooManyParts,
             CoreError::NetworkMismatch { .. } => ErrorCode::NetworkMismatch,
             CoreError::WalletNotFound(_) => ErrorCode::WalletNotFound,
             CoreError::DuplicateWallet(_) => ErrorCode::DuplicateWallet,
@@ -294,6 +305,7 @@ mod tests {
                 "unrecognized_input",
                 "private_material",
                 "invalid_input",
+                "too_many_parts",
                 "network_mismatch",
                 "wallet_not_found",
                 "duplicate_wallet",
@@ -369,6 +381,7 @@ mod tests {
                 },
                 ErrorCode::InvalidInput,
             ),
+            (CoreError::TooManyParts(5_001), ErrorCode::TooManyParts),
             (
                 CoreError::NetworkMismatch {
                     expected: "signet".to_owned(),

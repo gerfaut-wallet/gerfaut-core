@@ -162,10 +162,15 @@ fn ur_part_count_is_sane(frame: &str) -> bool {
 
 fn assemble_ur(frames: &[&str]) -> CoreResult<QrProgress> {
     let (ur_type, total) = ur_header(frames[0])?;
-    if total.is_some() && !ur_part_count_is_sane(frames[0]) {
-        return Err(qr_error(
-            "this QR code announces an impossible number of parts",
-        ));
+    match total {
+        Some(0) => {
+            return Err(qr_error(
+                "this QR code announces an impossible number of parts",
+            ));
+        }
+        // A code of its own: the screens say this one in their words.
+        Some(total) if total > MAX_UR_PARTS => return Err(CoreError::TooManyParts(total)),
+        _ => {}
     }
     let progress = |ur_type: &str,
                     received: u32,
@@ -964,8 +969,19 @@ mod tests {
     #[test]
     fn a_ur_announcing_more_parts_than_anyone_scans_is_refused() {
         let hostile = frame_announcing("bytes", 7_000, MAX_UR_PARTS + 1);
+        let refused = assemble(&[hostile]).unwrap_err();
+        assert!(
+            matches!(refused, CoreError::TooManyParts(5_001)),
+            "{refused}"
+        );
+        assert_eq!(refused.code(), crate::error::ErrorCode::TooManyParts);
+        assert_eq!(
+            refused.to_string(),
+            "invalid qr: this QR code announces 5001 parts, more than Gerfaut reads"
+        );
+        // A count of none is no count at all, not one too large.
         assert!(matches!(
-            assemble(&[hostile]),
+            assemble(&[frame_announcing("bytes", 1, 0)]),
             Err(CoreError::InvalidInput { kind: "qr", .. })
         ));
         let progress = assemble(&[frame_announcing("bytes", 1, MAX_UR_PARTS)]).unwrap();
@@ -980,9 +996,18 @@ mod tests {
         let hostile = frame_announcing_billions("bytes");
         assert!(matches!(
             assemble(std::slice::from_ref(&hostile)),
-            Err(CoreError::InvalidInput { kind: "qr", .. })
+            Err(CoreError::TooManyParts(4_294_967_294))
         ));
-        assert!(crate::input::parse_input(&hostile).is_err());
+        // Pasted, as a wallet or as a transaction, it meets the same
+        // refusal.
+        assert!(matches!(
+            crate::input::parse_input(&hostile),
+            Err(CoreError::TooManyParts(_))
+        ));
+        assert!(matches!(
+            crate::broadcast::decode_transaction(&hostile),
+            Err(CoreError::TooManyParts(_))
+        ));
 
         let mut bytes = Vec::new();
         ciborium::into_writer(&tag(TAG_WPKH, hdkey(None)), &mut bytes).unwrap();
