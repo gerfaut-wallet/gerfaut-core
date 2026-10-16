@@ -70,7 +70,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc, watch};
@@ -699,7 +699,7 @@ impl WalletManager {
         context: &notice::Context,
     ) -> Vec<notice::Notice> {
         let composed = notice::compose(wallet_id, held, context);
-        notice::within_budget(&mut self.budgets(), composed, Instant::now())
+        notice::within_budget(&mut self.budgets(), composed, SystemTime::now())
     }
 
     /// [`Self::notices`] for a batch of any wallets, as
@@ -721,7 +721,7 @@ impl WalletManager {
     /// cannot flood with it. `None` from the minute's twentieth on, the
     /// one a budget keeps for the line that says more is waiting.
     pub fn test_notice(&self) -> Option<notice::Notice> {
-        let allowance = self.budgets().transactions.allow(Instant::now());
+        let allowance = self.budgets().transactions.allow(SystemTime::now());
         (allowance == notice::Allowance::Post).then(notice::test_notice)
     }
 

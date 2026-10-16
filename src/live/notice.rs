@@ -21,7 +21,7 @@
 //!   and folding it into a count would leave the promise standing.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +48,11 @@ const MAX_DROPPED_HELD: usize = 64;
 /// backend says. A server can make a wallet look busy; it cannot make
 /// the device ring without end. Payments no longer coming draw on a
 /// budget of the same size of their own.
+///
+/// The window is a minute of the wall clock. A monotonic clock stops
+/// while a phone sleeps, which is most of the time under Live: one
+/// burst would then hold the budget shut for hours, and what it
+/// silenced is already claimed, so never said.
 pub(crate) const BUDGET: u32 = 20;
 pub(crate) const BUDGET_WINDOW: Duration = Duration::from_secs(60);
 
@@ -381,7 +386,7 @@ pub(crate) fn test_notice() -> Notice {
 /// A cap on what is posted per minute.
 #[derive(Debug)]
 pub(crate) struct Budget {
-    started: Option<Instant>,
+    started: Option<SystemTime>,
     spent: u32,
 }
 
@@ -402,10 +407,13 @@ impl Budget {
         }
     }
 
-    pub(crate) fn allow(&mut self, now: Instant) -> Allowance {
-        let fresh = self
-            .started
-            .is_none_or(|started| now.duration_since(started) >= BUDGET_WINDOW);
+    /// A clock set back starts a new window: the budget errs towards
+    /// saying more, never towards a silence longer than a minute.
+    pub(crate) fn allow(&mut self, now: SystemTime) -> Allowance {
+        let fresh = self.started.is_none_or(|started| {
+            now.duration_since(started)
+                .map_or(true, |elapsed| elapsed >= BUDGET_WINDOW)
+        });
         if fresh {
             self.started = Some(now);
             self.spent = 0;
@@ -441,7 +449,7 @@ impl Budgets {
 pub(crate) fn within_budget(
     budgets: &mut Budgets,
     notices: Vec<Notice>,
-    now: Instant,
+    now: SystemTime,
 ) -> Vec<Notice> {
     let mut out = Vec::new();
     for notice in notices {
@@ -932,7 +940,7 @@ mod tests {
     #[test]
     fn the_budget_caps_a_minute_and_says_more_is_waiting() {
         let mut budget = Budgets::new();
-        let start = Instant::now();
+        let start = SystemTime::now();
         let notices = notices(NoticeKind::Transaction, 50);
         let posted = within_budget(&mut budget, notices.clone(), start);
         assert_eq!(posted.len(), BUDGET as usize);
@@ -956,8 +964,14 @@ mod tests {
             )
             .is_empty()
         );
-        let later = within_budget(&mut budget, notices, start + BUDGET_WINDOW);
+        let later = within_budget(&mut budget, notices.clone(), start + BUDGET_WINDOW);
         assert_eq!(later.len(), BUDGET as usize);
+
+        // A clock set back opens a new window rather than a long silence.
+        let spent = within_budget(&mut budget, notices.clone(), start + BUDGET_WINDOW);
+        assert!(spent.is_empty());
+        let set_back = within_budget(&mut budget, notices, start);
+        assert_eq!(set_back.len(), BUDGET as usize);
     }
 
     /// A minute spent on new transactions leaves the payments no longer
@@ -965,7 +979,7 @@ mod tests {
     #[test]
     fn a_burst_of_transactions_never_silences_a_payment_no_longer_coming() {
         let mut budgets = Budgets::new();
-        let start = Instant::now();
+        let start = SystemTime::now();
         let mut all = notices(NoticeKind::Transaction, 50);
         all.push(Notice {
             title: "Cold storage".to_owned(),
