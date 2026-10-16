@@ -27,7 +27,7 @@ pub mod updates;
 pub mod wallet;
 pub mod watch;
 
-pub use error::{CoreError, CoreResult};
+pub use error::{CoreError, CoreResult, ErrorCode};
 pub use manager::WalletManager;
 pub use network::Network;
 

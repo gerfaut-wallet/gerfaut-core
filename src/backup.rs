@@ -187,11 +187,12 @@ pub struct ImportReport {
     pub settings_applied: bool,
 }
 
-fn backup_error(detail: impl Into<String>) -> CoreError {
-    CoreError::InvalidInput {
-        kind: "backup",
-        detail: detail.into(),
-    }
+/// The refusal of what cannot be read as a backup, whatever it turns
+/// out to be. Never a password's fault: that one is
+/// [`VaultError::WrongKeyOrCorrupted`], and the screens say "wrong
+/// password" for it and for nothing else.
+fn unreadable(detail: impl Into<String>) -> CoreError {
+    CoreError::UnreadableBackup(detail.into())
 }
 
 /// The key a password derives to, after the checks both sides share.
@@ -224,20 +225,20 @@ pub fn seal(payload: &BackupPayload, password: &str) -> CoreResult<Vec<u8>> {
 
 /// The refusal a backup from a newer Gerfaut gets, whichever part of
 /// it this build does not know: the envelope version, the key profile
-/// the password is derived under, or the payload schema. Its own
-/// sentence, and never the one a wrong password or a damaged file
-/// gets: the restore screens show that one as "wrong password", and a
-/// person holding the right password would only type it again.
+/// the password is derived under, or the payload schema. Its own code,
+/// and never the one a wrong password or a damaged file gets: a person
+/// holding the right password would only type it again.
 fn newer_gerfaut(unknown: &str) -> CoreError {
-    backup_error(format!(
+    CoreError::NewerBackup(format!(
         "this backup was written by a newer Gerfaut ({unknown}); update Gerfaut to open it"
     ))
 }
 
 /// Opens a sealed backup. A wrong password and a tampered file are one
-/// and the same failure; a file that is not a backup is said to be so;
-/// a file written by a newer Gerfaut, at any layer of its format, is
-/// refused by name rather than half-read or blamed on the password.
+/// and the same failure; a file that is not a backup, or one the
+/// password opens but that holds no wallet list, is unreadable; a file
+/// written by a newer Gerfaut, at any layer of its format, is refused
+/// by name rather than half-read or blamed on the password.
 pub fn open(bytes: &[u8], password: &str) -> CoreResult<BackupPayload> {
     let key = password_key(password)?;
     let compressed =
@@ -246,17 +247,22 @@ pub fn open(bytes: &[u8], password: &str) -> CoreResult<BackupPayload> {
                 newer_gerfaut(&format!("file version {version}"))
             }
             VaultError::UnsupportedKdf(kdf) => newer_gerfaut(&format!("key profile {kdf}")),
+            // Another magic, or too short for a header.
+            VaultError::NotAVault => unreadable("this is not a Gerfaut backup"),
             other => other.into(),
         })?;
+    // Past the seal the password was right: what fails from here on is
+    // the file, never the person who typed it.
+    let damaged = |e: &dyn std::fmt::Display| unreadable(format!("this backup is damaged: {e}"));
     let mut json = Vec::new();
     // Bounded: zlib reaches a thousand to one, and a crafted file must
     // not be able to inflate until the device gives up.
     flate2::read::ZlibDecoder::new(&compressed[..])
         .take(MAX_BACKUP_PAYLOAD as u64 + 1)
         .read_to_end(&mut json)
-        .map_err(|e| VaultError::CorruptedPayload(e.to_string()))?;
+        .map_err(|e| damaged(&e))?;
     if json.len() > MAX_BACKUP_PAYLOAD {
-        return Err(backup_error(
+        return Err(unreadable(
             "this backup expands to far more than any wallet list",
         ));
     }
@@ -265,12 +271,11 @@ pub fn open(bytes: &[u8], password: &str) -> CoreResult<BackupPayload> {
     struct Versioned {
         version: u32,
     }
-    let Versioned { version } =
-        serde_json::from_slice(&json).map_err(|e| VaultError::CorruptedPayload(e.to_string()))?;
+    let Versioned { version } = serde_json::from_slice(&json).map_err(|e| damaged(&e))?;
     if version > BACKUP_VERSION {
         return Err(newer_gerfaut(&format!("backup version {version}")));
     }
-    serde_json::from_slice(&json).map_err(|e| VaultError::CorruptedPayload(e.to_string()).into())
+    serde_json::from_slice(&json).map_err(|e| damaged(&e))
 }
 
 /// Bytes of a backup handed over as text: bare base64 of the file, or
@@ -281,7 +286,7 @@ pub fn decode_source(source: &str) -> CoreResult<Vec<u8>> {
     // past the cap is not one, and decoding it would only spend memory
     // to reach the same answer.
     if source.len() > MAX_BACKUP_TEXT {
-        return Err(backup_error(
+        return Err(unreadable(
             "this file is far too large to be a Gerfaut backup",
         ));
     }
@@ -293,7 +298,7 @@ pub fn decode_source(source: &str) -> CoreResult<Vec<u8>> {
         _ => compact.as_str(),
     };
     if body.is_empty() {
-        return Err(backup_error("nothing to restore"));
+        return Err(unreadable("nothing to restore"));
     }
     let padded = match body.len() % 4 {
         0 => body.to_owned(),
@@ -301,9 +306,9 @@ pub fn decode_source(source: &str) -> CoreResult<Vec<u8>> {
     };
     let bytes = data_encoding::BASE64
         .decode(padded.as_bytes())
-        .map_err(|_| backup_error("expected the text of a backup file or a scanned backup"))?;
+        .map_err(|_| unreadable("expected the text of a backup file or a scanned backup"))?;
     if !bytes.starts_with(BACKUP_MAGIC) {
-        return Err(backup_error("this is not a Gerfaut backup"));
+        return Err(unreadable("this is not a Gerfaut backup"));
     }
     Ok(bytes)
 }
@@ -340,6 +345,7 @@ pub fn frames(bytes: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorCode;
     use crate::input::ScriptKind;
     use crate::input::qr::{QrFormat, assemble};
 
@@ -489,19 +495,16 @@ mod tests {
         };
         let sealed = seal(&future, PASSWORD).unwrap();
         let error = open(&sealed, PASSWORD).unwrap_err();
-        assert!(
-            matches!(error, CoreError::InvalidInput { kind: "backup", .. }),
-            "{error}"
-        );
+        assert_eq!(error.code(), ErrorCode::NewerFormat, "{error}");
         assert!(error.to_string().contains("version 2"), "{error}");
         assert!(error.to_string().contains("newer Gerfaut"), "{error}");
     }
 
     /// A backup whose header names a key profile or an envelope version
     /// this build does not know was written by a newer Gerfaut. It is
-    /// refused under that name, in the sentence the restore screens
-    /// print as it is, and never as the wrong-password failure they
-    /// rewrite into "wrong password, or the file is damaged".
+    /// refused under that name, with a code of its own, and never as
+    /// the wrong-password failure the restore screens word as "wrong
+    /// password, or the file is damaged".
     #[test]
     fn a_file_from_a_newer_gerfaut_is_not_blamed_on_the_password() {
         let sealed = seal(&payload(), PASSWORD).unwrap();
@@ -517,10 +520,7 @@ mod tests {
             let mut newer = sealed.clone();
             newer[offset] = forged;
             let error = open(&newer, PASSWORD).unwrap_err();
-            assert!(
-                matches!(error, CoreError::InvalidInput { kind: "backup", .. }),
-                "{error}"
-            );
+            assert_eq!(error.code(), ErrorCode::NewerFormat, "{error}");
             let message = error.to_string();
             assert_eq!(
                 message,
@@ -546,14 +546,66 @@ mod tests {
     fn a_vault_is_not_a_backup() {
         let key = VaultKey::Password(PASSWORD.to_owned());
         let vault = cipher::seal(b"{}", &key).unwrap();
-        assert!(matches!(
-            open(&vault, PASSWORD),
-            Err(CoreError::Vault(VaultError::NotAVault))
-        ));
-        assert!(matches!(
-            open(b"garbage", PASSWORD),
-            Err(CoreError::Vault(VaultError::NotAVault))
-        ));
+        for bytes in [&vault[..], b"garbage"] {
+            let error = open(bytes, PASSWORD).unwrap_err();
+            assert!(matches!(error, CoreError::UnreadableBackup(_)), "{error}");
+            assert_eq!(
+                error.to_string(),
+                "invalid backup: this is not a Gerfaut backup"
+            );
+        }
+    }
+
+    /// What the restore screens decide on, met the way they meet it:
+    /// "wrong password" is the answer to a wrong password and to a file
+    /// altered under its seal, and to nothing else. A file that is not
+    /// a backup, or one the seal no longer guards, is unreadable; one
+    /// from a newer Gerfaut says so.
+    #[test]
+    fn each_refusal_reaches_the_screens_under_its_own_code() {
+        let sealed = seal(&payload(), PASSWORD).unwrap();
+        let code = |bytes: &[u8], password: &str| open(bytes, password).unwrap_err().code();
+
+        // A file altered under its seal is the same failure to the
+        // cipher: `tampering_is_detected`.
+        assert_eq!(
+            code(&sealed, "correct horse battery stapler"),
+            ErrorCode::WrongKey
+        );
+
+        let vault = cipher::seal(b"{}", &VaultKey::Raw([7; 32])).unwrap();
+        // Cut inside the header, there is nothing left to try a
+        // password on.
+        for unreadable in [&vault[..], b"garbage", &sealed[..20]] {
+            assert_eq!(code(unreadable, PASSWORD), ErrorCode::UnreadableBackup);
+            // Whatever the password, it is not what is in question.
+            assert_eq!(
+                code(unreadable, "correct horse battery stapler"),
+                ErrorCode::UnreadableBackup
+            );
+        }
+        // Sealed under the right password, but not a compressed wallet
+        // list: the password opened it, the file is at fault.
+        let key = VaultKey::Password(PASSWORD.to_owned());
+        for inside in [&b"not zlib at all"[..], b"x\x9c\x03\x00\x00\x00\x00\x01"] {
+            let odd = cipher::seal_with(BACKUP_MAGIC, inside, &key).unwrap();
+            let error = open(&odd, PASSWORD).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::UnreadableBackup, "{error}");
+            assert!(error.to_string().contains("damaged"), "{error}");
+        }
+
+        let mut newer = sealed.clone();
+        newer[8] = 3;
+        assert_eq!(code(&newer, PASSWORD), ErrorCode::NewerFormat);
+
+        // Text read the way the restore reads it; the last one is the
+        // magic alone.
+        for text in ["", "not base64 at all!", "R0ZCQUNLVVA="] {
+            let refused = decode_source(text)
+                .and_then(|bytes| open(&bytes, PASSWORD))
+                .unwrap_err();
+            assert_eq!(refused.code(), ErrorCode::UnreadableBackup, "{text:?}");
+        }
     }
 
     #[test]
@@ -585,7 +637,7 @@ mod tests {
         for garbage in ["", "   ", "not base64 at all!", "wpkh(abc)", BACKUP_PREFIX] {
             let error = decode_source(garbage).unwrap_err();
             assert!(
-                matches!(error, CoreError::InvalidInput { kind: "backup", .. }),
+                matches!(error, CoreError::UnreadableBackup(_)),
                 "{garbage:?}: {error}"
             );
         }
@@ -764,7 +816,7 @@ mod tests {
         let huge = "A".repeat(MAX_BACKUP_TEXT + 1);
         let refused = decode_source(&huge).unwrap_err();
         assert!(
-            matches!(refused, CoreError::InvalidInput { kind: "backup", .. }),
+            matches!(refused, CoreError::UnreadableBackup(_)),
             "{refused}"
         );
         assert!(refused.to_string().contains("too large"), "{refused}");
