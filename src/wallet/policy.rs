@@ -9,6 +9,9 @@
 //! and the wallet's coins. Pure: no I/O and no engine; the manager
 //! hands it what it needs.
 //!
+//! Each branch comes with the tone its state is shown in, so that the
+//! applications only have to word it.
+//!
 //! A branch is read through its thresholds. A threshold is met with the
 //! k-th soonest of its items, so an "and" waits for its last lock, an
 //! "or" for its first, and `thresh(3, A, B, older(N1), older(N2))` for
@@ -48,6 +51,9 @@ const RELATIVE_TIME_UNIT: u64 = 512;
 /// The low sixteen bits of a sequence number carry the lock's value;
 /// bit 22 says whether it counts blocks or time units.
 const SEQUENCE_VALUE_MASK: u32 = 0x0000_FFFF;
+/// Under this much left, a branch reads as close rather than far off.
+/// Thirty days exactly are not yet under it.
+const CLOSE_SECONDS: u64 = 30 * 86_400;
 
 type Semantic = Policy<DescriptorPublicKey>;
 
@@ -274,6 +280,48 @@ pub enum BranchState {
     NeedsPreimage,
 }
 
+/// The tone a branch's state is shown in.
+///
+/// Colour comes at two thresholds only, and the core draws both so the
+/// applications have no table of their own to keep: a branch open now,
+/// and one that opens in under thirty days. A lock further off, a wait
+/// of unknown length, a branch with no coin to count from and one that
+/// needs a secret are all neutral. No branch puts funds at risk, so
+/// none is ever an alert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchTone {
+    /// Open now: the branch, or every coin under it.
+    Confirmed,
+    /// Opens in under thirty days: the branch, or its next coin.
+    Pending,
+    /// Anything else.
+    Neutral,
+}
+
+impl BranchState {
+    /// The tone this state is shown in.
+    pub fn tone(&self) -> BranchTone {
+        match self {
+            BranchState::SpendableNow => BranchTone::Confirmed,
+            BranchState::Locked { until } => until.tone(),
+            BranchState::PerCoin {
+                unlocked,
+                waiting,
+                locked,
+                next,
+            } => {
+                if *locked == 0 && *waiting == 0 && *unlocked > 0 {
+                    BranchTone::Confirmed
+                } else {
+                    next.map_or(BranchTone::Neutral, |next| next.tone())
+                }
+            }
+            BranchState::NoCoins | BranchState::NeedsPreimage => BranchTone::Neutral,
+        }
+    }
+}
+
 /// One way to spend: a top-level alternative of the policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyBranch {
@@ -291,6 +339,8 @@ pub struct PolicyBranch {
     pub state: BranchState,
     /// `state` is `SpendableNow`, for a quick test.
     pub spendable_now: bool,
+    /// The tone `state` is shown in, so that no screen decides it.
+    pub tone: BranchTone,
 }
 
 /// A wallet's policy read against the chain.
@@ -362,6 +412,7 @@ pub fn analyze(input: PolicyInput<'_>) -> CoreResult<PolicySnapshot> {
             label,
             summary: summary(&draft.condition, &book),
             spendable_now: matches!(draft.state, BranchState::SpendableNow),
+            tone: draft.state.tone(),
             condition: draft.condition,
             timelocks: draft.timelocks,
             state: draft.state,
@@ -834,6 +885,15 @@ impl Remaining {
             remaining_blocks: None,
             remaining_seconds: Some(seconds),
             unlocks_at_unix: Some(unlocks_at),
+        }
+    }
+
+    /// Pending under thirty days; neutral further off, or when the
+    /// distance is not known.
+    fn tone(&self) -> BranchTone {
+        match self.remaining_seconds {
+            Some(seconds) if seconds < CLOSE_SECONDS => BranchTone::Pending,
+            _ => BranchTone::Neutral,
         }
     }
 
@@ -1720,6 +1780,7 @@ mod tests {
         assert!(branch.timelocks.is_empty());
         assert_eq!(branch.state, BranchState::SpendableNow);
         assert!(branch.spendable_now);
+        assert_eq!(branch.tone, BranchTone::Confirmed);
     }
 
     #[test]
@@ -1737,6 +1798,7 @@ mod tests {
         assert_eq!(branch.summary, "Any 2 of 3 keys");
         assert_eq!(branch.role, BranchRole::Primary);
         assert!(branch.spendable_now);
+        assert_eq!(branch.tone, BranchTone::Confirmed);
         assert_eq!(
             branch.condition,
             Condition::Thresh {
@@ -1855,6 +1917,7 @@ mod tests {
         assert_eq!(primary.role, BranchRole::Primary);
         assert_eq!(primary.summary, "Key A");
         assert!(primary.spendable_now);
+        assert_eq!(primary.tone, BranchTone::Confirmed);
 
         assert_eq!(recovery.role, BranchRole::Recovery);
         assert_eq!(recovery.label, "Recovery");
@@ -1877,6 +1940,8 @@ mod tests {
                 next: Some(next),
             }
         );
+        // 42,559 blocks to go: far off, so neutral.
+        assert_eq!(recovery.tone, BranchTone::Neutral);
         assert_eq!(recovery.timelocks.len(), 1);
         let lock = &recovery.timelocks[0];
         assert!(lock.required);
@@ -1996,6 +2061,132 @@ mod tests {
             ]
         );
         assert!(!snapshot.branches[1].spendable_now, "primary, yet it waits");
+    }
+
+    /// A branch turns pending under thirty days, not at them, whatever
+    /// counts the wait: the blocks to a height, a coin's own wait, or
+    /// the clock.
+    #[test]
+    fn a_branch_is_pending_under_thirty_days() {
+        // 4,320 blocks are thirty days to the minute.
+        let height = |left: u32| {
+            let descriptor = format!(
+                "wsh(or_d(pk({A}/0/*),and_v(v:pkh({B}/0/*),after({}))))",
+                TIP + left
+            );
+            wsh(&descriptor, Vec::new()).branches[1].tone
+        };
+        assert_eq!(height(4_320), BranchTone::Neutral);
+        assert_eq!(height(4_319), BranchTone::Pending);
+        assert_eq!(height(1), BranchTone::Pending);
+
+        // A coin confirmed at height h has waited TIP - h + 1 blocks.
+        let coin_left = |left: u32| {
+            let confirmed = TIP + 1 + left - 52_560;
+            let snapshot = wsh(&liana(), vec![coin("aa:0", Some(confirmed), None)]);
+            let recovery = &snapshot.branches[1];
+            assert_eq!(
+                recovery.state,
+                BranchState::PerCoin {
+                    unlocked: 0,
+                    waiting: 0,
+                    locked: 1,
+                    next: Some(Remaining::blocks(left, NOW)),
+                }
+            );
+            recovery.tone
+        };
+        assert_eq!(coin_left(4_320), BranchTone::Neutral);
+        assert_eq!(coin_left(4_319), BranchTone::Pending);
+
+        // A date, against the clock.
+        let clock = |left: u64| {
+            let descriptor = format!(
+                "wsh(or_d(pk({A}/0/*),and_v(v:pkh({B}/0/*),after({}))))",
+                NOW + left
+            );
+            wsh(&descriptor, Vec::new()).branches[1].tone
+        };
+        assert_eq!(clock(30 * 86_400), BranchTone::Neutral);
+        assert_eq!(clock(30 * 86_400 - 1), BranchTone::Pending);
+    }
+
+    /// Every state has its tone: confirmed when the branch, or every
+    /// coin under it, is open; neutral when nothing says how near it is.
+    #[test]
+    fn every_branch_state_has_a_tone() {
+        let tone = |coins: Vec<Coin>| {
+            let snapshot = wsh(&liana(), coins);
+            assert_eq!(snapshot.branches[0].tone, BranchTone::Confirmed);
+            (
+                snapshot.branches[1].state.clone(),
+                snapshot.branches[1].tone,
+            )
+        };
+        let old = || coin("aa:0", Some(700_000), None);
+        let pending = || coin("bb:0", None, None);
+        assert_eq!(
+            tone(vec![old(), coin("cc:0", Some(740_000), None)]),
+            (
+                BranchState::PerCoin {
+                    unlocked: 2,
+                    waiting: 0,
+                    locked: 0,
+                    next: None,
+                },
+                BranchTone::Confirmed
+            ),
+            "every coin past the lock"
+        );
+        assert_eq!(
+            tone(vec![old(), pending()]).1,
+            BranchTone::Neutral,
+            "a coin whose count has not started"
+        );
+        assert_eq!(tone(vec![pending()]).1, BranchTone::Neutral);
+        assert_eq!(
+            tone(Vec::new()),
+            (BranchState::NoCoins, BranchTone::Neutral)
+        );
+        // Far off, the nearest coin as much as the others.
+        assert_eq!(
+            tone(vec![old(), coin("dd:0", Some(790_000), None)]).1,
+            BranchTone::Neutral
+        );
+
+        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let secret = wsh(
+            &format!("wsh(or_d(pk({A}/0/*),and_v(v:pk({B}/0/*),sha256({hash}))))"),
+            Vec::new(),
+        );
+        assert_eq!(secret.branches[1].state, BranchState::NeedsPreimage);
+        assert_eq!(secret.branches[1].tone, BranchTone::Neutral);
+
+        // With no tip, a lock of unknown distance is no nearer than any.
+        let unsynced = analyze(PolicyInput {
+            external_descriptor: &format!("wsh(and_v(v:pk({A}/0/*),after(800001)))"),
+            script: ScriptKind::WitnessScript,
+            coins: Vec::new(),
+            tip_height: None,
+            now_unix: NOW,
+        })
+        .unwrap();
+        assert_eq!(
+            unsynced.branches[0].state,
+            BranchState::Locked {
+                until: Remaining::default()
+            }
+        );
+        assert_eq!(unsynced.branches[0].tone, BranchTone::Neutral);
+        let unsynced = analyze(PolicyInput {
+            external_descriptor: &liana(),
+            script: ScriptKind::WitnessScript,
+            coins: vec![old()],
+            tip_height: None,
+            now_unix: NOW,
+        })
+        .unwrap();
+        assert_eq!(unsynced.branches[1].tone, BranchTone::Neutral);
     }
 
     #[test]
@@ -2709,6 +2900,8 @@ mod tests {
             r#""kind":"thresh""#,
             r#""time_basis":"wall_clock""#,
             r#""spendable_now":true"#,
+            r#""tone":"confirmed""#,
+            r#""tone":"neutral""#,
         ] {
             assert!(json.contains(expected), "{expected} missing in {json}");
         }
