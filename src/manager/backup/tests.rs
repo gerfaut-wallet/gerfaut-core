@@ -570,20 +570,36 @@ async fn backup_needs_its_password_and_scans_as_a_qr() {
 
     let target_dir = tempfile::tempdir().unwrap();
     let target = manager(target_dir.path()).await;
-    assert!(matches!(
+    let wrong = target
+        .preview_backup(&bundle.data, "not the password")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            wrong,
+            CoreError::Vault(crate::error::VaultError::WrongKeyOrCorrupted)
+        ),
+        "{wrong}"
+    );
+    assert_eq!(wrong.code(), crate::error::ErrorCode::WrongKey);
+    // Neither call takes a file that is not a backup for a password
+    // that is wrong.
+    for refused in [
         target
-            .preview_backup(&bundle.data, "not the password")
-            .await,
-        Err(CoreError::Vault(
-            crate::error::VaultError::WrongKeyOrCorrupted
-        ))
-    ));
-    assert!(matches!(
+            .preview_backup("not a backup", BACKUP_PASSWORD)
+            .await
+            .unwrap_err(),
         target
             .import_backup("not a backup", BACKUP_PASSWORD, &ImportChoices::default())
-            .await,
-        Err(CoreError::InvalidInput { kind: "backup", .. })
-    ));
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(
+            matches!(refused, CoreError::UnreadableBackup(_)),
+            "{refused}"
+        );
+        assert_eq!(refused.code(), crate::error::ErrorCode::UnreadableBackup);
+    }
 
     // The frames a camera sees assemble into the text the restore
     // accepts, and the wallet import refuses by name.

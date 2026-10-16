@@ -45,6 +45,15 @@ pub enum ErrorCode {
     /// The vault could not be read or written: the disk, a damaged
     /// file, a key derivation that failed.
     Vault,
+    /// What was handed over as a backup cannot be read as one: not a
+    /// Gerfaut backup at all (another file, a vault, a QR code of
+    /// something else), or one damaged outside what the password
+    /// guards. The password is not in question.
+    UnreadableBackup,
+    /// A vault or a backup written by a newer Gerfaut, in a format this
+    /// build does not know: updating Gerfaut opens it. The password is
+    /// not in question either.
+    NewerFormat,
     /// A chain backend failed during a sync.
     Sync,
     /// The network refused a transaction, or no backend took it.
@@ -71,6 +80,8 @@ impl ErrorCode {
         ErrorCode::WrongKey,
         ErrorCode::VaultInUse,
         ErrorCode::Vault,
+        ErrorCode::UnreadableBackup,
+        ErrorCode::NewerFormat,
         ErrorCode::Sync,
         ErrorCode::Broadcast,
         ErrorCode::BackendUnavailable,
@@ -91,6 +102,8 @@ impl ErrorCode {
             ErrorCode::WrongKey => "wrong_key",
             ErrorCode::VaultInUse => "vault_in_use",
             ErrorCode::Vault => "vault",
+            ErrorCode::UnreadableBackup => "unreadable_backup",
+            ErrorCode::NewerFormat => "newer_format",
             ErrorCode::Sync => "sync",
             ErrorCode::Broadcast => "broadcast",
             ErrorCode::BackendUnavailable => "backend_unavailable",
@@ -145,6 +158,17 @@ pub enum CoreError {
     #[error(transparent)]
     Vault(#[from] VaultError),
 
+    /// What was handed over as a backup is not one this build can read:
+    /// not a Gerfaut backup, or a backup damaged outside its seal. A
+    /// wrong password is never this: it is
+    /// [`VaultError::WrongKeyOrCorrupted`].
+    #[error("invalid backup: {0}")]
+    UnreadableBackup(String),
+
+    /// A backup written by a newer Gerfaut, at any layer of its format.
+    #[error("invalid backup: {0}")]
+    NewerBackup(String),
+
     /// Chain backend errors during sync.
     #[error("sync failed via {backend}: {detail}")]
     Sync { backend: String, detail: String },
@@ -184,6 +208,8 @@ impl CoreError {
             CoreError::WalletNotFound(_) => ErrorCode::WalletNotFound,
             CoreError::DuplicateWallet(_) => ErrorCode::DuplicateWallet,
             CoreError::Vault(error) => error.code(),
+            CoreError::UnreadableBackup(_) => ErrorCode::UnreadableBackup,
+            CoreError::NewerBackup(_) => ErrorCode::NewerFormat,
             CoreError::Sync { .. } => ErrorCode::Sync,
             CoreError::Broadcast { .. } => ErrorCode::Broadcast,
             CoreError::BackendUnavailable(_) => ErrorCode::BackendUnavailable,
@@ -233,17 +259,19 @@ pub enum VaultError {
 }
 
 impl VaultError {
-    /// The code a vault failure reaches the apps under. A wrong key and
-    /// a vault held elsewhere are named apart: the first is what a
-    /// password explains, the second a healthy vault.
+    /// The code a vault failure reaches the apps under. A wrong key, a
+    /// vault held elsewhere and a file from a newer Gerfaut are named
+    /// apart: the first is what a password explains, the second a
+    /// healthy vault, the third an update away.
     pub fn code(&self) -> ErrorCode {
         match self {
             VaultError::WrongKeyOrCorrupted => ErrorCode::WrongKey,
             VaultError::AlreadyOpen => ErrorCode::VaultInUse,
+            VaultError::UnsupportedVersion(_) | VaultError::UnsupportedKdf(_) => {
+                ErrorCode::NewerFormat
+            }
             VaultError::Io(_)
             | VaultError::NotAVault
-            | VaultError::UnsupportedVersion(_)
-            | VaultError::UnsupportedKdf(_)
             | VaultError::CorruptedPayload(_)
             | VaultError::Kdf(_) => ErrorCode::Vault,
         }
@@ -272,6 +300,8 @@ mod tests {
                 "wrong_key",
                 "vault_in_use",
                 "vault",
+                "unreadable_backup",
+                "newer_format",
                 "sync",
                 "broadcast",
                 "backend_unavailable",
@@ -296,18 +326,22 @@ mod tests {
         }
     }
 
-    /// A wrong key is the only vault failure under `wrong_key`, and a
-    /// vault held elsewhere the only one under `vault_in_use`.
+    /// A wrong key is the only vault failure under `wrong_key`, a vault
+    /// held elsewhere the only one under `vault_in_use`, and a file
+    /// from a newer Gerfaut is under `newer_format`.
     #[test]
     fn a_wrong_key_is_told_apart_from_other_vault_failures() {
         let code = |error: VaultError| CoreError::Vault(error).code();
         assert_eq!(code(VaultError::WrongKeyOrCorrupted), ErrorCode::WrongKey);
         assert_eq!(code(VaultError::AlreadyOpen), ErrorCode::VaultInUse);
+        assert_eq!(
+            code(VaultError::UnsupportedVersion(9)),
+            ErrorCode::NewerFormat
+        );
+        assert_eq!(code(VaultError::UnsupportedKdf(9)), ErrorCode::NewerFormat);
         for other in [
             VaultError::Io(std::io::Error::other("disk gone")),
             VaultError::NotAVault,
-            VaultError::UnsupportedVersion(9),
-            VaultError::UnsupportedKdf(9),
             VaultError::CorruptedPayload("truncated".to_owned()),
             VaultError::Kdf("out of memory".to_owned()),
         ] {
@@ -347,6 +381,11 @@ mod tests {
                 CoreError::DuplicateWallet(text()),
                 ErrorCode::DuplicateWallet,
             ),
+            (
+                CoreError::UnreadableBackup(text()),
+                ErrorCode::UnreadableBackup,
+            ),
+            (CoreError::NewerBackup(text()), ErrorCode::NewerFormat),
             (
                 CoreError::Sync {
                     backend: text(),
