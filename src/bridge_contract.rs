@@ -7,7 +7,8 @@
 //! variant of an enum, and optional fields both present and absent.
 //! The values are built below, through the functions of the core
 //! wherever one makes them, from public test material only: BIP-32
-//! test vectors, the tpub of the "abandon" mnemonic, BIP-173 addresses.
+//! test vectors, the public descriptor of the BDK documentation,
+//! BIP-173 addresses.
 //!
 //! The tests of both apps read these files from the gerfaut-core
 //! checkout beside them and decode every case with their own types: a
@@ -308,8 +309,8 @@ fn fixtures() -> Vec<Fixture> {
 
 // --- public test material ----------------------------------------------
 
-/// The tpub of the "abandon … about" mnemonic, account 0 of BIP-84 on
-/// the test networks, as a two-path descriptor.
+/// The public two-path descriptor of the BDK documentation, a BIP-84
+/// account on the test networks.
 const MULTIPATH: &str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)";
 const RECEIVE: &str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)";
 const CHANGE: &str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)";
@@ -337,7 +338,7 @@ fn txid(seed: &str) -> String {
     sha256::Hash::hash(seed.as_bytes()).to_string()
 }
 
-/// Address `index` of a descriptor of the abandon tpub, on signet.
+/// Address `index` of a descriptor of the BDK tpub, on signet.
 fn address(descriptor: &str, index: u32) -> String {
     Descriptor::<DescriptorPublicKey>::from_str(descriptor)
         .expect("a test descriptor")
@@ -1792,7 +1793,7 @@ fn script_of(address: &str) -> ScriptBuf {
 }
 
 /// The coin [`spend`] spends: 1,000,000 sats on the first receive
-/// address of the abandon tpub.
+/// address of the BDK tpub.
 fn spent_coin() -> TxOut {
     TxOut {
         value: Amount::from_sat(1_000_000),
@@ -1831,7 +1832,7 @@ fn coinbase() -> Transaction {
 }
 
 /// A payment of 250,000 sats from the first receive address of the
-/// abandon tpub, with change, as a signed raw transaction or as the
+/// BDK tpub, with change, as a signed raw transaction or as the
 /// unsigned skeleton of a PSBT.
 fn spend(signed: bool) -> DecodedTx {
     let script = script_of;
