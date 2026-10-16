@@ -851,15 +851,36 @@ pub fn build_preview(
             warnings.push(spent_caution(i, txid, facts.spent_by));
         }
     }
-    // Every input's value known and the sum fine, and still no fee:
-    // the outputs pay more than the inputs bring.
-    let overspends = inputs.iter().all(|i| i.value_sats.is_some()) && fee_sats.is_none();
+    // Why a fee is missing when every input's value is known. Sums past
+    // every bitcoin there will ever be are no sums: the amounts cannot be
+    // right, whoever declared them. Otherwise the outputs pay more than
+    // the inputs bring.
+    let values_known = inputs.iter().all(|i| i.value_sats.is_some());
+    let impossible = out_total.is_none() || (values_known && in_total.is_none());
+    let overspends = values_known && !impossible && fee_sats.is_none();
+    // That is a sure refusal only on amounts a watched wallet or a
+    // backend stood behind. A PSBT's word about the coin it spends may be
+    // wrong, and the node goes by the coin, not by the word.
+    let vouched =
+        (0..inputs.len()).all(|i| input_facts.get(i).is_some_and(|f| f.prevout.is_some()));
     match (fee_sats, fee_rate_sat_vb, in_total) {
+        (None, _, _) if impossible => warnings.push(TxWarning::new(
+            TxWarningKind::FeeUnknown,
+            "The amounts in this transaction add up to more than all the bitcoin there will \
+             ever be: they cannot be right."
+                .to_owned(),
+        )),
         // No block takes it, whichever node it reaches.
-        (None, _, _) if overspends => warnings.push(TxWarning::refused(
+        (None, _, _) if overspends && vouched => warnings.push(TxWarning::refused(
             TxWarningKind::FeeUnknown,
             "The outputs pay more than the inputs bring: the network will refuse this \
              transaction."
+                .to_owned(),
+        )),
+        (None, _, _) if overspends => warnings.push(TxWarning::new(
+            TxWarningKind::FeeUnknown,
+            "The outputs pay more than the inputs bring, by the amounts this transaction \
+             declares for its coins: if those are right, the network will refuse it."
                 .to_owned(),
         )),
         (None, _, _) => warnings.push(TxWarning::new(
@@ -1184,6 +1205,13 @@ mod tests {
             .collect();
         let preview = build_preview(&decoded, Network::Signet, &facts, &[], Some(100), 0);
         assert_eq!(preview.fee_sats, None);
+        let fee = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::FeeUnknown)
+            .unwrap();
+        assert!(fee.message.contains("cannot be right"), "{}", fee.message);
+        assert!(!fee.blocking, "an overflow is no refusal anyone made");
 
         let mut small = signed_tx();
         small.output[0].value = Amount::from_sat(10_000_000);
@@ -1625,8 +1653,8 @@ mod tests {
         }
     }
 
-    /// Outputs worth more than the inputs: no block takes that, whichever
-    /// node it reaches.
+    /// Outputs worth more than inputs a wallet or a backend confirmed: no
+    /// block takes that, whichever node it reaches.
     #[test]
     fn outputs_over_the_inputs_block_the_send() {
         let decoded = decode_transaction(&encode::serialize_hex(&signed_tx())).unwrap();
@@ -1649,6 +1677,110 @@ mod tests {
             .unwrap();
         assert!(fee.blocking);
         assert!(fee.message.contains("the network will refuse"));
+    }
+
+    /// A finalized PSBT that declares, in its witness entries, coins
+    /// worth `declared` and pays `paid`: the coins' values are the PSBT's
+    /// word and nothing else.
+    fn declared_psbt(declared: &[u64], paid: &[u64]) -> DecodedTx {
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: (0..declared.len())
+                .map(|n| TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([n as u8 + 1; 32]), 0),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: paid
+                .iter()
+                .map(|&sats| TxOut {
+                    value: Amount::from_sat(sats),
+                    script_pubkey: p2wpkh(0x11),
+                })
+                .collect(),
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        for (input, &sats) in psbt.inputs.iter_mut().zip(declared) {
+            let mut witness = Witness::new();
+            witness.push([0x30; 71]);
+            witness.push([0x02; 33]);
+            input.witness_utxo = Some(TxOut {
+                value: Amount::from_sat(sats),
+                script_pubkey: p2wpkh(0x33),
+            });
+            input.final_script_witness = Some(witness);
+        }
+        decode_transaction(&data_encoding::BASE64.encode(&psbt.serialize())).unwrap()
+    }
+
+    /// No backend answered about any coin: what each is worth is what the
+    /// PSBT says.
+    fn nobody_answered(inputs: usize) -> Vec<InputFacts> {
+        (0..inputs)
+            .map(|_| InputFacts {
+                unchecked: true,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// Outputs over the amounts a PSBT declares for its coins, which no
+    /// wallet and no backend confirmed: if the declaration is wrong, the
+    /// node may well take it. Said, and left to the node.
+    #[test]
+    fn outputs_over_declared_amounts_leave_the_send_to_the_node() {
+        let decoded = declared_psbt(&[1_000], &[90_000]);
+        let preview = build_preview(
+            &decoded,
+            Network::Signet,
+            &nobody_answered(1),
+            &[],
+            Some(100),
+            0,
+        );
+        let fee = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::FeeUnknown)
+            .unwrap();
+        assert!(!fee.blocking, "{}", fee.message);
+        assert!(
+            fee.message
+                .contains("by the amounts this transaction declares"),
+            "{}",
+            fee.message
+        );
+        assert!(preview.ready);
+        assert_eq!(preview.readiness, TxReadiness::Ready);
+        assert!(preview.hex.is_some());
+    }
+
+    /// Amounts whose sum overflows are no amounts at all, declared or
+    /// confirmed: the caution says they cannot be right, and blocks
+    /// nothing, since they are not a refusal anyone made.
+    #[test]
+    fn sums_past_all_bitcoin_are_impossible_not_refused() {
+        let half = u64::MAX / 2 + 1;
+        let declared = declared_psbt(&[half, half], &[1_000]);
+        let preview = build_preview(
+            &declared,
+            Network::Signet,
+            &nobody_answered(2),
+            &[],
+            Some(100),
+            0,
+        );
+        let fee = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::FeeUnknown)
+            .unwrap();
+        assert!(fee.message.contains("cannot be right"), "{}", fee.message);
+        assert!(!fee.blocking);
+        assert!(preview.ready);
     }
 
     /// The pill's state is the core's: refused before unsigned, since a
