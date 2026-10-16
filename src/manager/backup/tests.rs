@@ -699,3 +699,74 @@ async fn a_backup_pairing_two_wallets_is_not_restored() {
     );
     assert!(manager.list_wallets(None).await.is_empty());
 }
+
+/// A certificate in a backup is restored only for an Electrum server a
+/// backend of the same backup names: a pin for a host the settings
+/// never reach would wait in the vault for the day that host is typed
+/// in. The preview promises the same hosts the restore pins.
+#[tokio::test]
+async fn a_backup_pins_only_the_servers_its_backends_name() {
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: Vec::new(),
+        backends: Some(
+            [
+                (
+                    Network::Signet,
+                    BackendConfig::CustomElectrum {
+                        url: "ssl://Node.Example.org.:50002".to_owned(),
+                        own_node: false,
+                    },
+                ),
+                (
+                    Network::Mainnet,
+                    BackendConfig::CustomEsplora {
+                        url: "https://esplora.example.org/api".to_owned(),
+                        own_node: false,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        electrum_certs: Some(
+            [
+                ("node.example.org:50002".to_owned(), fingerprint("aa")),
+                // Pinned once, its backend gone since.
+                ("old.example.org:50002".to_owned(), fingerprint("BB")),
+                // The host of the Esplora backend: no Electrum there.
+                ("esplora.example.org:50002".to_owned(), fingerprint("CC")),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    assert_eq!(
+        preview.electrum_hosts,
+        vec!["node.example.org:50002".to_owned()]
+    );
+
+    let choices = ImportChoices {
+        indexes: None,
+        apply_settings: true,
+    };
+    manager
+        .import_backup(&text, BACKUP_PASSWORD, &choices)
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.settings().await.electrum_certs,
+        [("node.example.org:50002".to_owned(), fingerprint("AA"))]
+            .into_iter()
+            .collect()
+    );
+}

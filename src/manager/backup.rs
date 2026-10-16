@@ -1,7 +1,7 @@
 //! Backups: sealing wallets and settings under a password, reading a
 //! backup before anything changes, and restoring what the user picks.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::backup::{
     self, BACKUP_VERSION, BackupBackendPreview, BackupBundle, BackupOptions, BackupPayload,
@@ -104,16 +104,10 @@ impl WalletManager {
                     })
                 })
                 .collect(),
-            // The hosts a restore would pin: the same check as the
+            // The hosts a restore would pin: the same reading as the
             // import, so the list shows what would land and nothing
             // that would be dropped on the way.
-            electrum_hosts: payload
-                .electrum_certs
-                .iter()
-                .flatten()
-                .filter(|(_, fingerprint)| chain::tls::is_fingerprint(fingerprint))
-                .map(|(host, _)| host.clone())
-                .collect(),
+            electrum_hosts: restorable_certs(&payload).into_keys().collect(),
             wallets: payload
                 .wallets
                 .iter()
@@ -135,12 +129,13 @@ impl WalletManager {
     /// labels; a wallet already watched is skipped, never duplicated or
     /// overwritten. The settings the backup carries are applied only
     /// when asked: backends replace the ones present for the same
-    /// networks, accepted certificates are added but never replaced (a
-    /// fingerprint that changed is exactly what pinning refuses to
-    /// switch in silence), the gap limit is bounded like
-    /// [`Self::set_gap_limit`]. A wallet whose material does not hold
-    /// together, a change descriptor of another wallet among it, fails
-    /// the restore, which then leaves the vault as it was.
+    /// networks, the certificates accepted for the servers those
+    /// backends name are added but never replaced (a fingerprint that
+    /// changed is exactly what pinning refuses to switch in silence),
+    /// the gap limit is bounded like [`Self::set_gap_limit`]. A wallet
+    /// whose material does not hold together, a change descriptor of
+    /// another wallet among it, fails the restore, which then leaves
+    /// the vault as it was.
     pub async fn import_backup(
         &self,
         source: &str,
@@ -228,22 +223,8 @@ impl WalletManager {
                             |(network, config)| Some((*network, config.clone().canonical().ok()?)),
                         ));
                     }
-                    if let Some(certs) = &payload.electrum_certs {
-                        for (host, fingerprint) in certs {
-                            // The same check an acceptance made by hand goes
-                            // through: a backup must not be able to pin what
-                            // the dialog would have refused, nor a fingerprint
-                            // shaped so that no real certificate can ever
-                            // match it and the host becomes permanently
-                            // unreachable.
-                            if !chain::tls::is_fingerprint(fingerprint) {
-                                continue;
-                            }
-                            settings
-                                .electrum_certs
-                                .entry(host.clone())
-                                .or_insert_with(|| fingerprint.to_ascii_uppercase());
-                        }
+                    for (host, fingerprint) in restorable_certs(&payload) {
+                        settings.electrum_certs.entry(host).or_insert(fingerprint);
                     }
                     settings.gap_limit = gap_limit;
                 }
@@ -267,6 +248,44 @@ impl WalletManager {
         self.live_refresh().await;
         result
     }
+}
+
+/// The certificates a restore pins, by host, as an acceptance made by
+/// hand stores them. Only those of an Electrum server that a backend of
+/// the same backup names: a pin is a decision about the server the
+/// settings point at, and one for a host the backup's settings never
+/// reach would wait in the vault, unseen, for the day that host is
+/// typed in, and take its certificate as accepted. Each one also passes
+/// the check of the acceptance dialog: a backup must not pin what the
+/// dialog would have refused, nor a fingerprint shaped so that no real
+/// certificate can ever match it and the host becomes permanently
+/// unreachable.
+fn restorable_certs(payload: &BackupPayload) -> BTreeMap<String, String> {
+    let named: HashSet<String> = payload
+        .backends
+        .iter()
+        .flatten()
+        .filter_map(|(network, config)| {
+            chain::endpoints(config, *network, &chain::TrustedCerts::new()).ok()
+        })
+        .flatten()
+        .filter_map(|endpoint| match endpoint {
+            chain::Endpoint::Electrum(target) => {
+                Some(chain::electrum::certificate_key(&target.url))
+            }
+            chain::Endpoint::Esplora(_) => None,
+        })
+        .collect();
+    payload
+        .electrum_certs
+        .iter()
+        .flatten()
+        .map(|(host, fingerprint)| (chain::electrum::certificate_key(host), fingerprint))
+        .filter(|(host, fingerprint)| {
+            named.contains(host) && chain::tls::is_fingerprint(fingerprint)
+        })
+        .map(|(host, fingerprint)| (host, fingerprint.to_ascii_uppercase()))
+        .collect()
 }
 
 /// What the import screen would have recognized a restored wallet as:
