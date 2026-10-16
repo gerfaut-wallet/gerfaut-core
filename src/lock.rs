@@ -238,20 +238,18 @@ fn write_whole(path: &Path, stored: &StoredAttempts) -> std::io::Result<()> {
     tmp.push(".tmp");
     {
         use std::io::Write;
-        let mut file = crate::store::owner_only(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true),
-        )
-        .open(&tmp)?;
-        // A file left by a write that never finished keeps the mode it
-        // was created with: it is given this one again.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        // Always a new file, its owner's alone: one left by a write that
+        // never finished is removed first, and whatever stands at that
+        // name when the file is created, a link planted there among
+        // others, fails the write instead of being followed and
+        // truncated.
+        match std::fs::remove_file(&tmp) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
         }
+        let mut file =
+            crate::store::owner_only(std::fs::OpenOptions::new().write(true).create_new(true))
+                .open(&tmp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
     }
@@ -574,6 +572,23 @@ mod tests {
         attempts.fail(Instant::now());
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// A link planted at the name of the temporary file is never
+    /// followed: the file it points to keeps its content, and the
+    /// record is written all the same.
+    #[cfg(unix)]
+    #[test]
+    fn the_record_never_writes_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.attempts");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("gerfaut.attempts.tmp")).unwrap();
+        let mut attempts = LockAttempts::load(path.clone());
+        attempts.fail(Instant::now());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert_eq!(LockAttempts::load(path).failures(), 1);
     }
 
     #[test]
