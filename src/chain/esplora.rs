@@ -438,7 +438,7 @@ fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, Strin
     // An Esplora API does not redirect. One that does would send the
     // scripts of the wallet where the route was never checked: in the
     // clear, or an onion name to the system's resolver.
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::chain::http_client()
         .connect_timeout(budget.connect)
         .timeout(budget.total)
         .redirect(reqwest::redirect::Policy::none());
@@ -1106,6 +1106,21 @@ mod error_tests {
         connect: Duration::from_secs(15),
         total: Duration::from_secs(30),
     };
+
+    /// An Esplora sync goes straight to the server, or through the Tor
+    /// proxy for an onion, and never through a proxy the environment
+    /// names.
+    #[test]
+    fn a_sync_takes_no_proxy_but_tor() {
+        let clear = client("https://esplora.example.org/api", None).unwrap();
+        assert!(!crate::chain::takes_a_proxy(&clear.http));
+        let onion = client(
+            "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api",
+            Some("127.0.0.1:9050"),
+        )
+        .unwrap();
+        assert!(crate::chain::takes_a_proxy(&onion.http));
+    }
 
     #[test]
     fn a_status_is_a_code_and_a_reason() {

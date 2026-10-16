@@ -183,6 +183,26 @@ pub(crate) fn server_words(text: &str) -> String {
     short
 }
 
+/// What every HTTP client of the core is built from: one that takes no
+/// proxy but the one its caller sets, the Tor proxy. Left to itself,
+/// reqwest sends its requests through whatever `HTTP_PROXY`,
+/// `HTTPS_PROXY` or `ALL_PROXY` the environment names, which the
+/// Electrum connections never did: the price and update checks and
+/// every Esplora sync would leave the machine by a route the person
+/// never chose, and the choice of Tor in the settings would not be the
+/// whole story of where they go.
+pub(crate) fn http_client() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().no_proxy()
+}
+
+/// Whether a client sends its requests through a proxy of any kind.
+/// The client prints its proxies, and one left to read the environment
+/// counts the system's among them, whatever the environment holds.
+#[cfg(test)]
+pub(crate) fn takes_a_proxy(client: &reqwest::Client) -> bool {
+    format!("{client:?}").contains("proxies")
+}
+
 /// The redirections an HTTP client of the core follows, to fixed public
 /// services: to the same host, port and scheme, over HTTPS, five at
 /// most. One anywhere else ends there, as an answer that is no success:
@@ -945,6 +965,17 @@ pub(crate) async fn fetch_address_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What tells a client that reads the environment's proxy from one
+    /// that does not, whatever this machine's environment holds.
+    #[test]
+    fn a_client_built_for_the_core_takes_no_proxy_of_its_own() {
+        assert!(
+            takes_a_proxy(&reqwest::Client::new()),
+            "reqwest's default does"
+        );
+        assert!(!takes_a_proxy(&http_client().build().unwrap()));
+    }
 
     /// A hidden service is one whatever case its name was read in: a QR
     /// code prints capitals, and a `.ONION` taken for a clearnet host

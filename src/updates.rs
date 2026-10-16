@@ -66,21 +66,7 @@ pub(crate) async fn check_update(
     current_version: &str,
     proxy: Option<&str>,
 ) -> CoreResult<UpdateCheck> {
-    // A Tor circuit is slower to build than a connection is to open.
-    let budget = if proxy.is_some() { 60 } else { 15 };
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(budget))
-        .user_agent("gerfaut")
-        .redirect(crate::chain::redirects());
-    if let Some(proxy) = proxy {
-        let proxy = reqwest::Proxy::all(format!("socks5h://{proxy}"))
-            .map_err(|e| CoreError::Tor(format!("invalid Tor proxy address: {e}")))?;
-        builder = builder.proxy(proxy);
-    }
-    let client = builder
-        .build()
-        .map_err(|e| CoreError::Internal(format!("http client: {e}")))?;
-    let mut response = client
+    let mut response = client(proxy)?
         .get(format!("{api}/repos/{repo}/releases/latest"))
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -103,6 +89,25 @@ pub(crate) async fn check_update(
     let value: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| check_error(e.to_string()))?;
     read_release(&value, repo, current_version)
+}
+
+/// The client the check goes out with: through the Tor proxy when there
+/// is one, and through no other proxy at all.
+fn client(proxy: Option<&str>) -> CoreResult<reqwest::Client> {
+    // A Tor circuit is slower to build than a connection is to open.
+    let budget = if proxy.is_some() { 60 } else { 15 };
+    let mut builder = crate::chain::http_client()
+        .timeout(std::time::Duration::from_secs(budget))
+        .user_agent("gerfaut")
+        .redirect(crate::chain::redirects());
+    if let Some(proxy) = proxy {
+        let proxy = reqwest::Proxy::all(format!("socks5h://{proxy}"))
+            .map_err(|e| CoreError::Tor(format!("invalid Tor proxy address: {e}")))?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|e| CoreError::Internal(format!("http client: {e}")))
 }
 
 /// Largest answer read from the releases API: one release, its notes
@@ -368,6 +373,16 @@ mod tests {
         assert!(read(&"9".repeat(33), "").is_err());
         assert!(read("", "").is_err());
         assert!(read("v1.0.0 <b>", "").is_err());
+    }
+
+    /// The check goes out straight, or through the Tor proxy, and never
+    /// through a proxy the environment names.
+    #[test]
+    fn a_check_takes_no_proxy_but_tor() {
+        assert!(!crate::chain::takes_a_proxy(&client(None).unwrap()));
+        assert!(crate::chain::takes_a_proxy(
+            &client(Some("127.0.0.1:9050")).unwrap()
+        ));
     }
 
     #[test]
