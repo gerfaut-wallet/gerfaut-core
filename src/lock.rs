@@ -238,7 +238,20 @@ fn write_whole(path: &Path, stored: &StoredAttempts) -> std::io::Result<()> {
     tmp.push(".tmp");
     {
         use std::io::Write;
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = crate::store::owner_only(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+        )
+        .open(&tmp)?;
+        // A file left by a write that never finished keeps the mode it
+        // was created with: it is given this one again.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(&bytes)?;
         file.sync_all()?;
     }
@@ -543,6 +556,24 @@ mod tests {
         assert_eq!(stored.blocked_until_unix, None);
         let json = serde_json::to_string(&stored).unwrap();
         assert_eq!(json, r#"{"failures":3,"blocked_until_unix":null}"#);
+    }
+
+    /// On Unix the record of failed unlocks is its owner's alone, even
+    /// when a write that never finished left its temporary file open to
+    /// others.
+    #[cfg(unix)]
+    #[test]
+    fn the_record_is_its_owners_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.attempts");
+        let tmp = dir.path().join("gerfaut.attempts.tmp");
+        std::fs::write(&tmp, b"half a record").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut attempts = LockAttempts::load(path.clone());
+        attempts.fail(Instant::now());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
