@@ -769,6 +769,13 @@ fn parse_descriptor_file(lines: &[&str]) -> CoreResult<ParsedInput> {
     Ok(wallet)
 }
 
+/// [`check_pair`] for a pair stored as text: the one a backup carries,
+/// or a parsed input the app hands back to be added, which reach the
+/// engine without going through the parser.
+pub(crate) fn check_descriptor_pair(external: &str, internal: &str) -> CoreResult<()> {
+    check_pair(&read_descriptor(external)?, &read_descriptor(internal)?)
+}
+
 /// Holds the change descriptor of a pair to the receive one. The two
 /// are one wallet: the same script type, the same keys with the same
 /// say, on other paths. The policy page reads the receive descriptor

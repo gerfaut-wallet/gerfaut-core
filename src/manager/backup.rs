@@ -138,7 +138,9 @@ impl WalletManager {
     /// networks, accepted certificates are added but never replaced (a
     /// fingerprint that changed is exactly what pinning refuses to
     /// switch in silence), the gap limit is bounded like
-    /// [`Self::set_gap_limit`].
+    /// [`Self::set_gap_limit`]. A wallet whose material does not hold
+    /// together, a change descriptor of another wallet among it, fails
+    /// the restore, which then leaves the vault as it was.
     pub async fn import_backup(
         &self,
         source: &str,

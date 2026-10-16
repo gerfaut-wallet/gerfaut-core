@@ -631,3 +631,71 @@ async fn backup_needs_its_password_and_scans_as_a_qr() {
         Err(CoreError::InvalidInput { kind: "backup", .. })
     ));
 }
+
+/// A backup pairing the receive descriptor of one wallet with the
+/// change descriptor of another, which no export makes: the policy
+/// page would vouch for the first while change went to the second. The
+/// restore refuses it in the words an import uses and leaves the vault
+/// as it was; the same pair handed back as a parsed input is refused
+/// alike.
+#[tokio::test]
+async fn a_backup_pairing_two_wallets_is_not_restored() {
+    const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+    const XPUB_B: &str = "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw";
+    let kind = WalletKind::Descriptors {
+        external: format!("wpkh({XPUB}/0/*)"),
+        internal: Some(format!("wpkh({XPUB_B}/1/*)")),
+        script: crate::input::ScriptKind::Segwit,
+    };
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: vec![BackupWallet {
+            name: "Handed over".to_owned(),
+            network: Network::Mainnet,
+            kind: kind.clone(),
+            gap_limit: 20,
+            labels: Default::default(),
+            created_at: 1_755_000_000,
+            live_pinned: false,
+        }],
+        backends: None,
+        electrum_certs: None,
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let error = manager
+        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, CoreError::Descriptor(detail) if detail.contains("another wallet")),
+        "{error}"
+    );
+    assert!(manager.list_wallets(None).await.is_empty());
+
+    // The same material as an input the app hands back.
+    let WalletKind::Descriptors {
+        external, internal, ..
+    } = kind
+    else {
+        unreachable!()
+    };
+    let mut parsed = parse_input(&format!("wpkh({XPUB}/<0;1>/*)")).unwrap();
+    parsed.payload = crate::input::ParsedPayload::Descriptors {
+        external,
+        internal,
+        script: crate::input::ScriptKind::Segwit,
+    };
+    let error = manager
+        .add_wallet("Handed over", &parsed, Network::Mainnet)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, CoreError::Descriptor(detail) if detail.contains("another wallet")),
+        "{error}"
+    );
+    assert!(manager.list_wallets(None).await.is_empty());
+}

@@ -220,6 +220,16 @@ fn create_engine(
     for descriptor in std::iter::once(external).chain(internal) {
         require_public_descriptor(descriptor)?;
     }
+    // The same text is held to what a pair is held to on import: one
+    // wallet on two branches. A backup written by hand could otherwise
+    // pair a receive descriptor, which the policy page reads, with a
+    // change descriptor of another wallet.
+    if let Some(internal) = internal {
+        crate::input::check_descriptor_pair(external, internal).map_err(|e| match e {
+            CoreError::InvalidInput { detail, .. } => CoreError::Descriptor(detail),
+            other => other,
+        })?;
+    }
     let params = match internal {
         Some(internal) => bdk_wallet::Wallet::create(external.to_owned(), internal.to_owned()),
         None => bdk_wallet::Wallet::create_single(external.to_owned()),
