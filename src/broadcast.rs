@@ -748,8 +748,18 @@ pub fn build_preview(
     let out_total: Option<u64> = outputs
         .iter()
         .try_fold(0u64, |acc, o| acc.checked_add(o.value_sats));
+    // Past every bitcoin there will ever be, an amount is no amount. An
+    // output there, or outputs that add up there, is a consensus
+    // refusal whatever the inputs bring. Inputs that add up there can
+    // only be the PSBT's word, and a wrong one.
+    let max_money = bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat();
+    let values_known = inputs.iter().all(|i| i.value_sats.is_some());
+    let outputs_impossible = outputs.iter().any(|o| o.value_sats > max_money)
+        || out_total.is_none_or(|total| total > max_money);
+    let inputs_impossible = values_known && in_total.is_none_or(|total| total > max_money);
     let fee_sats = in_total
         .zip(out_total)
+        .filter(|_| !outputs_impossible && !inputs_impossible)
         .and_then(|(total, out)| total.checked_sub(out));
     let vsize = tx.vsize() as u64;
     let fee_rate_sat_vb = fee_sats.map(|fee| fee as f64 / vsize as f64);
@@ -851,23 +861,27 @@ pub fn build_preview(
             warnings.push(spent_caution(i, txid, facts.spent_by));
         }
     }
-    // Why a fee is missing when every input's value is known. Sums past
-    // every bitcoin there will ever be are no sums: the amounts cannot be
-    // right, whoever declared them. Otherwise the outputs pay more than
-    // the inputs bring.
-    let values_known = inputs.iter().all(|i| i.value_sats.is_some());
-    let impossible = out_total.is_none() || (values_known && in_total.is_none());
-    let overspends = values_known && !impossible && fee_sats.is_none();
+    // Every value known, every amount possible, and still no fee: the
+    // outputs pay more than the inputs bring.
+    let overspends =
+        values_known && !outputs_impossible && !inputs_impossible && fee_sats.is_none();
     // That is a sure refusal only on amounts a watched wallet or a
     // backend stood behind. A PSBT's word about the coin it spends may be
     // wrong, and the node goes by the coin, not by the word.
     let vouched =
         (0..inputs.len()).all(|i| input_facts.get(i).is_some_and(|f| f.prevout.is_some()));
     match (fee_sats, fee_rate_sat_vb, in_total) {
-        (None, _, _) if impossible => warnings.push(TxWarning::new(
+        // No block takes it, whatever the inputs bring.
+        (None, _, _) if outputs_impossible => warnings.push(TxWarning::refused(
             TxWarningKind::FeeUnknown,
-            "The amounts in this transaction add up to more than all the bitcoin there will \
-             ever be: they cannot be right."
+            "The outputs pay more than all the bitcoin there will ever be: the network will \
+             refuse this transaction."
+                .to_owned(),
+        )),
+        (None, _, _) if inputs_impossible => warnings.push(TxWarning::new(
+            TxWarningKind::FeeUnknown,
+            "The coins this transaction spends add up to more than all the bitcoin there \
+             will ever be, as it declares them: those amounts cannot be right."
                 .to_owned(),
         )),
         // No block takes it, whichever node it reaches.
@@ -1210,8 +1224,15 @@ mod tests {
             .iter()
             .find(|w| w.kind == TxWarningKind::FeeUnknown)
             .unwrap();
-        assert!(fee.message.contains("cannot be right"), "{}", fee.message);
-        assert!(!fee.blocking, "an overflow is no refusal anyone made");
+        assert!(
+            fee.message
+                .contains("outputs pay more than all the bitcoin"),
+            "{}",
+            fee.message
+        );
+        assert!(fee.blocking, "outputs past every bitcoin are a refusal");
+        assert_eq!(preview.readiness, TxReadiness::Refused);
+        assert!(preview.hex.is_none());
 
         let mut small = signed_tx();
         small.output[0].value = Amount::from_sat(10_000_000);
@@ -1758,9 +1779,9 @@ mod tests {
         assert!(preview.hex.is_some());
     }
 
-    /// Amounts whose sum overflows are no amounts at all, declared or
-    /// confirmed: the caution says they cannot be right, and blocks
-    /// nothing, since they are not a refusal anyone made.
+    /// Coins declared at amounts whose sum overflows are no amounts at
+    /// all: the caution says they cannot be right, and blocks nothing,
+    /// since the node goes by the real coins.
     #[test]
     fn sums_past_all_bitcoin_are_impossible_not_refused() {
         let half = u64::MAX / 2 + 1;
@@ -1780,7 +1801,68 @@ mod tests {
             .unwrap();
         assert!(fee.message.contains("cannot be right"), "{}", fee.message);
         assert!(!fee.blocking);
-        assert!(preview.ready);
+        assert_eq!(preview.readiness, TxReadiness::Ready);
+        assert!(preview.hex.is_some());
+    }
+
+    /// One bitcoin past the 21 million, in one output or across several:
+    /// every node refuses it, whatever the inputs bring, known or not.
+    #[test]
+    fn outputs_past_all_bitcoin_are_refused() {
+        let max = bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat();
+        for paid in [vec![max + 1], vec![max / 2 + 1, max / 2 + 1]] {
+            let decoded = declared_psbt(&[1_000], &paid);
+            let preview = build_preview(
+                &decoded,
+                Network::Signet,
+                &nobody_answered(1),
+                &[],
+                Some(100),
+                0,
+            );
+            let fee = preview
+                .warnings
+                .iter()
+                .find(|w| w.kind == TxWarningKind::FeeUnknown)
+                .unwrap();
+            assert!(fee.blocking, "{paid:?}: {}", fee.message);
+            assert!(
+                fee.message
+                    .contains("outputs pay more than all the bitcoin"),
+                "{}",
+                fee.message
+            );
+            assert_eq!(preview.readiness, TxReadiness::Refused, "{paid:?}");
+            assert!(preview.hex.is_none());
+            assert_eq!(preview.fee_sats, None);
+        }
+    }
+
+    /// Coins declared at more than all the bitcoin there will ever be,
+    /// without any sum overflowing: the declaration is wrong, and that is
+    /// all anyone can say. The node goes by the real coins.
+    #[test]
+    fn declared_coins_past_all_bitcoin_cannot_be_right() {
+        let max = bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat();
+        let decoded = declared_psbt(&[max + 1], &[1_000]);
+        let preview = build_preview(
+            &decoded,
+            Network::Signet,
+            &nobody_answered(1),
+            &[],
+            Some(100),
+            0,
+        );
+        let fee = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::FeeUnknown)
+            .unwrap();
+        assert!(fee.message.contains("cannot be right"), "{}", fee.message);
+        assert!(!fee.blocking);
+        assert_eq!(preview.fee_sats, None, "no fee from amounts that cannot be");
+        assert_eq!(preview.readiness, TxReadiness::Ready);
+        assert!(preview.hex.is_some());
     }
 
     /// The pill's state is the core's: refused before unsigned, since a
