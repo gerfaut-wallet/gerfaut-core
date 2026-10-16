@@ -264,6 +264,11 @@ pub struct TxPreview {
     /// Fee in satoshis, when every input's value is known.
     pub fee_sats: Option<u64>,
     pub fee_rate_sat_vb: Option<f64>,
+    /// Whether a value shown for an input is only what the transaction
+    /// declares: a witness entry that no watched wallet, no backend and
+    /// no previous transaction stands behind. The inputs total and the
+    /// fee rest on that word then, and say so.
+    pub amounts_declared: bool,
     /// Virtual size in vbytes.
     pub vsize: u64,
     /// Weight units.
@@ -782,6 +787,21 @@ pub fn build_preview(
     let vsize = tx.vsize() as u64;
     let fee_rate_sat_vb = fee_sats.map(|fee| fee as f64 / vsize as f64);
 
+    // Whether each value shown is proven, input by input: by a watched
+    // wallet or a backend, or by the previous transaction a PSBT carries,
+    // whose txid the outpoint commits to. A witness entry alone proves
+    // nothing.
+    let proven: Vec<bool> = (0..inputs.len())
+        .map(|i| {
+            input_facts.get(i).is_some_and(|f| f.prevout.is_some())
+                || decoded.inputs[i].prevout_proven
+        })
+        .collect();
+    let amounts_declared = inputs
+        .iter()
+        .zip(&proven)
+        .any(|(input, &proven)| input.value_sats.is_some() && !proven);
+
     let txid = tx.compute_txid();
     let mut warnings = Vec::new();
     let unsigned = inputs.iter().filter(|i| !i.signed).count();
@@ -876,6 +896,18 @@ pub fn build_preview(
                      another network, or spend a coin this backend does not know."
                 ),
             ));
+        } else if facts.unchecked && proven.get(i) == Some(&true) {
+            // Nothing answered, but the previous transaction the PSBT
+            // carries proves the value: what is left open is the coin's
+            // standing on the chain, not what it is worth.
+            warnings.push(TxWarning::new(
+                TxWarningKind::InputUnknown,
+                format!(
+                    "Input {i} could not be checked: no backend answered about this coin. \
+                     Its value is proven by the previous transaction the PSBT carries, the \
+                     one this input spends; whether the coin is still there to spend is not."
+                ),
+            ));
         } else if facts.unchecked {
             // Saying it "was not found" would be a claim nobody made.
             // Nothing answered, so the value shown for this coin is the
@@ -896,13 +928,10 @@ pub fn build_preview(
     // outputs pay more than the inputs bring.
     let overspends =
         values_known && !outputs_impossible && !inputs_impossible && fee_sats.is_none();
-    // That is a sure refusal only on amounts proven, input by input: by a
-    // watched wallet or a backend, or by the previous transaction a PSBT
-    // carries, whose txid the outpoint commits to. A witness entry alone
-    // may be wrong, and the node goes by the coin, not by the word.
-    let vouched = (0..inputs.len()).all(|i| {
-        input_facts.get(i).is_some_and(|f| f.prevout.is_some()) || decoded.inputs[i].prevout_proven
-    });
+    // That is a sure refusal only on amounts proven, every one of them:
+    // a witness entry alone may be wrong, and the node goes by the coin,
+    // not by the word.
+    let vouched = proven.iter().all(|&proven| proven);
     match (fee_sats, fee_rate_sat_vb, in_total) {
         // No block takes it, whatever the inputs bring.
         (None, _, _) if outputs_impossible => warnings.push(TxWarning::refused(
@@ -1030,6 +1059,7 @@ pub fn build_preview(
         outputs,
         fee_sats,
         fee_rate_sat_vb,
+        amounts_declared,
         vsize,
         weight: tx.weight().to_wu(),
         size: tx.total_size() as u64,
@@ -1854,6 +1884,13 @@ mod tests {
         assert!(preview.ready);
         assert_eq!(preview.readiness, TxReadiness::Ready);
         assert!(preview.hex.is_some());
+        assert!(preview.amounts_declared);
+        let unknown = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InputUnknown)
+            .unwrap();
+        assert!(unknown.message.contains("claims"), "{}", unknown.message);
     }
 
     /// The previous transaction a PSBT carries proves the coin: its txid
@@ -1879,6 +1916,22 @@ mod tests {
         assert!(fee.blocking, "{}", fee.message);
         assert_eq!(preview.readiness, TxReadiness::Refused);
         assert!(preview.hex.is_none());
+        // No backend answered, and the value is still not the PSBT's
+        // word: the caution says what is open, which is not the amount.
+        assert!(!preview.amounts_declared);
+        let unknown = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InputUnknown)
+            .unwrap();
+        assert!(
+            unknown
+                .message
+                .contains("proven by the previous transaction"),
+            "{}",
+            unknown.message
+        );
+        assert!(!unknown.message.contains("claims"), "{}", unknown.message);
     }
 
     /// A watched address lists a coin at 1 000 sats; the PSBT carries the
