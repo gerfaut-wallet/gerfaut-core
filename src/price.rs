@@ -115,10 +115,10 @@ pub enum CurrencyReach {
     CoingeckoOnly,
 }
 
-/// The one table behind [`FiatCurrency`]: variant, ISO 4217 code, and
-/// which sources quote it. Order is display order.
+/// The one table behind [`FiatCurrency`]: variant, ISO 4217 code,
+/// English name, and which sources quote it. Order is display order.
 macro_rules! fiat_currencies {
-    ($($variant:ident, $code:literal, $reach:ident;)+) => {
+    ($($variant:ident, $code:literal, $name:literal, $reach:ident;)+) => {
         /// Display currencies offered in the settings.
         ///
         /// The first seven are quoted by every source. The rest are the
@@ -142,6 +142,14 @@ macro_rules! fiat_currencies {
                 }
             }
 
+            /// Its English name, to read beside the code: a list of
+            /// thirty codes is not a list anyone can read.
+            pub fn name(self) -> &'static str {
+                match self {
+                    $(FiatCurrency::$variant => $name,)+
+                }
+            }
+
             /// Which sources quote this currency.
             pub fn reach(self) -> CurrencyReach {
                 match self {
@@ -153,36 +161,113 @@ macro_rules! fiat_currencies {
 }
 
 fiat_currencies! {
-    Eur, "EUR", Every;
-    Usd, "USD", Every;
-    Gbp, "GBP", Every;
-    Chf, "CHF", Every;
-    Jpy, "JPY", Every;
-    Cad, "CAD", Every;
-    Aud, "AUD", Every;
-    Inr, "INR", CoingeckoOnly;
-    Cny, "CNY", CoingeckoOnly;
-    Brl, "BRL", CoingeckoOnly;
-    Ngn, "NGN", CoingeckoOnly;
-    Idr, "IDR", CoingeckoOnly;
-    Pkr, "PKR", CoingeckoOnly;
-    Bdt, "BDT", CoingeckoOnly;
-    Rub, "RUB", CoingeckoOnly;
-    Mxn, "MXN", CoingeckoOnly;
-    Php, "PHP", CoingeckoOnly;
-    Vnd, "VND", CoingeckoOnly;
-    Try, "TRY", CoingeckoOnly;
-    Ars, "ARS", CoingeckoOnly;
-    Krw, "KRW", CoingeckoOnly;
-    Zar, "ZAR", CoingeckoOnly;
-    Thb, "THB", CoingeckoOnly;
-    Uah, "UAH", CoingeckoOnly;
-    Pln, "PLN", CoingeckoOnly;
-    Sek, "SEK", CoingeckoOnly;
-    Sgd, "SGD", CoingeckoOnly;
-    Hkd, "HKD", CoingeckoOnly;
-    Aed, "AED", CoingeckoOnly;
-    Nzd, "NZD", CoingeckoOnly;
+    Eur, "EUR", "Euro", Every;
+    Usd, "USD", "US dollar", Every;
+    Gbp, "GBP", "Pound sterling", Every;
+    Chf, "CHF", "Swiss franc", Every;
+    Jpy, "JPY", "Japanese yen", Every;
+    Cad, "CAD", "Canadian dollar", Every;
+    Aud, "AUD", "Australian dollar", Every;
+    Inr, "INR", "Indian rupee", CoingeckoOnly;
+    Cny, "CNY", "Chinese yuan", CoingeckoOnly;
+    Brl, "BRL", "Brazilian real", CoingeckoOnly;
+    Ngn, "NGN", "Nigerian naira", CoingeckoOnly;
+    Idr, "IDR", "Indonesian rupiah", CoingeckoOnly;
+    Pkr, "PKR", "Pakistani rupee", CoingeckoOnly;
+    Bdt, "BDT", "Bangladeshi taka", CoingeckoOnly;
+    Rub, "RUB", "Russian ruble", CoingeckoOnly;
+    Mxn, "MXN", "Mexican peso", CoingeckoOnly;
+    Php, "PHP", "Philippine peso", CoingeckoOnly;
+    Vnd, "VND", "Vietnamese dong", CoingeckoOnly;
+    Try, "TRY", "Turkish lira", CoingeckoOnly;
+    Ars, "ARS", "Argentine peso", CoingeckoOnly;
+    Krw, "KRW", "South Korean won", CoingeckoOnly;
+    Zar, "ZAR", "South African rand", CoingeckoOnly;
+    Thb, "THB", "Thai baht", CoingeckoOnly;
+    Uah, "UAH", "Ukrainian hryvnia", CoingeckoOnly;
+    Pln, "PLN", "Polish zloty", CoingeckoOnly;
+    Sek, "SEK", "Swedish krona", CoingeckoOnly;
+    Sgd, "SGD", "Singapore dollar", CoingeckoOnly;
+    Hkd, "HKD", "Hong Kong dollar", CoingeckoOnly;
+    Aed, "AED", "UAE dirham", CoingeckoOnly;
+    Nzd, "NZD", "New Zealand dollar", CoingeckoOnly;
+}
+
+/// How often the price is asked while the fiat value is on, and how
+/// long a failure waits for the next try: often enough that no amount
+/// is priced at the rate of an hour ago, seldom enough for an endpoint
+/// that asks for no key.
+pub const REFRESH_SECS: u64 = 60;
+
+/// What the settings offer for the fiat value, and how often its price
+/// is asked: one table for both apps, which offer what it lists, in its
+/// order, and nothing it does not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriceTable {
+    /// Every currency on offer, in display order: the ones every source
+    /// quotes first.
+    pub currencies: Vec<CurrencyEntry>,
+    /// Every source, in display order.
+    pub sources: Vec<SourceEntry>,
+    /// Seconds from one price to the next while the fiat value is on,
+    /// and from a failure to the next try: [`REFRESH_SECS`].
+    pub refresh_secs: u64,
+}
+
+/// One currency of the [`PriceTable`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrencyEntry {
+    pub currency: FiatCurrency,
+    /// ISO 4217 code: the identifier, in capitals.
+    pub code: String,
+    /// Its English name.
+    pub name: String,
+    /// How many sources quote it, which is how the settings group it.
+    pub reach: CurrencyReach,
+    /// The sources that quote it, in display order: the ones a settings
+    /// screen lets the user pick with it.
+    pub sources: Vec<PriceSource>,
+}
+
+/// One source of the [`PriceTable`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceEntry {
+    pub source: PriceSource,
+    /// Its name, as it writes it.
+    pub label: String,
+    /// The chart ranges it serves without a key, shortest first.
+    pub ranges: Vec<PriceRange>,
+}
+
+/// The currencies and sources on offer, and how often a price is asked.
+pub fn price_table() -> PriceTable {
+    PriceTable {
+        currencies: FiatCurrency::ALL
+            .iter()
+            .map(|&currency| CurrencyEntry {
+                currency,
+                code: currency.code().to_owned(),
+                name: currency.name().to_owned(),
+                reach: currency.reach(),
+                sources: PriceSource::ALL
+                    .into_iter()
+                    .filter(|source| source.supports_currency(currency))
+                    .collect(),
+            })
+            .collect(),
+        sources: PriceSource::ALL
+            .into_iter()
+            .map(|source| SourceEntry {
+                source,
+                label: source.label().to_owned(),
+                ranges: PriceRange::ALL
+                    .into_iter()
+                    .filter(|&range| source.supports(range))
+                    .collect(),
+            })
+            .collect(),
+        refresh_secs: REFRESH_SECS,
+    }
 }
 
 /// One BTC priced in a fiat currency, at a point in time.
@@ -546,6 +631,62 @@ mod tests {
             assert_eq!(code.len(), 3, "{code}");
             assert!(code.chars().all(|c| c.is_ascii_uppercase()), "{code}");
         }
+    }
+
+    /// The apps write a code as the identifier in capitals, the way the
+    /// table spells it: the two never part.
+    #[test]
+    fn a_code_is_its_identifier_in_capitals() {
+        for currency in FiatCurrency::ALL {
+            let id = serde_json::to_value(currency).unwrap();
+            assert_eq!(id.as_str().unwrap().to_uppercase(), currency.code());
+        }
+    }
+
+    /// The table lists every currency and every source in display
+    /// order, each currency with the sources that quote it and each
+    /// source with the ranges it serves.
+    #[test]
+    fn the_table_is_the_one_behind_the_types() {
+        let table = price_table();
+        assert_eq!(table.refresh_secs, 60);
+        let currencies: Vec<FiatCurrency> = table
+            .currencies
+            .iter()
+            .map(|entry| entry.currency)
+            .collect();
+        assert_eq!(currencies, FiatCurrency::ALL);
+        for entry in &table.currencies {
+            assert_eq!(entry.code, entry.currency.code());
+            assert!(!entry.name.is_empty());
+            assert_eq!(entry.reach, entry.currency.reach());
+            for source in PriceSource::ALL {
+                assert_eq!(
+                    entry.sources.contains(&source),
+                    source.supports_currency(entry.currency),
+                    "{} from {source:?}",
+                    entry.code
+                );
+            }
+        }
+        let sources: Vec<PriceSource> = table.sources.iter().map(|entry| entry.source).collect();
+        assert_eq!(sources, PriceSource::ALL);
+        let mempool = &table.sources[2];
+        assert_eq!(mempool.label, "mempool.space");
+        assert_eq!(
+            mempool.ranges,
+            [PriceRange::Month, PriceRange::Year, PriceRange::Max]
+        );
+        assert_eq!(
+            serde_json::to_value(&table.currencies[0]).unwrap(),
+            serde_json::json!({
+                "currency": "eur",
+                "code": "EUR",
+                "name": "Euro",
+                "reach": "every",
+                "sources": ["coingecko", "kraken", "mempool_space"],
+            })
+        );
     }
 
     #[test]
