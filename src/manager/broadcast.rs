@@ -115,6 +115,8 @@ impl WalletManager {
                                 });
                                 input_facts[i].wallet = Some(wallet_ref.clone());
                                 input_facts[i].spent = Some(false);
+                                // The server's figure, not a transaction.
+                                input_facts[i].listed = true;
                             }
                         }
                         for (i, output) in decoded.tx.output.iter().enumerate() {

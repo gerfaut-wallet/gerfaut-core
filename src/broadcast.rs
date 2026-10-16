@@ -266,10 +266,11 @@ pub struct TxPreview {
     /// more than the inputs bring.
     pub fee_sats: Option<u64>,
     pub fee_rate_sat_vb: Option<f64>,
-    /// Whether a value shown for an input is only what the transaction
-    /// declares: a witness entry that no watched wallet, no backend and
-    /// no previous transaction stands behind. The inputs total and the
-    /// fee rest on that word then, and say so.
+    /// Whether a value shown for an input is one nothing proves: a
+    /// witness entry the PSBT declares, or a watched address's listing,
+    /// with no wallet engine, no backend and no previous transaction
+    /// behind it. The inputs total and the fee rest on that word then,
+    /// and say so.
     pub amounts_declared: bool,
     /// Virtual size in vbytes.
     pub vsize: u64,
@@ -675,6 +676,10 @@ pub struct InputFacts {
     /// The transaction that spends it, when it is spent and the wallet
     /// or the backend named it.
     pub spent_by: Option<SpentBy>,
+    /// Whether `prevout` is a watched address's listing (`listunspent`,
+    /// `/utxo`): a figure the server gives and no txid backs. It is
+    /// shown, but it proves nothing.
+    pub listed: bool,
     /// Whether the backend was asked and did not know the outpoint.
     pub unknown: bool,
     /// Whether nothing could be asked at all: every endpoint tried
@@ -789,13 +794,16 @@ pub fn build_preview(
     let vsize = tx.vsize() as u64;
     let fee_rate_sat_vb = fee_sats.map(|fee| fee as f64 / vsize as f64);
 
-    // Whether each value shown is proven, input by input: by a watched
-    // wallet or a backend, or by the previous transaction a PSBT carries,
-    // whose txid the outpoint commits to. A witness entry alone proves
-    // nothing.
+    // Whether each value shown is proven, input by input: by a wallet
+    // engine or a backend, which read it in a transaction whose txid
+    // they checked, or by the previous transaction a PSBT carries, whose
+    // txid the outpoint commits to. A witness entry alone proves nothing,
+    // and neither does a watched address's listing.
     let proven: Vec<bool> = (0..inputs.len())
         .map(|i| {
-            input_facts.get(i).is_some_and(|f| f.prevout.is_some())
+            input_facts
+                .get(i)
+                .is_some_and(|f| f.prevout.is_some() && !f.listed)
                 || decoded.inputs[i].prevout_proven
         })
         .collect();
@@ -957,8 +965,8 @@ pub fn build_preview(
         )),
         (None, _, _) if overspends => warnings.push(TxWarning::new(
             TxWarningKind::FeeUnknown,
-            "The outputs pay more than the inputs bring, by the amounts this transaction \
-             declares for its coins: if those are right, the network will refuse it."
+            "The outputs pay more than the inputs bring, by amounts nothing proves: if those \
+             amounts are right, the network will refuse this transaction."
                 .to_owned(),
         )),
         (None, _, _) => warnings.push(TxWarning::new(
@@ -1578,6 +1586,7 @@ mod tests {
             }),
             spent: Some(false),
             spent_by: None,
+            listed: false,
             unknown: false,
             unchecked: false,
         }];
@@ -1617,6 +1626,7 @@ mod tests {
             wallet: None,
             spent: Some(true),
             spent_by: None,
+            listed: false,
             unknown: false,
             unchecked: false,
         }];
@@ -1878,8 +1888,7 @@ mod tests {
             .unwrap();
         assert!(!fee.blocking, "{}", fee.message);
         assert!(
-            fee.message
-                .contains("by the amounts this transaction declares"),
+            fee.message.contains("by amounts nothing proves"),
             "{}",
             fee.message
         );
@@ -1982,6 +1991,48 @@ mod tests {
         assert!(!preview.warnings.iter().any(|w| w.blocking));
     }
 
+    /// A watched address lists a coin at 1 000 sats; the PSBT, with a
+    /// witness entry alone, says 100 000 and pays 90 000. The listing is
+    /// the server's figure, no txid behind it: it is shown, the outputs
+    /// over it are said, and nothing is refused on it. The same figure
+    /// read by a wallet engine or a backend, in a transaction whose txid
+    /// it checked, is a proof.
+    #[test]
+    fn an_address_listing_proves_nothing() {
+        let decoded = declared_psbt(&[100_000], &[90_000]);
+        let facts = |listed: bool| {
+            vec![InputFacts {
+                prevout: Some(TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: p2wpkh(0x33),
+                }),
+                wallet: Some(WalletRef {
+                    id: "w2".into(),
+                    name: "Watch".into(),
+                }),
+                spent: Some(false),
+                listed,
+                ..Default::default()
+            }]
+        };
+        let preview = build_preview(&decoded, Network::Signet, &facts(true), &[], Some(100), 0);
+        assert_eq!(preview.inputs[0].value_sats, Some(1_000));
+        assert!(preview.amounts_declared);
+        assert!(!preview.warnings.iter().any(|w| w.blocking));
+        assert_eq!(preview.readiness, TxReadiness::Ready);
+        assert!(preview.hex.is_some());
+        let fee = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::FeeUnknown)
+            .unwrap();
+        assert!(fee.message.contains("nothing proves"), "{}", fee.message);
+
+        let checked = build_preview(&decoded, Network::Signet, &facts(false), &[], Some(100), 0);
+        assert!(!checked.amounts_declared);
+        assert_eq!(checked.readiness, TxReadiness::Refused);
+    }
+
     /// One coin proven, the other only declared: the overspend rests on
     /// the declared one too, so it is said and left to the node.
     #[test]
@@ -2004,8 +2055,7 @@ mod tests {
             .unwrap();
         assert!(!fee.blocking, "{}", fee.message);
         assert!(
-            fee.message
-                .contains("by the amounts this transaction declares"),
+            fee.message.contains("by amounts nothing proves"),
             "{}",
             fee.message
         );
@@ -2353,6 +2403,7 @@ mod tests {
             }),
             spent: Some(false),
             spent_by: None,
+            listed: false,
             unknown: false,
             unchecked: false,
         }]
@@ -2526,6 +2577,7 @@ mod tests {
             wallet: None,
             spent: Some(false),
             spent_by: None,
+            listed: false,
             unknown: false,
             unchecked: false,
         }];

@@ -533,3 +533,113 @@ async fn the_backend_places_a_spend_the_vault_does_not_know() {
         assert_eq!(preview.inputs[0].value_sats, Some(50_000));
     }
 }
+
+/// A taproot address, BIP-350's own testnet example: public, nobody's.
+const TAPROOT: &str = "tb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesf3hn0c";
+
+/// A manager watching [`TAPROOT`] on signet, whose server listed one coin
+/// at `listed` sats: the outpoint of that coin, and the address script.
+async fn listed_coin(
+    dir: &std::path::Path,
+    listed: u64,
+    coin: bdk_wallet::bitcoin::OutPoint,
+) -> (WalletManager, bdk_wallet::bitcoin::ScriptBuf) {
+    use crate::input::parse_input;
+    use crate::wallet::{AddressUtxo, AddressWatchState};
+    use std::str::FromStr;
+
+    let manager = manager(dir).await;
+    let watch = manager
+        .add_wallet("Watch", &parse_input(TAPROOT).unwrap(), Network::Signet)
+        .await
+        .unwrap();
+    crate::manager::find_record_mut(&mut manager.state.lock().await.payload, &watch.id)
+        .unwrap()
+        .address_state = Some(AddressWatchState {
+        utxos: vec![AddressUtxo {
+            txid: coin.txid.to_string(),
+            vout: coin.vout,
+            value_sats: listed,
+            height: Some(10),
+            timestamp: None,
+        }],
+        ..Default::default()
+    });
+    let script = bdk_wallet::bitcoin::Address::from_str(TAPROOT)
+        .unwrap()
+        .assume_checked()
+        .script_pubkey();
+    (manager, script)
+}
+
+/// A finalized PSBT spending `coin` and paying `paid` sats elsewhere,
+/// the coin described by `describe`.
+fn psbt_spending_coin(
+    coin: bdk_wallet::bitcoin::OutPoint,
+    paid: u64,
+    describe: impl FnOnce(&mut bdk_wallet::bitcoin::psbt::Input),
+) -> String {
+    use bdk_wallet::bitcoin::{
+        Psbt, ScriptBuf, Sequence, Transaction, TxIn, Witness, absolute, transaction,
+    };
+    let spend = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: coin,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(paid),
+            script_pubkey: ScriptBuf::from_hex(&crate::testkit::script(9)).unwrap(),
+        }],
+    };
+    let mut psbt = Psbt::from_unsigned_tx(spend).unwrap();
+    let mut witness = Witness::new();
+    witness.push([0x30; 64]);
+    psbt.inputs[0].final_script_witness = Some(witness);
+    describe(&mut psbt.inputs[0]);
+    data_encoding::BASE64.encode(&psbt.serialize())
+}
+
+/// A watched taproot address whose server lists a coin at 1 000 sats,
+/// and a PSBT that describes it, by a witness entry alone, as 100 000
+/// and pays 90 000 from it. The listing is no proof: it is shown, the
+/// outputs over it are said, and the transaction is not refused on it.
+#[tokio::test]
+async fn a_listing_never_refuses_a_transaction() {
+    use crate::broadcast::{TxReadiness, TxWarningKind};
+    use bdk_wallet::bitcoin::hashes::Hash;
+    use bdk_wallet::bitcoin::{OutPoint, Txid};
+
+    let coin = OutPoint::new(Txid::from_byte_array([0x55; 32]), 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, script) = listed_coin(dir.path(), 1_000, coin).await;
+    let text = psbt_spending_coin(coin, 90_000, |input| {
+        input.witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: script,
+        });
+    });
+    let preview = manager
+        .preview_transaction(&text, Network::Signet)
+        .await
+        .unwrap();
+    assert_eq!(preview.inputs[0].value_sats, Some(1_000));
+    assert!(preview.amounts_declared);
+    assert!(
+        !preview.warnings.iter().any(|w| w.blocking),
+        "{:?}",
+        preview.warnings
+    );
+    assert_eq!(preview.readiness, TxReadiness::Ready);
+    assert!(preview.hex.is_some());
+    assert!(
+        preview
+            .warnings
+            .iter()
+            .any(|w| w.kind == TxWarningKind::InputMismatch)
+    );
+}
