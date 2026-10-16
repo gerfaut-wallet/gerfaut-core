@@ -1615,8 +1615,11 @@ mod tests {
 
     /// A vault written before the update check had a record of its own
     /// opens with the check on and nothing known, whatever preferences
-    /// the apps kept for it then; the record is written back with the
-    /// rest, and a build that predates it still reads the vault.
+    /// the apps kept for it then. The record is written back with the
+    /// rest, the settings and the wallets as they were. A build that
+    /// predates it does not read that vault: it is written at version 3,
+    /// and a build of version 2 refuses it rather than drop the record
+    /// and the shared preferences at its next save.
     #[test]
     fn a_vault_without_an_update_record_opens_with_the_check_on() {
         let dir = tempfile::tempdir().unwrap();
