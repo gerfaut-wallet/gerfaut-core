@@ -266,6 +266,10 @@ pub struct TxPreview {
     /// more than the inputs bring.
     pub fee_sats: Option<u64>,
     pub fee_rate_sat_vb: Option<f64>,
+    /// Why there is no fee, in the words of the caution that says it:
+    /// what each application repeats where the send is decided. `None`
+    /// when there is a fee.
+    pub fee_unknown_reason: Option<String>,
     /// Whether a value shown for an input is one nothing proves: a
     /// witness entry the PSBT declares, or a watched address's listing,
     /// with no wallet engine, no backend and no previous transaction
@@ -1071,6 +1075,10 @@ pub fn build_preview(
         ));
     }
 
+    let fee_unknown_reason = warnings
+        .iter()
+        .find(|w| w.kind == TxWarningKind::FeeUnknown)
+        .map(|w| w.message.clone());
     // A transaction the network is sure to refuse is not one to call
     // ready next to the caution that says so. A refusal a signature does
     // not fix is said before a missing signature.
@@ -1095,6 +1103,7 @@ pub fn build_preview(
         outputs,
         fee_sats,
         fee_rate_sat_vb,
+        fee_unknown_reason,
         amounts_declared,
         vsize,
         weight: tx.weight().to_wu(),
@@ -1600,6 +1609,26 @@ mod tests {
 
     #[test]
     fn preview_computes_fee_and_warnings() {
+        // A fee, so no reason for one missing.
+        let signed = decode_transaction(&encode::serialize_hex(&signed_tx())).unwrap();
+        let known = build_preview(
+            &signed,
+            Network::Signet,
+            &[InputFacts {
+                prevout: Some(TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: p2wpkh(0x33),
+                }),
+                spent: Some(false),
+                ..Default::default()
+            }],
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(known.fee_sats, Some(1_000));
+        assert_eq!(known.fee_unknown_reason, None);
+
         let decoded = decode_transaction(&encode::serialize_hex(&signed_tx())).unwrap();
         let facts = vec![InputFacts {
             prevout: Some(TxOut {
@@ -2056,6 +2085,11 @@ mod tests {
             .find(|w| w.kind == TxWarningKind::FeeUnknown)
             .unwrap();
         assert!(fee.message.contains("nothing proves"), "{}", fee.message);
+        // Said again where the send is decided, word for word.
+        assert_eq!(
+            preview.fee_unknown_reason.as_deref(),
+            Some(fee.message.as_str())
+        );
 
         let checked = build_preview(&decoded, Network::Signet, &facts(false), &[], Some(100), 0);
         assert!(!checked.amounts_declared);
