@@ -56,7 +56,8 @@ pub struct UpdateRecord {
     /// The app checks on its own. On unless the user turned it off.
     #[serde(default = "on")]
     pub(crate) automatic: bool,
-    /// When a session first opened on this vault, unix seconds. No
+    /// When a session first opened on this vault, unix seconds, by a
+    /// clock that could be right ([`UpdateRecord::session_at`]). No
     /// check goes out on its own within a day of it: a new install is up
     /// to date, and the user gets to see the setting before the app
     /// speaks to GitHub.
@@ -102,6 +103,15 @@ impl Default for UpdateRecord {
 /// first session and the first of them.
 pub(crate) const CHECK_EVERY: u64 = 24 * 60 * 60;
 
+/// 16 October 2026, midnight UTC, in unix seconds. No build of this
+/// code was made before that day, so a clock that is right cannot read
+/// an earlier time while it runs: such a time is a clock that is not
+/// set yet, or was reset by a flat battery. Taken as the first session,
+/// it would end the day that asks nothing once the clock is set right,
+/// and the check would go out minutes after the install. Never raised
+/// past the day of the build that carries it.
+pub(crate) const NO_RIGHT_CLOCK_BEFORE: u64 = 1_792_108_800;
+
 impl UpdateRecord {
     /// Whether the app should check on its own at `now`, unix seconds:
     /// the setting is on, a day has gone by since the first session, and
@@ -121,8 +131,13 @@ impl UpdateRecord {
 
     /// A session opened at `now`: the first one starts the day that
     /// asks nothing, and a first session from the future comes back to
-    /// now.
+    /// now. A time before [`NO_RIGHT_CLOCK_BEFORE`] is a clock not yet
+    /// set right, and starts nothing: the first session is the next one
+    /// that reads a time it could be.
     pub(crate) fn session_at(&mut self, now: u64) {
+        if now < NO_RIGHT_CLOCK_BEFORE {
+            return;
+        }
         if self.first_session_at.is_none_or(|at| at > now) {
             self.first_session_at = Some(now);
         }
@@ -528,6 +543,26 @@ mod tests {
             Some(NOW),
             "a later session moves nothing"
         );
+    }
+
+    /// A clock behind at the first launch, never set or reset by a flat
+    /// battery, then set right: the time it read starts nothing, and the
+    /// first day is counted from the session that saw the right time.
+    #[test]
+    fn a_first_session_before_any_right_clock_starts_nothing() {
+        let mut record = UpdateRecord::default();
+        record.session_at(0);
+        record.session_at(NO_RIGHT_CLOCK_BEFORE - 1);
+        assert_eq!(record.first_session_at, None);
+        assert!(!record.due(NOW), "no first session seen yet");
+        record.session_at(NOW);
+        assert_eq!(record.first_session_at, Some(NOW));
+        assert!(!record.due(NOW + DAY - 1));
+        assert!(record.due(NOW + DAY));
+
+        let mut fresh = UpdateRecord::default();
+        fresh.session_at(NO_RIGHT_CLOCK_BEFORE);
+        assert_eq!(fresh.first_session_at, Some(NO_RIGHT_CLOCK_BEFORE));
     }
 
     #[test]
