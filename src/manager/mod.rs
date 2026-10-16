@@ -13,8 +13,8 @@
 //!   the app's preferences, and whether a connection goes through Tor.
 //! - `wallets.rs`: which wallets, in which order, and what each holds.
 //! - `sync.rs`: how far a sync reads, and which caller waits for which.
-//! - `broadcast.rs`: what a transaction does, and where it stands once
-//!   sent.
+//! - `broadcast.rs`: what a transaction does, the last ones sent, and
+//!   where each stands.
 //! - `price.rs`: what a bitcoin is worth, asked by the route the syncs
 //!   take.
 //! - `app_lock.rs`: who may open the app.

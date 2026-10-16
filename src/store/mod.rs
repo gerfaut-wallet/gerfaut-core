@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::broadcast::{RECENT_BROADCASTS, RecentBroadcast};
 use crate::chain::BackendConfig;
 use crate::chain::tor::TorSettings;
 use crate::error::VaultError;
@@ -246,6 +247,14 @@ pub struct VaultPayload {
     /// earlier build skips it, and loses only that.
     #[serde(default)]
     pub updates: UpdateRecord,
+    /// The transactions this app broadcast, newest first, one per txid
+    /// and [`RECENT_BROADCASTS`] at most. Absent while there are none,
+    /// and from vaults written before. The version stays as it was: a
+    /// build that predates it reads past it and drops it at its next
+    /// save, which costs a list of transactions already on the network,
+    /// not the vault itself to that build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) broadcasts: Vec<RecentBroadcast>,
 }
 
 impl Default for VaultPayload {
@@ -258,7 +267,44 @@ impl Default for VaultPayload {
             unclaimed: Vec::new(),
             vanishing: Vec::new(),
             updates: UpdateRecord::default(),
+            broadcasts: Vec::new(),
         }
+    }
+}
+
+impl VaultPayload {
+    /// Puts a transaction just sent at the head of the recent
+    /// broadcasts, in place of an earlier record of the same txid, and
+    /// lets the oldest go past [`RECENT_BROADCASTS`].
+    pub(crate) fn remember_broadcast(&mut self, sent: RecentBroadcast) {
+        self.broadcasts.retain(|kept| kept.txid != sent.txid);
+        self.broadcasts.insert(0, sent);
+        self.broadcasts.truncate(RECENT_BROADCASTS);
+    }
+
+    /// Takes in the broadcasts an app kept under [`APP_BROADCASTS`]
+    /// before the vault kept them itself, after those it already holds,
+    /// and removes the preference: whether there was one. An entry that
+    /// does not read, or whose bytes are not the transaction its txid
+    /// names, stays out.
+    fn adopt_app_broadcasts(&mut self) -> bool {
+        let Some(raw) = self.settings.app_prefs.remove(APP_BROADCASTS) else {
+            return false;
+        };
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap_or_default();
+        for entry in entries {
+            if self.broadcasts.len() >= RECENT_BROADCASTS {
+                break;
+            }
+            let Ok(entry) = serde_json::from_value::<RecentBroadcast>(entry) else {
+                continue;
+            };
+            if entry.holds_together() && !self.broadcasts.iter().any(|kept| kept.txid == entry.txid)
+            {
+                self.broadcasts.push(entry);
+            }
+        }
+        true
     }
 }
 
@@ -275,6 +321,11 @@ struct Retired {
 /// that start with this: the ntfy topic of each of its channels among
 /// them. Nothing reads them any more, and they leave with the account.
 const RETIRED_PREFS: &str = "premium.";
+
+/// The app preference the recent broadcasts were kept under, as a JSON
+/// list, before the vault kept them: see
+/// [`VaultPayload::adopt_app_broadcasts`].
+const APP_BROADCASTS: &str = "broadcast.recent";
 
 /// Handle on the vault file. Owns the key material, and the exclusive
 /// lock that keeps every other opener out while it lives.
@@ -360,8 +411,9 @@ impl Vault {
     }
 
     /// [`Self::load`], and whether the file still holds what earlier
-    /// builds kept and this one dropped: see [`Retired`] and
-    /// [`RETIRED_PREFS`]. The payload comes without either.
+    /// builds kept and this one dropped or keeps elsewhere: see
+    /// [`Retired`], [`RETIRED_PREFS`] and [`APP_BROADCASTS`]. The payload
+    /// comes without any of them.
     fn read(&self) -> Result<(VaultPayload, bool), VaultError> {
         #[derive(Deserialize)]
         struct Head<'a> {
@@ -388,6 +440,9 @@ impl Vault {
         let before = prefs.len();
         prefs.retain(|key, _| !key.starts_with(RETIRED_PREFS));
         let retired = retired || prefs.len() < before;
+        // Taken in once: the vault written back without the preference
+        // is one no later open reads it from.
+        let retired = payload.adopt_app_broadcasts() || retired;
         Ok((payload, retired))
     }
 
@@ -968,6 +1023,124 @@ mod tests {
         assert!(still_there);
         vault.save(&payload).unwrap();
         assert!(!holds_premium(&path));
+    }
+
+    /// A sent transaction as an app kept it: `n` tells two apart.
+    fn sent(n: u8, network: Network) -> RecentBroadcast {
+        use crate::testkit::{nowhere, script, transaction};
+        let tx = transaction(&[nowhere(n, 0)], &[(&script(n), 50_000)]);
+        RecentBroadcast {
+            txid: tx.compute_txid().to_string(),
+            network,
+            hex: bdk_wallet::bitcoin::consensus::encode::serialize_hex(&tx),
+            backend: "mempool.space".to_owned(),
+            at: 1_790_000_000 + u64::from(n),
+        }
+    }
+
+    /// The last ten broadcasts, every network together, newest first,
+    /// and a transaction sent again is moved up rather than listed twice.
+    #[test]
+    fn the_recent_broadcasts_are_the_last_ten() {
+        let mut payload = VaultPayload::default();
+        for n in 1..=11 {
+            let network = if n % 2 == 0 {
+                Network::Signet
+            } else {
+                Network::Mainnet
+            };
+            payload.remember_broadcast(sent(n, network));
+        }
+        let order = |payload: &VaultPayload| -> Vec<u64> {
+            payload
+                .broadcasts
+                .iter()
+                .map(|kept| kept.at - 1_790_000_000)
+                .collect()
+        };
+        assert_eq!(order(&payload), [11, 10, 9, 8, 7, 6, 5, 4, 3, 2]);
+        payload.remember_broadcast(sent(5, Network::Mainnet));
+        assert_eq!(order(&payload), [5, 11, 10, 9, 8, 7, 6, 4, 3, 2]);
+    }
+
+    /// The list the apps kept among their preferences is taken in at the
+    /// first open, after what the vault holds, and the preference leaves
+    /// the file then: no later open reads it again. An entry of the
+    /// Android app, which kept no host, comes in with none; one that
+    /// does not read, or whose bytes are another transaction, stays out.
+    #[test]
+    fn the_broadcasts_the_apps_kept_are_taken_in_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let desktop = sent(1, Network::Signet);
+        let mut android = serde_json::to_value(sent(2, Network::Mainnet)).unwrap();
+        android.as_object_mut().unwrap().remove("backend");
+        let mut mismatched = serde_json::to_value(sent(3, Network::Signet)).unwrap();
+        mismatched["hex"] = sent(4, Network::Signet).hex.into();
+        let kept_already = sent(5, Network::Signet);
+        let list = serde_json::json!([
+            desktop,
+            android,
+            {"txid": "ab", "network": "signet"},
+            mismatched,
+            kept_already,
+        ]);
+        let mut payload = VaultPayload::default();
+        payload.broadcasts.push(kept_already.clone());
+        payload
+            .settings
+            .app_prefs
+            .insert("desktop.theme".to_owned(), "dark".to_owned());
+        payload
+            .settings
+            .app_prefs
+            .insert(APP_BROADCASTS.to_owned(), list.to_string());
+        let sealed = cipher::seal(&serde_json::to_vec(&payload).unwrap(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        let expected = vec![
+            kept_already,
+            desktop,
+            RecentBroadcast {
+                backend: String::new(),
+                ..sent(2, Network::Mainnet)
+            },
+        ];
+        let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(payload.broadcasts, expected);
+        assert_eq!(
+            payload.settings.app_prefs,
+            BTreeMap::from([("desktop.theme".to_owned(), "dark".to_owned())])
+        );
+        // Gone from the file at the open, before any change is saved.
+        let plaintext = cipher::unseal(&std::fs::read(&path).unwrap(), &key()).unwrap();
+        assert!(
+            !String::from_utf8(plaintext)
+                .unwrap()
+                .contains(APP_BROADCASTS)
+        );
+        drop(vault);
+        let (_, reopened) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(reopened.broadcasts, expected);
+    }
+
+    /// A preference that is no list at all is dropped like any entry
+    /// that does not read: the vault opens, with nothing taken in.
+    #[test]
+    fn an_unreadable_list_of_broadcasts_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let mut payload = VaultPayload::default();
+        payload
+            .settings
+            .app_prefs
+            .insert(APP_BROADCASTS.to_owned(), "{not json".to_owned());
+        let sealed = cipher::seal(&serde_json::to_vec(&payload).unwrap(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        let (_, payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert!(payload.broadcasts.is_empty());
+        assert!(payload.settings.app_prefs.is_empty());
     }
 
     #[test]
