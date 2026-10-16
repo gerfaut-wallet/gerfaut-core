@@ -742,9 +742,9 @@ pub fn build_preview(
         warnings.push(TxWarning::refused(
             TxWarningKind::Unsigned,
             format!(
-                "{unsigned} of {} inputs carry no signature: the network will refuse this \
-                 transaction. It has to go back to the signer.",
-                inputs.len()
+                "{}: the network will refuse this transaction. It has to go back to the \
+                 signer.",
+                unsigned_count(unsigned, inputs.len())
             ),
         ));
     }
@@ -939,6 +939,17 @@ pub fn build_preview(
         ready,
         warnings,
         hex: ready.then(|| encode::serialize_hex(tx)),
+    }
+}
+
+/// How many of the inputs carry no signature, in a sentence that agrees
+/// with its count.
+fn unsigned_count(unsigned: usize, total: usize) -> String {
+    match (unsigned, total) {
+        (1, 1) => "The input carries no signature".to_owned(),
+        (u, t) if u == t => format!("None of the {t} inputs carries a signature"),
+        (1, t) => format!("1 of {t} inputs carries no signature"),
+        (u, t) => format!("{u} of {t} inputs carry no signature"),
     }
 }
 
@@ -1653,6 +1664,33 @@ mod tests {
         );
         assert!(unknown.ready);
         assert!(unknown.warnings.iter().all(|w| !w.blocking));
+    }
+
+    /// "1 of 1 inputs carry" read as a typo on the one transaction a
+    /// person is most likely to paste: a single unsigned input.
+    #[test]
+    fn the_unsigned_count_agrees_with_itself() {
+        assert_eq!(unsigned_count(1, 1), "The input carries no signature");
+        assert_eq!(
+            unsigned_count(2, 2),
+            "None of the 2 inputs carries a signature"
+        );
+        assert_eq!(unsigned_count(1, 3), "1 of 3 inputs carries no signature");
+        assert_eq!(unsigned_count(2, 3), "2 of 3 inputs carry no signature");
+
+        let decoded = decode_transaction(&encode::serialize_hex(&unsigned_tx())).unwrap();
+        let preview = build_preview(&decoded, Network::Signet, &[], &[], None, 0);
+        let unsigned = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::Unsigned)
+            .unwrap();
+        assert!(unsigned.blocking);
+        assert_eq!(
+            unsigned.message,
+            "The input carries no signature: the network will refuse this transaction. \
+             It has to go back to the signer."
+        );
     }
 
     #[test]
