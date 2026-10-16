@@ -19,7 +19,9 @@ use bdk_wallet::bitcoin::NetworkKind;
 use bdk_wallet::bitcoin::address::Address;
 use bdk_wallet::bitcoin::base58;
 use bdk_wallet::miniscript::ForEachKey;
-use bdk_wallet::miniscript::descriptor::{Descriptor, DescriptorPublicKey, DescriptorType};
+use bdk_wallet::miniscript::descriptor::{
+    Descriptor, DescriptorPublicKey, DescriptorType, Wildcard,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::backup::BACKUP_PREFIX;
@@ -433,12 +435,87 @@ pub(crate) fn reject_private_material(input: &str) -> CoreResult<()> {
 
 // --- descriptors -------------------------------------------------------
 
-fn parse_descriptor_str(s: &str) -> CoreResult<Descriptor<DescriptorPublicKey>> {
-    s.parse::<Descriptor<DescriptorPublicKey>>()
-        .map_err(|e| CoreError::InvalidInput {
-            kind: "descriptor",
-            detail: e.to_string(),
-        })
+/// Deepest nesting a descriptor may have, in parentheses and braces.
+/// A real wallet stays within a dozen levels. Miniscript reads and
+/// walks a descriptor recursively, so text nested thousands deep would
+/// overflow the stack of whatever thread reads it.
+const MAX_DESCRIPTOR_DEPTH: usize = 100;
+
+/// Reads a descriptor of public keys. Every descriptor comes in through
+/// here, whether pasted, opened from a file, scanned, read from a BSMS
+/// record or a backup, or handed back by the app to be added, and two
+/// things miniscript only fails on at the wrong moment are refused
+/// first: nesting deep enough to overflow the stack, before the parser
+/// sees the text, and a key that cannot derive its own addresses.
+pub(crate) fn read_descriptor(text: &str) -> CoreResult<Descriptor<DescriptorPublicKey>> {
+    let invalid = |detail: String| CoreError::InvalidInput {
+        kind: "descriptor",
+        detail,
+    };
+    if nesting_depth(text) > MAX_DESCRIPTOR_DEPTH {
+        return Err(invalid(format!(
+            "the descriptor nests deeper than {MAX_DESCRIPTOR_DEPTH} levels"
+        )));
+    }
+    let descriptor = text
+        .parse::<Descriptor<DescriptorPublicKey>>()
+        .map_err(|e| invalid(e.to_string()))?;
+    if let Some(step) = hardened_derivation(&descriptor) {
+        return Err(invalid(format!(
+            "an extended public key cannot derive {step}: write the hardened steps in the key \
+             origin, as in `[fingerprint/84'/0'/0']xpub…/0/*`"
+        )));
+    }
+    Ok(descriptor)
+}
+
+/// The deepest the parentheses and braces of `text` nest, counted on
+/// the text alone.
+fn nesting_depth(text: &str) -> usize {
+    let mut depth = 0usize;
+    let mut deepest = 0usize;
+    for byte in text.bytes() {
+        match byte {
+            b'(' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b')' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// What an extended key in the descriptor is asked to derive and
+/// cannot: a hardened step written after the key, or a hardened
+/// wildcard. Only the private key derives those, and miniscript panics
+/// when asked for such an address. The steps belong in the key origin,
+/// which records what the signer derived.
+fn hardened_derivation(descriptor: &Descriptor<DescriptorPublicKey>) -> Option<String> {
+    let mut found = None;
+    descriptor.for_any_key(|key| {
+        let (paths, wildcard) = match key {
+            DescriptorPublicKey::Single(_) => return false,
+            DescriptorPublicKey::XPub(xkey) => {
+                (std::slice::from_ref(&xkey.derivation_path), xkey.wildcard)
+            }
+            DescriptorPublicKey::MultiXPub(xkey) => {
+                (xkey.derivation_paths.paths().as_slice(), xkey.wildcard)
+            }
+        };
+        let step = paths
+            .iter()
+            .flat_map(|path| path.into_iter())
+            .find(|step| step.is_hardened());
+        found = match (step, wildcard) {
+            (Some(step), _) => Some(format!("the hardened step `{step}` written after it")),
+            (None, Wildcard::Hardened) => Some("hardened addresses (`*h`)".to_owned()),
+            (None, _) => None,
+        };
+        found.is_some()
+    });
+    found
 }
 
 fn script_kind_of(descriptor: &Descriptor<DescriptorPublicKey>) -> ScriptKind {
@@ -560,7 +637,7 @@ fn descriptor_function(kind: DescriptorType) -> &'static str {
 
 fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
     let (s, hints) = xpub::normalize_descriptor_keys(s)?;
-    let descriptor = parse_descriptor_str(&s)?;
+    let descriptor = read_descriptor(&s)?;
     check_slip132_hints(&hints, &descriptor)?;
     let mut warnings = slip132_warning(!hints.is_empty());
 
@@ -620,8 +697,8 @@ fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
 fn parse_descriptor_pair(first: &str, second: &str) -> CoreResult<ParsedInput> {
     let (first, first_hints) = xpub::normalize_descriptor_keys(first)?;
     let (second, second_hints) = xpub::normalize_descriptor_keys(second)?;
-    let external = parse_descriptor_str(&first)?;
-    let internal = parse_descriptor_str(&second)?;
+    let external = read_descriptor(&first)?;
+    let internal = read_descriptor(&second)?;
     check_slip132_hints(&first_hints, &external)?;
     check_slip132_hints(&second_hints, &internal)?;
     if external.is_multipath() || internal.is_multipath() {
@@ -749,7 +826,7 @@ fn descriptors_for_xpub(
             }
         };
         // Canonicalize through the parser: validates and appends checksums.
-        Ok(parse_descriptor_str(&descriptor)?.to_string())
+        Ok(read_descriptor(&descriptor)?.to_string())
     };
     let external = build(&derivation.receive)?;
     let internal = derivation.change.as_deref().map(build).transpose()?;
@@ -1052,7 +1129,7 @@ fn first_address(payload: &ParsedPayload, network: Network) -> Option<String> {
     let ParsedPayload::Descriptors { external, .. } = payload else {
         return None;
     };
-    let descriptor = external.parse::<Descriptor<DescriptorPublicKey>>().ok()?;
+    let descriptor = read_descriptor(external).ok()?;
     let definite = descriptor.at_derivation_index(0).ok()?;
     definite
         .address(network.to_bitcoin())
@@ -1280,7 +1357,7 @@ fn derives_first(parsed: &ParsedInput, first: &str) -> bool {
     let ParsedPayload::Descriptors { external, .. } = &parsed.payload else {
         return false;
     };
-    let Ok(descriptor) = external.parse::<Descriptor<DescriptorPublicKey>>() else {
+    let Ok(descriptor) = read_descriptor(external) else {
         return false;
     };
     let Ok(definite) = descriptor.at_derivation_index(0) else {
@@ -2206,6 +2283,102 @@ mod tests {
         let other = format!(", \"desc\": \"pkh([0f056943/84h/1h/0h]{TPUB}/<0;1>/*)\"");
         let error = parse_input(&account(&other)).unwrap_err().to_string();
         assert!(error.contains("another script type"), "{error}");
+    }
+
+    /// A hardened step after an extended key, or a hardened wildcard,
+    /// asks a public key for a child only the private key can derive,
+    /// and miniscript panics when asked for its address. Every way a
+    /// descriptor comes in refuses it first, and says where those
+    /// steps belong.
+    #[test]
+    fn a_hardened_step_after_an_extended_key_is_refused_wherever_it_comes_from() {
+        let refused = |input: &str| {
+            let error = parse_input(input).unwrap_err();
+            let text = error.to_string();
+            assert!(
+                matches!(
+                    error,
+                    CoreError::InvalidInput {
+                        kind: "descriptor",
+                        ..
+                    }
+                ),
+                "{input}: {text}"
+            );
+            assert!(text.contains("key origin"), "{input}: {text}");
+        };
+        let stepped = format!("wpkh({TPUB}/84h/0/*)");
+        let wildcard = format!("wpkh([9a6a2580/84'/1'/0']{TPUB}/0/*h)");
+
+        // Pasted, with or without its checksum.
+        refused(&stepped);
+        refused(&wildcard);
+        refused(&format!("{stepped}#{}", desc_checksum(&stepped).unwrap()));
+        refused(&format!("wpkh({})", slip132(TPUB, VPUB) + "/0'/0/*"));
+        // As one multipath descriptor, and on the second key of a
+        // multisig.
+        refused(&format!("wpkh({TPUB}/1'/<0;1>/*)"));
+        refused(&format!("wsh(sortedmulti(1,{TPUB}/0/*,{TPUB}/0h/*))"));
+        // As a pair on two lines, the hardened one first or second.
+        refused(&format!("wpkh({TPUB}/0/*)\nwpkh({TPUB}/1h/*)"));
+        refused(&format!("wpkh({TPUB}/0h/*)\nwpkh({TPUB}/1/*)"));
+        // As a Sparrow descriptor file.
+        refused(&format!(
+            "wpkh({TPUB}/7h/<0;1>/*)\nwpkh({TPUB}/7h/0/*)\nwpkh({TPUB}/7h/1/*)"
+        ));
+        // In a JSON export, generic or Coldcard.
+        refused(&serde_json::json!({ "descriptor": stepped }).to_string());
+        refused(
+            &serde_json::json!({ "descriptor": format!("wpkh({TPUB}/0/*)"), "change_descriptor": wildcard })
+                .to_string(),
+        );
+        refused(&serde_json::json!({ "bip84": { "desc": stepped } }).to_string());
+        // In a QR envelope.
+        let hex = |text: &str| -> String { text.bytes().map(|b| format!("{b:02X}")).collect() };
+        refused(&format!("B$HU0100{}", hex(&stepped)));
+        // In a BSMS record, bare or in an envelope.
+        let record = format!(
+            "BSMS 1.0\nwsh(sortedmulti(1,{TPUB}/**,{TPUB}/0h/**))\n/0/*,/1/*\n\
+             tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx\n"
+        );
+        refused(&record);
+        refused(&format!("B$HU0100{}", hex(&record)));
+
+        // The same keys, the hardened steps in their origin, are fine.
+        let parsed = parse_input(&format!("wpkh([9a6a2580/84'/1'/0']{TPUB}/0/*)")).unwrap();
+        assert!(parsed.preview_address.is_some());
+    }
+
+    /// Text nested past any real wallet is refused before miniscript,
+    /// which reads and walks a descriptor recursively, gets to recurse
+    /// over it; the depth of a real one is far from the limit.
+    #[test]
+    fn a_descriptor_nested_past_reason_is_refused_unparsed() {
+        // A key of its own at each level: miniscript refuses one
+        // repeated.
+        let key = |level: usize| format!("{TPUB}/{level}/*");
+        let nested = |levels: usize| {
+            let branches: String = (0..levels)
+                .map(|l| format!("or_i(pk({}),", key(l)))
+                .collect();
+            format!("wsh({branches}pk({}){})", key(levels), ")".repeat(levels))
+        };
+        assert!(parse_input(&nested(3)).is_ok());
+        // Just past the limit, and as deep as the input cap lets a
+        // pasted text go.
+        for levels in [MAX_DESCRIPTOR_DEPTH - 1, 400] {
+            let error = parse_input(&nested(levels)).unwrap_err().to_string();
+            assert!(error.contains("nests deeper"), "{levels}: {error}");
+        }
+        let leaves: String = (1..=150).map(|l| format!("{{pk({}),", key(l))).collect();
+        let tree = format!("tr({},{leaves}pk({}){})", key(0), key(151), "}".repeat(150));
+        let error = parse_input(&tree).unwrap_err().to_string();
+        assert!(error.contains("nests deeper"), "{error}");
+        // Past any cap on the input, still no stack to overflow.
+        let error = read_descriptor(&"sh(".repeat(1_000_000))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nests deeper"), "{error}");
     }
 
     #[test]

@@ -225,14 +225,16 @@ fn create_engine(
 }
 
 /// Refuses a descriptor that carries private key material, or that does
-/// not read as a descriptor of public keys alone.
+/// not read as a descriptor of public keys alone, held to what an
+/// import is held to.
 fn require_public_descriptor(descriptor: &str) -> CoreResult<()> {
     crate::input::reject_private_material(descriptor)?;
-    use bdk_wallet::miniscript::{Descriptor, DescriptorPublicKey};
-    descriptor
-        .parse::<Descriptor<DescriptorPublicKey>>()
+    crate::input::read_descriptor(descriptor)
         .map(|_| ())
-        .map_err(|e| CoreError::Descriptor(e.to_string()))
+        .map_err(|e| match e {
+            CoreError::InvalidInput { detail, .. } => CoreError::Descriptor(detail),
+            other => other,
+        })
 }
 
 /// The wallet already watching the same material on the same network,

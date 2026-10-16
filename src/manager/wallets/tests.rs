@@ -33,6 +33,41 @@ async fn add_list_snapshot_descriptor_wallet() {
     assert_eq!(snapshot.tip_height, 0);
 }
 
+/// The app hands the parsed input back to be added, so what it holds
+/// is read again: a hardened step after the key, which miniscript
+/// panics on when asked for an address, or a descriptor nested past
+/// reason, is refused in words, and nothing is stored.
+#[tokio::test]
+async fn a_descriptor_the_parser_would_refuse_is_refused_when_handed_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let tpub = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
+    let mut parsed = parse_input(MULTIPATH).unwrap();
+    for (external, refusal) in [
+        (format!("wpkh({tpub}/84h/0/*)"), "key origin"),
+        (format!("wpkh({tpub}/0/*h)"), "key origin"),
+        (
+            format!("{}{tpub}/0/*{}", "sh(".repeat(150), ")".repeat(150)),
+            "nests deeper",
+        ),
+    ] {
+        parsed.payload = ParsedPayload::Descriptors {
+            external,
+            internal: None,
+            script: crate::input::ScriptKind::Segwit,
+        };
+        let error = manager
+            .add_wallet("Handed back", &parsed, Network::Signet)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, CoreError::Descriptor(detail) if detail.contains(refusal)),
+            "{error}"
+        );
+    }
+    assert!(manager.list_wallets(None).await.is_empty());
+}
+
 #[tokio::test]
 async fn policy_of_a_descriptor_wallet_reads_its_keys() {
     let dir = tempfile::tempdir().unwrap();
