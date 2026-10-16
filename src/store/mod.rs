@@ -399,6 +399,15 @@ impl Vault {
         // cannot be looked at (a permission, a storage error) fails the
         // open rather than being replaced by an empty one.
         if vault.path.try_exists()? {
+            // A vault an earlier build created with the default mode is
+            // closed to others now, not at the next save, which a vault
+            // that is only read may not see for weeks. One that cannot
+            // be changed, on a file system without modes, opens all the
+            // same.
+            #[cfg(unix)]
+            if let Err(error) = keep_to_owner(&vault.path) {
+                log::warn!("the vault could not be made its owner's alone: {error}");
+            }
             let (payload, retired) = vault.read()?;
             // What earlier builds kept and this one dropped, secrets
             // among it, leaves the file now rather than at the next
@@ -686,6 +695,18 @@ pub fn owner_only(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptio
         options.mode(0o600);
     }
     options
+}
+
+/// Takes from a file every right of its group and of everyone else,
+/// and leaves its owner's as they are. Nothing when there were none.
+#[cfg(unix)]
+fn keep_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)?.permissions().mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o700))?;
+    }
+    Ok(())
 }
 
 /// Creates `dir` so that only its owner may list or enter it on Unix,
@@ -1432,6 +1453,13 @@ mod tests {
         drop(Vault::open_or_create(mine.join("gerfaut.vault"), key()).unwrap());
         assert_eq!(mode(&mine), 0o755);
         assert_eq!(mode(&mine.join("gerfaut.vault")), 0o600);
+
+        // A vault an earlier build left open to others is closed as it
+        // opens, before any save.
+        drop(vault);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (_vault, _) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(mode(&path), 0o600);
     }
 
     /// The rule the apps write their exports with: a file created is
