@@ -432,7 +432,21 @@ async fn electrum_keeps_to_what_a_server_takes() {
                 coverage: Coverage::Partial,
                 watched_scripts: 3,
                 left_out_scripts: 7,
+                refused_scripts: 7,
             }]
+        );
+        // Not the user's own node: the way out is one.
+        assert_eq!(
+            status.left_out,
+            Some(LeftOut {
+                reason: LeftOutReason::ServerRefused,
+                limits: WatchLimits::DEFAULT,
+                own_node: false,
+                remedy: Some(Remedy::OwnNode {
+                    limits: WatchLimits::OWN_NODE
+                }),
+            }),
+            "{words}"
         );
 
         let before = asked(&server, "blockchain.scripthash.subscribe");
@@ -454,6 +468,107 @@ async fn electrum_keeps_to_what_a_server_takes() {
         // The scripts past the limit are not reported again.
         no_event(&mut events, Duration::from_millis(300)).await;
     }
+}
+
+/// The user's own node, the backend as a test sets it up.
+fn own_node(server: &FakeElectrum) -> BackendConfig {
+    let BackendConfig::CustomElectrum { url, .. } = server.backend() else {
+        unreachable!("the fake server is an Electrum one");
+    };
+    BackendConfig::CustomElectrum {
+        url,
+        own_node: true,
+    }
+}
+
+/// On the user's own node, a server that takes so many subscriptions on
+/// one connection and no more is what its owner can change: the status
+/// names the setting of the software it says it runs, and none for
+/// electrs as its author publishes it, which caps nothing. Scripts it
+/// turned down one by one, a history too long for it, no such setting
+/// brings in.
+#[tokio::test]
+async fn the_status_names_what_lets_an_own_node_take_more() {
+    let all: Vec<u8> = (1..=10).collect();
+    for (software, remedy) in [
+        (
+            "Fulcrum 1.12.0",
+            Some(Remedy::RaiseServerLimit {
+                server: Some(ServerSoftware::Fulcrum),
+                settings: vec!["max_subs_per_ip".to_owned()],
+            }),
+        ),
+        (
+            "SomethingElse 2.0",
+            Some(Remedy::RaiseServerLimit {
+                server: None,
+                settings: Vec::new(),
+            }),
+        ),
+        ("electrs/0.10.9", None),
+    ] {
+        let server = FakeElectrum::start().await;
+        {
+            let mut state = server.state.lock().unwrap();
+            state.software = software;
+            state.subscription_limit = Some((3, "subscription limit reached (3 max per client)"));
+        }
+        let (watch, _events) = LiveWatch::start_with(
+            config(own_node(&server)),
+            vec![
+                wallet("a", &all, &[], false),
+                wallet("b", &[20], &[], false),
+            ],
+            Some(timings()),
+        );
+        let status = until(&watch, "refused past three", |s| {
+            s.pushed_scripts == 3 && s.left_out_scripts == 8
+        })
+        .await;
+        let refused: Vec<(u32, u32)> = status
+            .wallets
+            .iter()
+            .map(|wallet| (wallet.left_out_scripts, wallet.refused_scripts))
+            .collect();
+        // Rank by rank, the head of "b" is heard before the tail of "a".
+        assert_eq!(refused, [(8, 8), (0, 0)], "{software}");
+        assert_eq!(
+            status.left_out,
+            Some(LeftOut {
+                reason: LeftOutReason::ServerRefused,
+                limits: WatchLimits::OWN_NODE,
+                own_node: true,
+                remedy,
+            }),
+            "{software}"
+        );
+    }
+
+    let server = FakeElectrum::start().await;
+    {
+        let mut state = server.state.lock().unwrap();
+        state.software = "Fulcrum 1.12.0";
+        state.refuse.insert(
+            "blockchain.scripthash.subscribe",
+            "history too long".to_owned(),
+        );
+    }
+    let (watch, _events) = LiveWatch::start_with(
+        config(own_node(&server)),
+        vec![wallet("a", &[1, 2], &[], false)],
+        Some(timings()),
+    );
+    let status = until(&watch, "refused one by one", |s| s.left_out_scripts == 2).await;
+    assert_eq!(status.wallets[0].refused_scripts, 2);
+    assert_eq!(
+        status.left_out,
+        Some(LeftOut {
+            reason: LeftOutReason::ServerRefused,
+            limits: WatchLimits::OWN_NODE,
+            own_node: true,
+            remedy: None,
+        })
+    );
 }
 
 /// The most a server takes is asked again once it ran out, on a new
@@ -503,8 +618,10 @@ async fn a_learned_limit_is_asked_again_once_it_ran_out() {
             coverage: Coverage::Live,
             watched_scripts: 10,
             left_out_scripts: 0,
+            refused_scripts: 0,
         }]
     );
+    assert_eq!(status.left_out, None);
     no_event(&mut events, Duration::from_millis(300)).await;
 }
 
@@ -654,7 +771,12 @@ async fn a_server_that_cuts_the_watch_for_its_cost_is_asked_less() {
             coverage: Coverage::Partial,
             watched_scripts: 3,
             left_out_scripts: 7,
+            refused_scripts: 7,
         }
+    );
+    assert_eq!(
+        status.left_out.map(|left_out| left_out.reason),
+        Some(LeftOutReason::ServerRefused)
     );
     no_event(&mut events, Duration::from_millis(800)).await;
     assert_eq!(server.subscriptions().len(), 2);
@@ -1490,6 +1612,13 @@ fn each_wallet_is_live_in_part_or_left_to_the_syncs() {
         watched.capped(None),
         vec!["large".to_owned(), "cut short".to_owned()]
     );
+    // Past the limits of the watch, none of it refused.
+    assert!(
+        watched
+            .coverage(None)
+            .iter()
+            .all(|wallet| wallet.refused_scripts == 0)
+    );
 
     // Pinned wallets that take it all leave nothing to the others.
     let limits = WatchLimits {
@@ -1535,7 +1664,7 @@ fn what_a_server_refused_is_counted_out() {
         .map(|entry| entry.hex.as_str())
         .collect();
     assert_eq!(heard, [script(1), script(2)]);
-    let coverage: Vec<(Coverage, u32, u32)> = watched
+    let coverage: Vec<(Coverage, u32, u32, u32)> = watched
         .coverage(Some(&refusals))
         .iter()
         .map(|wallet| {
@@ -1543,12 +1672,19 @@ fn what_a_server_refused_is_counted_out() {
                 wallet.coverage,
                 wallet.watched_scripts,
                 wallet.left_out_scripts,
+                wallet.refused_scripts,
             )
         })
         .collect();
     assert_eq!(
         coverage,
-        [(Coverage::Partial, 2, 1), (Coverage::SyncOnly, 0, 2)]
+        [(Coverage::Partial, 2, 1, 1), (Coverage::SyncOnly, 0, 2, 2)]
+    );
+    assert!(
+        watched
+            .coverage(None)
+            .iter()
+            .all(|wallet| wallet.refused_scripts == 0)
     );
     assert_eq!(
         watched.capped(Some(&refusals)),
@@ -1561,6 +1697,163 @@ fn what_a_server_refused_is_counted_out() {
         .map(|entry| entry.hex.as_str())
         .collect();
     assert_eq!(past, [script(5), script(3)]);
+}
+
+/// What raises the limit of a node, by what it answers to
+/// `server.version`: the setting each of these servers documents.
+#[test]
+fn a_node_is_told_the_setting_of_its_software() {
+    let raise = |software: Option<&str>| match Remedy::raise(software) {
+        Some(Remedy::RaiseServerLimit { server, settings }) => Some((server, settings)),
+        None => None,
+        Some(other) => panic!("not a setting to raise: {other:?}"),
+    };
+    let named = |server, settings: &[&str]| {
+        Some((
+            Some(server),
+            settings.iter().map(|&setting| setting.to_owned()).collect(),
+        ))
+    };
+    assert_eq!(
+        raise(Some("Fulcrum 1.12.0")),
+        named(ServerSoftware::Fulcrum, &["max_subs_per_ip"])
+    );
+    assert_eq!(
+        raise(Some(" ElectrumX 1.18.0")),
+        named(
+            ServerSoftware::ElectrumX,
+            &["COST_SOFT_LIMIT", "COST_HARD_LIMIT"]
+        )
+    );
+    assert_eq!(
+        raise(Some("electrs-esplora 0.4.1")),
+        named(
+            ServerSoftware::ElectrsEsplora,
+            &["--electrum-subscription-limit"]
+        )
+    );
+    assert_eq!(
+        raise(Some("mempool-electrs 3.4.0-dev")),
+        named(
+            ServerSoftware::MempoolElectrs,
+            &["--electrum-max-subscriptions"]
+        )
+    );
+    // electrs as its author publishes it caps nothing.
+    assert_eq!(raise(Some("electrs/0.10.9")), None);
+    // Anything else, or nothing said: a limit to raise, unnamed.
+    assert_eq!(raise(Some("SomethingElse 2.0")), Some((None, Vec::new())));
+    assert_eq!(raise(None), Some((None, Vec::new())));
+}
+
+/// The verdict: the server as soon as it refused a script, the limits of
+/// the watch otherwise; and the way out, a node of one's own anywhere
+/// else, and on it, the setting of the server when its limit on one
+/// connection is what left scripts out.
+#[test]
+fn the_verdict_says_why_scripts_are_left_out_and_the_way_out() {
+    let capped = [WalletCoverage::of("a".to_owned(), 200, 50, 0)];
+    let refused = [
+        WalletCoverage::of("a".to_owned(), 3, 57, 7),
+        WalletCoverage::of("b".to_owned(), 2, 0, 0),
+    ];
+    let public = BackendConfig::Public { server: None };
+    let custom = |own_node| BackendConfig::CustomElectrum {
+        url: "ssl://node.example.org:50002".to_owned(),
+        own_node,
+    };
+    let verdict = |reason, own_node, remedy| LeftOut {
+        reason,
+        limits: if own_node {
+            WatchLimits::OWN_NODE
+        } else {
+            WatchLimits::DEFAULT
+        },
+        own_node,
+        remedy,
+    };
+    let own_node = Some(Remedy::OwnNode {
+        limits: WatchLimits::OWN_NODE,
+    });
+    let fulcrum = Some("Fulcrum 1.12.0");
+
+    assert_eq!(
+        LeftOut::of(&capped, &public, false, None),
+        verdict(LeftOutReason::LiveLimit, false, own_node.clone())
+    );
+    assert_eq!(
+        LeftOut::of(&refused, &custom(false), true, fulcrum),
+        verdict(LeftOutReason::ServerRefused, false, own_node)
+    );
+    // On the user's own node, its limits reached: nothing takes more.
+    assert_eq!(
+        LeftOut::of(&capped, &custom(true), false, fulcrum),
+        verdict(LeftOutReason::LiveLimit, true, None)
+    );
+    assert_eq!(
+        LeftOut::of(&refused, &custom(true), true, Some("ElectrumX 1.18.0")),
+        verdict(
+            LeftOutReason::ServerRefused,
+            true,
+            Some(Remedy::RaiseServerLimit {
+                server: Some(ServerSoftware::ElectrumX),
+                settings: vec!["COST_SOFT_LIMIT".to_owned(), "COST_HARD_LIMIT".to_owned()],
+            })
+        )
+    );
+    // Turned down one by one, which no setting of the server lifts.
+    assert_eq!(
+        LeftOut::of(&refused, &custom(true), false, fulcrum),
+        verdict(LeftOutReason::ServerRefused, true, None)
+    );
+}
+
+/// The verdict as the apps read it.
+#[test]
+fn the_verdict_reads_as_the_apps_expect() {
+    let json = |left_out: &LeftOut| serde_json::to_string(left_out).unwrap();
+    let capped = LeftOut {
+        reason: LeftOutReason::LiveLimit,
+        limits: WatchLimits::DEFAULT,
+        own_node: false,
+        remedy: Some(Remedy::OwnNode {
+            limits: WatchLimits::OWN_NODE,
+        }),
+    };
+    assert_eq!(
+        json(&capped),
+        r#"{"reason":"live_limit","limits":{"per_wallet":200,"total":2000},"own_node":false,"remedy":{"type":"own_node","limits":{"per_wallet":20000,"total":20000}}}"#
+    );
+    let refused = LeftOut {
+        reason: LeftOutReason::ServerRefused,
+        limits: WatchLimits::OWN_NODE,
+        own_node: true,
+        remedy: Some(Remedy::RaiseServerLimit {
+            server: Some(ServerSoftware::ElectrumX),
+            settings: vec!["COST_SOFT_LIMIT".to_owned(), "COST_HARD_LIMIT".to_owned()],
+        }),
+    };
+    assert_eq!(
+        json(&refused),
+        r#"{"reason":"server_refused","limits":{"per_wallet":20000,"total":20000},"own_node":true,"remedy":{"type":"raise_server_limit","server":"electrumx","settings":["COST_SOFT_LIMIT","COST_HARD_LIMIT"]}}"#
+    );
+    let unknown = LeftOut {
+        remedy: Some(Remedy::RaiseServerLimit {
+            server: None,
+            settings: Vec::new(),
+        }),
+        ..refused.clone()
+    };
+    assert!(
+        json(&unknown)
+            .ends_with(r#""remedy":{"type":"raise_server_limit","server":null,"settings":[]}}"#)
+    );
+    for left_out in [capped, refused, unknown] {
+        assert_eq!(
+            serde_json::from_str::<LeftOut>(&json(&left_out)).unwrap(),
+            left_out
+        );
+    }
 }
 
 /// The most a server takes is kept a day, and a limit of none an hour:
@@ -1611,14 +1904,28 @@ async fn the_status_says_how_much_of_each_wallet_is_live() {
                 coverage: Coverage::Partial,
                 watched_scripts: 200,
                 left_out_scripts: 50,
+                refused_scripts: 0,
             },
             WalletCoverage {
                 wallet_id: "small".to_owned(),
                 coverage: Coverage::Live,
                 watched_scripts: 3,
                 left_out_scripts: 0,
+                refused_scripts: 0,
             },
         ]
+    );
+    // The limits of the watch, and the way past them.
+    assert_eq!(
+        status.left_out,
+        Some(LeftOut {
+            reason: LeftOutReason::LiveLimit,
+            limits: WatchLimits::DEFAULT,
+            own_node: false,
+            remedy: Some(Remedy::OwnNode {
+                limits: WatchLimits::OWN_NODE
+            }),
+        })
     );
 
     let BackendConfig::CustomElectrum { url, .. } = server.backend() else {
@@ -1631,6 +1938,7 @@ async fn the_status_says_how_much_of_each_wallet_is_live() {
     watch.reconfigure(config(own), wallets());
     let status = until(&watch, "subscribed whole", |s| s.pushed_scripts == 253).await;
     assert_eq!((status.left_out_wallets, status.left_out_scripts), (0, 0));
+    assert_eq!(status.left_out, None);
     assert!(
         status
             .wallets
@@ -1675,20 +1983,18 @@ fn a_status_and_a_list_from_before_coverage_still_read() {
     assert_eq!((status.left_out_scripts, status.left_out_wallets), (0, 0));
     assert!(status.wallets.is_empty());
     assert_eq!(status.server_software, None);
+    assert_eq!(status.left_out, None);
     let wallet: WatchedWallet =
         serde_json::from_str(r#"{"wallet_id":"w","scripts":[],"has_pending":false}"#).unwrap();
     assert!(!wallet.pinned && !wallet.holds_coins);
     assert_eq!(wallet.unlisted, 0);
-    let json = serde_json::to_string(&WalletCoverage {
-        wallet_id: "w".to_owned(),
-        coverage: Coverage::SyncOnly,
-        watched_scripts: 0,
-        left_out_scripts: 4,
-    })
-    .unwrap();
+    let before =
+        r#"{"wallet_id":"w","coverage":"sync_only","watched_scripts":0,"left_out_scripts":4}"#;
+    let coverage: WalletCoverage = serde_json::from_str(before).unwrap();
+    assert_eq!(coverage.refused_scripts, 0);
     assert_eq!(
-        json,
-        r#"{"wallet_id":"w","coverage":"sync_only","watched_scripts":0,"left_out_scripts":4}"#
+        serde_json::to_string(&coverage).unwrap(),
+        r#"{"wallet_id":"w","coverage":"sync_only","watched_scripts":0,"left_out_scripts":4,"refused_scripts":0}"#
     );
 }
 
@@ -1708,6 +2014,11 @@ fn the_users_own_node_lifts_what_a_watch_takes() {
     assert_eq!(WatchLimits::of(&own(false)), WatchLimits::DEFAULT);
     assert_eq!(WatchLimits::of(&own(true)), WatchLimits::OWN_NODE);
     assert_eq!(WatchLimits::OWN_NODE.total, 20_000);
+    // What the words of the setting are drawn from.
+    assert_eq!(
+        serde_json::to_string(&WatchLimitsChoice::CURRENT).unwrap(),
+        r#"{"any":{"per_wallet":200,"total":2000},"own_node":{"per_wallet":20000,"total":20000}}"#
+    );
 
     let large = || vec![numbered("large", 0, 5_000)];
     let anywhere = Watched::new(large(), WatchLimits::DEFAULT);
