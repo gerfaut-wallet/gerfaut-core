@@ -1,12 +1,15 @@
 //! Transactions handed in by the user: what one does before anything
 //! leaves the device, sending it, and where it stands once sent.
 
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
+use std::sync::Arc;
 
-use bdk_wallet::bitcoin::{Address, Amount, TxOut};
+use bdk_wallet::bitcoin::{Address, Amount, OutPoint, Transaction, TxOut, Txid};
+use bdk_wallet::chain::CanonicalizationParams;
 
 use crate::broadcast::{
-    self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, TxPreview, WalletRef,
+    self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, SpentBy, TxPreview, WalletRef,
 };
 use crate::chain;
 use crate::error::{CoreError, CoreResult};
@@ -67,20 +70,17 @@ impl WalletManager {
                     WalletKind::Descriptors { .. } => {
                         let engine = ensure_engine(&mut state, &id)?;
                         tip_height = tip_height.max(Some(views::tip_height(engine)));
-                        for (i, outpoint) in outpoints.iter().enumerate() {
-                            if let Some(utxo) = engine.get_utxo(*outpoint) {
-                                input_facts[i].prevout = Some(utxo.txout.clone());
-                                input_facts[i].wallet = Some(wallet_ref.clone());
-                                input_facts[i].spent = Some(false);
-                            } else if let Some(tx) = engine.get_tx(outpoint.txid)
-                                && let Some(txout) = tx.tx_node.output.get(outpoint.vout as usize)
-                                && engine.is_mine(txout.script_pubkey.clone())
-                            {
-                                // A coin of this wallet, no longer unspent.
-                                input_facts[i].prevout = Some(txout.clone());
-                                input_facts[i].wallet = Some(wallet_ref.clone());
-                                input_facts[i].spent = Some(true);
-                            }
+                        let coins = wallet_coins(engine, &outpoints);
+                        for (i, coin) in coins.into_iter().enumerate() {
+                            // A coin of this wallet: unspent, or spent by the one
+                            // transaction it holds as canonical.
+                            let Some((txout, spender)) = coin else {
+                                continue;
+                            };
+                            input_facts[i].prevout = Some(txout);
+                            input_facts[i].wallet = Some(wallet_ref.clone());
+                            input_facts[i].spent = Some(spender.is_some());
+                            input_facts[i].spent_by = spender;
                         }
                         for (i, output) in decoded.tx.output.iter().enumerate() {
                             if engine.is_mine(output.script_pubkey.clone()) {
@@ -115,6 +115,8 @@ impl WalletManager {
                                 });
                                 input_facts[i].wallet = Some(wallet_ref.clone());
                                 input_facts[i].spent = Some(false);
+                                // The server's figure, not a transaction.
+                                input_facts[i].listed = true;
                             }
                         }
                         for (i, output) in decoded.tx.output.iter().enumerate() {
@@ -127,6 +129,26 @@ impl WalletManager {
             }
             (config, certs, input_facts, output_facts, tip_height)
         };
+
+        // A listing that the previous transaction the PSBT carries
+        // contradicts is set aside: the transaction is the coin, the
+        // listing a server's figure. Its attribution and its "unspent" go
+        // with it, and the coin is looked up as one no wallet holds.
+        for (facts, described) in input_facts.iter_mut().zip(&decoded.inputs) {
+            let proof = described
+                .prevout
+                .as_ref()
+                .filter(|_| described.prevout_proven);
+            if facts.listed
+                && let (Some(listed), Some(proof)) = (facts.prevout.clone(), proof)
+                && listed != *proof
+            {
+                *facts = InputFacts {
+                    contradicted_listing: facts.wallet.take().map(|wallet| (wallet, listed)),
+                    ..InputFacts::default()
+                };
+            }
+        }
 
         // What only the chain knows, outside the lock: the coins the
         // vault does not hold, and whether known coins are still
@@ -173,6 +195,7 @@ impl WalletManager {
                             }
                             if facts.spent.is_none() {
                                 facts.spent = chain_facts.spent;
+                                facts.spent_by = chain_facts.spent_by;
                             }
                         }
                         // This one has stopped answering — throttled,
@@ -289,6 +312,70 @@ impl WalletManager {
         }
         Err(sync_failure(&endpoints, attempts))
     }
+}
+
+/// For each outpoint, the coin of the wallet it names and the transaction
+/// that spends it, as the wallet holds them canonical; `None` where it
+/// names no coin of the wallet. This runs under the manager's lock: a
+/// wallet that holds none of the transactions the outpoints come from is
+/// passed over without making its graph canonical, and one that holds
+/// some has it made canonical once, its spends read once.
+fn wallet_coins(
+    engine: &bdk_wallet::Wallet,
+    outpoints: &[OutPoint],
+) -> Vec<Option<(TxOut, Option<SpentBy>)>> {
+    let graph = engine.tx_graph();
+    if outpoints
+        .iter()
+        .all(|outpoint| graph.get_tx(outpoint.txid).is_none())
+    {
+        return vec![None; outpoints.len()];
+    }
+    let spends: Vec<Vec<Txid>> = outpoints
+        .iter()
+        .map(|outpoint| graph.outspends(*outpoint).iter().copied().collect())
+        .collect();
+    let wanted: HashSet<Txid> = outpoints
+        .iter()
+        .map(|outpoint| outpoint.txid)
+        .chain(spends.iter().flatten().copied())
+        .collect();
+    let chain = engine.local_chain();
+    // Each wanted transaction the wallet holds as canonical, with whether
+    // it is in a block.
+    let canonical: HashMap<Txid, (Arc<Transaction>, bool)> = graph
+        .list_canonical_txs(
+            chain,
+            chain.tip().block_id(),
+            CanonicalizationParams::default(),
+        )
+        .filter(|ctx| wanted.contains(&ctx.tx_node.txid))
+        .map(|ctx| {
+            (
+                ctx.tx_node.txid,
+                (ctx.tx_node.tx.clone(), ctx.chain_position.is_confirmed()),
+            )
+        })
+        .collect();
+    outpoints
+        .iter()
+        .zip(&spends)
+        .map(|(outpoint, spenders)| {
+            let (funding, _) = canonical.get(&outpoint.txid)?;
+            let txout = funding.output.get(outpoint.vout as usize)?;
+            if !engine.is_mine(txout.script_pubkey.clone()) {
+                return None;
+            }
+            // At most one spend is canonical.
+            let spender = spenders.iter().find_map(|txid| {
+                canonical.get(txid).map(|&(_, confirmed)| SpentBy {
+                    txid: *txid,
+                    confirmed,
+                })
+            });
+            Some((txout.clone(), spender))
+        })
+        .collect()
 }
 
 /// Every node said the same thing: say it once, with the first host.

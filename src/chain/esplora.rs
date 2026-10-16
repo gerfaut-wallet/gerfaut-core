@@ -1027,10 +1027,12 @@ fn node_words(text: &str) -> String {
     text.trim().to_owned()
 }
 
-/// The output an input spends, and whether it is already spent.
+/// The output an input spends, whether it is already spent, and by
+/// which transaction.
 pub(crate) struct PrevoutFacts {
     pub txout: Option<TxOut>,
     pub spent: Option<bool>,
+    pub spent_by: Option<crate::broadcast::SpentBy>,
 }
 
 /// Fetches a previous output. `None` in `txout` means the backend does
@@ -1044,16 +1046,31 @@ pub(crate) async fn fetch_prevout(
         return Ok(PrevoutFacts {
             txout: None,
             spent: None,
+            spent_by: None,
         });
     };
     let txout = crate::chain::output_at(&tx, outpoint)?;
-    let spent = client
+    let status = client
         .output_status(&outpoint.txid, outpoint.vout)
         .await
         .ok()
-        .flatten()
-        .map(|status| status.spent);
-    Ok(PrevoutFacts { txout, spent })
+        .flatten();
+    let spent = status.as_ref().map(|status| status.spent);
+    // Named only when the server says both who spends it and where that
+    // stands: a spend whose standing is unknown is not taken for one
+    // in a block.
+    let spent_by = status.and_then(|status| match (status.spent, status.txid, status.status) {
+        (true, Some(txid), Some(standing)) => Some(crate::broadcast::SpentBy {
+            txid,
+            confirmed: standing.confirmed,
+        }),
+        _ => None,
+    });
+    Ok(PrevoutFacts {
+        txout,
+        spent,
+        spent_by,
+    })
 }
 
 /// Where a transaction stands: unknown, in the mempool, or at a height.
