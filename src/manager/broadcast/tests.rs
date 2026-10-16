@@ -643,3 +643,77 @@ async fn a_listing_never_refuses_a_transaction() {
             .any(|w| w.kind == TxWarningKind::InputMismatch)
     );
 }
+
+/// The same watched address lists the coin at 1 000 sats, but the PSBT
+/// carries the previous transaction, which pays it 100 000. The listing
+/// is set aside with what came with it, the wallet's name and its
+/// "unspent": the coin goes to the backend like any coin no wallet
+/// holds, which says it was spent in a block. The listing never stood in
+/// for that answer.
+#[tokio::test]
+async fn a_contradicted_listing_sends_the_coin_to_the_backend() {
+    use crate::broadcast::{TxReadiness, TxWarningKind};
+    use crate::testkit::{nowhere, transaction};
+    use bdk_wallet::bitcoin::OutPoint;
+    use std::str::FromStr;
+
+    let script = bdk_wallet::bitcoin::Address::from_str(TAPROOT)
+        .unwrap()
+        .assume_checked()
+        .script_pubkey();
+    let funding = transaction(&[nowhere(1, 0)], &[(&script.to_hex_string(), 100_000)]);
+    let coin = OutPoint::new(funding.compute_txid(), 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, _) = listed_coin(dir.path(), 1_000, coin).await;
+    let other = "77".repeat(32);
+    manager
+        .set_backend(
+            Network::Signet,
+            BackendConfig::CustomEsplora {
+                url: esplora_answering(
+                    funding.clone(),
+                    Unknown::NotFound,
+                    format!(
+                        r#"{{"spent":true,"txid":"{other}","vin":0,"status":{{"confirmed":true}}}}"#
+                    ),
+                )
+                .await,
+                own_node: false,
+            },
+        )
+        .await
+        .unwrap();
+    let text = psbt_spending_coin(coin, 90_000, |input| {
+        input.non_witness_utxo = Some(funding.clone());
+    });
+    let preview = manager
+        .preview_transaction(&text, Network::Signet)
+        .await
+        .unwrap();
+    assert_eq!(preview.inputs[0].value_sats, Some(100_000));
+    assert_eq!(
+        preview.inputs[0].wallet, None,
+        "the listing's name went with it"
+    );
+    let kinds: Vec<TxWarningKind> = preview.warnings.iter().map(|w| w.kind).collect();
+    assert!(!kinds.contains(&TxWarningKind::SpendsWatched), "{kinds:?}");
+    let mismatch = preview
+        .warnings
+        .iter()
+        .find(|w| w.kind == TxWarningKind::InputMismatch)
+        .expect("the contradicted listing is said");
+    assert!(
+        mismatch.message.contains("Watch lists"),
+        "{}",
+        mismatch.message
+    );
+    // The backend was asked, and its answer, not the listing's
+    // "unspent", is what the preview goes by.
+    let spent = preview
+        .warnings
+        .iter()
+        .find(|w| w.kind == TxWarningKind::InputSpent)
+        .expect("the backend's answer about the coin");
+    assert!(spent.blocking);
+    assert_eq!(preview.readiness, TxReadiness::Refused);
+}

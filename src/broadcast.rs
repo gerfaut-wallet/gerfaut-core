@@ -680,6 +680,11 @@ pub struct InputFacts {
     /// `/utxo`): a figure the server gives and no txid backs. It is
     /// shown, but it proves nothing.
     pub listed: bool,
+    /// What a watched address listed for this coin when the previous
+    /// transaction the PSBT carries contradicts it: set aside with its
+    /// attribution and its "unspent", said in a caution, and the coin
+    /// looked up as one no wallet holds.
+    pub contradicted_listing: Option<(WalletRef, TxOut)>,
     /// Whether the backend was asked and did not know the outpoint.
     pub unknown: bool,
     /// Whether nothing could be asked at all: every endpoint tried
@@ -897,6 +902,27 @@ pub fn build_preview(
                 )
             };
             warnings.push(TxWarning::new(TxWarningKind::InputMismatch, message));
+        }
+        // A listing the previous transaction contradicts, set aside before
+        // the backend was asked.
+        if let (Some((wallet, listed)), Some(proof)) = (
+            &facts.contradicted_listing,
+            decoded.inputs.get(i).and_then(|d| d.prevout.as_ref()),
+        ) {
+            warnings.push(TxWarning::new(
+                TxWarningKind::InputMismatch,
+                format!(
+                    "Input {i} is not what {} lists: its server lists this coin as {} sats on \
+                     {}, but the previous transaction the PSBT carries, the one this input \
+                     spends, pays {} sats to {}. The value shown and the fee go by that \
+                     transaction.",
+                    wallet.name,
+                    listed.value.to_sat(),
+                    place(listed),
+                    proof.value.to_sat(),
+                    place(proof)
+                ),
+            ));
         }
         if facts.unknown {
             warnings.push(TxWarning::new(
@@ -1587,6 +1613,7 @@ mod tests {
             spent: Some(false),
             spent_by: None,
             listed: false,
+            contradicted_listing: None,
             unknown: false,
             unchecked: false,
         }];
@@ -1627,6 +1654,7 @@ mod tests {
             spent: Some(true),
             spent_by: None,
             listed: false,
+            contradicted_listing: None,
             unknown: false,
             unchecked: false,
         }];
@@ -1963,6 +1991,7 @@ mod tests {
                 name: "Watch".into(),
             }),
             spent: Some(false),
+            listed: true,
             ..Default::default()
         }];
         let preview = build_preview(&decoded, Network::Signet, &listed, &[], Some(100), 0);
@@ -2404,6 +2433,7 @@ mod tests {
             spent: Some(false),
             spent_by: None,
             listed: false,
+            contradicted_listing: None,
             unknown: false,
             unchecked: false,
         }]
@@ -2578,6 +2608,7 @@ mod tests {
             spent: Some(false),
             spent_by: None,
             listed: false,
+            contradicted_listing: None,
             unknown: false,
             unchecked: false,
         }];

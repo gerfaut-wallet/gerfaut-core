@@ -130,6 +130,26 @@ impl WalletManager {
             (config, certs, input_facts, output_facts, tip_height)
         };
 
+        // A listing that the previous transaction the PSBT carries
+        // contradicts is set aside: the transaction is the coin, the
+        // listing a server's figure. Its attribution and its "unspent" go
+        // with it, and the coin is looked up as one no wallet holds.
+        for (facts, described) in input_facts.iter_mut().zip(&decoded.inputs) {
+            let proof = described
+                .prevout
+                .as_ref()
+                .filter(|_| described.prevout_proven);
+            if facts.listed
+                && let (Some(listed), Some(proof)) = (facts.prevout.clone(), proof)
+                && listed != *proof
+            {
+                *facts = InputFacts {
+                    contradicted_listing: facts.wallet.take().map(|wallet| (wallet, listed)),
+                    ..InputFacts::default()
+                };
+            }
+        }
+
         // What only the chain knows, outside the lock: the coins the
         // vault does not hold, and whether known coins are still
         // unspent. One endpoint, the first that answers. A coin the
