@@ -20,6 +20,7 @@ use crate::chain::tor::TorSettings;
 use crate::error::VaultError;
 use crate::lock::AppLock;
 use crate::network::Network;
+use crate::updates::UpdateRecord;
 use crate::wallet::AddressWatchState;
 use crate::wallet::meta::WalletMeta;
 
@@ -238,6 +239,13 @@ pub struct VaultPayload {
     /// from vaults written before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) vanishing: Vec<Vanishing>,
+    /// The update check: its setting, when it last went out, and what
+    /// it found and the user closed. Apart from the app preferences,
+    /// which the apps write as they like: the core decides all of it.
+    /// A vault written before reads as the check on, nothing known; an
+    /// earlier build skips it, and loses only that.
+    #[serde(default)]
+    pub updates: UpdateRecord,
 }
 
 impl Default for VaultPayload {
@@ -249,6 +257,7 @@ impl Default for VaultPayload {
             announced: Vec::new(),
             unclaimed: Vec::new(),
             vanishing: Vec::new(),
+            updates: UpdateRecord::default(),
         }
     }
 }
@@ -1300,5 +1309,48 @@ mod tests {
         assert!(json.contains(r#""tor":{"mode":"system","socks_proxy":"127.0.0.1:9150"}"#));
         let again: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(again.tor, settings.tor);
+    }
+
+    /// A vault written before the update check had a record of its own
+    /// opens with the check on and nothing known, whatever preferences
+    /// the apps kept for it then; the record is written back with the
+    /// rest, and a build that predates it still reads the vault.
+    #[test]
+    fn a_vault_without_an_update_record_opens_with_the_check_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let mut stored: serde_json::Value = serde_json::from_str(VAULT_WITH_PREMIUM).unwrap();
+        let prefs = &mut stored["settings"]["app_prefs"];
+        prefs["update.auto"] = "0".into();
+        prefs["update.latest"] = "9.9.9".into();
+        prefs["updates.latest"] = "9.9.9".into();
+        prefs["updates.checked_at"] = "1".into();
+        let sealed = cipher::seal(&serde_json::to_vec(&stored).unwrap(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        let (vault, mut payload) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(payload.updates, UpdateRecord::default());
+        let status = payload.updates.status("0.1.0");
+        assert!(status.automatic);
+        assert_eq!(status.announce, None);
+        assert_eq!(payload.wallets.len(), 1);
+
+        payload.updates.answered("v0.2.0");
+        vault.save(&payload).unwrap();
+        drop(vault);
+        let (vault, reloaded) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(reloaded.updates, payload.updates);
+
+        #[derive(Deserialize)]
+        struct Earlier {
+            version: u32,
+            settings: Settings,
+            wallets: Vec<WalletRecord>,
+        }
+        let plaintext = cipher::unseal(&std::fs::read(vault.path()).unwrap(), &key()).unwrap();
+        let earlier: Earlier = serde_json::from_slice(&plaintext).unwrap();
+        assert_eq!(earlier.version, PAYLOAD_VERSION);
+        assert_eq!(earlier.settings.gap_limit, 42);
+        assert_eq!(earlier.wallets.len(), 1);
     }
 }
