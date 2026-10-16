@@ -882,6 +882,22 @@ fn derivation_error(detail: String) -> CoreError {
     }
 }
 
+/// Longest step an error quotes: an index and its hardened mark,
+/// `2147483647'`, fits with room to spare.
+const MAX_QUOTED_STEP: usize = 12;
+
+/// A step as an error about it quotes it, after a space: one short
+/// enough to be an index, and nothing for a longer one. What was typed
+/// stays on screen in its field; a message never copies a long run of
+/// it, which could be a key pasted in the wrong place.
+fn quoted_step(step: &str) -> String {
+    if step.chars().count() <= MAX_QUOTED_STEP {
+        format!(" (`{step}`)")
+    } else {
+        String::new()
+    }
+}
+
 /// One step of a path: its index and whether it is hardened. The error
 /// is a sentence tail to hang after the path's name.
 fn parse_step(step: &str) -> Result<(u32, bool), String> {
@@ -893,13 +909,22 @@ fn parse_step(step: &str) -> Result<(u32, bool), String> {
         None => (step, false),
     };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!("has a step that is not a number (`{step}`)"));
+        return Err(format!(
+            "has a step that is not a number{}",
+            quoted_step(step)
+        ));
     }
     let index = digits
         .parse::<u32>()
         .ok()
         .filter(|index| *index < HARDENED_INDEX)
-        .ok_or_else(|| format!("has an index above {} (`{step}`)", HARDENED_INDEX - 1))?;
+        .ok_or_else(|| {
+            format!(
+                "has an index above {}{}",
+                HARDENED_INDEX - 1,
+                quoted_step(step)
+            )
+        })?;
     Ok((index, hardened))
 }
 
@@ -913,7 +938,7 @@ fn canonical_branch(path: &str, which: &str) -> CoreResult<String> {
             "the {which} path is empty; wallets use `0/*` for receive and `1/*` for change"
         )));
     }
-    let refuse = |reason: String| derivation_error(format!("the {which} path `{path}` {reason}"));
+    let refuse = |reason: String| derivation_error(format!("the {which} path {reason}"));
     let steps = match path.strip_suffix('*') {
         Some("") => "",
         Some(steps) => steps
@@ -937,8 +962,9 @@ fn canonical_branch(path: &str, which: &str) -> CoreResult<String> {
             let (index, hardened) = parse_step(step).map_err(&refuse)?;
             if hardened {
                 return Err(refuse(format!(
-                    "has a hardened step (`{step}`): an extended public key cannot derive \
-                     hardened children"
+                    "has a hardened step{}: an extended public key cannot derive hardened \
+                     children",
+                    quoted_step(step)
                 )));
             }
             canonical.push(index.to_string());
@@ -954,7 +980,7 @@ fn canonical_branch(path: &str, which: &str) -> CoreResult<String> {
 /// records what the signer derived, not what this key will.
 fn canonical_origin(origin: &str) -> CoreResult<String> {
     let origin = origin.trim();
-    let refuse = |reason: String| derivation_error(format!("the key origin `{origin}` {reason}"));
+    let refuse = |reason: String| derivation_error(format!("the key origin {reason}"));
     let inner = match origin
         .strip_prefix('[')
         .and_then(|inner| inner.strip_suffix(']'))
@@ -970,10 +996,9 @@ fn canonical_origin(origin: &str) -> CoreResult<String> {
     let mut steps = inner.split('/');
     let fingerprint = steps.next().unwrap_or_default();
     if fingerprint.len() != 8 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(refuse(format!(
-            "must start with the master key fingerprint, 8 hexadecimal characters, not \
-             `{fingerprint}`"
-        )));
+        return Err(refuse(
+            "must start with the master key fingerprint, 8 hexadecimal characters".to_owned(),
+        ));
     }
     let mut canonical = fingerprint.to_ascii_lowercase();
     for step in steps {
@@ -1001,6 +1026,19 @@ fn effective_derivation(
 ) -> CoreResult<DerivationChoice> {
     let default = DerivationChoice::default();
     let choice = choice.unwrap_or(&default);
+    // The three fields are typed by hand, beside the one the key was
+    // pasted in: a private key pasted in one of them is refused the way
+    // that field refuses it, before any message could quote it.
+    for field in [
+        Some(choice.receive.as_str()),
+        choice.change.as_deref(),
+        choice.origin.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        reject_private_material(field)?;
+    }
     let receive = canonical_branch(&choice.receive, "receive")?;
     let change = choice
         .change
@@ -2527,6 +2565,43 @@ mod tests {
         assert!(rejected("[deadbeef/84'/x]").contains("not a number"));
         assert!(rejected("[deadbeef/84'/]").contains("empty step"));
         assert!(rejected("[deadbeef/84'").contains("brackets"));
+    }
+
+    /// A private key pasted into the receive, change or origin field is
+    /// refused as private material, as in the main field, and no error
+    /// about a path ever quotes a long run of what was typed.
+    #[test]
+    fn derivation_fields_refuse_private_keys_without_quoting_them() {
+        let refused = |options: ImportOptions| {
+            assert!(
+                matches!(
+                    parse_input_with_options(TPUB, &options),
+                    Err(CoreError::PrivateMaterialRejected)
+                ),
+                "{options:?}"
+            );
+        };
+        refused(with_derivation(&format!("{TPRV}/*"), Some("1/*"), None));
+        refused(with_derivation("0/*", Some(TPRV), None));
+        refused(with_derivation(
+            "0/*",
+            Some("1/*"),
+            Some(&format!("[deadbeef]{TPRV}")),
+        ));
+
+        let long = "a".repeat(64);
+        for options in [
+            with_derivation(&format!("{long}/*"), Some("1/*"), None),
+            with_derivation("0/*", Some(&long), None),
+            with_derivation("0/*", Some("1/*"), Some(&long)),
+            with_derivation("0/*", Some("1/*"), Some(&format!("[deadbeef/{long}]"))),
+        ] {
+            let error = parse_input_with_options(TPUB, &options).unwrap_err();
+            assert!(!error.to_string().contains(&long), "{error}");
+        }
+        let short = with_derivation("0/x1/*", Some("1/*"), None);
+        let error = parse_input_with_options(TPUB, &short).unwrap_err();
+        assert!(error.to_string().contains("(`x1`)"), "{error}");
     }
 
     #[test]
