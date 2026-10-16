@@ -129,8 +129,11 @@ pub enum TxWarningKind {
     /// backend holds at that outpoint, or other than the one its own
     /// previous transaction pays: another value, another script.
     InputMismatch,
-    /// The fee could not be computed: an input's value is unknown, or
-    /// the outputs pay more than the inputs bring, which blocks.
+    /// The fee could not be computed: an input's value is unknown, the
+    /// amounts are past all the bitcoin there will ever be, or the
+    /// outputs pay more than the inputs bring. Blocks when the outputs
+    /// alone are past that limit, or when they pay more than inputs
+    /// whose every amount is proven.
     FeeUnknown,
     /// An output below the dust threshold.
     DustOutput,
@@ -199,13 +202,16 @@ pub struct TxWarning {
     /// fall through a hand-written table into an untoned panel.
     pub severity: TxSeverity,
     /// Whether the network is sure to refuse the transaction while this
-    /// holds: a signature missing, a coin already spent in a block, the
-    /// outputs paying more than the inputs bring. A preview with one is
-    /// not ready, so neither application can send it, and neither says
-    /// it is ready. Never set on a node's policy (dust), on what a
-    /// backend could not say, or on a time lock read against a tip the
-    /// device may not have caught up with: a send the node refuses
-    /// costs a message, a send wrongly held back costs the send.
+    /// holds: a signature missing, a coin already spent in a block,
+    /// outputs past all the bitcoin there will ever be, or outputs over
+    /// inputs whose every amount is proven (by a watched wallet, the
+    /// backend, or the previous transaction a PSBT carries). A preview
+    /// with one is not ready, so neither application can send it, and
+    /// neither says it is ready. Never set on a node's policy (dust), on
+    /// an amount only declared, on what a backend could not say, or on a
+    /// time lock read against a tip the device may not have caught up
+    /// with: a send the node refuses costs a message, a send wrongly
+    /// held back costs the send.
     #[serde(default)]
     pub blocking: bool,
 }
@@ -238,9 +244,10 @@ pub enum TxReadiness {
     /// Every input signed, and nothing the network is sure to refuse.
     Ready,
     /// The network is sure to refuse it for something a signature does
-    /// not fix: a coin spent in a block, outputs worth more than the
-    /// inputs. Said before a missing signature, since signing again
-    /// changes neither.
+    /// not fix: a coin spent in a block, outputs past all the bitcoin
+    /// there will ever be, or outputs worth more than inputs whose every
+    /// amount is proven. Said before a missing signature, since signing
+    /// again changes neither.
     Refused,
     /// Some inputs carry no signature, and that is all that holds it.
     Unsigned,
