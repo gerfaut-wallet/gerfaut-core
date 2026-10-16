@@ -650,6 +650,16 @@ pub(crate) struct Synced {
 /// them, can hold.
 const HELD_MAX_SATS: u64 = i64::MAX as u64;
 
+/// What the outputs of `tx` pay together, when that is no more than the
+/// 21 million bitcoin there will ever be. `None` past it: a consensus
+/// rule every node applies, and each output is within the total.
+pub(crate) fn outputs_within_max_money(tx: &bdk_wallet::bitcoin::Transaction) -> Option<u64> {
+    tx.output
+        .iter()
+        .try_fold(0u64, |sum, out| sum.checked_add(out.value.to_sat()))
+        .filter(|&paid| paid <= bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat())
+}
+
 /// Refuses an update holding amounts no chain can carry: an output, or
 /// the outputs of one transaction together, above the 21 million bitcoin
 /// there will ever be; a transaction that spends one coin twice; or,
@@ -666,12 +676,7 @@ pub(crate) fn check_amounts(update: &bdk_wallet::Update, held_sats: u64) -> Resu
     let max_money = bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat();
     let mut total = held_sats;
     for tx in &update.tx_update.txs {
-        let paid = tx
-            .output
-            .iter()
-            .try_fold(0u64, |sum, out| sum.checked_add(out.value.to_sat()))
-            .filter(|&paid| paid <= max_money)
-            .ok_or_else(refused)?;
+        let paid = outputs_within_max_money(tx).ok_or_else(refused)?;
         let mut spent = HashSet::with_capacity(tx.input.len());
         if !tx
             .input

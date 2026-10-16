@@ -760,17 +760,14 @@ pub fn build_preview(
         .iter()
         .map(|i| i.value_sats)
         .try_fold(0u64, |acc, v| v.and_then(|v| acc.checked_add(v)));
-    let out_total: Option<u64> = outputs
-        .iter()
-        .try_fold(0u64, |acc, o| acc.checked_add(o.value_sats));
-    // Past every bitcoin there will ever be, an amount is no amount. An
-    // output there, or outputs that add up there, is a consensus
-    // refusal whatever the inputs bring. Inputs that add up there can
-    // only be the PSBT's word, and a wrong one.
+    // Past every bitcoin there will ever be, an amount is no amount.
+    // Outputs that add up there are a consensus refusal whatever the
+    // inputs bring. Inputs that add up there can only be the PSBT's word,
+    // and a wrong one.
+    let out_total = crate::chain::outputs_within_max_money(tx);
+    let outputs_impossible = out_total.is_none();
     let max_money = bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat();
     let values_known = inputs.iter().all(|i| i.value_sats.is_some());
-    let outputs_impossible = outputs.iter().any(|o| o.value_sats > max_money)
-        || out_total.is_none_or(|total| total > max_money);
     let inputs_impossible = values_known && in_total.is_none_or(|total| total > max_money);
     let fee_sats = in_total
         .zip(out_total)
