@@ -1,0 +1,18 @@
+{
+  "settled": {
+    "confirmed": 1250000,
+    "trusted_pending": 0,
+    "untrusted_pending": 0,
+    "immature": 0,
+    "total": 1250000,
+    "pending_net_sats": null
+  },
+  "pending": {
+    "confirmed": 1250000,
+    "trusted_pending": 0,
+    "untrusted_pending": 84000,
+    "immature": 0,
+    "total": 1334000,
+    "pending_net_sats": 84000
+  }
+}

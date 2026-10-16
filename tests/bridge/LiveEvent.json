@@ -1,0 +1,93 @@
+{
+  "transaction": {
+    "type": "transaction",
+    "wallet_id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+    "txid": "0e9fd1596c4b1dfca8ddcd36c567f11da43cf17968a5b912f0e67c5198f643f1",
+    "net_sats": 84000,
+    "stage": "mempool",
+    "replaces": null
+  },
+  "wallet_synced": {
+    "type": "wallet_synced",
+    "report": {
+      "wallet_id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+      "new_tx_count": 1,
+      "new_txs": [
+        {
+          "txid": "0e9fd1596c4b1dfca8ddcd36c567f11da43cf17968a5b912f0e67c5198f643f1",
+          "net_sats": -250340,
+          "confirmed": false
+        }
+      ],
+      "confirmed_txs": [
+        {
+          "txid": "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf",
+          "net_sats": 1000000,
+          "confirmed": true
+        }
+      ],
+      "balance": {
+        "confirmed": 1250000,
+        "trusted_pending": 0,
+        "untrusted_pending": 84000,
+        "immature": 0,
+        "total": 1334000,
+        "pending_net_sats": 84000
+      },
+      "tip_height": 800000,
+      "took_ms": 840,
+      "backend": "electrum.example.org"
+    }
+  },
+  "sync_failed": {
+    "type": "sync_failed",
+    "wallet_id": "a7d40b19-5c3e-4f82-b6a1-2e9c8d7f0b54",
+    "message": "sync failed via electrum.example.org: connection refused"
+  },
+  "new_block": {"type": "new_block", "height": 800001},
+  "status": {
+    "type": "status",
+    "state": "connected",
+    "transport": "electrum",
+    "server": "electrum.example.org",
+    "detail": null,
+    "watched_scripts": 246,
+    "pushed_scripts": 246,
+    "left_out_scripts": 65,
+    "left_out_wallets": 2,
+    "wallets": [
+      {
+        "wallet_id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+        "coverage": "live",
+        "watched_scripts": 46,
+        "left_out_scripts": 0,
+        "refused_scripts": 0
+      },
+      {
+        "wallet_id": "a7d40b19-5c3e-4f82-b6a1-2e9c8d7f0b54",
+        "coverage": "partial",
+        "watched_scripts": 200,
+        "left_out_scripts": 64,
+        "refused_scripts": 0
+      },
+      {
+        "wallet_id": "e2b85c07-1f6a-4c93-8d4e-7a0b3c5f9e26",
+        "coverage": "sync_only",
+        "watched_scripts": 0,
+        "left_out_scripts": 1,
+        "refused_scripts": 1
+      }
+    ],
+    "server_software": "Fulcrum 1.12.0",
+    "left_out": {
+      "reason": "server_refused",
+      "limits": {"per_wallet": 20000, "total": 20000},
+      "own_node": true,
+      "remedy": {
+        "type": "raise_server_limit",
+        "server": "fulcrum",
+        "settings": ["max_subs_per_ip"]
+      }
+    }
+  }
+}

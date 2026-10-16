@@ -1,0 +1,29 @@
+{
+  "not_tls": {"status": "not_tls"},
+  "tor": {"status": "tor"},
+  "trusted": {"status": "trusted"},
+  "pinned": {
+    "status": "pinned",
+    "fingerprint": "65:E2:79:2B:7E:69:3A:24:C1:DA:BA:FF:89:52:15:E6:60:C0:BD:24:A4:AC:1D:69:7A:AE:20:24:E1:27:11:52"
+  },
+  "unknown": {
+    "status": "unknown",
+    "fingerprint": "09:11:BE:56:A8:1E:50:90:2F:A6:A8:EC:21:DB:EC:BC:8B:1E:9D:CC:70:FA:03:6C:1D:F7:41:BB:54:42:09:F9",
+    "reason": "self-signed, or signed by an authority this machine does not know",
+    "subject": "electrum.example.org",
+    "expires": 1830297600
+  },
+  "unknown_bare": {
+    "status": "unknown",
+    "fingerprint": "09:11:BE:56:A8:1E:50:90:2F:A6:A8:EC:21:DB:EC:BC:8B:1E:9D:CC:70:FA:03:6C:1D:F7:41:BB:54:42:09:F9",
+    "reason": "written in X.509 version 1, older than the standard verifier reads",
+    "subject": null,
+    "expires": null
+  },
+  "changed": {
+    "status": "changed",
+    "stored": "65:E2:79:2B:7E:69:3A:24:C1:DA:BA:FF:89:52:15:E6:60:C0:BD:24:A4:AC:1D:69:7A:AE:20:24:E1:27:11:52",
+    "presented": "09:11:BE:56:A8:1E:50:90:2F:A6:A8:EC:21:DB:EC:BC:8B:1E:9D:CC:70:FA:03:6C:1D:F7:41:BB:54:42:09:F9"
+  },
+  "unreachable": {"status": "unreachable", "detail": "connection refused"}
+}

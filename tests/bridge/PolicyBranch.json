@@ -1,0 +1,70 @@
+{
+  "primary": {
+    "id": "b0",
+    "role": "primary",
+    "label": "Primary",
+    "summary": "Keys A and B",
+    "condition": {
+      "kind": "thresh",
+      "k": 2,
+      "n": 2,
+      "items": [
+        {"kind": "key", "key_id": "k0"},
+        {"kind": "key", "key_id": "k1"}
+      ]
+    },
+    "timelocks": [],
+    "state": {"kind": "spendable_now"},
+    "spendable_now": true,
+    "tone": "confirmed"
+  },
+  "recovery": {
+    "id": "b3",
+    "role": "recovery",
+    "label": "Recovery",
+    "summary": "Keys C and D, once a coin has waited 4,320 blocks",
+    "condition": {
+      "kind": "thresh",
+      "k": 3,
+      "n": 3,
+      "items": [
+        {"kind": "key", "key_id": "k2"},
+        {"kind": "key", "key_id": "k3"},
+        {"kind": "older", "lock": {"kind": "blocks", "blocks": 4320}}
+      ]
+    },
+    "timelocks": [
+      {
+        "lock": {
+          "kind": "relative",
+          "lock": {"kind": "blocks", "blocks": 4320}
+        },
+        "required": true,
+        "state": {
+          "kind": "per_coin",
+          "unlocked": 1,
+          "waiting": 1,
+          "locked": 1,
+          "next": {
+            "remaining_blocks": 319,
+            "remaining_seconds": 191400,
+            "unlocks_at_unix": 1750191400
+          }
+        }
+      }
+    ],
+    "state": {
+      "kind": "per_coin",
+      "unlocked": 1,
+      "waiting": 1,
+      "locked": 1,
+      "next": {
+        "remaining_blocks": 319,
+        "remaining_seconds": 191400,
+        "unlocks_at_unix": 1750191400
+      }
+    },
+    "spendable_now": false,
+    "tone": "pending"
+  }
+}

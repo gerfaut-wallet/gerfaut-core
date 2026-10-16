@@ -1,0 +1,20 @@
+{
+  "unrecognized_input": "unrecognized_input",
+  "private_material": "private_material",
+  "invalid_input": "invalid_input",
+  "too_many_parts": "too_many_parts",
+  "network_mismatch": "network_mismatch",
+  "wallet_not_found": "wallet_not_found",
+  "duplicate_wallet": "duplicate_wallet",
+  "wrong_key": "wrong_key",
+  "vault_in_use": "vault_in_use",
+  "vault": "vault",
+  "unreadable_backup": "unreadable_backup",
+  "newer_format": "newer_format",
+  "sync": "sync",
+  "broadcast": "broadcast",
+  "backend_unavailable": "backend_unavailable",
+  "tor": "tor",
+  "descriptor": "descriptor",
+  "internal": "internal"
+}

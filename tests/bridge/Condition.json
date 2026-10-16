@@ -1,0 +1,18 @@
+{
+  "key": {"kind": "key", "key_id": "k0"},
+  "thresh": {
+    "kind": "thresh",
+    "k": 2,
+    "n": 2,
+    "items": [
+      {"kind": "key", "key_id": "k1"},
+      {"kind": "older", "lock": {"kind": "blocks", "blocks": 52560}}
+    ]
+  },
+  "after": {"kind": "after", "lock": {"kind": "height", "height": 801432}},
+  "older": {"kind": "older", "lock": {"kind": "blocks", "blocks": 52560}},
+  "preimage": {
+    "kind": "preimage",
+    "hash": "cb6a9a14022d2f8e741d6dc684d6c78ca98ece1ef784a5cf4676c6b70eb7675c"
+  }
+}

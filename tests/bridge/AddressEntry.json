@@ -1,0 +1,14 @@
+{
+  "derived": {
+    "index": 1,
+    "address": "tb1qm4na5x7ptxxwepp7xmrsgv7t6hv2yw9h55s5r8",
+    "used": false,
+    "derivation": "m/84'/1'/0'/0/1"
+  },
+  "watched_address": {
+    "index": 0,
+    "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "used": true,
+    "derivation": null
+  }
+}

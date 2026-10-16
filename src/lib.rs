@@ -9,6 +9,8 @@
 //! private key material are rejected at the parsing boundary.
 
 pub mod backup;
+#[cfg(test)]
+mod bridge_contract;
 pub mod broadcast;
 pub mod chain;
 pub mod error;

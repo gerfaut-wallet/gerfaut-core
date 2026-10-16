@@ -1,0 +1,18 @@
+{
+  "signed_coin_of_a_wallet": {
+    "txid": "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf",
+    "vout": 0,
+    "value_sats": 1000000,
+    "address": "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx",
+    "signed": true,
+    "wallet": {"id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13", "name": "Savings"}
+  },
+  "unsigned_unknown_coin": {
+    "txid": "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf",
+    "vout": 0,
+    "value_sats": 1000000,
+    "address": "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx",
+    "signed": false,
+    "wallet": null
+  }
+}

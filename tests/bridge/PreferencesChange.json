@@ -1,0 +1,13 @@
+{
+  "nothing": {},
+  "currency": {"fiat_currency": "usd"},
+  "everything": {
+    "unit": "sats",
+    "masked": true,
+    "fiat": true,
+    "fiat_currency": "chf",
+    "price_source": "kraken",
+    "notify_new_tx": true,
+    "explorer_ack": true
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "unsigned": "unsigned",
+  "high_fee_rate": "high_fee_rate",
+  "high_fee_share": "high_fee_share",
+  "locked": "locked",
+  "input_unknown": "input_unknown",
+  "input_spent": "input_spent",
+  "input_mismatch": "input_mismatch",
+  "fee_unknown": "fee_unknown",
+  "dust_output": "dust_output",
+  "spends_watched": "spends_watched",
+  "uncommitted_outputs": "uncommitted_outputs"
+}

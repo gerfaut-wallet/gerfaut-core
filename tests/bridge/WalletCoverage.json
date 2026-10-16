@@ -1,0 +1,23 @@
+{
+  "live": {
+    "wallet_id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+    "coverage": "live",
+    "watched_scripts": 46,
+    "left_out_scripts": 0,
+    "refused_scripts": 0
+  },
+  "partial": {
+    "wallet_id": "a7d40b19-5c3e-4f82-b6a1-2e9c8d7f0b54",
+    "coverage": "partial",
+    "watched_scripts": 200,
+    "left_out_scripts": 64,
+    "refused_scripts": 0
+  },
+  "refused": {
+    "wallet_id": "e2b85c07-1f6a-4c93-8d4e-7a0b3c5f9e26",
+    "coverage": "sync_only",
+    "watched_scripts": 0,
+    "left_out_scripts": 1,
+    "refused_scripts": 1
+  }
+}

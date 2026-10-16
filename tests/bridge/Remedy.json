@@ -1,0 +1,16 @@
+{
+  "own_node": {
+    "type": "own_node",
+    "limits": {"per_wallet": 20000, "total": 20000}
+  },
+  "raise_fulcrum": {
+    "type": "raise_server_limit",
+    "server": "fulcrum",
+    "settings": ["max_subs_per_ip"]
+  },
+  "raise_unknown_server": {
+    "type": "raise_server_limit",
+    "server": null,
+    "settings": []
+  }
+}

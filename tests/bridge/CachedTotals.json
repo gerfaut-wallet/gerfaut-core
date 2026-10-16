@@ -1,0 +1,24 @@
+{
+  "synced": {
+    "balance": {
+      "confirmed": 1250000,
+      "trusted_pending": 0,
+      "untrusted_pending": 0,
+      "immature": 0,
+      "total": 1250000,
+      "pending_net_sats": null
+    },
+    "tx_count": 2
+  },
+  "never_synced": {
+    "balance": {
+      "confirmed": 0,
+      "trusted_pending": 0,
+      "untrusted_pending": 0,
+      "immature": 0,
+      "total": 0,
+      "pending_net_sats": null
+    },
+    "tx_count": 0
+  }
+}

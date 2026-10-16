@@ -108,6 +108,16 @@ pub struct TorRoute {
 }
 
 impl TorRoute {
+    /// A route that asks no credentials, built by a test.
+    #[cfg(test)]
+    pub(crate) fn without_credentials(socks: &str, via: TorVia) -> Self {
+        TorRoute {
+            socks: socks.to_owned(),
+            via,
+            credentials: None,
+        }
+    }
+
     /// The proxy as the chain layer takes it: `user:password@host:port`
     /// when the proxy asks for credentials, `host:port` otherwise. Never
     /// for display; [`Self::socks`] is.

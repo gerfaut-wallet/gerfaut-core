@@ -1,0 +1,26 @@
+{
+  "electrum_line": {
+    "kind": "electrum",
+    "url": "ssl://electrum.example.org:50002",
+    "host": "electrum.example.org",
+    "port": 50002,
+    "tls": true,
+    "onion": false
+  },
+  "esplora": {
+    "kind": "esplora",
+    "url": "https://esplora.example.org/api",
+    "host": "esplora.example.org",
+    "port": null,
+    "tls": true,
+    "onion": false
+  },
+  "onion": {
+    "kind": "electrum",
+    "url": "tcp://fixturefixturefixturefixturefixturefixturefixturefixture.onion:50001",
+    "host": "fixturefixturefixturefixturefixturefixturefixturefixture.onion",
+    "port": 50001,
+    "tls": false,
+    "onion": true
+  }
+}

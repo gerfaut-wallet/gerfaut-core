@@ -1,0 +1,60 @@
+{
+  "multipath_descriptor": {
+    "kind": "multipath_descriptor",
+    "networks": ["signet", "testnet4", "regtest"],
+    "payload": {
+      "type": "descriptors",
+      "external": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)#76ngmkux",
+      "internal": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)#0wkfxrv7",
+      "script": "segwit"
+    },
+    "warnings": [],
+    "script_options": [],
+    "derivation": null,
+    "derivation_editable": false,
+    "preview_address": "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx"
+  },
+  "descriptor_without_change": {
+    "kind": "descriptor",
+    "networks": ["signet", "testnet4", "regtest"],
+    "payload": {
+      "type": "descriptors",
+      "external": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)#76ngmkux",
+      "internal": null,
+      "script": "segwit"
+    },
+    "warnings": ["change_not_tracked"],
+    "script_options": [],
+    "derivation": null,
+    "derivation_editable": false,
+    "preview_address": "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx"
+  },
+  "extended_key": {
+    "kind": "extended_key",
+    "networks": ["mainnet"],
+    "payload": {
+      "type": "descriptors",
+      "external": "wpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/0/*)#wvk84d79",
+      "internal": "wpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/1/*)#lcnxgcwa",
+      "script": "segwit"
+    },
+    "warnings": ["assumed_segwit"],
+    "script_options": ["legacy", "nested_segwit", "segwit", "taproot"],
+    "derivation": {"receive": "0/*", "change": "1/*", "origin": null},
+    "derivation_editable": true,
+    "preview_address": "bc1qp5wfcq48h6d63wyy9qz0awtpfqwwv4sma86mhz"
+  },
+  "address": {
+    "kind": "address",
+    "networks": ["mainnet"],
+    "payload": {
+      "type": "address",
+      "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+    },
+    "warnings": [],
+    "script_options": [],
+    "derivation": null,
+    "derivation_editable": false,
+    "preview_address": null
+  }
+}

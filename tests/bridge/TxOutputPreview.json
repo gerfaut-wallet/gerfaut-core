@@ -1,0 +1,30 @@
+{
+  "payment": {
+    "index": 0,
+    "value_sats": 250000,
+    "address": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+    "op_return": null,
+    "wallet": null,
+    "change": false
+  },
+  "change": {
+    "index": 1,
+    "value_sats": 749660,
+    "address": "tb1qgtw9wgs0gtszee9feyd4fs00wprftdqxkr6f8n",
+    "op_return": null,
+    "wallet": {"id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13", "name": "Savings"},
+    "change": true
+  },
+  "op_return": {
+    "index": 2,
+    "value_sats": 0,
+    "address": null,
+    "op_return": {
+      "hex": "48656c6c6f2066726f6d207468652047657266617574207465737473",
+      "text": "Hello from the Gerfaut tests",
+      "label": null
+    },
+    "wallet": null,
+    "change": false
+  }
+}

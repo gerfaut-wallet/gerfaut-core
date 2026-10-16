@@ -1,0 +1,9 @@
+{
+  "told": {
+    "names": {"3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13": "Savings"},
+    "unit": "btc",
+    "masked": false,
+    "details": true
+  },
+  "discreet": {"names": {}, "unit": "sats", "masked": true, "details": false}
+}

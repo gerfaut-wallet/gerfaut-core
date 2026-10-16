@@ -1,0 +1,234 @@
+{
+  "table": {
+    "currencies": [
+      {
+        "currency": "eur",
+        "code": "EUR",
+        "name": "Euro",
+        "reach": "every",
+        "sources": ["coingecko", "kraken", "mempool_space"]
+      },
+      {
+        "currency": "usd",
+        "code": "USD",
+        "name": "US dollar",
+        "reach": "every",
+        "sources": ["coingecko", "kraken", "mempool_space"]
+      },
+      {
+        "currency": "gbp",
+        "code": "GBP",
+        "name": "Pound sterling",
+        "reach": "every",
+        "sources": ["coingecko", "kraken", "mempool_space"]
+      },
+      {
+        "currency": "chf",
+        "code": "CHF",
+        "name": "Swiss franc",
+        "reach": "every",
+        "sources": ["coingecko", "kraken", "mempool_space"]
+      },
+      {
+        "currency": "jpy",
+        "code": "JPY",
+        "name": "Japanese yen",
+        "reach": "every",
+        "sources": ["coingecko", "kraken", "mempool_space"]
+      },
+      {
+        "currency": "cad",
+        "code": "CAD",
+        "name": "Canadian dollar",
+        "reach": "every",
+        "sources": ["coingecko", "kraken", "mempool_space"]
+      },
+      {
+        "currency": "aud",
+        "code": "AUD",
+        "name": "Australian dollar",
+        "reach": "every",
+        "sources": ["coingecko", "kraken", "mempool_space"]
+      },
+      {
+        "currency": "inr",
+        "code": "INR",
+        "name": "Indian rupee",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "cny",
+        "code": "CNY",
+        "name": "Chinese yuan",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "brl",
+        "code": "BRL",
+        "name": "Brazilian real",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "ngn",
+        "code": "NGN",
+        "name": "Nigerian naira",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "idr",
+        "code": "IDR",
+        "name": "Indonesian rupiah",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "pkr",
+        "code": "PKR",
+        "name": "Pakistani rupee",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "bdt",
+        "code": "BDT",
+        "name": "Bangladeshi taka",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "rub",
+        "code": "RUB",
+        "name": "Russian ruble",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "mxn",
+        "code": "MXN",
+        "name": "Mexican peso",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "php",
+        "code": "PHP",
+        "name": "Philippine peso",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "vnd",
+        "code": "VND",
+        "name": "Vietnamese dong",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "try",
+        "code": "TRY",
+        "name": "Turkish lira",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "ars",
+        "code": "ARS",
+        "name": "Argentine peso",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "krw",
+        "code": "KRW",
+        "name": "South Korean won",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "zar",
+        "code": "ZAR",
+        "name": "South African rand",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "thb",
+        "code": "THB",
+        "name": "Thai baht",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "uah",
+        "code": "UAH",
+        "name": "Ukrainian hryvnia",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "pln",
+        "code": "PLN",
+        "name": "Polish zloty",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "sek",
+        "code": "SEK",
+        "name": "Swedish krona",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "sgd",
+        "code": "SGD",
+        "name": "Singapore dollar",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "hkd",
+        "code": "HKD",
+        "name": "Hong Kong dollar",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "aed",
+        "code": "AED",
+        "name": "UAE dirham",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      },
+      {
+        "currency": "nzd",
+        "code": "NZD",
+        "name": "New Zealand dollar",
+        "reach": "coingecko_only",
+        "sources": ["coingecko"]
+      }
+    ],
+    "sources": [
+      {
+        "source": "coingecko",
+        "label": "CoinGecko",
+        "ranges": ["day", "week", "month", "year"]
+      },
+      {
+        "source": "kraken",
+        "label": "Kraken",
+        "ranges": ["day", "week", "month", "year", "max"]
+      },
+      {
+        "source": "mempool_space",
+        "label": "mempool.space",
+        "ranges": ["month", "year", "max"]
+      }
+    ],
+    "refresh_secs": 60
+  }
+}

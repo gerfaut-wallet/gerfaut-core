@@ -1,0 +1,32 @@
+{
+  "up_to_date": {
+    "automatic": true,
+    "announce": null,
+    "available": null,
+    "tor_unavailable": false
+  },
+  "announce": {
+    "automatic": true,
+    "announce": "0.2.0",
+    "available": "0.2.0",
+    "tor_unavailable": false
+  },
+  "closed": {
+    "automatic": true,
+    "announce": null,
+    "available": "0.2.0",
+    "tor_unavailable": false
+  },
+  "tor_unavailable": {
+    "automatic": true,
+    "announce": null,
+    "available": null,
+    "tor_unavailable": true
+  },
+  "off": {
+    "automatic": false,
+    "announce": null,
+    "available": null,
+    "tor_unavailable": false
+  }
+}

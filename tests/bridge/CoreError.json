@@ -1,0 +1,71 @@
+{
+  "unrecognized_input": {
+    "kind": "unrecognized_input",
+    "message": "unrecognized input: expected a descriptor, an extended key or an address"
+  },
+  "private_material": {
+    "kind": "private_material",
+    "message": "input contains private key material and was rejected"
+  },
+  "invalid_input": {
+    "kind": "invalid_input",
+    "message": "invalid descriptor: checksum mismatch"
+  },
+  "too_many_parts": {
+    "kind": "too_many_parts",
+    "message": "invalid qr: this QR code announces 5001 parts, more than Gerfaut reads"
+  },
+  "network_mismatch": {
+    "kind": "network_mismatch",
+    "message": "network mismatch: input is for mainnet, expected signet"
+  },
+  "wallet_not_found": {
+    "kind": "wallet_not_found",
+    "message": "wallet not found: 3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13"
+  },
+  "duplicate_wallet": {
+    "kind": "duplicate_wallet",
+    "message": "wallet already exists: Savings"
+  },
+  "wrong_key": {
+    "kind": "wrong_key",
+    "message": "vault decryption failed: wrong key or corrupted file"
+  },
+  "vault_in_use": {
+    "kind": "vault_in_use",
+    "message": "the vault is already open in another Gerfaut process"
+  },
+  "vault": {
+    "kind": "vault",
+    "message": "vault payload is corrupted: truncated"
+  },
+  "unreadable_backup": {
+    "kind": "unreadable_backup",
+    "message": "invalid backup: not a Gerfaut backup"
+  },
+  "newer_format": {
+    "kind": "newer_format",
+    "message": "invalid backup: written by a newer Gerfaut"
+  },
+  "sync": {
+    "kind": "sync",
+    "message": "sync failed via electrum.example.org: connection refused"
+  },
+  "broadcast": {
+    "kind": "broadcast",
+    "message": "electrum.example.org refused the transaction: bad-txns-inputs-missingorspent"
+  },
+  "backend_unavailable": {
+    "kind": "backend_unavailable",
+    "message": "backend unavailable: no public backend for regtest"
+  },
+  "tor": {"kind": "tor", "message": "tor: no Tor answers on 127.0.0.1:9050"},
+  "descriptor": {
+    "kind": "descriptor",
+    "message": "descriptor error: the policy lets anyone spend"
+  },
+  "internal": {
+    "kind": "internal",
+    "message": "internal error: a lock was poisoned"
+  }
+}

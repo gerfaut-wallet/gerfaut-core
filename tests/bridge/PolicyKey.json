@@ -1,0 +1,16 @@
+{
+  "bare": {
+    "id": "k0",
+    "label": "Key A",
+    "fingerprint": "3442193e",
+    "origin_path": null,
+    "key_short": "xpub661M…GMcet8"
+  },
+  "with_origin": {
+    "id": "k0",
+    "label": "Key A",
+    "fingerprint": "9a6a2580",
+    "origin_path": "m/84'/1'/0'",
+    "key_short": "tpubDDnG…so9Kks"
+  }
+}

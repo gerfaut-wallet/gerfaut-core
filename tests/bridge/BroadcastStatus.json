@@ -1,0 +1,29 @@
+{
+  "confirmed": {
+    "txid": "40d6a7e07b4c3e49fc00670b4b309f13f4534f60f9dfbae3706d10947a2163e0",
+    "found": true,
+    "confirmed": true,
+    "block_height": 800001,
+    "confirmations": 1,
+    "backend": "electrum.example.org",
+    "at": 1750000700
+  },
+  "in_mempool": {
+    "txid": "40d6a7e07b4c3e49fc00670b4b309f13f4534f60f9dfbae3706d10947a2163e0",
+    "found": true,
+    "confirmed": false,
+    "block_height": null,
+    "confirmations": 0,
+    "backend": "electrum.example.org",
+    "at": 1750000700
+  },
+  "not_found": {
+    "txid": "40d6a7e07b4c3e49fc00670b4b309f13f4534f60f9dfbae3706d10947a2163e0",
+    "found": false,
+    "confirmed": false,
+    "block_height": null,
+    "confirmations": 0,
+    "backend": "electrum.example.org",
+    "at": 1750000700
+  }
+}

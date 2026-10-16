@@ -1,0 +1,37 @@
+{
+  "one_restored": {
+    "added": [
+      {
+        "id": "a7d40b19-5c3e-4f82-b6a1-2e9c8d7f0b54",
+        "name": "Cold storage",
+        "icon": "wallet",
+        "network": "signet",
+        "kind": {
+          "type": "descriptors",
+          "external": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)#76ngmkux",
+          "internal": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)#0wkfxrv7",
+          "script": "segwit"
+        },
+        "recognized_as": "multipath_descriptor",
+        "created_at": 1750000000,
+        "gap_limit": 20,
+        "scan_gap": 20,
+        "labels": {},
+        "last_sync": null,
+        "cached": {
+          "balance": {
+            "confirmed": 0,
+            "trusted_pending": 0,
+            "untrusted_pending": 0,
+            "immature": 0,
+            "total": 0,
+            "pending_net_sats": null
+          },
+          "tx_count": 0
+        }
+      }
+    ],
+    "skipped": 1,
+    "settings_applied": true
+  }
+}

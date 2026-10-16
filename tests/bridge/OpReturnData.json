@@ -1,0 +1,13 @@
+{
+  "text": {
+    "hex": "48656c6c6f2066726f6d207468652047657266617574207465737473",
+    "text": "Hello from the Gerfaut tests",
+    "label": null
+  },
+  "witness_commitment": {
+    "hex": "aa21a9ed5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+    "text": null,
+    "label": "Witness commitment"
+  },
+  "bytes": {"hex": "00ff1337", "text": null, "label": null}
+}

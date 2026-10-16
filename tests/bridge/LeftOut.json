@@ -1,0 +1,27 @@
+{
+  "past_live_limit": {
+    "reason": "live_limit",
+    "limits": {"per_wallet": 200, "total": 2000},
+    "own_node": false,
+    "remedy": {
+      "type": "own_node",
+      "limits": {"per_wallet": 20000, "total": 20000}
+    }
+  },
+  "server_refused": {
+    "reason": "server_refused",
+    "limits": {"per_wallet": 20000, "total": 20000},
+    "own_node": true,
+    "remedy": {
+      "type": "raise_server_limit",
+      "server": "fulcrum",
+      "settings": ["max_subs_per_ip"]
+    }
+  },
+  "own_node_at_its_limit": {
+    "reason": "live_limit",
+    "limits": {"per_wallet": 20000, "total": 20000},
+    "own_node": true,
+    "remedy": null
+  }
+}

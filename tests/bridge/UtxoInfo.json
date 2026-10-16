@@ -1,0 +1,29 @@
+{
+  "received": {
+    "txid": "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf",
+    "vout": 0,
+    "address": "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx",
+    "value_sats": 1000000,
+    "status": {"state": "confirmed", "height": 799995, "timestamp": 1749997000},
+    "keychain": "external",
+    "derivation_index": 0
+  },
+  "change_pending": {
+    "txid": "0e9fd1596c4b1dfca8ddcd36c567f11da43cf17968a5b912f0e67c5198f643f1",
+    "vout": 1,
+    "address": "tb1qgtw9wgs0gtszee9feyd4fs00wprftdqxkr6f8n",
+    "value_sats": 749660,
+    "status": {"state": "pending"},
+    "keychain": "internal",
+    "derivation_index": 0
+  },
+  "watched_address": {
+    "txid": "3433844a443e80708d701b27c3442d17911a71d7269f6495309237829d82fbc3",
+    "vout": 2,
+    "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    "value_sats": 21000,
+    "status": {"state": "confirmed", "height": 799900, "timestamp": 1749940000},
+    "keychain": null,
+    "derivation_index": null
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "sent": {
+    "summary": {
+      "txid": "0e9fd1596c4b1dfca8ddcd36c567f11da43cf17968a5b912f0e67c5198f643f1",
+      "net_sats": -250340,
+      "fee_sats": 340,
+      "status": {"state": "pending"},
+      "confirmations": 0
+    },
+    "inputs": [
+      {
+        "address": "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx",
+        "value_sats": 1000000,
+        "is_mine": true,
+        "change": false,
+        "op_return": null,
+        "prev_txid": "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf",
+        "prev_vout": 0
+      }
+    ],
+    "outputs": [
+      {
+        "address": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+        "value_sats": 250000,
+        "is_mine": false,
+        "change": false,
+        "op_return": null,
+        "prev_txid": null,
+        "prev_vout": null
+      },
+      {
+        "address": "tb1qgtw9wgs0gtszee9feyd4fs00wprftdqxkr6f8n",
+        "value_sats": 749660,
+        "is_mine": true,
+        "change": true,
+        "op_return": null,
+        "prev_txid": null,
+        "prev_vout": null
+      },
+      {
+        "address": null,
+        "value_sats": 0,
+        "is_mine": false,
+        "change": false,
+        "op_return": {
+          "hex": "48656c6c6f2066726f6d207468652047657266617574207465737473",
+          "text": "Hello from the Gerfaut tests",
+          "label": null
+        },
+        "prev_txid": null,
+        "prev_vout": null
+      }
+    ],
+    "vsize": 141,
+    "fee_rate_sat_vb": 2.4113475177304964,
+    "extras": {
+      "size_bytes": 222,
+      "vsize": 141,
+      "weight_wu": 561,
+      "version": 2,
+      "locktime": 799999,
+      "rbf_signaled": true,
+      "segwit": true,
+      "taproot": false,
+      "is_coinbase": false,
+      "coinbase_pool": null,
+      "coinbase_height": null,
+      "coinbase_tag": null,
+      "sigops": 1,
+      "raw_hex": "02000000000101bfe14b9fe1ce3c848dbdf171140350ea75fd8ac6eda7b4b9dffbb1023ce484630000000000fdffffff0290d0030000000000160014751e76e8199196d454941c45d1b3a323f1433bd65c700b000000000016001442dc57220f42e02ce4a9c91b54c1ef704695b4060247303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303021020202020202020202020202020202020202020202020202020202020202020202ff340c00"
+    }
+  },
+  "older_watched_address": {
+    "summary": {
+      "txid": "6384e43c02b1fbdfb9b4a7edc68afd75ea50031471f1bd8d843ccee19f4be1bf",
+      "net_sats": 1000000,
+      "fee_sats": null,
+      "status": {
+        "state": "confirmed",
+        "height": 799995,
+        "timestamp": 1749997000
+      },
+      "confirmations": 6
+    },
+    "inputs": [],
+    "outputs": [],
+    "vsize": 0,
+    "fee_rate_sat_vb": null,
+    "extras": null
+  }
+}

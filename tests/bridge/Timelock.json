@@ -1,0 +1,29 @@
+{
+  "required": {
+    "lock": {"kind": "relative", "lock": {"kind": "blocks", "blocks": 4320}},
+    "required": true,
+    "state": {
+      "kind": "per_coin",
+      "unlocked": 1,
+      "waiting": 1,
+      "locked": 1,
+      "next": {
+        "remaining_blocks": 319,
+        "remaining_seconds": 191400,
+        "unlocks_at_unix": 1750191400
+      }
+    }
+  },
+  "optional": {
+    "lock": {"kind": "absolute", "lock": {"kind": "height", "height": 801432}},
+    "required": false,
+    "state": {
+      "kind": "locked",
+      "until": {
+        "remaining_blocks": 4320,
+        "remaining_seconds": 2592000,
+        "unlocks_at_unix": 1752592000
+      }
+    }
+  }
+}

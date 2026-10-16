@@ -1,0 +1,123 @@
+{
+  "off": {
+    "state": "off",
+    "transport": null,
+    "server": null,
+    "detail": null,
+    "watched_scripts": 0,
+    "pushed_scripts": 0,
+    "left_out_scripts": 0,
+    "left_out_wallets": 0,
+    "wallets": [],
+    "server_software": null,
+    "left_out": null
+  },
+  "connected": {
+    "state": "connected",
+    "transport": "electrum",
+    "server": "electrum.example.org",
+    "detail": null,
+    "watched_scripts": 246,
+    "pushed_scripts": 246,
+    "left_out_scripts": 65,
+    "left_out_wallets": 2,
+    "wallets": [
+      {
+        "wallet_id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+        "coverage": "live",
+        "watched_scripts": 46,
+        "left_out_scripts": 0,
+        "refused_scripts": 0
+      },
+      {
+        "wallet_id": "a7d40b19-5c3e-4f82-b6a1-2e9c8d7f0b54",
+        "coverage": "partial",
+        "watched_scripts": 200,
+        "left_out_scripts": 64,
+        "refused_scripts": 0
+      },
+      {
+        "wallet_id": "e2b85c07-1f6a-4c93-8d4e-7a0b3c5f9e26",
+        "coverage": "sync_only",
+        "watched_scripts": 0,
+        "left_out_scripts": 1,
+        "refused_scripts": 1
+      }
+    ],
+    "server_software": "Fulcrum 1.12.0",
+    "left_out": {
+      "reason": "server_refused",
+      "limits": {"per_wallet": 20000, "total": 20000},
+      "own_node": true,
+      "remedy": {
+        "type": "raise_server_limit",
+        "server": "fulcrum",
+        "settings": ["max_subs_per_ip"]
+      }
+    }
+  },
+  "reconnecting": {
+    "state": "reconnecting",
+    "transport": "electrum",
+    "server": "electrum.example.org",
+    "detail": "connection reset by the server",
+    "watched_scripts": 246,
+    "pushed_scripts": 246,
+    "left_out_scripts": 65,
+    "left_out_wallets": 2,
+    "wallets": [
+      {
+        "wallet_id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+        "coverage": "live",
+        "watched_scripts": 46,
+        "left_out_scripts": 0,
+        "refused_scripts": 0
+      },
+      {
+        "wallet_id": "a7d40b19-5c3e-4f82-b6a1-2e9c8d7f0b54",
+        "coverage": "partial",
+        "watched_scripts": 200,
+        "left_out_scripts": 64,
+        "refused_scripts": 0
+      },
+      {
+        "wallet_id": "e2b85c07-1f6a-4c93-8d4e-7a0b3c5f9e26",
+        "coverage": "sync_only",
+        "watched_scripts": 0,
+        "left_out_scripts": 1,
+        "refused_scripts": 1
+      }
+    ],
+    "server_software": "Fulcrum 1.12.0",
+    "left_out": {
+      "reason": "live_limit",
+      "limits": {"per_wallet": 200, "total": 2000},
+      "own_node": false,
+      "remedy": {
+        "type": "own_node",
+        "limits": {"per_wallet": 20000, "total": 20000}
+      }
+    }
+  },
+  "polling": {
+    "state": "polling",
+    "transport": "esplora_polling",
+    "server": "esplora.example.org",
+    "detail": null,
+    "watched_scripts": 46,
+    "pushed_scripts": 0,
+    "left_out_scripts": 0,
+    "left_out_wallets": 0,
+    "wallets": [
+      {
+        "wallet_id": "3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13",
+        "coverage": "live",
+        "watched_scripts": 46,
+        "left_out_scripts": 0,
+        "refused_scripts": 0
+      }
+    ],
+    "server_software": null,
+    "left_out": null
+  }
+}

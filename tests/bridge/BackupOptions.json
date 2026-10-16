@@ -1,0 +1,7 @@
+{
+  "everything": {"wallet_ids": null, "include_settings": false},
+  "chosen": {
+    "wallet_ids": ["3f1c2a64-8b7e-4d21-9c5a-6e0f7b2d9a13"],
+    "include_settings": true
+  }
+}
