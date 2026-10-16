@@ -35,7 +35,7 @@ An app that depends on this crate copies the `[patch.crates-io]` section at the 
 |---|---|
 | `gerfaut-core` | Core Rust library, this repository |
 | [`gerfaut-mobile`](https://github.com/gerfaut-wallet/gerfaut-mobile) | Mobile app (Flutter, Android first) |
-| [`gerfaut-desktop`](https://github.com/gerfaut-wallet/gerfaut-desktop) | Desktop app (Tauri v2, for Windows, macOS, and Linux) |
+| [`gerfaut-desktop`](https://github.com/gerfaut-wallet/gerfaut-desktop) | Desktop app (Tauri v2, for Linux, macOS, and Windows) |
 | [`gerfaut-web`](https://github.com/gerfaut-wallet/gerfaut-web) | Website, documentation, downloads |
 
 ## License
