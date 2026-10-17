@@ -184,13 +184,7 @@ impl WalletManager {
         // the same as when every endpoint stopped answering. Without
         // this the PSBT's word went through unconfronted and unmarked.
         let route = if needs_chain || needs_tip {
-            match chain::endpoints(&config, network, &certs).map(|endpoints| {
-                chain::send_order(
-                    endpoints,
-                    self.live_endpoint(network, &config, &certs),
-                    Purpose::Preview,
-                )
-            }) {
+            match self.send_endpoints(network, &config, &certs, Purpose::Preview) {
                 Ok(endpoints) => match self.tor_proxy_for(&endpoints).await {
                     Ok(proxy) => Some((endpoints, proxy)),
                     Err(_) => None,
@@ -304,11 +298,7 @@ impl WalletManager {
             });
         }
         let (config, certs) = self.state.lock().await.chain_setup(network);
-        let endpoints = chain::send_order(
-            chain::endpoints(&config, network, &certs)?,
-            self.live_endpoint(network, &config, &certs),
-            Purpose::Broadcast,
-        );
+        let endpoints = self.send_endpoints(network, &config, &certs, Purpose::Broadcast)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
         let mut refusals: Vec<(String, String)> = Vec::new();
         for endpoint in &endpoints {
@@ -330,6 +320,26 @@ impl WalletManager {
             }
         }
         Err(broadcast_failure(refusals))
+    }
+
+    /// The endpoints the preview, the broadcast and the standing of a
+    /// transaction are asked of, in the order they are tried: the one
+    /// place that order is decided. The backend's endpoints, the operator
+    /// of the live watch first ([`chain::send_order`]). What else orders
+    /// the syncs, the server that answered last or the ones that failed
+    /// lately, goes here too, for all three at once.
+    fn send_endpoints(
+        &self,
+        network: Network,
+        config: &crate::chain::BackendConfig,
+        certs: &crate::chain::TrustedCerts,
+        purpose: Purpose,
+    ) -> CoreResult<Vec<chain::Endpoint>> {
+        Ok(chain::send_order(
+            chain::endpoints(config, network, certs)?,
+            self.live_endpoint(network, config, certs),
+            purpose,
+        ))
     }
 
     /// The server the live watch has on `network`, when the backend
@@ -429,11 +439,7 @@ impl WalletManager {
             });
         }
         let (config, certs) = self.state.lock().await.chain_setup(network);
-        let endpoints = chain::send_order(
-            chain::endpoints(&config, network, &certs)?,
-            self.live_endpoint(network, &config, &certs),
-            Purpose::Broadcast,
-        );
+        let endpoints = self.send_endpoints(network, &config, &certs, Purpose::Broadcast)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
         let mut attempts: Vec<String> = Vec::new();
         for endpoint in &endpoints {
