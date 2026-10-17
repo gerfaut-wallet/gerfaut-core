@@ -24,13 +24,60 @@ use crate::chain::BackendConfig;
 pub(crate) const ADDRESS: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
 pub(crate) const ADDRESS_SCRIPT: &str = "0014751e76e8199196d454941c45d1b3a323f1433bd6";
 
-/// A payment of `sats` to [`ADDRESS`], as Esplora lists it: `txid` and
-/// the transaction it spends are that byte repeated, and it spends
-/// output 0 of the latter, 60 000 sats of nobody's. Two payments that
-/// spend the same byte replace one another.
-pub(crate) fn esplora_payment(txid: u8, spends: u8, sats: u64, confirmed: bool) -> Value {
+thread_local! {
+    /// The txid of the last payment [`esplora_payment`] built under each
+    /// label, on this thread: a test runs on a thread of its own.
+    static PAYMENTS: std::cell::RefCell<HashMap<u8, String>> = Default::default();
+}
+
+/// The txid of a transaction as Esplora lists it: the hash of what it
+/// lists, as a server's must be.
+pub(crate) fn listed_txid(listed: &Value) -> String {
+    let tx: crate::chain::esplora::page::PageTx = serde_json::from_value(listed.clone()).unwrap();
+    tx.to_tx().compute_txid().to_string()
+}
+
+/// The txid of the payment labelled `label` this test built last with
+/// [`esplora_payment`]; the label repeated, a txid of nothing, when it
+/// built none under it.
+pub(crate) fn esplora_txid(label: u8) -> String {
+    PAYMENTS.with(|payments| {
+        payments
+            .borrow()
+            .get(&label)
+            .cloned()
+            .unwrap_or_else(|| format!("{label:02x}").repeat(32))
+    })
+}
+
+/// A payment of `sats` to [`ADDRESS`], as Esplora lists it, labelled
+/// `label`: its lock time, which tells apart payments alike otherwise,
+/// and the name [`esplora_txid`] finds its txid under. The transaction it
+/// spends is that byte repeated, and it spends output 0 of the latter,
+/// 60 000 sats of nobody's. Two payments that spend the same byte replace
+/// one another. Its txid is the hash of what it lists, as a server's is.
+pub(crate) fn esplora_payment(label: u8, spends: u8, sats: u64, confirmed: bool) -> Value {
+    use bdk_wallet::bitcoin::absolute::LockTime;
+    use bdk_wallet::bitcoin::hashes::Hash;
+    use bdk_wallet::bitcoin::{Amount, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+    let tx = Transaction {
+        version: bdk_wallet::bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::from_consensus(u32::from(label)),
+        input: vec![TxIn {
+            previous_output: OutPoint::new(Txid::from_byte_array([spends; 32]), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence(4_294_967_293),
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(sats),
+            script_pubkey: ScriptBuf::from_hex(ADDRESS_SCRIPT).unwrap(),
+        }],
+    };
+    let txid = tx.compute_txid().to_string();
+    PAYMENTS.with(|payments| payments.borrow_mut().insert(label, txid.clone()));
     json!({
-        "txid": format!("{txid:02x}").repeat(32), "version": 2, "locktime": 0, "size": 110,
+        "txid": txid, "version": 2, "locktime": label, "size": 110,
         "weight": 440, "fee": 60_000 - sats,
         "vin": [{
             "txid": format!("{spends:02x}").repeat(32), "vout": 0, "scriptsig": "",
@@ -40,7 +87,7 @@ pub(crate) fn esplora_payment(txid: u8, spends: u8, sats: u64, confirmed: bool) 
         "vout": [{ "scriptpubkey": ADDRESS_SCRIPT, "value": sats }],
         "status": if confirmed {
             json!({
-                "confirmed": true, "block_height": 501, "block_hash": "33".repeat(32),
+                "confirmed": true, "block_height": 500, "block_hash": "33".repeat(32),
                 "block_time": 1_700_000_000,
             })
         } else {
@@ -105,6 +152,36 @@ pub(crate) fn header_at(height: u32) -> String {
         bits: CompactTarget::from_consensus(0x207f_ffff),
         nonce: 0,
     })
+}
+
+/// The merkle root of a block of `txids`, and the branch of the one at
+/// `pos` as a server spells it: each hash reversed, in hex. The last
+/// node of an odd row is paired with a copy of itself, as consensus
+/// builds the tree. No transaction, no root: all zeroes.
+pub(crate) fn merkle_of(txids: &[Txid], pos: usize) -> ([u8; 32], Vec<String>) {
+    use bdk_wallet::bitcoin::hashes::{Hash, sha256d};
+    let mut row: Vec<[u8; 32]> = txids.iter().map(|txid| txid.to_byte_array()).collect();
+    let mut index = pos;
+    let mut branch = Vec::new();
+    while row.len() > 1 {
+        if row.len() % 2 == 1 {
+            row.push(*row.last().unwrap());
+        }
+        let mut sibling = row[index ^ 1];
+        sibling.reverse();
+        branch.push(data_encoding::HEXLOWER.encode(&sibling));
+        row = row
+            .chunks(2)
+            .map(|pair| {
+                let mut inner = [0u8; 64];
+                inner[..32].copy_from_slice(&pair[0]);
+                inner[32..].copy_from_slice(&pair[1]);
+                sha256d::Hash::hash(&inner).to_byte_array()
+            })
+            .collect();
+        index /= 2;
+    }
+    (row.first().copied().unwrap_or_default(), branch)
 }
 
 /// A transaction spending `inputs` to `outputs`, each a script in hex
@@ -200,6 +277,21 @@ pub(crate) struct ElectrumState {
     /// What the server says it runs, first in its answer to
     /// `server.version`.
     pub software: &'static str,
+    /// Headers served as they are at their height, whatever the chain
+    /// below them: real ones, or forged.
+    pub served: HashMap<u32, bdk_wallet::bitcoin::block::Header>,
+    /// The merkle branch sent for a transaction, as hashes in hex and a
+    /// position, in place of the empty one.
+    pub branches: HashMap<Txid, (Vec<String>, usize)>,
+    /// A header sent once for its height, the first time a header is
+    /// asked for there, and the chain's after it: the block a
+    /// reorganisation replaced while a client was reading.
+    pub stale_once: HashMap<u32, bdk_wallet::bitcoin::block::Header>,
+    /// Heights whose header is refused.
+    pub refused_headers: std::collections::HashSet<u32>,
+    /// The tip the server moves to once it has given its tip once: blocks
+    /// that come in while a client reads.
+    pub tip_later: Option<u32>,
 }
 
 /// Heights past which the fake Electrum server makes a header up on the
@@ -214,16 +306,66 @@ impl ElectrumState {
         serialize_hex(&self.header_of(height))
     }
 
-    /// The header at `height`: the signet genesis block at 0, so a
-    /// descriptor wallet's chain meets the server's there, and above it
-    /// the header of [`header_at`] with the one below as its parent,
-    /// whose merkle root is the txid of the transaction a history puts at
-    /// that height, if any: the one transaction of its block.
-    fn header_of(&self, height: u32) -> bdk_wallet::bitcoin::block::Header {
+    /// The headers from `start` up to `end`, excluded, as
+    /// [`Self::header_of`] makes them, the chain built once.
+    fn headers_between(&self, start: u32, end: u32) -> Vec<bdk_wallet::bitcoin::block::Header> {
+        if start > CHAINED_UP_TO || end <= start {
+            return (start..end).map(|height| self.header_of(height)).collect();
+        }
+        let mut headers = Vec::new();
+        let mut below = self.header_of(start);
+        headers.push(below);
+        for height in start + 1..end {
+            let header = if height > CHAINED_UP_TO || self.served.contains_key(&height) {
+                self.header_of(height)
+            } else {
+                use bdk_wallet::bitcoin::TxMerkleNode;
+                use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
+                use bdk_wallet::bitcoin::hashes::Hash;
+                let mut next: bdk_wallet::bitcoin::block::Header =
+                    deserialize_hex(&header_at(height)).unwrap();
+                next.prev_blockhash = below.block_hash();
+                let mined = self.mined_at(i64::from(height));
+                if !mined.is_empty() {
+                    next.merkle_root = TxMerkleNode::from_byte_array(merkle_of(&mined, 0).0);
+                }
+                next
+            };
+            headers.push(header);
+            below = header;
+        }
+        headers
+    }
+
+    /// The transactions the histories put at `height`, in the order
+    /// their block holds them: by txid.
+    fn mined_at(&self, height: i64) -> Vec<Txid> {
+        let mut mined: Vec<Txid> = self
+            .histories
+            .values()
+            .flatten()
+            .filter(|(_, at)| *at == height)
+            .map(|(txid, _)| *txid)
+            .collect();
+        mined.sort();
+        mined.dedup();
+        mined
+    }
+
+    /// The header at `height`: one [`ElectrumState::served`] as it is,
+    /// or else the signet genesis block at 0, so a descriptor wallet's
+    /// chain meets the server's there, and above it the header of
+    /// [`header_at`] with the one below as its parent, whose merkle root
+    /// is the root of the transactions the histories put at that height
+    /// ([`merkle_of`]), if any.
+    pub(crate) fn header_of(&self, height: u32) -> bdk_wallet::bitcoin::block::Header {
         use bdk_wallet::bitcoin::TxMerkleNode;
         use bdk_wallet::bitcoin::block::Header;
         use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
         use bdk_wallet::bitcoin::hashes::Hash;
+        if let Some(served) = self.served.get(&height) {
+            return *served;
+        }
         let mut header = bdk_wallet::bitcoin::constants::genesis_block(
             self.genesis.unwrap_or(bdk_wallet::bitcoin::Network::Signet),
         )
@@ -231,15 +373,16 @@ impl ElectrumState {
         if height > CHAINED_UP_TO {
             return deserialize_hex(&header_at(height)).unwrap();
         }
-        let mut mined: HashMap<i64, Txid> = HashMap::new();
-        for (txid, at) in self.histories.values().flatten() {
-            mined.entry(*at).or_insert(*txid);
+        let mut mined: HashMap<i64, Vec<Txid>> = HashMap::new();
+        for (_, at) in self.histories.values().flatten() {
+            mined.entry(*at).or_insert_with(|| self.mined_at(*at));
         }
         for at in 1..=height {
             let mut next: Header = deserialize_hex(&header_at(at)).unwrap();
             next.prev_blockhash = header.block_hash();
-            if let Some(txid) = mined.get(&i64::from(at)) {
-                next.merkle_root = TxMerkleNode::from_byte_array(txid.to_byte_array());
+            if let Some(txids) = mined.get(&i64::from(at)) {
+                let (root, _) = merkle_of(txids, 0);
+                next.merkle_root = TxMerkleNode::from_byte_array(root);
             }
             header = next;
         }
@@ -256,6 +399,7 @@ pub(crate) struct FakeElectrum {
 impl FakeElectrum {
     pub(crate) async fn start() -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        crate::chain::proof::forget_proven_coins(&listener.local_addr().unwrap().to_string());
         let fake = FakeElectrum {
             address: listener.local_addr().unwrap(),
             state: Arc::new(Mutex::new(ElectrumState {
@@ -420,22 +564,40 @@ impl FakeElectrum {
         let result = match method {
             "server.version" => json!([state.software, state.version]),
             "blockchain.headers.subscribe" => {
-                json!({ "height": state.height, "hex": state.header(state.height) })
+                let answer = json!({ "height": state.height, "hex": state.header(state.height) });
+                if let Some(later) = state.tip_later.take() {
+                    state.height = later;
+                }
+                answer
             }
             "blockchain.block.headers" => {
                 let start = param.as_u64().unwrap_or(0) as u32;
                 let count = request["params"][1].as_u64().unwrap_or(0) as u32;
                 let end = start.saturating_add(count).min(state.height + 1);
-                let hex: String = (start..end).map(|height| state.header(height)).collect();
+                let hex: String = state
+                    .headers_between(start, end)
+                    .iter()
+                    .map(serialize_hex)
+                    .collect();
                 json!({ "count": end.saturating_sub(start), "hex": hex, "max": 2016 })
             }
-            // The only transaction of its block, whose merkle root is
-            // its txid: an empty branch proves it.
-            "blockchain.transaction.get_merkle" => json!({
-                "block_height": request["params"][1].as_u64().unwrap_or(0),
-                "merkle": [],
-                "pos": 0,
-            }),
+            // Its branch in the block the histories make of its height,
+            // unless one was set for it.
+            "blockchain.transaction.get_merkle" => {
+                let height = request["params"][1].as_i64().unwrap_or(0);
+                let txid = param.as_str().and_then(|txid| txid.parse::<Txid>().ok());
+                let (merkle, pos) = match txid.and_then(|txid| state.branches.get(&txid)) {
+                    Some(set) => set.clone(),
+                    None => {
+                        let mined = state.mined_at(height);
+                        let pos = txid
+                            .and_then(|txid| mined.iter().position(|at| *at == txid))
+                            .unwrap_or(0);
+                        (merkle_of(&mined, pos).1, pos)
+                    }
+                };
+                json!({ "block_height": height, "merkle": merkle, "pos": pos })
+            }
             "blockchain.scripthash.subscribe" => {
                 state.connections[index].0.push(scripthash.clone());
                 // A status set by the test, or the one of the history,
@@ -484,7 +646,16 @@ impl FakeElectrum {
                     None => return refusal("No such mempool or blockchain transaction"),
                 }
             }
-            "blockchain.block.header" => json!(state.header(param.as_u64().unwrap_or(0) as u32)),
+            "blockchain.block.header" => {
+                let height = param.as_u64().unwrap_or(0) as u32;
+                if let Some(stale) = state.stale_once.remove(&height) {
+                    json!(serialize_hex(&stale))
+                } else if state.refused_headers.contains(&height) {
+                    return refusal("header not available");
+                } else {
+                    json!(state.header(height))
+                }
+            }
             _ => Value::Null,
         };
         Answer::Line(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
@@ -610,43 +781,242 @@ pub(crate) struct MempoolState {
     /// The network whose genesis block the REST side names at height 0,
     /// signet when `None`.
     pub genesis: Option<bdk_wallet::bitcoin::Network>,
+    /// Histories of scripts, by the key polling reads them under
+    /// ([`FakeMempool::rest_key`]), as Esplora spells each transaction,
+    /// newest first: what a descriptor wallet's sync reads, its counters
+    /// and its pages.
+    pub scripts: HashMap<String, Vec<Value>>,
+    /// Headers served as they are at their height.
+    pub served: HashMap<u32, bdk_wallet::bitcoin::block::Header>,
+    /// The branch sent for a txid, as hashes in hex and a position, in
+    /// place of the one its block makes.
+    pub branches: HashMap<String, (Vec<String>, usize)>,
+    /// The coins of the one address, as Esplora lists them.
+    pub utxos: Vec<Value>,
+    /// Whether the REST side has lost the headers of its blocks, as a
+    /// server has those of a block a reorganisation left behind.
+    pub headerless: bool,
+    /// Blocks a reorganisation replaced, by height: the statuses of the
+    /// transactions confirmed there still name them, and their headers
+    /// are still served, while the chain and the branches are the new
+    /// block's.
+    pub stale: HashMap<u32, bdk_wallet::bitcoin::block::Header>,
 }
 
+/// The headers of the chain the fake mempool serves, by height: see
+/// [`MempoolState::chain`].
+type Headers = std::collections::BTreeMap<u32, bdk_wallet::bitcoin::block::Header>;
+
+/// Heights past which the fake mempool makes a header up on the spot,
+/// above nothing: the chain it builds again for each request stays
+/// short, whatever tip a test makes it claim.
+const MEMPOOL_CHAINED_UP_TO: u32 = 10_000;
+
 impl MempoolState {
-    /// A page of the one history the REST side knows, as Esplora pages
-    /// it: the unconfirmed transactions and the first 25 confirmed ones,
-    /// or the 25 confirmed ones after the txid a path ends with.
-    fn history_page(&self, path: &str) -> Vec<Value> {
-        let confirmed = |tx: &&Value| tx["status"]["confirmed"] == true;
-        let chain = self.address_txs.iter().filter(confirmed);
-        match path.rsplit_once("/txs/chain/") {
-            Some((_, after)) => chain
-                .skip_while(|tx| tx["txid"] != after)
-                .skip(1)
-                .take(25)
-                .cloned()
-                .collect(),
-            None => self
-                .address_txs
-                .iter()
-                .filter(|tx| !confirmed(tx))
-                .chain(chain.take(25))
-                .cloned()
-                .collect(),
+    /// Every confirmed transaction listed anywhere, its txid and height,
+    /// and the time its status gives its block.
+    fn confirmed(&self) -> Vec<(Txid, u32, u64)> {
+        self.address_txs
+            .iter()
+            .chain(self.scripts.values().flatten())
+            .filter(|tx| tx["status"]["confirmed"] == true)
+            .filter_map(|tx| {
+                Some((
+                    tx["txid"].as_str()?.parse().ok()?,
+                    u32::try_from(tx["status"]["block_height"].as_u64()?).ok()?,
+                    tx["status"]["block_time"].as_u64().unwrap_or(0),
+                ))
+            })
+            .collect()
+    }
+
+    /// The blocks the confirmed transactions make: at each height, their
+    /// txids in the order their block holds them, by txid, and the time
+    /// their status gives the block.
+    fn blocks(&self) -> HashMap<u32, (Vec<Txid>, u64)> {
+        let mut blocks: HashMap<u32, (Vec<Txid>, u64)> = HashMap::new();
+        for (txid, height, time) in self.confirmed() {
+            let block = blocks.entry(height).or_default();
+            block.0.push(txid);
+            if block.1 == 0 {
+                block.1 = time;
+            }
+        }
+        for (txids, _) in blocks.values_mut() {
+            txids.sort();
+            txids.dedup();
+        }
+        blocks
+    }
+
+    /// The transactions confirmed at `height`, in the order their block
+    /// holds them.
+    fn mined_at(&self, height: u32) -> Vec<Txid> {
+        self.blocks()
+            .remove(&height)
+            .map(|(txids, _)| txids)
+            .unwrap_or_default()
+    }
+
+    /// A made-up header at `height` above `parent`: its merkle root the
+    /// root of the transactions confirmed there ([`merkle_of`]), its time
+    /// the one their status gives, or 1 700 000 000 plus the height.
+    fn made_up(
+        blocks: &HashMap<u32, (Vec<Txid>, u64)>,
+        height: u32,
+        parent: bdk_wallet::bitcoin::BlockHash,
+    ) -> bdk_wallet::bitcoin::block::Header {
+        use bdk_wallet::bitcoin::block::{Header, Version};
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::{CompactTarget, TxMerkleNode};
+        // The header of `header_at`, built without its hex.
+        let mut header = Header {
+            version: Version::TWO,
+            prev_blockhash: parent,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: 1_700_000_000_u32.wrapping_add(height),
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        };
+        if let Some((txids, time)) = blocks.get(&height) {
+            header.merkle_root = TxMerkleNode::from_byte_array(merkle_of(txids, 0).0);
+            if *time > 0 {
+                header.time = *time as u32;
+            }
+        }
+        header
+    }
+
+    /// The chain the REST side serves, by height: the genesis block of
+    /// the network at 0, signet unless set, then made-up headers each
+    /// above the one before ([`Self::made_up`]), up to the tip or the
+    /// highest confirmation, whichever is higher, and no higher than
+    /// [`MEMPOOL_CHAINED_UP_TO`]; a header [`Self::served`] stands in for
+    /// the one at its height.
+    fn chain(&self) -> Headers {
+        let network = self.genesis.unwrap_or(bdk_wallet::bitcoin::Network::Signet);
+        let blocks = self.blocks();
+        let top = blocks
+            .keys()
+            .copied()
+            .chain([self.tip])
+            .max()
+            .unwrap_or(0)
+            .min(MEMPOOL_CHAINED_UP_TO);
+        let mut chain = Headers::new();
+        let mut below = bdk_wallet::bitcoin::constants::genesis_block(network).header;
+        chain.insert(0, below);
+        for height in 1..=top {
+            let header = match self.served.get(&height) {
+                Some(served) => *served,
+                None => Self::made_up(&blocks, height, below.block_hash()),
+            };
+            chain.insert(height, header);
+            below = header;
+        }
+        for (height, header) in &self.served {
+            chain.insert(*height, *header);
+        }
+        chain
+    }
+
+    /// The header at `height`: the chain's, or, past it, a made-up one
+    /// above nothing.
+    fn header_in(&self, chain: &Headers, height: u32) -> bdk_wallet::bitcoin::block::Header {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        match chain.get(&height) {
+            Some(header) => *header,
+            None => Self::made_up(
+                &self.blocks(),
+                height,
+                bdk_wallet::bitcoin::BlockHash::all_zeros(),
+            ),
         }
     }
 
-    /// The id of the block at `height`: the genesis block of the network
-    /// at 0, signet unless set, and the height in hex above it, as the
-    /// tip's hash is read.
-    fn block_id(&self, height: u32) -> String {
-        if height == 0 {
-            let network = self.genesis.unwrap_or(bdk_wallet::bitcoin::Network::Signet);
-            return bdk_wallet::bitcoin::constants::genesis_block(network)
-                .block_hash()
-                .to_string();
+    /// A transaction as the REST side lists it: when confirmed in a block
+    /// it names, in the block of the chain at its height, at that block's
+    /// time. A status that names no block is listed as it is.
+    fn as_listed(&self, chain: &Headers, tx: &Value) -> Value {
+        let mut tx = tx.clone();
+        if tx["status"]["confirmed"] == true
+            && tx["status"].get("block_hash").is_some()
+            && let Some(height) = tx["status"]["block_height"].as_u64()
+        {
+            let header = match self.stale.get(&(height as u32)) {
+                Some(stale) => *stale,
+                None => self.header_in(chain, height as u32),
+            };
+            tx["status"]["block_hash"] = json!(header.block_hash().to_string());
+            tx["status"]["block_time"] = json!(header.time);
         }
-        format!("{height:064x}")
+        tx
+    }
+
+    /// A page of a history, as Esplora pages it: the unconfirmed
+    /// transactions and the first 25 confirmed ones, the 25 confirmed
+    /// ones after the txid a path ends with, or the unconfirmed ones
+    /// alone.
+    fn history_page(&self, chain_headers: &Headers, history: &[Value], path: &str) -> Vec<Value> {
+        let confirmed = |tx: &&Value| tx["status"]["confirmed"] == true;
+        let chain = history.iter().filter(confirmed);
+        let page: Vec<&Value> = if path.ends_with("/txs/mempool") {
+            history.iter().filter(|tx| !confirmed(tx)).collect()
+        } else {
+            match path.rsplit_once("/txs/chain/") {
+                Some((_, after)) => chain
+                    .skip_while(|tx| tx["txid"] != after)
+                    .skip(1)
+                    .take(25)
+                    .collect(),
+                None => history
+                    .iter()
+                    .filter(|tx| !confirmed(tx))
+                    .chain(chain.take(25))
+                    .collect(),
+            }
+        };
+        page.into_iter()
+            .map(|tx| self.as_listed(chain_headers, tx))
+            .collect()
+    }
+
+    /// The id of the block at `height` in the chain the REST side
+    /// serves ([`Self::chain`]).
+    fn block_id(&self, chain: &Headers, height: u32) -> String {
+        self.header_in(chain, height).block_hash().to_string()
+    }
+
+    /// A transaction listed anywhere, in its raw bytes.
+    fn raw_tx(&self, txid: &str) -> Option<Vec<u8>> {
+        let listed = self
+            .address_txs
+            .iter()
+            .chain(self.scripts.values().flatten())
+            .find(|tx| tx["txid"] == txid)?;
+        let tx: crate::chain::esplora::page::PageTx =
+            serde_json::from_value(listed.clone()).ok()?;
+        Some(bdk_wallet::bitcoin::consensus::encode::serialize(
+            &tx.to_tx(),
+        ))
+    }
+
+    /// The branch of a confirmed transaction in its block, as Esplora
+    /// sends it, unless one was set for it.
+    fn merkle_proof(&self, txid: &str) -> Option<Value> {
+        let (_, height, _) = self
+            .confirmed()
+            .into_iter()
+            .find(|(confirmed, _, _)| confirmed.to_string() == txid)?;
+        let (merkle, pos) = match self.branches.get(txid) {
+            Some(set) => set.clone(),
+            None => {
+                let mined = self.mined_at(height);
+                let pos = mined.iter().position(|at| at.to_string() == txid)?;
+                (merkle_of(&mined, pos).1, pos)
+            }
+        };
+        Some(json!({ "block_height": height, "merkle": merkle, "pos": pos }))
     }
 }
 
@@ -659,6 +1029,7 @@ pub(crate) struct FakeMempool {
 impl FakeMempool {
     pub(crate) async fn start(websocket: bool, limit: usize) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        crate::chain::proof::forget_proven_coins(&listener.local_addr().unwrap().to_string());
         let fake = FakeMempool {
             address: listener.local_addr().unwrap(),
             state: Arc::new(Mutex::new(MempoolState {
@@ -749,12 +1120,62 @@ impl FakeMempool {
     async fn rest(mut stream: TcpStream, path: &str, state: Arc<Mutex<MempoolState>>) {
         let mut request = vec![0u8; 4096];
         let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut request).await;
+        let mut raw: Option<Vec<u8>> = None;
         let (status, body) = {
             let mut state = state.lock().unwrap();
             state.paths.push(path.to_owned());
-            if path.ends_with("/blocks/tip/hash") {
+            let chain = state.chain();
+            let script = path
+                .rsplit_once("/scripthash/")
+                .map(|(_, rest)| rest.split('/').next().unwrap_or_default().to_owned())
+                .filter(|key| state.scripts.contains_key(key));
+            if let Some(hash) = path
+                .strip_suffix("/header")
+                .and_then(|path| path.rsplit_once("/block/"))
+                .map(|(_, hash)| hash)
+            {
+                let header = chain
+                    .values()
+                    .chain(state.stale.values())
+                    .find(|header| header.block_hash().to_string() == hash)
+                    .copied()
+                    .or_else(|| {
+                        state.confirmed().into_iter().find_map(|(_, height, _)| {
+                            let header = state.header_in(&chain, height);
+                            (header.block_hash().to_string() == hash).then_some(header)
+                        })
+                    });
+                match header.filter(|_| !state.headerless) {
+                    Some(header) => ("200 OK", serialize_hex(&header)),
+                    None => ("404 Not Found", "Block not found".to_owned()),
+                }
+            } else if let Some(txid) = path
+                .strip_suffix("/raw")
+                .and_then(|path| path.rsplit_once("/tx/"))
+                .map(|(_, txid)| txid)
+            {
+                match state.raw_tx(txid) {
+                    Some(bytes) => {
+                        raw = Some(bytes);
+                        ("200 OK", String::new())
+                    }
+                    None => ("404 Not Found", "Transaction not found".to_owned()),
+                }
+            } else if let Some(txid) = path
+                .strip_suffix("/merkle-proof")
+                .and_then(|path| path.rsplit_once("/tx/"))
+                .map(|(_, txid)| txid)
+            {
+                match state.merkle_proof(txid) {
+                    Some(proof) => ("200 OK", proof.to_string()),
+                    None => (
+                        "404 Not Found",
+                        "Transaction not found or is unconfirmed".to_owned(),
+                    ),
+                }
+            } else if path.ends_with("/blocks/tip/hash") {
                 state.tips_asked.push(std::time::Instant::now());
-                ("200 OK", format!("{:064x}", state.tip))
+                ("200 OK", state.block_id(&chain, state.tip))
             } else if path.ends_with("/blocks/tip/height") {
                 ("200 OK", state.tip.to_string())
             } else if path.ends_with("/blocks") {
@@ -762,10 +1183,11 @@ impl FakeMempool {
                 let blocks: Vec<Value> = (tip.saturating_sub(9)..=tip)
                     .rev()
                     .map(|height| {
+                        let header = state.header_in(&chain, height);
                         json!({
-                            "id": state.block_id(height),
+                            "id": header.block_hash().to_string(),
                             "height": height,
-                            "previousblockhash": height.checked_sub(1).map(|below| state.block_id(below)),
+                            "previousblockhash": (height > 0).then(|| header.prev_blockhash.to_string()),
                         })
                     })
                     .collect();
@@ -775,15 +1197,46 @@ impl FakeMempool {
                 .and_then(|(_, height)| height.parse::<u32>().ok())
             {
                 if height <= state.tip {
-                    ("200 OK", state.block_id(height))
+                    ("200 OK", state.block_id(&chain, height))
                 } else {
                     ("404 Not Found", "Block not found".to_owned())
                 }
             } else if path.ends_with("/utxo") {
-                ("200 OK", "[]".to_owned())
+                ("200 OK", Value::Array(state.utxos.clone()).to_string())
+            } else if let Some(key) = script.as_ref().filter(|_| path.contains("/txs")) {
+                let history = state.scripts[key].clone();
+                (
+                    "200 OK",
+                    Value::Array(state.history_page(&chain, &history, path)).to_string(),
+                )
+            } else if let Some(key) = script {
+                state.looked_up.push(key.clone());
+                let side = |confirmed: bool| {
+                    let txs: Vec<&Value> = state.scripts[&key]
+                        .iter()
+                        .filter(|tx| (tx["status"]["confirmed"] == true) == confirmed)
+                        .collect();
+                    let funded: u64 = txs
+                        .iter()
+                        .map(|tx| tx["vout"][0]["value"].as_u64().unwrap_or(0))
+                        .sum();
+                    json!({
+                        "funded_txo_count": txs.len(), "funded_txo_sum": funded,
+                        "spent_txo_count": 0, "spent_txo_sum": 0, "tx_count": txs.len(),
+                    })
+                };
+                (
+                    "200 OK",
+                    json!({ "scripthash": key, "chain_stats": side(true), "mempool_stats": side(false) })
+                        .to_string(),
+                )
             } else if path.ends_with("/txs") || path.contains("/txs/chain/") {
                 state.history_pages += 1;
-                ("200 OK", Value::Array(state.history_page(path)).to_string())
+                let history = state.address_txs.clone();
+                (
+                    "200 OK",
+                    Value::Array(state.history_page(&chain, &history, path)).to_string(),
+                )
             } else if let Some(address) = path.rsplit_once("/address/").map(|(_, a)| a) {
                 let count = |confirmed: bool| {
                     let txs = state
@@ -819,11 +1272,22 @@ impl FakeMempool {
                 ("404 Not Found", "Not Found".to_owned())
             }
         };
-        let answer = format!(
-            "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        let body = raw.unwrap_or_else(|| body.into_bytes());
+        let mut answer = format!(
+            "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
-        );
-        let _ = stream.write_all(answer.as_bytes()).await;
+        )
+        .into_bytes();
+        answer.extend_from_slice(&body);
+        let _ = stream.write_all(&answer).await;
+    }
+
+    /// The header of the chain the REST side serves at `height`.
+    pub(crate) fn header_at_height(
+        state: &MempoolState,
+        height: u32,
+    ) -> bdk_wallet::bitcoin::block::Header {
+        state.header_in(&state.chain(), height)
     }
 
     pub(crate) fn backend(&self) -> BackendConfig {

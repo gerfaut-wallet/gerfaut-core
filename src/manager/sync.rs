@@ -196,7 +196,13 @@ impl WalletManager {
     /// a replacement paying the same amount leaves the counters as they
     /// were.
     pub async fn sync_wallet(&self, id: &str) -> CoreResult<SyncReport> {
-        let reach = self.routine_reach(id).await;
+        let (reach, network) = self.routine_reach(id).await;
+        // The sync the app runs, the one as it opens among them, waits
+        // for the first pass of a watch of the wallet's network
+        // (`live_first_pass`), and before it takes the wallet's turn.
+        if let Some(network) = network {
+            self.live_first_pass(network).await;
+        }
         let (report, _) = self.sync_wallet_read(id, reach, None).await?;
         self.live_offer(&report);
         Ok(report)
@@ -207,27 +213,31 @@ impl WalletManager {
     /// watches the addresses it revealed, so funds that landed past
     /// them, or a descriptor also used elsewhere, are only found by
     /// starting over. A watched address has no gap: this is a sync.
+    /// Asked for by the person, it does not wait for the first session
+    /// of the live watch.
     pub async fn rescan_wallet(&self, id: &str) -> CoreResult<SyncReport> {
         let (report, _) = self.sync_wallet_read(id, Reach::Full, None).await?;
         self.live_offer(&report);
         Ok(report)
     }
 
-    /// How far a sync the app asks for reads: see [`Self::sync_wallet`].
-    async fn routine_reach(&self, id: &str) -> Reach {
+    /// How far a sync the app asks for reads: see [`Self::sync_wallet`];
+    /// and the network of the wallet, when there is such a wallet.
+    async fn routine_reach(&self, id: &str) -> (Reach, Option<Network>) {
         let done_here = self
             .complete_here
             .lock()
             .map(|done| done.contains(id))
             .unwrap_or(false);
         let state = self.state.lock().await;
-        let recent = find_record(&state.payload, id)
-            .is_ok_and(|record| complete_lately(&record.meta, now_secs()));
-        if done_here && recent {
+        let record = find_record(&state.payload, id).ok();
+        let recent = record.is_some_and(|record| complete_lately(&record.meta, now_secs()));
+        let reach = if done_here && recent {
             Reach::Checked
         } else {
             Reach::Complete
-        }
+        };
+        (reach, record.map(|record| record.meta.network))
     }
 
     /// One sync of a wallet at a time, whoever asks: the app, a
@@ -878,10 +888,22 @@ fn relegation_for(before: u32) -> Duration {
 }
 
 /// One error covering every endpoint tried, so the user sees each
-/// backend's outcome instead of only the last one.
+/// backend's outcome instead of only the last one. When one of them was
+/// refused for a proof that does not hold, the error says so by its code
+/// ([`CoreError::FalseProof`]).
 pub(super) fn sync_failure(endpoints: &[Endpoint], attempts: Vec<String>) -> CoreError {
+    let backend = config_label(endpoints);
+    if attempts
+        .iter()
+        .any(|attempt| chain::proof::is_false_proof(attempt))
+    {
+        return CoreError::FalseProof {
+            backend,
+            detail: attempts.join("; "),
+        };
+    }
     CoreError::Sync {
-        backend: config_label(endpoints),
+        backend,
         detail: if attempts.is_empty() {
             "no backend available".to_owned()
         } else {

@@ -105,10 +105,9 @@ fn top_chain(network: Network, proven: &[Proven]) -> Option<&Headers> {
         .chain
         .windows(2)
         .all(|pair| pair[1].prev_blockhash == pair[0].block_hash());
-    let worked = top
-        .chain
-        .iter()
-        .all(|header| has_proof_of_work(network, header));
+    let worked = (top.first..)
+        .zip(&top.chain)
+        .all(|(height, header)| has_proof_of_work(network, height, header));
     let holds_all = proven.iter().all(|proven| {
         block_of(proven).is_some_and(|(height, header)| {
             top.at(height)

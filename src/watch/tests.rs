@@ -41,6 +41,7 @@ fn timings() -> Timings {
         refused: Duration::from_millis(600),
         limit_kept: Duration::from_secs(3600),
         zero_limit_kept: Duration::from_secs(3600),
+        first_session: Duration::from_secs(5),
         stale: Duration::from_secs(3600),
     }
 }
@@ -2818,7 +2819,7 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
     let announced = |stage| {
         LiveEvent::Transaction(LiveTx {
             wallet_id: wallet.id.clone(),
-            txid: "11".repeat(32),
+            txid: crate::testkit::esplora_txid(0x11),
             net_sats: 50_000,
             stage,
             replaces: None,
@@ -2854,12 +2855,12 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
         wallet_id: wallet.id.clone(),
         new_tx_count: 1,
         new_txs: vec![crate::wallet::snapshot::NewTx {
-            txid: "11".repeat(32),
+            txid: crate::testkit::esplora_txid(0x11),
             net_sats: 50_000,
             confirmed: false,
         }],
         confirmed_txs: vec![crate::wallet::snapshot::NewTx {
-            txid: "11".repeat(32),
+            txid: crate::testkit::esplora_txid(0x11),
             net_sats: 50_000,
             confirmed: true,
         }],
@@ -2888,8 +2889,9 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
     // after the sync that found it, whether or not that is the caller
     // that ran the sync.
     let mut second = payment(false);
-    second["txid"] = json!("44".repeat(32));
     second["vin"][0]["txid"] = json!("55".repeat(32));
+    let second_txid = crate::testkit::listed_txid(&second);
+    second["txid"] = json!(second_txid);
     server.state.lock().unwrap().address_txs = vec![second, payment(true)];
     let found = reopened.sync_wallet(&wallet.id).await.unwrap();
     assert_eq!(found.new_txs.len(), 1);
@@ -2904,7 +2906,7 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
         claimed,
         vec![LiveTx {
             wallet_id: wallet.id.clone(),
-            txid: "44".repeat(32),
+            txid: second_txid,
             net_sats: 50_000,
             stage: TxStage::Mempool,
             replaces: None,

@@ -12,6 +12,7 @@
   "unreadable_backup": "unreadable_backup",
   "newer_format": "newer_format",
   "sync": "sync",
+  "false_proof": "false_proof",
   "broadcast": "broadcast",
   "backend_unavailable": "backend_unavailable",
   "tor": "tor",

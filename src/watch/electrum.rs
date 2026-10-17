@@ -767,7 +767,7 @@ impl Session {
             .get("hex")
             .and_then(Value::as_str)
             .and_then(|hex| deserialize_hex::<Header>(hex).ok())
-            .filter(|header| has_proof_of_work(network, header));
+            .filter(|header| has_proof_of_work(network, height, header));
         let Some(header) = header else {
             self.headers = None;
             return;
