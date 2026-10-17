@@ -321,12 +321,27 @@ pub(crate) const GITHUB_API_VERSION: &str = "2026-03-10";
 /// has to go through Tor; the name of the host then goes to the proxy,
 /// never to a resolver.
 ///
-/// A version GitHub no longer supports is answered `410 Gone`, with a
-/// message that says so: an install left without updates for years,
-/// the one the check is for, then asks once more without naming one, as
-/// GitHub reads it by default. A `410` about anything else, a removed
-/// repository say, is a failed check like any other.
+/// A version GitHub no longer supports is answered `410 Gone`: an
+/// install left without updates for years, the one the check is for,
+/// then asks once more without naming one, as GitHub reads it by
+/// default. Once, and both requests within the one budget of the check.
 pub(crate) async fn latest_tag(api: &str, repo: &str, proxy: Option<&str>) -> CoreResult<String> {
+    latest_tag_within(api, repo, proxy, budget(proxy)).await
+}
+
+/// [`latest_tag`], all of it within `budget`.
+pub(crate) async fn latest_tag_within(
+    api: &str,
+    repo: &str,
+    proxy: Option<&str>,
+    budget: std::time::Duration,
+) -> CoreResult<String> {
+    tokio::time::timeout(budget, ask_latest(api, repo, proxy))
+        .await
+        .map_err(|_| check_error("timed out".to_owned()))?
+}
+
+async fn ask_latest(api: &str, repo: &str, proxy: Option<&str>) -> CoreResult<String> {
     let client = client(proxy)?;
     let ask = |version: Option<&'static str>| {
         let mut request = client
@@ -339,10 +354,6 @@ pub(crate) async fn latest_tag(api: &str, repo: &str, proxy: Option<&str>) -> Co
     };
     let mut response = ask(Some(GITHUB_API_VERSION)).await.map_err(failed)?;
     if response.status() == reqwest::StatusCode::GONE {
-        let gone = response.status();
-        if !names_a_version(&body_of(response).await?) {
-            return Err(check_error(format!("http {gone}")));
-        }
         response = ask(None).await.map_err(failed)?;
     }
     if !response.status().is_success() {
@@ -371,23 +382,17 @@ async fn body_of(mut response: reqwest::Response) -> CoreResult<Vec<u8>> {
     Ok(body)
 }
 
-/// Whether a `410 Gone` is about the version of the API the request
-/// named: GitHub's message says "version", whatever else it says.
-fn names_a_version(body: &[u8]) -> bool {
-    let said = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| value["message"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
-    said.to_lowercase().contains("version")
+/// How long a check may take, its every request together: a Tor
+/// circuit is slower to build than a connection is to open.
+fn budget(proxy: Option<&str>) -> std::time::Duration {
+    std::time::Duration::from_secs(if proxy.is_some() { 60 } else { 15 })
 }
 
 /// The client the check goes out with: through the Tor proxy when there
 /// is one, and through no other proxy at all.
 fn client(proxy: Option<&str>) -> CoreResult<reqwest::Client> {
-    // A Tor circuit is slower to build than a connection is to open.
-    let budget = if proxy.is_some() { 60 } else { 15 };
     let mut builder = crate::chain::http_client()
-        .timeout(std::time::Duration::from_secs(budget))
+        .timeout(budget(proxy))
         .user_agent("gerfaut")
         .redirect(crate::chain::redirects());
     if let Some(proxy) = proxy {

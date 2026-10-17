@@ -19,16 +19,27 @@ const NOW: u64 = 1_800_000_000;
 const ONION: &str = "tcp://gerfautexample000000000000000000000000000000000000000.onion:50001";
 
 /// Something that answers like the releases API: the tag a test sets,
-/// or a failure when it sets none, and counts who came. Retired, it
-/// answers `410 Gone` with the message it was given to a request that
-/// names the API version.
+/// or a failure when it sets none, and counts who came. Gone, it
+/// answers `410 Gone` to a request that names the API version, or to
+/// every request.
 struct Releases {
     api: String,
     visits: Arc<Mutex<u32>>,
     tag: Arc<Mutex<Option<String>>>,
     /// The head of each request, lowercased, in the order they came.
     heads: Arc<Mutex<Vec<String>>>,
-    retired: Arc<Mutex<Option<String>>>,
+    gone: Arc<Mutex<Option<Gone>>>,
+}
+
+/// What the releases API answers `410 Gone` to.
+#[derive(Clone, Copy)]
+enum Gone {
+    /// A request that names the API version; the others hang.
+    VersionedAndStall,
+    /// A request that names the API version.
+    Versioned,
+    /// Every request.
+    Every,
 }
 
 impl Releases {
@@ -38,31 +49,49 @@ impl Releases {
         let visits = Arc::new(Mutex::new(0u32));
         let tag = Arc::new(Mutex::new(Some(tag.to_owned())));
         let heads: Arc<Mutex<Vec<String>>> = Arc::default();
-        let retired: Arc<Mutex<Option<String>>> = Arc::default();
-        let (counted, answered, seen, gone) =
-            (visits.clone(), tag.clone(), heads.clone(), retired.clone());
+        let gone: Arc<Mutex<Option<Gone>>> = Arc::default();
+        let (counted, answered, seen, going) =
+            (visits.clone(), tag.clone(), heads.clone(), gone.clone());
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 *counted.lock().unwrap() += 1;
-                let mut request = [0u8; 2048];
-                let read = stream.read(&mut request).await.unwrap_or(0);
-                let head = String::from_utf8_lossy(&request[..read]).to_lowercase();
+                // The whole head, up to the blank line, however many
+                // reads it comes in.
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&request).to_lowercase();
                 let versioned = head.contains("\r\nx-github-api-version:");
                 seen.lock().unwrap().push(head);
-                let gone = gone.lock().unwrap().clone();
-                let tag = match gone {
-                    Some(message) if versioned => {
-                        let body = format!(r#"{{"message":"{message}","status":"410"}}"#);
-                        let answer = format!(
-                            "HTTP/1.1 410 Gone\r\nContent-Type: application/json\r\n\
-                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        );
-                        let _ = stream.write_all(answer.as_bytes()).await;
-                        continue;
-                    }
-                    _ => answered.lock().unwrap().clone(),
+                let gone = match *going.lock().unwrap() {
+                    Some(Gone::Every) => true,
+                    Some(Gone::Versioned | Gone::VersionedAndStall) => versioned,
+                    None => false,
                 };
+                if gone {
+                    let body = r#"{"message":"Gone","status":"410"}"#;
+                    let answer = format!(
+                        "HTTP/1.1 410 Gone\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                    continue;
+                }
+                if matches!(*going.lock().unwrap(), Some(Gone::VersionedAndStall)) {
+                    // Holds the connection, answering nothing.
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        drop(stream);
+                    });
+                    continue;
+                }
+                let tag = answered.lock().unwrap().clone();
                 let answer = match tag {
                     // The page it names is never the one an app opens.
                     Some(tag) => {
@@ -87,14 +116,13 @@ impl Releases {
             visits,
             tag,
             heads,
-            retired,
+            gone,
         }
     }
 
-    /// From now on, a request that names a version is answered `410
-    /// Gone`, with `message`.
-    fn gone_with(&self, message: &str) {
-        *self.retired.lock().unwrap() = Some(message.to_owned());
+    /// From now on, what `gone` names is answered `410 Gone`.
+    fn gone(&self, gone: Gone) {
+        *self.gone.lock().unwrap() = Some(gone);
     }
 
     fn heads(&self) -> Vec<String> {
@@ -209,7 +237,7 @@ async fn the_check_names_the_api_version() {
 #[tokio::test]
 async fn a_retired_api_version_asks_again_without_one() {
     let releases = Releases::start("v0.2.0").await;
-    releases.gone_with("API version 2026-03-10 is no longer supported.");
+    releases.gone(Gone::Versioned);
     let dir = tempfile::tempdir().unwrap();
     let manager = open(dir.path()).await;
 
@@ -221,12 +249,12 @@ async fn a_retired_api_version_asks_again_without_one() {
     assert!(!heads[1].contains("\r\nx-github-api-version:"));
 }
 
-/// A `410` about anything but the version, a repository taken down
-/// say, fails the check without a second request.
+/// A `410` to the second request too, a repository taken down say,
+/// fails the check: one more request, never a third.
 #[tokio::test]
-async fn another_gone_is_a_failed_check() {
+async fn a_gone_asks_once_more_and_no_more() {
     let releases = Releases::start("v0.2.0").await;
-    releases.gone_with("Repository access blocked");
+    releases.gone(Gone::Every);
     let dir = tempfile::tempdir().unwrap();
     let manager = open(dir.path()).await;
 
@@ -234,7 +262,26 @@ async fn another_gone_is_a_failed_check() {
         releases.button(&manager, "0.1.0").await,
         Err(CoreError::Sync { .. })
     ));
-    assert_eq!(releases.heads().len(), 1, "no second request");
+    assert_eq!(releases.heads().len(), 2, "one more request, no third");
+}
+
+/// The second request comes out of the check's budget, not a new one:
+/// a `410` then a server that says nothing ends at the budget.
+#[tokio::test]
+async fn the_second_request_keeps_to_the_budget() {
+    let releases = Releases::start("v0.2.0").await;
+    releases.gone(Gone::VersionedAndStall);
+    let started = std::time::Instant::now();
+    let answer = crate::updates::latest_tag_within(
+        &releases.api,
+        REPO,
+        None,
+        std::time::Duration::from_millis(800),
+    )
+    .await;
+    assert!(matches!(answer, Err(CoreError::Sync { .. })), "{answer:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    assert_eq!(releases.heads().len(), 2);
 }
 
 /// A clock a year ahead at the first launch, then set right: the first
