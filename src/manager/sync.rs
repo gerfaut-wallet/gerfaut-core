@@ -333,8 +333,7 @@ impl WalletManager {
         } else {
             reach
         };
-        let mut attempts: Vec<String> = Vec::new();
-        let mut failed: Vec<&Endpoint> = Vec::new();
+        let mut attempts = Attempts::default();
 
         for endpoint in endpoints {
             // Build a fresh plan under the lock (a plan is consumed by
@@ -348,12 +347,7 @@ impl WalletManager {
 
             let response = chain::sync_engine(endpoint, plan, proxy).await;
             match response {
-                Err(detail) => {
-                    if chain::is_outage(&detail) {
-                        failed.push(endpoint);
-                    }
-                    attempts.push(format!("{}: {detail}", endpoint.label()));
-                }
+                Err(detail) => attempts.failed(endpoint, &detail),
                 Ok(synced) => {
                     let mut state = self.state.lock().await;
                     state.orders.extend(synced.orders);
@@ -415,7 +409,7 @@ impl WalletManager {
                         complete,
                     )?;
                     drop(state);
-                    self.answered_after(endpoint, &failed);
+                    self.answered_after(endpoint, &attempts.down);
                     if complete && let Ok(mut done) = self.complete_here.lock() {
                         done.insert(meta.id.clone());
                     }
@@ -424,7 +418,7 @@ impl WalletManager {
             }
         }
 
-        Err(sync_failure(endpoints, attempts))
+        Err(sync_failure(endpoints, attempts.said))
     }
 
     async fn sync_address_wallet(
@@ -435,7 +429,7 @@ impl WalletManager {
         proxy: Option<&str>,
         started: Instant,
     ) -> CoreResult<(SyncReport, Endpoint)> {
-        let mut attempts: Vec<String> = Vec::new();
+        let mut attempts = Attempts::default();
         // What the wallet holds: what the server lists as it was is not
         // read again.
         let held: Vec<AddressTx> = {
@@ -446,15 +440,9 @@ impl WalletManager {
                 .map(|watch| watch.txs.clone())
                 .unwrap_or_default()
         };
-        let mut failed: Vec<&Endpoint> = Vec::new();
         for endpoint in endpoints {
             match chain::fetch_address_state(endpoint, address, meta.network, proxy, &held).await {
-                Err(detail) => {
-                    if chain::is_outage(&detail) {
-                        failed.push(endpoint);
-                    }
-                    attempts.push(format!("{}: {detail}", endpoint.label()));
-                }
+                Err(detail) => attempts.failed(endpoint, &detail),
                 Ok(mut watch) => {
                     let mut state = self.state.lock().await;
                     // Against the state as stored, before the older
@@ -510,12 +498,12 @@ impl WalletManager {
                         true,
                     )?;
                     drop(state);
-                    self.answered_after(endpoint, &failed);
+                    self.answered_after(endpoint, &attempts.down);
                     return Ok((report, endpoint.clone()));
                 }
             }
         }
-        Err(sync_failure(endpoints, attempts))
+        Err(sync_failure(endpoints, attempts.said))
     }
 
     /// Fetches an older round of history for a watched address and
@@ -547,8 +535,7 @@ impl WalletManager {
         let endpoints = self.sync_endpoints(&meta, &config, &certs, None)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
 
-        let mut attempts: Vec<String> = Vec::new();
-        let mut failed: Vec<&Endpoint> = Vec::new();
+        let mut attempts = Attempts::default();
         for endpoint in &endpoints {
             match chain::fetch_address_history(
                 endpoint,
@@ -559,12 +546,7 @@ impl WalletManager {
             )
             .await
             {
-                Err(detail) => {
-                    if chain::is_outage(&detail) {
-                        failed.push(endpoint);
-                    }
-                    attempts.push(format!("{}: {detail}", endpoint.label()));
-                }
+                Err(detail) => attempts.failed(endpoint, &detail),
                 Ok(round) => {
                     let mut state = self.state.lock().await;
                     let record = find_record_mut(&mut state.payload, id)?;
@@ -586,12 +568,12 @@ impl WalletManager {
                     record.meta.cached.tx_count = tx_count;
                     state.vault.save(&state.payload)?;
                     drop(state);
-                    self.answered_after(endpoint, &failed);
+                    self.answered_after(endpoint, &attempts.down);
                     return Ok(added);
                 }
             }
         }
-        Err(sync_failure(&endpoints, attempts))
+        Err(sync_failure(&endpoints, attempts.said))
     }
 
     /// The servers a sync of the wallet of `meta` tries, in order.
@@ -703,6 +685,25 @@ fn sync_order(
         endpoints.insert(0, first);
     }
     endpoints
+}
+
+/// What the servers a sync tried before one answered said, and those of
+/// them that were down.
+#[derive(Default)]
+struct Attempts<'a> {
+    /// Each server's words, for the error the sync fails with.
+    said: Vec<String>,
+    /// The ones relegated if a later one answers ([`chain::is_outage`]).
+    down: Vec<&'a Endpoint>,
+}
+
+impl<'a> Attempts<'a> {
+    fn failed(&mut self, endpoint: &'a Endpoint, detail: &str) {
+        if chain::is_outage(detail) {
+            self.down.push(endpoint);
+        }
+        self.said.push(format!("{}: {detail}", endpoint.label()));
+    }
 }
 
 /// How long a server that failed while a later one answered is first
