@@ -376,8 +376,10 @@ impl WalletManager {
             let response = chain::sync_engine(endpoint, plan, proxy).await;
             match response {
                 Err(detail) => {
+                    if chain::is_outage(&detail) {
+                        failed.push(endpoint);
+                    }
                     attempts.push(format!("{}: {detail}", endpoint.label()));
-                    failed.push(endpoint);
                 }
                 Ok(synced) => {
                     self.answered_after(endpoint, &failed);
@@ -475,8 +477,10 @@ impl WalletManager {
         for endpoint in endpoints {
             match chain::fetch_address_state(endpoint, address, meta.network, proxy, &held).await {
                 Err(detail) => {
+                    if chain::is_outage(&detail) {
+                        failed.push(endpoint);
+                    }
                     attempts.push(format!("{}: {detail}", endpoint.label()));
-                    failed.push(endpoint);
                 }
                 Ok(mut watch) => {
                     self.answered_after(endpoint, &failed);
@@ -582,8 +586,10 @@ impl WalletManager {
             .await
             {
                 Err(detail) => {
+                    if chain::is_outage(&detail) {
+                        failed.push(endpoint);
+                    }
                     attempts.push(format!("{}: {detail}", endpoint.label()));
-                    failed.push(endpoint);
                 }
                 Ok(round) => {
                     self.answered_after(endpoint, &failed);
@@ -690,12 +696,17 @@ fn sync_order(
 const RELEGATION_FIRST: Duration = Duration::from_secs(5 * 60);
 const RELEGATION_MAX: Duration = Duration::from_secs(60 * 60);
 
-/// The servers a sync tries after the others for a while. One that
-/// fails where a later one of the same list answers costs its timeout
-/// to every sync that starts with it, wallet after wallet: it is tried
-/// last for [`RELEGATION_FIRST`], then twice as long each time it fails
-/// so again, up to [`RELEGATION_MAX`], and no longer once it answers.
-/// When every server fails, the request is at fault, and none is.
+/// The servers a sync tries after the others for a while. One that is
+/// down where a later one of the same list answers costs its timeout to
+/// every sync that starts with it, wallet after wallet: it is tried last
+/// for [`RELEGATION_FIRST`], then twice as long each time it is so
+/// again, up to [`RELEGATION_MAX`], and no longer once it answers.
+///
+/// Only an outage counts ([`chain::is_outage`]): a refusal of one
+/// request, a history too long for that server, says nothing of the
+/// next wallet, and relegating the server for it would send that wallet
+/// to the others. When every server fails, the request is at fault, and
+/// none is relegated.
 ///
 /// Only the order changes, among the servers the backend names: none
 /// is added, since the more often a sync turns to the others, the more
@@ -734,9 +745,9 @@ impl Relegations {
         kept.into_iter().chain(relegated).collect()
     }
 
-    /// `answered` answered at `now`, after each of `failed` did not:
+    /// `answered` answered at `now`, after each of `failed` was down:
     /// those are relegated, unless one already is, by another sync that
-    /// met the same failure, and `answered` is no longer.
+    /// met the same outage, and `answered` is no longer.
     fn answered(&mut self, answered: &Endpoint, failed: &[&Endpoint], now: tokio::time::Instant) {
         self.0.remove(answered);
         for endpoint in failed {

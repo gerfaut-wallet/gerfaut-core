@@ -887,6 +887,30 @@ mod tests {
         assert_eq!((calls, waited), (1, false));
     }
 
+    /// A connection that fails, in the words this client puts it in, is an
+    /// outage, and so is a server out of memory twice in a row; another
+    /// refusal is not.
+    #[test]
+    fn connections_that_fail_are_outages() {
+        use crate::chain::is_outage;
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::UnexpectedEof,
+        ] {
+            let detail = describe_io(&Error::from(kind), TIMEOUT);
+            assert!(is_outage(&detail), "{kind:?}: {detail}");
+        }
+        assert!(is_outage(&describe(&out_of_memory(), TIMEOUT)));
+        let refused = electrum_client::Error::Protocol(serde_json::json!({
+            "code": 1, "message": "Too many history entries",
+        }));
+        assert!(!is_outage(&describe(&refused, TIMEOUT)));
+    }
+
     /// A sync whose server turns transactions down for want of memory,
     /// the electrs of Blockstream under load, waits and asks for them
     /// again on its connection, and reads the wallet there: before, the

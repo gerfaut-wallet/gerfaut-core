@@ -1378,6 +1378,18 @@ mod error_tests {
         assert_eq!(short.take_rate_limit(), Some(RATE_WAIT_MIN));
     }
 
+    /// A server error or a limited rate is an outage, in the words this
+    /// client puts them in; a request the server finds bad is not.
+    #[test]
+    fn server_errors_and_limited_rates_are_outages() {
+        use crate::chain::is_outage;
+        assert!(is_outage(&describe_status(500)));
+        assert!(is_outage(&describe_status(503)));
+        assert!(is_outage(&rate_limited(RATE_WAIT_MIN)));
+        assert!(!is_outage(&describe_status(400)));
+        assert!(!is_outage(&describe_status(404)));
+    }
+
     /// `Retry-After` names a wait in seconds, or the date to come back at.
     #[test]
     fn a_retry_after_date_is_a_wait_until_then() {

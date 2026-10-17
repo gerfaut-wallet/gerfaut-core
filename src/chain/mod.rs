@@ -183,6 +183,42 @@ pub(crate) fn server_words(text: &str) -> String {
     short
 }
 
+/// The words of a failed request that say the server is down, or asks
+/// for less, whatever was asked: the connection failed, timed out or was
+/// cut, its certificate would not do, the server answered HTTP 429 or a
+/// 5xx, or the electrs of Blockstream ran out of memory for its answers
+/// twice in a row. Each is this crate's own wording.
+const OUTAGES: [&str; 13] = [
+    "could not connect",
+    "timed out",
+    "the connection was closed",
+    "the connection ended unexpectedly",
+    "connection failed",
+    "host not found",
+    "TLS handshake failed",
+    "the server's certificate",
+    "no answer within",
+    "the server stopped reading",
+    "request failed",
+    "HTTP 429",
+    "HTTP 5",
+];
+
+/// Whether a request failed because of the server, not because of what
+/// was asked: see [`OUTAGES`]. A refusal in the server's own words, a
+/// history too long for it or a page it would not serve, is about one
+/// request or one wallet, whatever those words say, unless they are the
+/// ones of a server out of memory for its answers.
+pub(crate) fn is_outage(detail: &str) -> bool {
+    if ["the server refused", "the server will not send"]
+        .iter()
+        .any(|refused| detail.contains(refused))
+    {
+        return detail.contains("budget exhausted");
+    }
+    OUTAGES.iter().any(|outage| detail.contains(outage))
+}
+
 /// What every HTTP client of the core is built from: one that takes no
 /// proxy but the one its caller sets, the Tor proxy. Left to itself,
 /// reqwest sends its requests through whatever `HTTP_PROXY`,
@@ -1485,6 +1521,43 @@ mod tests {
         );
         twice.tx_update.txs = vec![paying(0, vec![coin, OutPoint { vout: 1, ..coin }])];
         assert!(check_amounts(&twice, 0).is_ok());
+    }
+
+    /// A server down, or asking for less, is an outage; a refusal of what
+    /// was asked is not, whatever words the server put in it, unless they
+    /// say it is out of memory for its answers. Nor is a server that lies.
+    #[test]
+    fn an_outage_is_told_from_a_refused_request() {
+        for outage in [
+            "could not connect within 10 s",
+            "could not connect through Tor: host unreachable",
+            "timed out after 20 s",
+            "the connection was closed",
+            "no answer within 600 s",
+            "TLS handshake failed: invalid peer certificate: UnknownIssuer",
+            "host not found",
+            "request failed",
+            "HTTP 503: server error",
+            "HTTP 429: rate limited, try again in 5 s",
+            "the server refused the request: response budget exhausted, retry later",
+            "the server refused the history of this address: response budget exhausted, retry later",
+        ] {
+            assert!(is_outage(outage), "{outage}");
+        }
+        for refused in [
+            "the server refused the request: history too large",
+            "the server refused the request: request timed out",
+            "the server will not send the history of this address, too long for it \
+             (could not connect); an Esplora backend can read it",
+            "HTTP 400: bad request",
+            "HTTP 404: not found",
+            "unexpected response",
+            ANOTHER_NETWORK,
+            IMPOSSIBLE_TIP,
+            "the history of this address changed since the last sync; sync the wallet and try again",
+        ] {
+            assert!(!is_outage(refused), "{refused}");
+        }
     }
 
     /// The highest tip a chain can have is far past the real one, with

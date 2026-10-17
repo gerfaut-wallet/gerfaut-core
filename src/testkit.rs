@@ -565,6 +565,9 @@ pub(crate) struct MempoolState {
     pub history_pages: usize,
     /// Every path the REST side was asked for, in order.
     pub paths: Vec<String>,
+    /// The REST side closes every connection without an answer, a server
+    /// that is down.
+    pub down: bool,
     /// The network whose genesis block the REST side names at height 0,
     /// signet when `None`.
     pub genesis: Option<bdk_wallet::bitcoin::Network>,
@@ -642,6 +645,13 @@ impl FakeMempool {
         };
         let head = String::from_utf8_lossy(&head[..read]).into_owned();
         let path = head.split(' ').nth(1).unwrap_or_default().to_owned();
+        {
+            let mut state = state.lock().unwrap();
+            if state.down {
+                state.paths.push(path);
+                return;
+            }
+        }
         if path.ends_with("/v1/ws") && state.lock().unwrap().websocket {
             Self::websocket(stream, state).await;
         } else {

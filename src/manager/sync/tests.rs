@@ -246,12 +246,14 @@ fn asked(server: &crate::testkit::FakeMempool) -> Vec<String> {
     std::mem::take(&mut server.state.lock().unwrap().paths)
 }
 
-/// The rotation of the automatic backend, one server that fails and one
-/// that answers: the first sync asks both, and the next one, of another
-/// wallet, asks only the one that answered. When every server fails,
-/// none is relegated: the next sync asks them in their order.
+/// The rotation of the automatic backend, one server that is down and
+/// one that answers: the first sync asks both, and the next one, of
+/// another wallet, asks only the one that answered. A server that
+/// refuses one request, here one of another network, is not relegated
+/// for it. When every server is down, none is: the next sync asks them
+/// in their order.
 #[tokio::test]
-async fn a_sync_tries_last_the_server_that_failed_where_another_answered() {
+async fn a_sync_tries_last_a_server_that_was_down_where_another_answered() {
     use crate::testkit::FakeMempool;
     let flaky = FakeMempool::start(false, 0).await;
     let steady = FakeMempool::start(false, 0).await;
@@ -262,46 +264,52 @@ async fn a_sync_tries_last_the_server_that_failed_where_another_answered() {
         ],
         &[],
     );
-    let other_network = Some(bdk_wallet::bitcoin::Network::Testnet4);
-    let watching = |address: &'static str| async move {
+    let watching = |addresses: &'static [&'static str]| async move {
         let dir = tempfile::tempdir().unwrap();
         let watcher = manager(dir.path()).await;
-        let wallet = watcher
-            .add_wallet(address, &parse_input(address).unwrap(), Network::Signet)
-            .await
-            .unwrap()
-            .id;
-        (dir, watcher, wallet)
+        let mut wallets = Vec::new();
+        for address in addresses {
+            let parsed = parse_input(address).unwrap();
+            let wallet = watcher.add_wallet(address, &parsed, Network::Signet).await;
+            wallets.push(wallet.unwrap().id);
+        }
+        (dir, watcher, wallets)
     };
+    let both = &[crate::testkit::ADDRESS, SECOND_ADDRESS];
 
-    let (_dir, watcher, first) = watching(crate::testkit::ADDRESS).await;
-    let second = watcher
-        .add_wallet(
-            "Second",
-            &parse_input(SECOND_ADDRESS).unwrap(),
-            Network::Signet,
-        )
-        .await
-        .unwrap()
-        .id;
-    flaky.state.lock().unwrap().genesis = other_network;
-    watcher.sync_wallet(&first).await.unwrap();
+    let (_dir, watcher, wallets) = watching(both).await;
+    flaky.state.lock().unwrap().down = true;
+    watcher.sync_wallet(&wallets[0]).await.unwrap();
     assert!(!asked(&flaky).is_empty());
     assert!(!asked(&steady).is_empty());
     // The other wallet has no server it last synced with.
-    watcher.sync_wallet(&second).await.unwrap();
+    watcher.sync_wallet(&wallets[1]).await.unwrap();
     assert_eq!(asked(&flaky), Vec::<String>::new());
     assert!(!asked(&steady).is_empty());
 
-    // Every server fails, on another manager: none is relegated.
-    let (_dir, watcher, wallet) = watching(SECOND_ADDRESS).await;
-    steady.state.lock().unwrap().genesis = other_network;
-    assert!(watcher.sync_wallet(&wallet).await.is_err());
+    // A refusal of what was asked: the next wallet asks it first again.
+    let (_dir, watcher, wallets) = watching(both).await;
+    {
+        let mut flaky = flaky.state.lock().unwrap();
+        flaky.down = false;
+        flaky.genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    }
+    watcher.sync_wallet(&wallets[0]).await.unwrap();
+    assert!(!asked(&flaky).is_empty());
+    watcher.sync_wallet(&wallets[1]).await.unwrap();
+    assert!(!asked(&flaky).is_empty(), "relegated for one refusal");
     flaky.state.lock().unwrap().genesis = None;
-    steady.state.lock().unwrap().genesis = None;
+
+    // Every server is down: none is relegated.
+    let (_dir, watcher, wallets) = watching(&[SECOND_ADDRESS]).await;
+    flaky.state.lock().unwrap().down = true;
+    steady.state.lock().unwrap().down = true;
+    assert!(watcher.sync_wallet(&wallets[0]).await.is_err());
+    flaky.state.lock().unwrap().down = false;
+    steady.state.lock().unwrap().down = false;
     asked(&flaky);
     asked(&steady);
-    watcher.sync_wallet(&wallet).await.unwrap();
+    watcher.sync_wallet(&wallets[0]).await.unwrap();
     assert!(!asked(&flaky).is_empty());
     assert_eq!(asked(&steady), Vec::<String>::new());
 }
