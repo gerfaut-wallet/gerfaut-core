@@ -288,6 +288,140 @@ fn replay(outcome: &CoreResult<QrProgress>) -> CoreResult<QrProgress> {
     }
 }
 
+// --- Scans held by an app ----------------------------------------------
+
+/// Most scans an app holds open at once. A screen opens one when its
+/// camera starts and closes it when it goes; one left open by a screen
+/// that never closed it is dropped when a new one would pass the bound.
+pub const MAX_OPEN_SCANS: usize = 4;
+
+/// Longest frame a scan takes, in bytes: what the largest QR code holds
+/// once decoded, 7,089 digits. Whatever is longer did not come from a
+/// camera, and the frames of a scan are kept until it ends.
+pub const MAX_FRAME_LEN: usize = 7_089;
+
+/// Most bytes of frames one scan takes before it is refused as a code
+/// larger than Gerfaut reads: past what [`MAX_SCAN_FRAMES`] frames of a
+/// large PSBT bring, far short of what they could at [`MAX_FRAME_LEN`].
+pub const MAX_SCAN_BYTES: usize = 16 << 20;
+
+/// The scans an app holds for its screens, each read one frame at a
+/// time: the apps keep one of these in their state and send each frame
+/// once, under the number [`QrScans::open`] gave the scan.
+///
+/// A scan ends with its answer: once a frame completes it or has it
+/// refused, what it held is dropped and the next frame starts a new
+/// one, which is what both screens do on a refusal. Bounded in number
+/// ([`MAX_OPEN_SCANS`]) and in the frames each takes: frames past
+/// [`MAX_FRAME_LEN`] are refused, and a scan past [`MAX_SCAN_BYTES`] or
+/// past its frame bound ([`scan_frame_limit`]) too.
+///
+/// Left unbounded by bytes: the fountain decoder of the `ur` crate
+/// keeps, for each mixed part it takes, the list of the fragments mixed
+/// in it, twice, 16 bytes a fragment. An honest scan of a 5,000-part
+/// code holds some 550 a part, about 40 MB at worst; a code drawn so
+/// that every part mixes thousands of fragments holds up to 700 MB at
+/// the frame bound, shown frame after frame for twenty minutes. The
+/// list handed whole to [`assemble`] at each frame reached the same
+/// peak. Counting it would take the degree of each part before the
+/// decoder does, which the crate only gives through `minicbor`, one
+/// more dependency, and a sampler call that underflows on a part
+/// numbered 0: left for a release after 0.1.0, or for a part bound
+/// smaller than the 5,000 parts a UR may announce.
+#[derive(Default)]
+pub struct QrScans {
+    open: std::sync::Mutex<OpenScans>,
+}
+
+#[derive(Default)]
+struct OpenScans {
+    /// The number the last scan opened was given.
+    last: u32,
+    /// Open scans, oldest first.
+    scans: std::collections::VecDeque<(u32, std::sync::Arc<std::sync::Mutex<HeldScan>>)>,
+}
+
+/// One scan an app holds, and the bytes of frames it took.
+#[derive(Default)]
+struct HeldScan {
+    scan: QrScan,
+    bytes: usize,
+}
+
+impl HeldScan {
+    fn push(&mut self, frame: &str) -> CoreResult<QrProgress> {
+        let taken = frame.trim().len();
+        if taken > MAX_FRAME_LEN {
+            return Err(qr_error("this frame is longer than any QR code holds"));
+        }
+        self.bytes += taken;
+        if self.bytes > MAX_SCAN_BYTES {
+            return Err(CoreError::TooManyFrames(self.scan.frames() as u32 + 1));
+        }
+        self.scan.push(frame)
+    }
+}
+
+/// The lock, taken back from a thread that panicked holding it.
+fn held<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl QrScans {
+    /// Opens a scan and gives the number its frames go under. The oldest
+    /// open scan is dropped when there are already [`MAX_OPEN_SCANS`].
+    pub fn open(&self) -> u32 {
+        let mut open = held(&self.open);
+        open.last = open.last.wrapping_add(1);
+        let id = open.last;
+        while open.scans.len() >= MAX_OPEN_SCANS {
+            open.scans.pop_front();
+        }
+        open.scans.push_back((id, Default::default()));
+        id
+    }
+
+    /// Gives one frame to an open scan: where it stands, as [`assemble`]
+    /// says of every frame it took. A scan that answers with its text or
+    /// a refusal starts again empty.
+    pub fn push(&self, id: u32, frame: &str) -> CoreResult<QrProgress> {
+        let scan = held(&self.open)
+            .scans
+            .iter()
+            .find(|(open, _)| *open == id)
+            .map(|(_, scan)| scan.clone())
+            .ok_or_else(|| qr_error("this scan was closed: open the scanner again"))?;
+        let mut scan = match scan.lock() {
+            Ok(scan) => scan,
+            // A frame that panicked the decoder left it halfway: the
+            // scan starts over rather than read on from there.
+            Err(poisoned) => {
+                scan.clear_poison();
+                let mut scan = poisoned.into_inner();
+                *scan = HeldScan::default();
+                scan
+            }
+        };
+        let outcome = scan.push(frame);
+        if !matches!(&outcome, Ok(progress) if !progress.complete) {
+            *scan = HeldScan::default();
+        }
+        outcome
+    }
+
+    /// Closes a scan and lets go of what it held; a scan already closed
+    /// is left as it is.
+    pub fn close(&self, id: u32) {
+        held(&self.open).scans.retain(|(open, _)| *open != id);
+    }
+
+    /// How many scans are open.
+    pub fn open_count(&self) -> usize {
+        held(&self.open).scans.len()
+    }
+}
+
 // --- Uniform Resources ------------------------------------------------
 
 /// `ur:TYPE/SEQ-TOTAL/PAYLOAD` → (type, Some(total)) or `ur:TYPE/PAYLOAD`
@@ -1820,5 +1954,71 @@ mod tests {
             Err(CoreError::TooManyFrames(2_003))
         ));
         assert_eq!(scan.frames(), MIN_SCAN_FRAMES + 3);
+    }
+
+    /// The scans an app holds: one frame at a time under its number,
+    /// started again after its answer, closed, bounded in number and in
+    /// what they take.
+    #[test]
+    fn the_scans_an_app_holds_are_bounded() {
+        let scans = QrScans::default();
+        let frames = bbqr_frames(&format!("wpkh({TPUB}/<0;1>/*)"), 3);
+        let id = scans.open();
+        assert!(!scans.push(id, &frames[0]).unwrap().complete);
+        assert_eq!(scans.push(id, &frames[2]).unwrap().received, 2);
+        let done = scans.push(id, &frames[1]).unwrap();
+        assert!(done.complete);
+        // The answer given, the scan starts again empty.
+        assert_eq!(scans.push(id, &frames[1]).unwrap().received, 1);
+
+        // A refusal starts it again too, as both screens do.
+        let other = bbqr_frames(&format!("pkh({TPUB}/<0;1>/*)"), 3);
+        let refused = scans.push(id, &other[1]).unwrap_err();
+        assert!(refused.to_string().contains("one at a time"), "{refused}");
+        assert_eq!(scans.push(id, &other[1]).unwrap().received, 1);
+
+        // A frame longer than any QR code holds is refused.
+        let long = format!("B$ZU0300{}", "A".repeat(MAX_FRAME_LEN));
+        assert!(matches!(
+            scans.push(id, &long),
+            Err(CoreError::InvalidInput { kind: "qr", .. })
+        ));
+
+        // So is a scan past its bytes, as a code larger than Gerfaut
+        // reads.
+        let wide = |seq: usize| format!("ur:bytes/{seq}-4000/{}", "a".repeat(MAX_FRAME_LEN - 20));
+        let mut bytes = 0;
+        let mut seq = 1;
+        let refused = loop {
+            let frame = wide(seq);
+            bytes += frame.len();
+            match scans.push(id, &frame) {
+                Ok(progress) => assert!(!progress.complete),
+                Err(e) => break e,
+            }
+            seq += 1;
+        };
+        assert!(bytes > MAX_SCAN_BYTES);
+        assert!(bytes - MAX_SCAN_BYTES <= MAX_FRAME_LEN);
+        assert!(matches!(refused, CoreError::TooManyFrames(n) if n as usize == seq));
+        assert_eq!(refused.code(), crate::error::ErrorCode::TooManyParts);
+
+        // Closed, a scan takes no more frames.
+        scans.close(id);
+        scans.close(id);
+        assert_eq!(scans.open_count(), 0);
+        assert!(matches!(
+            scans.push(id, &frames[0]),
+            Err(CoreError::InvalidInput { kind: "qr", .. })
+        ));
+
+        // The oldest goes past the bound.
+        let opened: Vec<u32> = (0..MAX_OPEN_SCANS + 2).map(|_| scans.open()).collect();
+        assert_eq!(scans.open_count(), MAX_OPEN_SCANS);
+        assert!(scans.push(opened[0], &frames[0]).is_err());
+        assert!(scans.push(opened[1], &frames[0]).is_err());
+        for id in &opened[2..] {
+            assert!(scans.push(*id, &frames[0]).is_ok());
+        }
     }
 }
