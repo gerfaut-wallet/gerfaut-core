@@ -9,6 +9,7 @@ pub mod connect;
 pub(crate) mod electrum;
 pub(crate) mod esplora;
 pub(crate) mod net;
+pub(crate) mod proof;
 pub mod public;
 pub(crate) mod tls;
 pub mod tor;
@@ -345,25 +346,7 @@ pub(crate) fn height_limit(network: Network, now: u64) -> u32 {
     u32::try_from(elapsed / FASTEST_BLOCK_SECS).unwrap_or(u32::MAX)
 }
 
-/// Whether a header carries the proof of work its target asks for, and
-/// that target is one the network allows. Signet blocks are made valid
-/// by a signature, not by work, and regtest blocks by nobody, so only
-/// mainnet and testnet4 are held to it. It does not prove the work the
-/// chain asks for at that height, which takes every header since the
-/// last retarget: a server that mines a header at the easiest target
-/// passes. What it refuses is a header no one mined at all.
-pub(crate) fn has_proof_of_work(
-    network: Network,
-    header: &bdk_wallet::bitcoin::block::Header,
-) -> bool {
-    if !matches!(network, Network::Mainnet | Network::Testnet4) {
-        return true;
-    }
-    let easiest =
-        bdk_wallet::bitcoin::params::Params::new(network.to_bitcoin()).max_attainable_target;
-    let target = header.target();
-    target <= easiest && target.is_met_by(header.block_hash())
-}
+pub(crate) use proof::has_proof_of_work;
 
 /// Whether a backend URL points at a Tor hidden service. Onion hosts
 /// are routed through the Tor proxy [`tor`] resolves, never looked up.
@@ -1578,19 +1561,19 @@ mod tests {
     fn a_header_no_one_mined_has_no_work() {
         use bdk_wallet::bitcoin::constants::genesis_block;
         let genesis = genesis_block(bdk_wallet::bitcoin::Network::Bitcoin).header;
-        assert!(has_proof_of_work(Network::Mainnet, &genesis));
+        assert!(has_proof_of_work(Network::Mainnet, 0, &genesis));
         let unmined = bdk_wallet::bitcoin::block::Header {
             nonce: genesis.nonce.wrapping_add(1),
             ..genesis
         };
-        assert!(!has_proof_of_work(Network::Mainnet, &unmined));
+        assert!(!has_proof_of_work(Network::Mainnet, 0, &unmined));
         // The easiest target there is, on a network that asks for more.
         let easy = bdk_wallet::bitcoin::block::Header {
             bits: bdk_wallet::bitcoin::CompactTarget::from_consensus(0x207f_ffff),
             ..genesis
         };
-        assert!(!has_proof_of_work(Network::Testnet4, &easy));
-        assert!(has_proof_of_work(Network::Signet, &unmined));
+        assert!(!has_proof_of_work(Network::Testnet4, 0, &easy));
+        assert!(has_proof_of_work(Network::Signet, 0, &unmined));
     }
 
     /// A descriptor wallet on signet whose backend is `backend`, synced

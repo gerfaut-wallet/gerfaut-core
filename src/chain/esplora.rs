@@ -709,7 +709,7 @@ pub(crate) async fn fetch_address_state(
     let our_script = address.script_pubkey();
     check_network(client, network).await?;
 
-    let tip_height = client.height().await?;
+    let tip_height = read_tip(client, network).await?;
     let stats = client.address_stats(&address).await?;
 
     let round = history_round(
@@ -717,24 +717,23 @@ pub(crate) async fn fetch_address_state(
         &address,
         &our_script,
         network,
+        tip_height,
         None,
         Some(stats.chain_stats.tx_count as usize),
         held,
     )
     .await?;
 
-    let utxos = client
-        .address_utxos(&address)
-        .await?
-        .into_iter()
-        .map(|utxo| AddressUtxo {
-            txid: utxo.txid.to_string(),
-            vout: utxo.vout,
-            value_sats: utxo.value,
-            height: utxo.status.block_height,
-            timestamp: utxo.status.block_time,
-        })
-        .collect();
+    let utxos = coins(
+        client,
+        network,
+        tip_height,
+        &our_script,
+        client.address_utxos(&address).await?,
+        &round,
+        held,
+    )
+    .await?;
 
     Ok(AddressWatchState {
         txs: round.txs,
@@ -743,6 +742,167 @@ pub(crate) async fn fetch_address_state(
         truncated: round.cursor.is_some(),
         history_cursor: round.cursor,
     })
+}
+
+/// The coins of the address, as far as what was read vouches for each,
+/// as over Electrum ([`crate::chain::electrum::address`]). A coin of a
+/// transaction of the round must be an output of it that pays the
+/// address that much, or the server is refused, and it is as confirmed as
+/// that transaction. When older transactions remain past the round, a
+/// coin of one of them, no higher than the round's oldest confirmation,
+/// is confirmed where the server puts it, at the time the wallet has for
+/// it, if the wallet holds its transaction there paying it, or if this
+/// session proved it there on the same server
+/// ([`crate::chain::proof::proven_coin`]). Otherwise its transaction is
+/// read again, counted against what the sync may keep, found to pay it,
+/// and its confirmation proven. Any other coin is taken as unconfirmed.
+/// A coin listed twice counts once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn coins(
+    client: &Client,
+    network: Network,
+    tip: u32,
+    ours: &bdk_wallet::bitcoin::ScriptBuf,
+    utxos: Vec<api::Utxo>,
+    round: &HistoryRound,
+    held: &[AddressTx],
+) -> Result<Vec<AddressUtxo>, String> {
+    use crate::chain::proof::{ProvenCoin, pays, proven_coin, remember_coin};
+    use bdk_wallet::chain::BlockId;
+    use std::collections::{HashMap, HashSet};
+    let in_round: HashMap<&str, &AddressTx> =
+        round.txs.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
+    let held: HashMap<&str, &AddressTx> = held.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
+    let oldest = round.txs.iter().filter_map(|tx| tx.height).min();
+    let mut seen = HashSet::new();
+    let utxos: Vec<(String, api::Utxo)> = utxos
+        .into_iter()
+        .filter(|utxo| seen.insert((utxo.txid, utxo.vout)))
+        .map(|utxo| (utxo.txid.to_string(), utxo))
+        .collect();
+    let proven_as = |utxo: &api::Utxo, height: u32| ProvenCoin {
+        script: ours.clone(),
+        value: utxo.value,
+        height,
+        time: None,
+    };
+    let outpoint = |utxo: &api::Utxo| OutPoint::new(utxo.txid, utxo.vout);
+
+    // Where each coin past the round stands: vouched for, at the time
+    // given, or its transaction to read again and prove.
+    let mut vouched: HashMap<(Txid, u32), Option<u64>> = HashMap::new();
+    let mut unread: Vec<(Txid, BlockId)> = Vec::new();
+    let mut to_read: HashSet<(Txid, BlockId)> = HashSet::new();
+    for (txid, utxo) in &utxos {
+        let block = match (utxo.status.block_height, utxo.status.block_hash, oldest) {
+            (Some(height), Some(hash), Some(oldest))
+                if round.cursor.is_some()
+                    && height <= oldest
+                    && !in_round.contains_key(txid.as_str()) =>
+            {
+                BlockId { height, hash }
+            }
+            _ => continue,
+        };
+        let from_held = held
+            .get(txid.as_str())
+            .filter(|tx| tx.height == Some(block.height) && tx.pays(utxo.vout, utxo.value))
+            .map(|tx| tx.timestamp);
+        match from_held.or_else(|| {
+            proven_coin(
+                network,
+                &client.base,
+                outpoint(utxo),
+                &proven_as(utxo, block.height),
+            )
+        }) {
+            Some(time) => {
+                vouched.insert((utxo.txid, utxo.vout), time);
+            }
+            None => {
+                if to_read.insert((utxo.txid, block)) {
+                    unread.push((utxo.txid, block));
+                }
+            }
+        }
+    }
+
+    // Each transaction read again is counted, checked against every coin
+    // listed of it, and dropped.
+    let mut listed_of: HashMap<Txid, Vec<&api::Utxo>> = HashMap::new();
+    for (_, utxo) in &utxos {
+        listed_of.entry(utxo.txid).or_default().push(utxo);
+    }
+    let mut read: HashSet<Txid> = HashSet::new();
+    for chunk in unread.chunks(PARALLEL_REQUESTS) {
+        let txs = futures_util::future::try_join_all(chunk.iter().map(|(txid, _)| client.tx(txid)))
+            .await?;
+        for ((txid, _), tx) in chunk.iter().zip(txs) {
+            let Some(tx) = tx else {
+                continue;
+            };
+            if tx.compute_txid() != *txid {
+                return Err(
+                    "the server answered with another transaction than the one asked for"
+                        .to_owned(),
+                );
+            }
+            client.keep(tx.total_size())?;
+            let paid = listed_of
+                .get(txid)
+                .into_iter()
+                .flatten()
+                .all(|utxo| pays(&tx, utxo.vout, ours, utxo.value));
+            if !paid {
+                return Err(crate::chain::proof::COIN_NOT_PAID.to_owned());
+            }
+            read.insert(*txid);
+        }
+    }
+    let unread: Vec<(Txid, BlockId)> = unread
+        .into_iter()
+        .filter(|(txid, _)| read.contains(txid))
+        .collect();
+    let times = sync::prove_confirmations(client, network, tip, &unread).await?;
+    for ((txid, block), time) in unread.iter().zip(times) {
+        let Some(time) = time else {
+            continue;
+        };
+        for utxo in listed_of.get(txid).into_iter().flatten() {
+            if utxo.status.block_height == Some(block.height) {
+                vouched.insert((utxo.txid, utxo.vout), Some(time));
+                let coin = ProvenCoin {
+                    time: Some(time),
+                    ..proven_as(utxo, block.height)
+                };
+                remember_coin(network, &client.base, outpoint(utxo), coin);
+            }
+        }
+    }
+
+    let mut coins = Vec::with_capacity(utxos.len());
+    for (txid, utxo) in utxos {
+        let (height, timestamp) = match in_round.get(txid.as_str()) {
+            Some(tx) => {
+                if !tx.pays(utxo.vout, utxo.value) {
+                    return Err(crate::chain::proof::COIN_NOT_PAID.to_owned());
+                }
+                (tx.height, tx.timestamp)
+            }
+            None => match vouched.get(&(utxo.txid, utxo.vout)) {
+                Some(time) => (utxo.status.block_height, *time),
+                None => (None, None),
+            },
+        };
+        coins.push(AddressUtxo {
+            txid,
+            vout: utxo.vout,
+            value_sats: utxo.value,
+            height,
+            timestamp,
+        });
+    }
+    Ok(coins)
 }
 
 /// Fetches the next round of older transactions, continuing after
@@ -760,16 +920,28 @@ pub(crate) async fn fetch_address_history(
         .parse()
         .map_err(|_| format!("invalid history cursor: {from}"))?;
     check_network(client, network).await?;
+    let tip = read_tip(client, network).await?;
     history_round(
         client,
         &address,
         &our_script,
         network,
+        tip,
         Some(from),
         None,
         &[],
     )
     .await
+}
+
+/// The server's tip, refused past any height a chain of `network` can
+/// have reached ([`crate::chain::height_limit`]).
+async fn read_tip(client: &Client, network: Network) -> Result<u32, String> {
+    let tip = client.height().await?;
+    if tip > crate::chain::height_limit(network, crate::now_secs()) {
+        return Err(crate::chain::IMPOSSIBLE_TIP.to_owned());
+    }
+    Ok(tip)
 }
 
 /// Refuses a server whose genesis block is not the network's. Testnet,
@@ -801,17 +973,31 @@ pub(crate) fn parse_address(address: &str, network: Network) -> Result<Address, 
 /// Pages through the address history from `from` (newest first when
 /// `None`), at most [`HISTORY_PAGES_PER_ROUND`] pages.
 ///
+/// Every transaction read must hash to the txid listed, the ones the
+/// wallet holds too: a proof is of a txid, and a server would otherwise
+/// pass off any transaction of a block as one paying the address, or
+/// rewrite what one the wallet holds pays. What the coins its inputs
+/// spend were is the server's word still, as the fee is. A confirmation
+/// read that the wallet does not hold at the same height is then proven
+/// ([`sync::prove_confirmations`]); an unsure proof leaves it
+/// unconfirmed. One it holds there keeps the time it holds.
+///
+/// A confirmation above `tip`, the tip the server gave before, is weighed
+/// by [`crate::chain::proof::above_the_tip`].
+///
 /// A page that lists only transactions of `held`, what the wallet holds,
 /// each at the height it holds it, ends the reading: the history below
 /// it is what the wallet holds, and the round is filled from there. An
 /// address paid a thousand times reads one page a sync, not forty. When
 /// what the wallet holds below would come to more than the server counts,
 /// the pages are read on.
+#[allow(clippy::too_many_arguments)]
 async fn history_round(
     client: &Client,
     address: &Address,
     our_script: &bdk_wallet::bitcoin::ScriptBuf,
     network: Network,
+    tip: u32,
     from: Option<Txid>,
     confirmed_total: Option<usize>,
     held: &[AddressTx],
@@ -820,6 +1006,10 @@ async fn history_round(
         .iter()
         .map(|tx| (tx.txid.as_str(), tx.height))
         .collect();
+    let held_times: std::collections::HashMap<(&str, Option<u32>), Option<u64>> = held
+        .iter()
+        .map(|tx| ((tx.txid.as_str(), tx.height), tx.timestamp))
+        .collect();
     // Each page is read into what the app shows as soon as it arrives,
     // and dropped: forty pages are never held as the server spelled them.
     // What is kept of them, every input and output of each transaction,
@@ -827,6 +1017,7 @@ async fn history_round(
     let mut txs: Vec<AddressTx> = Vec::new();
     let mut confirmed = 0usize;
     let mut last_seen: Option<Txid> = None;
+    let mut claimed: Vec<(Txid, bdk_wallet::chain::BlockId)> = Vec::new();
     let mut read = |page: Vec<PageTx>, txs: &mut Vec<AddressTx>| {
         let mut all_held = true;
         for tx in page {
@@ -834,7 +1025,25 @@ async fn history_round(
                 confirmed += 1;
                 last_seen = Some(tx.txid);
             }
-            let tx = to_address_tx(tx, our_script, network);
+            let whole = tx.to_tx();
+            if whole.compute_txid() != tx.txid {
+                return Err(
+                    "the server answered with another transaction than the one it listed"
+                        .to_owned(),
+                );
+            }
+            if let (true, Some(height), Some(hash)) = (
+                tx.status.confirmed,
+                tx.status.block_height,
+                tx.status.block_hash,
+            ) && known.get(tx.txid.to_string().as_str()) != Some(&Some(height))
+            {
+                let block = bdk_wallet::chain::BlockId { height, hash };
+                if !claimed.contains(&(tx.txid, block)) {
+                    claimed.push((tx.txid, block));
+                }
+            }
+            let tx = to_address_tx(tx, &whole, our_script, network);
             all_held &= known.get(tx.txid.as_str()) == Some(&tx.height);
             client.keep(crate::chain::held_by(&tx))?;
             txs.push(tx);
@@ -881,6 +1090,29 @@ async fn history_round(
         }
         (confirmed_so_far, last, all_held) = read(page, &mut txs)?;
     }
+    let times = sync::prove_confirmations(client, network, tip, &claimed).await?;
+    let proven: std::collections::HashMap<(String, u32), Option<u64>> = claimed
+        .iter()
+        .zip(times)
+        .map(|((txid, block), time)| ((txid.to_string(), block.height), time))
+        .collect();
+    for tx in &mut txs {
+        let Some(height) = tx.height else {
+            continue;
+        };
+        match proven.get(&(tx.txid.clone(), height)) {
+            Some(Some(time)) => tx.timestamp = Some(*time),
+            Some(None) => {
+                tx.height = None;
+                tx.timestamp = None;
+            }
+            None => {
+                if let Some(time) = held_times.get(&(tx.txid.as_str(), Some(height))) {
+                    tx.timestamp = *time;
+                }
+            }
+        }
+    }
     Ok(HistoryRound { txs, cursor })
 }
 
@@ -922,9 +1154,11 @@ fn fill_from_held(
 /// history, a script's or an address's.
 const PAGE: usize = 25;
 
-/// One esplora transaction as seen from the watched address.
+/// One esplora transaction as seen from the watched address. `whole` is
+/// the transaction itself, as [`PageTx::to_tx`] builds it.
 fn to_address_tx(
     tx: PageTx,
+    whole: &Transaction,
     our_script: &bdk_wallet::bitcoin::ScriptBuf,
     network: Network,
 ) -> AddressTx {
@@ -991,12 +1225,17 @@ fn to_address_tx(
             })
         })
         .collect();
-    let extras = tx_extras::analyze(&tx.to_tx(), |op| prevouts.get(op).cloned());
+    let extras = tx_extras::analyze(whole, |op| prevouts.get(op).cloned());
     AddressTx {
         txid: tx.txid.to_string(),
         net_sats: crate::chain::net_sats(received, spent),
         fee_sats: (!is_coinbase).then_some(tx.fee),
-        height: tx.status.block_height,
+        // Confirmed in a block it names, or not confirmed at all: a
+        // height alone names no block to prove it in.
+        height: tx
+            .status
+            .block_height
+            .filter(|_| tx.status.confirmed && tx.status.block_hash.is_some()),
         timestamp: tx.status.block_time,
         vsize: tx.weight.div_ceil(4),
         inputs,
@@ -1636,7 +1875,8 @@ mod error_tests {
         );
         let page: PageTx = serde_json::from_str(&listed).unwrap();
         let ours = ScriptBuf::from_hex(ADDRESS_SCRIPT).unwrap();
-        let read = to_address_tx(page, &ours, Network::Signet);
+        let whole = page.to_tx();
+        let read = to_address_tx(page, &whole, &ours, Network::Signet);
         assert_eq!(read.net_sats, i64::MAX);
         assert_eq!(crate::chain::net_sats(0, u64::MAX), -i64::MAX);
     }

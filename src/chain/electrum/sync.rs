@@ -27,6 +27,10 @@ use bdk_wallet::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use electrum_client::{self, ElectrumApi, GetHistoryRes};
 
+use crate::chain::proof::{
+    FALSE_PROOF, Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
+    check_confirmation, recheck,
+};
 use crate::chain::{
     ANOTHER_NETWORK, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX, has_proof_of_work,
     height_limit,
@@ -115,7 +119,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
     }
 
     pass.fetch_missing(client)?;
-    pass.prove(client, &mut chain)?;
+    pass.prove(client, network, &mut chain)?;
     pass.fetch_prevouts(client)?;
     let tip = chain.update(&pass.update);
     Ok(Synced {
@@ -145,6 +149,9 @@ struct Chain {
     /// chain of the update was built without them: see
     /// [`Synced::drop_above`].
     dropped: Option<u32>,
+    /// The tip the server announced: no confirmation sits above it but
+    /// for blocks that came in since ([`above_the_tip`]).
+    server_tip: u32,
 }
 
 impl Chain {
@@ -203,6 +210,7 @@ impl Chain {
                         headers,
                         agreement: at,
                         dropped,
+                        server_tip: height,
                     });
                 }
                 same_network(client, &local, &mut network_checked)?;
@@ -258,6 +266,7 @@ impl Chain {
             headers,
             agreement: agreement.height(),
             dropped,
+            server_tip: height,
         })
     }
 
@@ -314,9 +323,9 @@ fn checked_suffix(
         let at_tip = headers
             .last()
             .is_some_and(|last| last.block_hash() == tip.block_hash());
-        let worked = headers
-            .iter()
-            .all(|header| has_proof_of_work(network, header));
+        let worked = (start..)
+            .zip(&headers)
+            .all(|(at, header)| has_proof_of_work(network, at, header));
         if chained && at_tip && worked {
             return Ok(headers);
         }
@@ -413,12 +422,50 @@ impl Pass<'_> {
     }
 
     /// Proves the confirmations the wallet does not hold: the header of
-    /// each block, then the merkle branch of each transaction in it. A
-    /// branch that does not lead to the header's root proves nothing,
-    /// and the transaction is left unconfirmed, as the engine of BDK
-    /// leaves it.
-    fn prove(&mut self, client: &impl ElectrumApi, chain: &mut Chain) -> Result<(), Error> {
-        let to_prove = std::mem::take(&mut self.to_prove);
+    /// each block, then the merkle branch of each transaction in it,
+    /// each held to [`check_confirmation`]. A proof that does not hold
+    /// refuses the server ([`FALSE_PROOF`]): it named a confirmation it
+    /// cannot back, and the next server is asked instead of this one
+    /// being believed on anything else. One that is unsure leaves the
+    /// transaction unconfirmed, as seen in the mempool now: among them, a
+    /// branch or a header the server refused, one into a block that
+    /// replaced the one read ([`recheck`]), one in a block that came in
+    /// since the tip was read ([`above_the_tip`]), and an early one whose
+    /// chain to its checkpoint the server would not send. That chain is
+    /// read last, a period at a time ([`chains_to_read`]): one that does
+    /// not end at the checkpoint, or holds another block, refuses the
+    /// server.
+    fn prove(
+        &mut self,
+        client: &impl ElectrumApi,
+        network: Network,
+        chain: &mut Chain,
+    ) -> Result<(), Error> {
+        let false_proof = || Error::Message(FALSE_PROOF.to_owned());
+        let mut to_prove = std::mem::take(&mut self.to_prove);
+        // A long sync may have seen blocks come in since the tip was
+        // read: the tip is read again before anything is refused for it.
+        if to_prove
+            .iter()
+            .any(|(_, height)| above_the_tip(*height, chain.server_tip) == Some(Proof::False))
+        {
+            let again = client.block_headers_subscribe()?;
+            if let Ok(height) = u32::try_from(again.height)
+                && height <= height_limit(network, self.start_time)
+            {
+                chain.server_tip = chain.server_tip.max(height);
+            }
+        }
+        for (txid, height) in &to_prove {
+            match above_the_tip(*height, chain.server_tip) {
+                Some(Proof::False) => return Err(false_proof()),
+                Some(_) => {
+                    self.update.seen_ats.insert((*txid, self.start_time));
+                }
+                None => {}
+            }
+        }
+        to_prove.retain(|(_, height)| *height <= chain.server_tip);
         let mut missing: Vec<u32> = to_prove
             .iter()
             .map(|(_, height)| *height)
@@ -427,32 +474,94 @@ impl Pass<'_> {
         missing.sort_unstable();
         missing.dedup();
         for heights in missing.chunks(BATCH) {
-            let headers = client.batch_block_header(heights.iter().copied())?;
-            for (height, header) in heights.iter().zip(headers) {
-                chain.headers.insert(*height, header);
+            match client.batch_block_header(heights.iter().copied()) {
+                Ok(headers) if headers.len() == heights.len() => {
+                    for (height, header) in heights.iter().zip(headers) {
+                        chain.headers.insert(*height, header);
+                    }
+                }
+                Ok(_) => return Err(false_proof()),
+                // Refused, as for a block a reorganisation took: each is
+                // asked alone, and one still refused leaves what it would
+                // prove unsure.
+                Err(error) if refused(&error) => {
+                    for height in heights {
+                        match client.block_header(*height as usize) {
+                            Ok(header) => {
+                                chain.headers.insert(*height, header);
+                            }
+                            Err(error) if refused(&error) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
+        let mut proven: Vec<(Txid, u32, Header)> = Vec::new();
         for batch in to_prove.chunks(BATCH) {
-            let proofs = client
-                .batch_transaction_get_merkle(batch.iter().map(|(txid, h)| (*txid, *h as usize)))?;
-            for ((txid, height), proof) in batch.iter().zip(proofs) {
-                let Some(header) = chain.headers.get(height) else {
+            for ((txid, height), proof) in batch.iter().zip(branches(client, batch)?) {
+                let Some(header) = chain.headers.get(height).copied() else {
+                    self.update.seen_ats.insert((*txid, self.start_time));
                     continue;
                 };
-                if electrum_client::utils::validate_merkle_proof(txid, &header.merkle_root, &proof)
-                {
-                    self.update.anchors.insert((
-                        ConfirmationBlockTime {
-                            block_id: BlockId {
-                                height: *height,
-                                hash: header.block_hash(),
+                let verdict = match &proof {
+                    None => Proof::Unsure,
+                    Some(proof) => {
+                        match check_confirmation(network, *height, &header, *txid, proof) {
+                            Proof::Elsewhere => match client.block_header(*height as usize) {
+                                Ok(again) => {
+                                    recheck(network, *height, &header, &again, *txid, proof)
+                                }
+                                Err(error) if refused(&error) => Proof::Unsure,
+                                Err(error) => return Err(error),
                             },
-                            confirmation_time: u64::from(header.time),
-                        },
-                        *txid,
-                    ));
+                            verdict => verdict,
+                        }
+                    }
+                };
+                match verdict {
+                    Proof::Holds => proven.push((*txid, *height, header)),
+                    Proof::Unsure => {
+                        self.update.seen_ats.insert((*txid, self.start_time));
+                    }
+                    Proof::False | Proof::Elsewhere => return Err(false_proof()),
                 }
             }
+        }
+
+        // Then the chains to the checkpoints the early ones need.
+        let blocks: Vec<(u32, BlockHash)> = proven
+            .iter()
+            .map(|(_, height, header)| (*height, header.block_hash()))
+            .collect();
+        let mut read = HashMap::new();
+        for (from, count) in chains_to_read(network, &blocks) {
+            let Some(headers) = headers_from(client, from, count)? else {
+                continue;
+            };
+            let hashes = chain_to_checkpoint(network, from, &headers).ok_or_else(false_proof)?;
+            read.insert(from, hashes);
+        }
+        for (txid, height, header) in proven {
+            match chained(network, height, header.block_hash(), &read) {
+                Proof::Holds => {}
+                Proof::Unsure => {
+                    self.update.seen_ats.insert((txid, self.start_time));
+                    continue;
+                }
+                Proof::False | Proof::Elsewhere => return Err(false_proof()),
+            }
+            self.update.anchors.insert((
+                ConfirmationBlockTime {
+                    block_id: BlockId {
+                        height,
+                        hash: header.block_hash(),
+                    },
+                    confirmation_time: u64::from(header.time),
+                },
+                txid,
+            ));
         }
         Ok(())
     }
@@ -490,6 +599,64 @@ impl Pass<'_> {
             self.update.txouts.insert(outpoint, txout.clone());
         }
         Ok(())
+    }
+}
+
+/// The merkle branches of a batch of confirmations, in its order: `None`
+/// for one the server refused, as it does when a block came in since it
+/// listed the history and the transaction is no longer where it said.
+/// The batch is asked as one; refused, each is asked alone.
+fn branches(
+    client: &impl ElectrumApi,
+    batch: &[(Txid, u32)],
+) -> Result<Vec<Option<electrum_client::GetMerkleRes>>, Error> {
+    let asked = batch.iter().map(|(txid, height)| (*txid, *height as usize));
+    match client.batch_transaction_get_merkle(asked) {
+        Ok(proofs) if proofs.len() == batch.len() => Ok(proofs.into_iter().map(Some).collect()),
+        Ok(_) => Err(Error::Message(FALSE_PROOF.to_owned())),
+        Err(error) if refused(&error) => batch
+            .iter()
+            .map(
+                |(txid, height)| match client.transaction_get_merkle(txid, *height as usize) {
+                    Ok(proof) => Ok(Some(proof)),
+                    Err(error) if refused(&error) => Ok(None),
+                    Err(error) => Err(error),
+                },
+            )
+            .collect(),
+        Err(error) => Err(error),
+    }
+}
+
+/// The `count` headers from `from`, asked as many times as the server's
+/// own limit takes; `None` when it refuses them.
+fn headers_from(
+    client: &impl ElectrumApi,
+    from: u32,
+    count: u32,
+) -> Result<Option<Vec<Header>>, Error> {
+    let mut headers: Vec<Header> = Vec::with_capacity(count as usize);
+    while (headers.len() as u32) < count {
+        let next = from + headers.len() as u32;
+        let left = count - headers.len() as u32;
+        match client.block_headers(next as usize, left as usize) {
+            Ok(answer) if !answer.headers.is_empty() => headers.extend(answer.headers),
+            Ok(_) => break,
+            Err(error) if refused(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+    headers.truncate(count as usize);
+    Ok(Some(headers))
+}
+
+/// Whether the server answered with an error of its own, rather than
+/// failing to answer at all.
+fn refused(error: &Error) -> bool {
+    match error {
+        Error::Protocol(_) => true,
+        Error::AllAttemptsErrored(errors) => errors.last().is_some_and(refused),
+        _ => false,
     }
 }
 
