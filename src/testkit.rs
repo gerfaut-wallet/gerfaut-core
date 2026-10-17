@@ -250,6 +250,24 @@ impl ElectrumState {
     }
 }
 
+/// What goes out now of `bytes`, with whatever was held before them,
+/// or nothing, all of it held: see [`ElectrumState::hold`].
+fn hold_back(
+    hold: Option<(usize, std::time::Duration)>,
+    held: &mut Vec<u8>,
+    written: usize,
+    bytes: Vec<u8>,
+) -> Option<Vec<u8>> {
+    let Some((size, _)) = hold else {
+        return Some(bytes);
+    };
+    held.extend_from_slice(&bytes);
+    if held.len() < size && written >= 1024 {
+        return None;
+    }
+    Some(std::mem::take(held))
+}
+
 #[derive(Clone)]
 pub(crate) struct FakeElectrum {
     pub address: SocketAddr,
@@ -363,8 +381,11 @@ impl FakeElectrum {
                     }
                     let bytes = match answer {
                         Answer::Line(answer) => format!("{answer}\n").into_bytes(),
+                        // Whatever is held goes out first, as ElectrumX
+                        // sends what it holds before it closes.
                         Answer::Last(answer) => {
-                            let _ = writer.write_all(format!("{answer}\n").as_bytes()).await;
+                            held.extend_from_slice(format!("{answer}\n").as_bytes());
+                            let _ = writer.write_all(&held).await;
                             return;
                         }
                         Answer::Stall => {
@@ -373,20 +394,13 @@ impl FakeElectrum {
                         }
                         Answer::Flood(size) => vec![b'x'; size],
                     };
-                    let bytes = match hold {
-                        Some((size, _)) => {
-                            held.extend_from_slice(&bytes);
-                            if held.len() < size && written >= 1024 {
-                                held_answers += 1;
-                                let mut state = state.lock().unwrap();
-                                state.held_most = state.held_most.max(held_answers);
-                                continue;
-                            }
-                            held_answers = 0;
-                            std::mem::take(&mut held)
-                        }
-                        None => bytes,
+                    let Some(bytes) = hold_back(hold, &mut held, written, bytes) else {
+                        held_answers += 1;
+                        let mut state = state.lock().unwrap();
+                        state.held_most = state.held_most.max(held_answers);
+                        continue;
                     };
+                    held_answers = 0;
                     if writer.write_all(&bytes).await.is_err() {
                         return;
                     }
@@ -394,10 +408,18 @@ impl FakeElectrum {
                     last_write = tokio::time::Instant::now();
                 }
                 pushed = pushed.recv() => match pushed {
+                    // Held with the answers, in the order they come.
                     Some(Some(line)) => {
-                        if writer.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                        let line = format!("{line}\n").into_bytes();
+                        let Some(bytes) = hold_back(hold, &mut held, written, line) else {
+                            continue;
+                        };
+                        held_answers = 0;
+                        if writer.write_all(&bytes).await.is_err() {
                             return;
                         }
+                        written += bytes.len();
+                        last_write = tokio::time::Instant::now();
                     }
                     // Hang up.
                     _ => return,
@@ -855,5 +877,45 @@ impl FakeMempool {
             .decode(script_hex.as_bytes())
             .unwrap();
         data_encoding::HEXLOWER.encode(&sha256::Hash::hash(&bytes).to_byte_array())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A notification is held with the answers before it, and goes out
+    /// after them, as ElectrumX sends it.
+    #[tokio::test]
+    async fn a_held_notification_follows_the_answers_held_before_it() {
+        let server = FakeElectrum::start().await;
+        server.state.lock().unwrap().hold =
+            Some((usize::MAX, std::time::Duration::from_millis(200)));
+        let stream = TcpStream::connect(server.address).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        // Past the first kilobyte, which goes out at once.
+        let headers = json!({ "id": 0, "method": "blockchain.block.headers", "params": [0, 10] });
+        writer
+            .write_all(format!("{headers}\n").as_bytes())
+            .await
+            .unwrap();
+        let first: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(first["id"], 0);
+        let subscribe =
+            json!({ "id": 1, "method": "blockchain.scripthash.subscribe", "params": ["00"] });
+        writer
+            .write_all(format!("{subscribe}\n").as_bytes())
+            .await
+            .unwrap();
+        while server.state.lock().unwrap().asked.len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        server.push(json!({ "method": "blockchain.headers.subscribe", "params": [] }).to_string());
+        let next: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(next["id"], 1);
+        let last: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(last["method"], "blockchain.headers.subscribe");
     }
 }
