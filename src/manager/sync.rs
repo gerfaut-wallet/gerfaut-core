@@ -378,12 +378,10 @@ impl WalletManager {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(synced) => {
                     let mut state = self.state.lock().await;
-                    let report =
+                    let (report, complete) =
                         apply_synced(&mut state, meta, synced, endpoint, &reach, &known, started)?;
                     drop(state);
-                    if matches!(reach, Reach::Full | Reach::Complete)
-                        && let Ok(mut done) = self.complete_here.lock()
-                    {
+                    if complete && let Ok(mut done) = self.complete_here.lock() {
                         done.insert(meta.id.clone());
                     }
                     return Ok((report, reach, endpoint.clone()));
@@ -568,7 +566,9 @@ pub(super) fn nothing_new(
 /// Takes what a sync of a descriptor wallet that read `reach` came to,
 /// read from `endpoint`, `known` being what the wallet held before:
 /// applied to the wallet, what it found recorded for whoever announces,
-/// and the vault saved.
+/// and the vault saved. Also says whether it read every script: a sync
+/// that set a history aside is not the complete read of the day, nor
+/// the scan of a gap limit.
 fn apply_synced(
     state: &mut ManagerState,
     meta: &WalletMeta,
@@ -577,7 +577,8 @@ fn apply_synced(
     reach: &Reach,
     known: &views::Known,
     started: Instant,
-) -> CoreResult<SyncReport> {
+) -> CoreResult<(SyncReport, bool)> {
+    let whole = !synced.set_aside;
     state.orders.extend(synced.orders);
     let vanishing = crate::live::news::vanishing(&state.payload, &meta.id);
     if let Some(height) = synced.drop_above {
@@ -625,8 +626,8 @@ fn apply_synced(
         took_ms: started.elapsed().as_millis() as u64,
         backend: endpoint.label(),
     };
-    let scanned = (*reach == Reach::Full).then_some(meta.gap_limit);
-    let complete = matches!(reach, Reach::Full | Reach::Complete);
+    let scanned = (*reach == Reach::Full && whole).then_some(meta.gap_limit);
+    let complete = matches!(reach, Reach::Full | Reach::Complete) && whole;
     finish_sync(
         state,
         &meta.id,
@@ -636,7 +637,7 @@ fn apply_synced(
         scanned,
         complete,
     )?;
-    Ok(report)
+    Ok((report, complete))
 }
 
 /// Takes the state of a watched address read from `endpoint`: what

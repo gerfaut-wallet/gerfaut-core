@@ -196,7 +196,8 @@ fn take_descriptor(
             &meta.id, balance, tip_height, server, started,
         ))),
         Some(Some((synced, reach))) => {
-            apply_synced(state, meta, synced, server, &reach, &known, started).map(Some)
+            apply_synced(state, meta, synced, server, &reach, &known, started)
+                .map(|(report, _)| Some(report))
         }
     }
 }
@@ -259,6 +260,7 @@ fn descriptor_update(
         update,
         drop_above: None,
         orders: listed,
+        set_aside: false,
     };
     Some(Some((synced, Reach::Scripts(scripts))))
 }

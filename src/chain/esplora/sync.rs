@@ -215,6 +215,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, String> {
         },
         orders: Vec::new(),
         drop_above: dropped,
+        set_aside: false,
     })
 }
 

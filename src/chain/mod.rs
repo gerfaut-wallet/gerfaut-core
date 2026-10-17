@@ -666,6 +666,9 @@ pub(crate) struct Synced {
     /// The histories an Electrum server listed, in its order, by script:
     /// the order its statuses hash them in.
     pub orders: Vec<(ScriptBuf, Vec<(Txid, i32)>)>,
+    /// A history was set aside unread ([`electrum::status`]): the sync
+    /// did not read every script it was to read.
+    pub set_aside: bool,
 }
 
 /// The most the transactions of one wallet may carry, every output of

@@ -2122,3 +2122,19 @@ async fn a_watched_address_sets_aside_a_history_its_status_disowns() {
     assert!(shown(&manager, &wallet).await.contains(&paid.to_string()));
     manager.live_stop().await;
 }
+
+/// A complete sync that set a history aside did not read every script:
+/// it is not taken for the complete read of the day, and the next look
+/// reads the wallet whole again.
+#[tokio::test]
+async fn a_sync_that_set_a_history_aside_is_not_complete() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, _events, script, _) = several_waiting(&server, dir.path(), 1).await;
+
+    server.set_history(&script, &[]);
+    let old = age(&manager, &wallet).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    assert_eq!(complete_at(&manager, &wallet).await, Some(old));
+    manager.live_stop().await;
+}

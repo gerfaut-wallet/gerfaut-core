@@ -73,11 +73,13 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
     };
 
     let mut covered: HashSet<ScriptBuf> = scripts.iter().cloned().collect();
+    let mut set_aside = false;
     for batch in scripts.chunks(BATCH) {
         let histories = client.batch_script_get_history(batch.iter().map(|s| s.as_script()))?;
         for (script, history) in batch.iter().zip(histories) {
-            if let Some(history) = stood_by(client, told, &held, script, history)? {
-                pass.take(script, &history, &chain);
+            match stood_by(client, told, &held, script, history)? {
+                Some(history) => pass.take(script, &history, &chain),
+                None => set_aside = true,
             }
         }
     }
@@ -96,6 +98,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
                 // Set aside, it may hold something: the scan goes on.
                 let Some(history) = stood_by(client, told, &held, script, history)? else {
                     covered.insert(script.clone());
+                    set_aside = true;
                     unused = 0;
                     continue;
                 };
@@ -120,8 +123,9 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
     for batch in moved.chunks(BATCH) {
         let histories = client.batch_script_get_history(batch.iter().map(|s| s.as_script()))?;
         for (script, history) in batch.iter().zip(histories) {
-            if let Some(history) = stood_by(client, told, &held, script, history)? {
-                pass.take(script, &history, &chain);
+            match stood_by(client, told, &held, script, history)? {
+                Some(history) => pass.take(script, &history, &chain),
+                None => set_aside = true,
             }
         }
     }
@@ -138,6 +142,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
         },
         orders: pass.orders,
         drop_above: chain.dropped,
+        set_aside,
     })
 }
 
