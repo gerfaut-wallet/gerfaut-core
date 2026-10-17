@@ -36,10 +36,15 @@ use crate::chain::{ANOTHER_NETWORK, Endpoint, is_genesis_of};
 /// The longest line read. A status is 64 characters and a header 160;
 /// a server sending more than this is not speaking the protocol.
 const MAX_LINE: usize = 64 * 1024;
-/// Subscriptions awaiting their answer at any time: as many as ElectrumX
-/// serves at once before it slows a session down. More go no faster, and
-/// are already sent when the server starts refusing.
-const WINDOW: usize = 10;
+/// Subscriptions awaiting their answer at any time. ElectrumX, from 1.18
+/// on, holds small answers back until a kilobyte of them waits, or a
+/// second has passed since it last wrote: the answer for a script
+/// without history is about forty bytes, so a window under twenty-five
+/// or so waits that second at every round. Thirty-two fill it.
+/// ElectrumX works through ten at a time and queues the rest at no cost
+/// to the session, and a server at its limit refuses the few already
+/// sent.
+const WINDOW: usize = 32;
 /// The codes aiorpcx, under ElectrumX, refuses a request with when the
 /// session costs the server too much, before it closes it: excessive
 /// resource usage, and server busy.

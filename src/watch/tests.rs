@@ -389,6 +389,36 @@ async fn a_script_the_server_refused_is_left_to_the_syncs() {
     no_event(&mut events, Duration::from_millis(300)).await;
 }
 
+/// ElectrumX, from 1.18 on, holds small answers back until a kilobyte
+/// of them waits, or a second has passed since it last wrote. The watch
+/// keeps enough subscriptions awaiting their answer to fill that
+/// kilobyte, so the server's wait comes once, at the end of the list,
+/// not every few subscriptions: ten at a time went through at ten a
+/// second.
+#[tokio::test]
+async fn electrum_fills_what_a_padding_server_holds_back() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().hold = Some((1024, Duration::from_secs(3)));
+    let all: Vec<u8> = (0..200).collect();
+    let started = std::time::Instant::now();
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            // Pings answered within the hold.
+            keepalive: Duration::from_secs(60),
+            pong: Duration::from_secs(10),
+            ..timings()
+        }),
+    );
+    until(&watch, "half subscribed", |s| s.pushed_scripts >= 100).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "held back: {:?}",
+        started.elapsed()
+    );
+}
+
 /// A server that takes so many subscriptions on one connection and no
 /// more, whether its refusal says so or it only refuses one after the
 /// other: what it took is watched, and every script past it is reported

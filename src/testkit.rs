@@ -186,6 +186,11 @@ pub(crate) struct ElectrumState {
     /// What the server says it runs, first in its answer to
     /// `server.version`.
     pub software: &'static str,
+    /// Answers held back, as ElectrumX holds them from 1.18 on against
+    /// traffic analysis, until this many bytes of them wait or this long
+    /// has passed since the last write; the first kilobyte goes out at
+    /// once, for the handshake.
+    pub hold: Option<(usize, std::time::Duration)>,
 }
 
 /// Heights past which the fake Electrum server makes a header up on the
@@ -274,8 +279,30 @@ impl FakeElectrum {
         // another test just closed, and a client of that test, still
         // trying it, is neither answered nor counted.
         let mut spoke = false;
+        let hold = state.lock().unwrap().hold;
+        let mut held: Vec<u8> = Vec::new();
+        let mut last_write = tokio::time::Instant::now();
+        // What was written, the first kilobyte of which goes out at once
+        // so that the handshake is not held back.
+        let mut written = 0usize;
         loop {
+            let flush_at = hold
+                .filter(|_| !held.is_empty())
+                .map(|(_, wait)| last_write + wait);
             tokio::select! {
+                () = async {
+                    match flush_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let bytes = std::mem::take(&mut held);
+                    if writer.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                    written += bytes.len();
+                    last_write = tokio::time::Instant::now();
+                }
                 line = lines.next_line() => {
                     let Ok(Some(line)) = line else {
                         if spoke {
@@ -320,9 +347,21 @@ impl FakeElectrum {
                         }
                         Answer::Flood(size) => vec![b'x'; size],
                     };
+                    let bytes = match hold {
+                        Some((size, _)) => {
+                            held.extend_from_slice(&bytes);
+                            if held.len() < size && written >= 1024 {
+                                continue;
+                            }
+                            std::mem::take(&mut held)
+                        }
+                        None => bytes,
+                    };
                     if writer.write_all(&bytes).await.is_err() {
                         return;
                     }
+                    written += bytes.len();
+                    last_write = tokio::time::Instant::now();
                 }
                 pushed = pushed.recv() => match pushed {
                     Some(Some(line)) => {
