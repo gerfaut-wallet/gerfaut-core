@@ -663,9 +663,10 @@ impl Timings {
 }
 
 enum Command {
-    /// The wallets, and the count of setups handed over so far, this
-    /// one included: see [`LiveWatch::first_pass`].
-    Wallets(Vec<WatchedWallet>, u64),
+    /// The wallets, and, when they come to a watch that followed no
+    /// script, the count of setups handed over so far, this one
+    /// included: see [`LiveWatch::first_pass`].
+    Wallets(Vec<WatchedWallet>, Option<u64>),
     /// The new configuration, the wallets, and the count of setups.
     Reconfigure(Box<WatchConfig>, Vec<WatchedWallet>, u64),
     Tick,
@@ -685,10 +686,13 @@ pub struct LiveWatch {
     /// Where the first pass of the latest setup the watcher took stands:
     /// see [`LiveWatch::first_pass`].
     first_pass: watch::Receiver<FirstPass>,
-    /// The setups handed to the watcher so far, configurations and lists
-    /// of wallets, the first one counted: the watcher may not have taken
+    /// The setups handed to the watcher so far that may open a first
+    /// pass, the first one counted: a configuration, or wallets coming to
+    /// a watch that followed no script. The watcher may not have taken
     /// the latest yet.
     setups: std::sync::atomic::AtomicU64,
+    /// Whether the last list of wallets handed over held no script.
+    followed_none: std::sync::atomic::AtomicBool,
     /// Set once to stop the watcher, whatever it is waiting on.
     halt: watch::Sender<bool>,
 }
@@ -704,6 +708,11 @@ pub(crate) struct FirstPass {
     /// watch, or the configuration names a single server, which leaves
     /// a sync no other.
     until: Option<Instant>,
+}
+
+/// Whether a list of wallets gives the watch no script to follow.
+fn no_scripts(wallets: &[WatchedWallet]) -> bool {
+    wallets.iter().all(|wallet| wallet.scripts.is_empty())
 }
 
 /// How long a sync waits for the watcher to take a setup just handed to
@@ -782,7 +791,9 @@ impl LiveWatch {
             heard_by: None,
             last_alive: SystemTime::now(),
             fixed_timings,
+            reopened: false,
         };
+        let followed_none = no_scripts(&wallets);
         hub.watched = Watched::new(wallets, WatchLimits::of(&hub.config.backend));
         hub.open_first_pass(1);
         let (halt, halted) = watch::channel(false);
@@ -795,6 +806,7 @@ impl LiveWatch {
                 held,
                 first_pass,
                 setups: std::sync::atomic::AtomicU64::new(1),
+                followed_none: std::sync::atomic::AtomicBool::new(followed_none),
                 halt,
             },
             WatchEvents { events },
@@ -804,9 +816,13 @@ impl LiveWatch {
     /// Replaces the list of what is watched: after a sync, a wallet
     /// added or removed. Scripts already subscribed stay as they are.
     pub fn set_wallets(&self, wallets: Vec<WatchedWallet>) {
-        let _ = self
-            .commands
-            .send(Command::Wallets(wallets, self.next_setup()));
+        // Only wallets coming to a watch that followed no script open a
+        // first pass; any other list leaves the syncs as they were.
+        let followed_none = self
+            .followed_none
+            .swap(no_scripts(&wallets), std::sync::atomic::Ordering::SeqCst);
+        let count = followed_none.then(|| self.next_setup());
+        let _ = self.commands.send(Command::Wallets(wallets, count));
     }
 
     /// Counts one more setup handed to the watcher.
@@ -819,6 +835,8 @@ impl LiveWatch {
     /// Another network, another backend, other Tor settings, a newly
     /// accepted certificate: the connection is reopened under them.
     pub fn reconfigure(&self, config: WatchConfig, wallets: Vec<WatchedWallet>) {
+        self.followed_none
+            .store(no_scripts(&wallets), std::sync::atomic::Ordering::SeqCst);
         let count = self.next_setup();
         let _ = self
             .commands
@@ -1383,6 +1401,9 @@ pub(crate) struct Hub {
     last_alive: SystemTime,
     /// Timings given by a test, which a new configuration leaves alone.
     fixed_timings: bool,
+    /// Wallets came to a watch that followed nothing and opened a first
+    /// pass: a backoff under way ends.
+    reopened: bool,
 }
 
 impl Hub {
@@ -1646,12 +1667,15 @@ impl Hub {
                     let had_none = self.watched.entries.is_empty();
                     self.watched = Watched::new(wallets, WatchLimits::of(&self.config.backend));
                     // A watch that had nothing to follow opened no session:
-                    // its first one starts now, and the sync of the wallet
-                    // just added waits for it.
-                    if had_none && !self.watched.entries.is_empty() {
-                        self.open_first_pass(count);
-                    } else {
-                        self.first_pass.send_modify(|pass| pass.setup = count);
+                    // its first one starts now, at once even in a backoff,
+                    // and the sync of the wallet just added waits for it.
+                    if let Some(count) = count {
+                        if had_none && !self.watched.entries.is_empty() {
+                            self.open_first_pass(count);
+                            self.reopened = true;
+                        } else {
+                            self.first_pass.send_modify(|pass| pass.setup = count);
+                        }
                     }
                     let kept: HashSet<&String> =
                         self.watched.wallets.iter().map(|(id, _)| id).collect();
@@ -1765,8 +1789,12 @@ impl Hub {
                     Wake::Stop => return Some(Exit::Stop),
                     Wake::Reconfigured => return Some(Exit::Reconfigured),
                     // A list that arrives while nothing is watched is
-                    // the end of that wait; a tick ends any wait.
-                    Wake::Wallets if until.is_none() => return None,
+                    // the end of that wait, and so is one that opened a
+                    // first pass, which a backoff must not hold; a tick
+                    // ends any wait.
+                    Wake::Wallets if until.is_none() || std::mem::take(&mut self.reopened) => {
+                        return None;
+                    }
                     Wake::Tick { .. } => return None,
                     Wake::Wallets | Wake::Flushed => {}
                 },

@@ -1132,6 +1132,25 @@ async fn the_first_wallet_of_an_empty_watch_waits_for_its_session() {
     manager.live_stop().await;
 }
 
+/// Once the first pass is over, the lists of wallets the syncs hand the
+/// watch make no later sync wait.
+#[tokio::test]
+async fn syncs_after_the_first_pass_do_not_wait() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let live = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) = automatic(dir.path(), &rotation, &[&live]).await;
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    let started = std::time::Instant::now();
+    for _ in 0..5 {
+        manager.sync_wallet(&wallet).await.unwrap();
+    }
+    let five = started.elapsed();
+    assert!(five < Duration::from_secs(2), "five syncs took {five:?}");
+    manager.live_stop().await;
+}
+
 /// A server behind the wallet whose chain never meets the wallet's, one
 /// of another network: the sync fails, saying so once the first block
 /// differs, and the payment the wallet holds is not taken for gone from
