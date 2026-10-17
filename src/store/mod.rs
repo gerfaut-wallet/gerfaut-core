@@ -699,12 +699,24 @@ pub fn owner_only(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptio
 
 /// Takes from a file every right of its group and of everyone else,
 /// and leaves its owner's as they are. Nothing when there were none.
+/// Only a regular file at that very name: a link there is not followed,
+/// whatever it points to is not the vault's to change, and the mode is
+/// set on the file opened, after making sure it is the one looked at.
 #[cfg(unix)]
 fn keep_to_owner(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(path)?.permissions().mode() & 0o7777;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let seen = std::fs::symlink_metadata(path)?;
+    if !seen.file_type().is_file() {
+        return Ok(());
+    }
+    let file = std::fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if (opened.dev(), opened.ino()) != (seen.dev(), seen.ino()) {
+        return Ok(());
+    }
+    let mode = opened.permissions().mode() & 0o7777;
     if mode & 0o077 != 0 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o700))?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode & 0o700))?;
     }
     Ok(())
 }
@@ -1458,8 +1470,18 @@ mod tests {
         // opens, before any save.
         drop(vault);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let (_vault, _) = Vault::open_or_create(&path, key()).unwrap();
+        let (vault, _) = Vault::open_or_create(&path, key()).unwrap();
         assert_eq!(mode(&path), 0o600);
+
+        // A link at the vault's name is not followed: the file it points
+        // to keeps its mode.
+        drop(vault);
+        let elsewhere = dir.path().join("elsewhere.vault");
+        std::fs::rename(&path, &elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        let (_vault, _) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(mode(&elsewhere), 0o644);
     }
 
     /// The rule the apps write their exports with: a file created is
