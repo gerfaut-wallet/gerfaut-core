@@ -504,6 +504,60 @@ pub(crate) async fn sync(
     .await
 }
 
+// --- a server out of memory for its answers --------------------------------
+
+/// The shortest wait before a request a server turned down for want of
+/// memory is asked again: the five seconds an Esplora server that limits
+/// the rate of requests is given at least.
+const BUSY_WAIT: Duration = Duration::from_secs(5);
+
+/// Whether an error is the electrs of Blockstream turning a request down
+/// because the answers it holds for all its clients at that moment take
+/// the memory it allows them, 64 MiB by default: code 2, "response budget
+/// exhausted, retry later". Only an answer over 16 KiB is counted, a big
+/// transaction or a long history, and a moment later the same request
+/// may go through. Code 2 also carries the refusals of the node behind
+/// the server, a broadcast it turned down among them, which asking again
+/// would not change: the words tell the two apart.
+pub(crate) fn out_of_budget(error: &serde_json::Value) -> bool {
+    error.get("code").and_then(serde_json::Value::as_i64) == Some(2)
+        && error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.to_ascii_lowercase().contains("budget exhausted"))
+}
+
+/// The wait before such a request is asked again: [`BUSY_WAIT`], and up
+/// to a fifth more so that the clients turned down together do not come
+/// back together.
+pub(crate) fn busy_pause() -> Duration {
+    BUSY_WAIT.mul_f64(1.0 + 0.2 * rand::random::<f64>())
+}
+
+/// `call`, made once more after [`busy_pause`] when the server turned it
+/// down for want of memory ([`out_of_budget`]), the way an Esplora server
+/// that limits the rate of requests is asked again once: a second
+/// refusal is the answer. The thread of the sync sleeps meanwhile, its
+/// connection open.
+pub(crate) fn patiently<T>(
+    call: impl FnMut() -> Result<T, electrum_client::Error>,
+) -> Result<T, electrum_client::Error> {
+    patiently_with(call, std::thread::sleep)
+}
+
+fn patiently_with<T>(
+    mut call: impl FnMut() -> Result<T, electrum_client::Error>,
+    pause: impl FnOnce(Duration),
+) -> Result<T, electrum_client::Error> {
+    match call() {
+        Err(electrum_client::Error::Protocol(error)) if out_of_budget(&error) => {
+            pause(busy_pause());
+            call()
+        }
+        other => other,
+    }
+}
+
 // --- errors ---------------------------------------------------------------
 
 /// The budget a server gets: onion hosts the longer one.
@@ -816,6 +870,151 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(standing, (true, Some(90), 100));
+    }
+
+    fn out_of_memory() -> electrum_client::Error {
+        electrum_client::Error::Protocol(serde_json::json!({
+            "code": 2, "message": "response budget exhausted, retry later",
+        }))
+    }
+
+    /// The electrs of Blockstream turns a request down for want of memory
+    /// with code 2 and words that say so. The same code in the words of
+    /// the node, a broadcast it refused, is not that, and neither is code
+    /// 1, an answer too long or a history too large.
+    #[test]
+    fn a_server_out_of_memory_is_told_by_its_code_and_its_words() {
+        use serde_json::json;
+        let electrum_client::Error::Protocol(busy) = out_of_memory() else {
+            unreachable!()
+        };
+        assert!(out_of_budget(&busy));
+        assert!(out_of_budget(&json!({
+            "code": 2, "message": "batch response budget exhausted; not executed",
+        })));
+        assert!(!out_of_budget(&json!({
+            "code": 2, "message": "sendrawtransaction RPC error -26: min relay fee not met",
+        })));
+        assert!(!out_of_budget(&json!({
+            "code": 1, "message": "response line exceeds max_response_bytes",
+        })));
+        assert!(!out_of_budget(&json!({ "code": 2 })));
+    }
+
+    /// A request turned down for want of memory is made once more, five
+    /// seconds later and up to a fifth more, and its second answer is
+    /// the answer, a second refusal included. Any other error is the
+    /// answer at once.
+    #[test]
+    fn a_request_turned_down_for_memory_is_made_once_more() {
+        let mut calls = 0;
+        let mut paused = None;
+        let answer = patiently_with(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(out_of_memory())
+                } else {
+                    Ok(7)
+                }
+            },
+            |pause| paused = Some(pause),
+        );
+        assert_eq!(answer.unwrap(), 7);
+        assert_eq!(calls, 2);
+        let paused = paused.unwrap();
+        assert!(
+            paused >= BUSY_WAIT && paused <= BUSY_WAIT.mul_f64(1.2),
+            "{paused:?}"
+        );
+
+        let mut calls = 0;
+        let refused = patiently_with(
+            || {
+                calls += 1;
+                Err::<(), _>(out_of_memory())
+            },
+            |_| {},
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(
+            describe(&refused.unwrap_err(), TIMEOUT),
+            "the server refused the request: response budget exhausted, retry later"
+        );
+
+        let mut calls = 0;
+        let mut waited = false;
+        let refused = patiently_with(
+            || {
+                calls += 1;
+                Err::<(), _>(electrum_client::Error::Protocol(serde_json::json!({
+                    "code": 1, "message": "Too many history entries",
+                })))
+            },
+            |_| waited = true,
+        );
+        assert!(refused.is_err());
+        assert_eq!((calls, waited), (1, false));
+    }
+
+    /// A sync whose server turns transactions down for want of memory,
+    /// the electrs of Blockstream under load, waits and asks for them
+    /// again on its connection, and reads the wallet there: before, the
+    /// sync failed over to the next server of the rotation, another
+    /// operator.
+    #[tokio::test]
+    async fn a_sync_turned_down_for_memory_asks_again_and_reads_the_wallet() {
+        use crate::testkit::{FakeElectrum, nowhere, transaction};
+        const WALLET: &str = "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)";
+        let server = FakeElectrum::start().await;
+        let receive = bdk_wallet::Wallet::create_single(WALLET.to_owned())
+            .network(bdk_wallet::bitcoin::Network::Signet)
+            .create_wallet_no_persist()
+            .unwrap()
+            .peek_address(bdk_wallet::KeychainKind::External, 0)
+            .script_pubkey()
+            .to_hex_string();
+        let parent = transaction(&[nowhere(1, 0)], &[(&crate::testkit::script(9), 11_000)]);
+        let payment = transaction(
+            &[OutPoint::new(parent.compute_txid(), 0)],
+            &[(&receive, 10_000)],
+        );
+        server.add_tx(&parent);
+        server.add_tx(&payment);
+        server.set_history(&receive, &[(payment.compute_txid(), 90)]);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .busy
+            .insert("blockchain.transaction.get", 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            crate::WalletManager::open(dir.path(), crate::store::VaultKey::Raw([7; 32])).unwrap();
+        manager
+            .set_backend(crate::network::Network::Signet, server.backend())
+            .await
+            .unwrap();
+        let wallet = manager
+            .add_wallet(
+                "Cold",
+                &crate::input::parse_input(WALLET).unwrap(),
+                crate::network::Network::Signet,
+            )
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let report = manager.sync_wallet(&wallet.id).await.unwrap();
+        assert!(started.elapsed() >= BUSY_WAIT);
+        assert_eq!(report.balance.confirmed, 10_000);
+        let asked = server.state.lock().unwrap().asked.clone();
+        let fetched = asked
+            .iter()
+            .filter(|method| *method == "blockchain.transaction.get")
+            .count();
+        // The payment twice, then the coin it spends.
+        assert_eq!(fetched, 3, "{asked:?}");
     }
 
     /// A server that answers `server.version`, then starts its answer
