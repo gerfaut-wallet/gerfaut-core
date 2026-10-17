@@ -58,6 +58,11 @@ pub enum ErrorCode {
     NewerFormat,
     /// A chain backend failed during a sync.
     Sync,
+    /// A server answered a sync with a proof that does not hold: a
+    /// confirmation its block's header and branch do not back, or a coin
+    /// its own transaction does not pay. It lies, or is broken: another
+    /// server, or one's own node, is the way out.
+    FalseProof,
     /// The network refused a transaction, or no backend took it.
     Broadcast,
     /// The configured backend cannot serve this request.
@@ -86,6 +91,7 @@ impl ErrorCode {
         ErrorCode::UnreadableBackup,
         ErrorCode::NewerFormat,
         ErrorCode::Sync,
+        ErrorCode::FalseProof,
         ErrorCode::Broadcast,
         ErrorCode::BackendUnavailable,
         ErrorCode::Tor,
@@ -109,6 +115,7 @@ impl ErrorCode {
             ErrorCode::UnreadableBackup => "unreadable_backup",
             ErrorCode::NewerFormat => "newer_format",
             ErrorCode::Sync => "sync",
+            ErrorCode::FalseProof => "false_proof",
             ErrorCode::Broadcast => "broadcast",
             ErrorCode::BackendUnavailable => "backend_unavailable",
             ErrorCode::Tor => "tor",
@@ -183,6 +190,11 @@ pub enum CoreError {
     #[error("sync failed via {backend}: {detail}")]
     Sync { backend: String, detail: String },
 
+    /// A sync that failed on a server whose proof did not hold, among the
+    /// servers tried: see [`ErrorCode::FalseProof`].
+    #[error("sync failed via {backend}: {detail}")]
+    FalseProof { backend: String, detail: String },
+
     /// The network refused a transaction handed to it, or no backend
     /// could be reached to try. `detail` is the node's own words.
     #[error("{backend} refused the transaction: {detail}")]
@@ -222,6 +234,7 @@ impl CoreError {
             CoreError::UnreadableBackup(_) => ErrorCode::UnreadableBackup,
             CoreError::NewerBackup(_) => ErrorCode::NewerFormat,
             CoreError::Sync { .. } => ErrorCode::Sync,
+            CoreError::FalseProof { .. } => ErrorCode::FalseProof,
             CoreError::Broadcast { .. } => ErrorCode::Broadcast,
             CoreError::BackendUnavailable(_) => ErrorCode::BackendUnavailable,
             CoreError::Tor(_) => ErrorCode::Tor,
@@ -315,6 +328,7 @@ mod tests {
                 "unreadable_backup",
                 "newer_format",
                 "sync",
+                "false_proof",
                 "broadcast",
                 "backend_unavailable",
                 "tor",
@@ -405,6 +419,13 @@ mod tests {
                     detail: text(),
                 },
                 ErrorCode::Sync,
+            ),
+            (
+                CoreError::FalseProof {
+                    backend: text(),
+                    detail: text(),
+                },
+                ErrorCode::FalseProof,
             ),
             (
                 CoreError::Broadcast {

@@ -1230,6 +1230,40 @@ mod servers {
         assert_eq!(state.txs[0].height, None);
     }
 
+    /// A sync that every server failed, one of them for a false proof,
+    /// says so by its code: the apps tell a lying server from one that is
+    /// down.
+    #[tokio::test]
+    async fn a_false_proof_has_its_own_code() {
+        let server = signet().await;
+        let payment = pay_address(&server, 90);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .branches
+            .insert(payment.compute_txid(), (vec!["ab".repeat(32)], 0));
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            crate::WalletManager::open(dir.path(), crate::store::VaultKey::Raw([7; 32])).unwrap();
+        manager
+            .set_backend(Network::Signet, server.backend())
+            .await
+            .unwrap();
+        let parsed = crate::input::parse_input(SIGNET_ADDRESS).unwrap();
+        let wallet = manager
+            .add_wallet("Watched", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        let refused = manager.sync_wallet(&wallet.id).await.unwrap_err();
+        assert_eq!(
+            refused.code(),
+            crate::error::ErrorCode::FalseProof,
+            "{refused}"
+        );
+        assert!(refused.to_string().contains(FALSE_PROOF), "{refused}");
+    }
+
     /// On mainnet, a real confirmation of the last checkpoint's block is
     /// taken, and one in a header no one mined refuses the server.
     #[tokio::test]

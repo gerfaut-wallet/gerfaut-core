@@ -51,6 +51,10 @@
     "kind": "sync",
     "message": "sync failed via electrum.example.org: connection refused"
   },
+  "false_proof": {
+    "kind": "false_proof",
+    "message": "sync failed via electrum.example.org: the server sent a false proof of a confirmation"
+  },
   "broadcast": {
     "kind": "broadcast",
     "message": "electrum.example.org refused the transaction: bad-txns-inputs-missingorspent"

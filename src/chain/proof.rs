@@ -84,6 +84,16 @@ mod tests;
 /// not lead to its root.
 pub(crate) const FALSE_PROOF: &str = "the server sent a false proof of a confirmation";
 
+/// What a server that lists a coin its own transaction does not pay is
+/// refused with.
+pub(crate) const COIN_NOT_PAID: &str = "the server listed a coin its transaction does not pay";
+
+/// Whether a server was refused, in `detail`, for a proof that does not
+/// hold: [`FALSE_PROOF`] or [`COIN_NOT_PAID`].
+pub(crate) fn is_false_proof(detail: &str) -> bool {
+    detail.contains(FALSE_PROOF) || detail.contains(COIN_NOT_PAID)
+}
+
 /// Blocks between two retargets.
 const RETARGET_PERIOD: u32 = 2_016;
 

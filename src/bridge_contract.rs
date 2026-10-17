@@ -2685,6 +2685,10 @@ fn errors() -> Vec<Fixture> {
             backend: text("electrum.example.org"),
             detail: text("connection refused"),
         },
+        CoreError::FalseProof {
+            backend: text("electrum.example.org"),
+            detail: text(crate::chain::proof::FALSE_PROOF),
+        },
         CoreError::Broadcast {
             backend: text("electrum.example.org"),
             detail: text("bad-txns-inputs-missingorspent"),

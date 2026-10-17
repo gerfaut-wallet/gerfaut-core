@@ -40,8 +40,8 @@ use super::rpc::{CallError, Connection};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
 use crate::chain::proof::{
-    FALSE_PROOF, Proof, ProvenCoin, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
-    check_confirmation, proven_coin, recheck, remember_coin,
+    COIN_NOT_PAID, FALSE_PROOF, Proof, ProvenCoin, above_the_tip, chain_to_checkpoint, chained,
+    chains_to_read, check_confirmation, proven_coin, recheck, remember_coin,
 };
 use crate::chain::{IMPOSSIBLE_TIP, KEEP_MAX, Kept, height_limit};
 use crate::network::Network;
@@ -58,9 +58,6 @@ pub(crate) const CONFIRMED_PER_ROUND: usize = HISTORY_PAGES_PER_ROUND * 25;
 const TXS_AT_ONCE: usize = 10;
 /// Blocks whose time is read for one round, at most.
 const MAX_HEADERS: usize = 2_000;
-/// What a server that lists a coin its own transaction does not pay is
-/// refused with.
-pub(crate) const COIN_NOT_PAID: &str = "the server listed a coin its transaction does not pay";
 
 #[derive(Deserialize)]
 struct Tip {

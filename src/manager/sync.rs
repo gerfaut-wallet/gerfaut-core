@@ -792,10 +792,22 @@ fn relegation_for(before: u32) -> Duration {
 }
 
 /// One error covering every endpoint tried, so the user sees each
-/// backend's outcome instead of only the last one.
+/// backend's outcome instead of only the last one. When one of them was
+/// refused for a proof that does not hold, the error says so by its code
+/// ([`CoreError::FalseProof`]).
 pub(super) fn sync_failure(endpoints: &[Endpoint], attempts: Vec<String>) -> CoreError {
+    let backend = config_label(endpoints);
+    if attempts
+        .iter()
+        .any(|attempt| chain::proof::is_false_proof(attempt))
+    {
+        return CoreError::FalseProof {
+            backend,
+            detail: attempts.join("; "),
+        };
+    }
     CoreError::Sync {
-        backend: config_label(endpoints),
+        backend,
         detail: if attempts.is_empty() {
             "no backend available".to_owned()
         } else {

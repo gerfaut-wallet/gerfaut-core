@@ -854,7 +854,7 @@ pub(crate) async fn coins(
                 .flatten()
                 .all(|utxo| pays(&tx, utxo.vout, ours, utxo.value));
             if !paid {
-                return Err(crate::chain::electrum::address::COIN_NOT_PAID.to_owned());
+                return Err(crate::chain::proof::COIN_NOT_PAID.to_owned());
             }
             read.insert(*txid);
         }
@@ -885,7 +885,7 @@ pub(crate) async fn coins(
         let (height, timestamp) = match in_round.get(txid.as_str()) {
             Some(tx) => {
                 if !tx.pays(utxo.vout, utxo.value) {
-                    return Err(crate::chain::electrum::address::COIN_NOT_PAID.to_owned());
+                    return Err(crate::chain::proof::COIN_NOT_PAID.to_owned());
                 }
                 (tx.height, tx.timestamp)
             }
