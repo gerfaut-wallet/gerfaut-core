@@ -2089,8 +2089,8 @@ async fn too_many_waiting_to_reorder_are_asked_again_then_read() {
 
 /// A watched address, the same way: the server of the watch lists the
 /// address without the payment its status holds. The sync sets that
-/// history aside, says nothing new and fails nothing, and the payment
-/// stays.
+/// history aside and says it read nothing, a failure rather than a sync
+/// with nothing new; it asks no other server, and the payment stays.
 #[tokio::test]
 async fn a_watched_address_sets_aside_a_history_its_status_disowns() {
     let server = FakeElectrum::start().await;
@@ -2112,12 +2112,8 @@ async fn a_watched_address_sets_aside_a_history_its_status_disowns() {
     server.set_history(ADDRESS_SCRIPT, &[]);
     server.set_unspent(ADDRESS_SCRIPT, &[]);
     let before = server.histories_of(ADDRESS_SCRIPT);
-    let report = manager.sync_wallet(&wallet).await.unwrap();
-    assert!(report.new_txs.is_empty() && report.confirmed_txs.is_empty());
-    assert_eq!(
-        report.balance.untrusted_pending + report.balance.trusted_pending,
-        12_000
-    );
+    let error = manager.sync_wallet(&wallet).await.unwrap_err().to_string();
+    assert!(error.contains("not read"), "{error}");
     assert_eq!(server.histories_of(ADDRESS_SCRIPT), before + 1);
     assert!(shown(&manager, &wallet).await.contains(&paid.to_string()));
     manager.live_stop().await;

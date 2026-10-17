@@ -431,22 +431,14 @@ impl WalletManager {
                     return Ok((report, endpoint.clone()));
                 }
                 // A history its server's own status disowns: nothing was
-                // read, and the address stays as it was until the watch
-                // hears it move again.
+                // read, which is said as such, and the address stays as
+                // it was. No other server is asked: the one the watch
+                // listens to is the operator that sees the wallet.
                 Ok(None) => {
-                    let state = self.state.lock().await;
-                    let stored = find_record(&state.payload, &meta.id)?
-                        .address_state
-                        .clone()
-                        .unwrap_or_default();
-                    let report = nothing_new(
-                        &meta.id,
-                        views::address_balance(&stored),
-                        stored.tip_height,
-                        endpoint,
-                        started,
-                    );
-                    return Ok((report, endpoint.clone()));
+                    return Err(CoreError::Sync {
+                        backend: endpoint.label(),
+                        detail: NOT_READ.to_owned(),
+                    });
                 }
             }
         }
@@ -542,6 +534,11 @@ impl WalletManager {
         report
     }
 }
+
+/// Why the sync of a watched address read nothing: the server's history
+/// of it does not hash to the status it announced to the live watch,
+/// and leaves out what the wallet holds there.
+const NOT_READ: &str = "the server's history does not match what it announced: not read";
 
 /// A report of a wallet that took nothing: what it holds, as it was.
 pub(super) fn nothing_new(
