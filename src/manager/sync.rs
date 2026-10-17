@@ -376,66 +376,12 @@ impl WalletManager {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
                 Ok(synced) => {
                     let mut state = self.state.lock().await;
-                    state.orders.extend(synced.orders);
-                    let vanishing = crate::live::news::vanishing(&state.payload, &meta.id);
-                    if let Some(height) = synced.drop_above {
-                        drop_blocks_above(&mut state, &meta.id, height)?;
-                    }
-                    let engine = ensure_engine(&mut state, &meta.id)?;
-                    engine
-                        .apply_update(synced.update)
-                        .map_err(|e| CoreError::Sync {
-                            backend: endpoint.label(),
-                            detail: e.to_string(),
-                        })?;
-
-                    let balance = views::balance(engine);
-                    let tip_height = views::tip_height(engine);
-                    let tx_count_after = engine.transactions().count() as u32;
-                    let moves = views::moves(engine, &known);
-                    let read = match &reach {
-                        Reach::Scripts(scripts) => Some(scripts.iter().cloned().collect()),
-                        _ => None,
-                    };
-                    let recheck = views::recheck(engine, &vanishing, read.as_ref());
-                    let (new_txs, confirmed_txs) = moves.lines();
-                    let staged = engine.take_staged();
-
-                    if let Some(staged) = staged {
-                        merge_changeset(&mut state, &meta.id, staged)?;
-                    }
-                    let now = now_secs();
-                    crate::live::news::record(
-                        &mut state.payload,
-                        &meta.id,
-                        meta.last_sync.is_none(),
-                        &moves,
-                        now,
-                    );
-                    crate::live::news::settle(&mut state.payload, &meta.id, &recheck, now);
-                    let report = SyncReport {
-                        wallet_id: meta.id.clone(),
-                        new_tx_count: new_txs.len() as u32,
-                        new_txs,
-                        confirmed_txs,
-                        balance,
-                        tip_height,
-                        took_ms: started.elapsed().as_millis() as u64,
-                        backend: endpoint.label(),
-                    };
-                    let scanned = (reach == Reach::Full).then_some(meta.gap_limit);
-                    let complete = matches!(reach, Reach::Full | Reach::Complete);
-                    finish_sync(
-                        &mut state,
-                        &meta.id,
-                        &report,
-                        endpoint,
-                        tx_count_after,
-                        scanned,
-                        complete,
-                    )?;
+                    let report =
+                        apply_synced(&mut state, meta, synced, endpoint, &reach, &known, started)?;
                     drop(state);
-                    if complete && let Ok(mut done) = self.complete_here.lock() {
+                    if matches!(reach, Reach::Full | Reach::Complete)
+                        && let Ok(mut done) = self.complete_here.lock()
+                    {
                         done.insert(meta.id.clone());
                     }
                     return Ok((report, reach, endpoint.clone()));
@@ -468,60 +414,10 @@ impl WalletManager {
         for endpoint in endpoints {
             match chain::fetch_address_state(endpoint, address, meta.network, proxy, &held).await {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
-                Ok(mut watch) => {
+                Ok(watch) => {
                     let mut state = self.state.lock().await;
-                    // Against the state as stored, before the older
-                    // rounds are carried over into the fresh one.
-                    let moves = views::address_moves(
-                        find_record(&state.payload, &meta.id)?
-                            .address_state
-                            .as_ref(),
-                        &watch,
-                    );
-                    let recheck = views::address_recheck(
-                        &crate::live::news::vanishing(&state.payload, &meta.id),
-                        &watch,
-                    );
-                    let (new_txs, confirmed_txs) = moves.lines();
-                    // A sync fetches the newest round only. Keep the older
-                    // rounds the user already loaded, otherwise every sync
-                    // would silently undo "load older transactions".
-                    if let Some(previous) = find_record(&state.payload, &meta.id)?
-                        .address_state
-                        .as_ref()
-                    {
-                        keep_older_history(&mut watch, previous);
-                    }
-                    let tx_count_after = watch.txs.len() as u32;
-                    let now = now_secs();
-                    crate::live::news::record(
-                        &mut state.payload,
-                        &meta.id,
-                        meta.last_sync.is_none(),
-                        &moves,
-                        now,
-                    );
-                    crate::live::news::settle(&mut state.payload, &meta.id, &recheck, now);
-                    let report = SyncReport {
-                        wallet_id: meta.id.clone(),
-                        new_tx_count: new_txs.len() as u32,
-                        new_txs,
-                        confirmed_txs,
-                        balance: views::address_balance(&watch),
-                        tip_height: watch.tip_height,
-                        took_ms: started.elapsed().as_millis() as u64,
-                        backend: endpoint.label(),
-                    };
-                    find_record_mut(&mut state.payload, &meta.id)?.address_state = Some(watch);
-                    finish_sync(
-                        &mut state,
-                        &meta.id,
-                        &report,
-                        endpoint,
-                        tx_count_after,
-                        None,
-                        true,
-                    )?;
+                    let report =
+                        apply_address_state(&mut state, meta, watch, endpoint, started, true)?;
                     return Ok((report, endpoint.clone()));
                 }
             }
@@ -617,6 +513,147 @@ impl WalletManager {
         }
         report
     }
+}
+
+/// Takes what a sync of a descriptor wallet that read `reach` came to,
+/// read from `endpoint`, `known` being what the wallet held before:
+/// applied to the wallet, what it found recorded for whoever announces,
+/// and the vault saved.
+fn apply_synced(
+    state: &mut ManagerState,
+    meta: &WalletMeta,
+    synced: chain::Synced,
+    endpoint: &Endpoint,
+    reach: &Reach,
+    known: &views::Known,
+    started: Instant,
+) -> CoreResult<SyncReport> {
+    state.orders.extend(synced.orders);
+    let vanishing = crate::live::news::vanishing(&state.payload, &meta.id);
+    if let Some(height) = synced.drop_above {
+        drop_blocks_above(state, &meta.id, height)?;
+    }
+    let engine = ensure_engine(state, &meta.id)?;
+    engine
+        .apply_update(synced.update)
+        .map_err(|e| CoreError::Sync {
+            backend: endpoint.label(),
+            detail: e.to_string(),
+        })?;
+
+    let balance = views::balance(engine);
+    let tip_height = views::tip_height(engine);
+    let tx_count_after = engine.transactions().count() as u32;
+    let moves = views::moves(engine, known);
+    let read = match reach {
+        Reach::Scripts(scripts) => Some(scripts.iter().cloned().collect()),
+        _ => None,
+    };
+    let recheck = views::recheck(engine, &vanishing, read.as_ref());
+    let (new_txs, confirmed_txs) = moves.lines();
+    let staged = engine.take_staged();
+
+    if let Some(staged) = staged {
+        merge_changeset(state, &meta.id, staged)?;
+    }
+    let now = now_secs();
+    crate::live::news::record(
+        &mut state.payload,
+        &meta.id,
+        meta.last_sync.is_none(),
+        &moves,
+        now,
+    );
+    crate::live::news::settle(&mut state.payload, &meta.id, &recheck, now);
+    let report = SyncReport {
+        wallet_id: meta.id.clone(),
+        new_tx_count: new_txs.len() as u32,
+        new_txs,
+        confirmed_txs,
+        balance,
+        tip_height,
+        took_ms: started.elapsed().as_millis() as u64,
+        backend: endpoint.label(),
+    };
+    let scanned = (*reach == Reach::Full).then_some(meta.gap_limit);
+    let complete = matches!(reach, Reach::Full | Reach::Complete);
+    finish_sync(
+        state,
+        &meta.id,
+        &report,
+        endpoint,
+        tx_count_after,
+        scanned,
+        complete,
+    )?;
+    Ok(report)
+}
+
+/// Takes the state of a watched address read from `endpoint`: what
+/// changed against the state stored recorded for whoever announces, the
+/// older rounds the user loaded kept, and the vault saved. `complete`
+/// says it was read whole.
+fn apply_address_state(
+    state: &mut ManagerState,
+    meta: &WalletMeta,
+    mut watch: AddressWatchState,
+    endpoint: &Endpoint,
+    started: Instant,
+    complete: bool,
+) -> CoreResult<SyncReport> {
+    // Against the state as stored, before the older rounds are carried
+    // over into the fresh one.
+    let moves = views::address_moves(
+        find_record(&state.payload, &meta.id)?
+            .address_state
+            .as_ref(),
+        &watch,
+    );
+    let recheck = views::address_recheck(
+        &crate::live::news::vanishing(&state.payload, &meta.id),
+        &watch,
+    );
+    let (new_txs, confirmed_txs) = moves.lines();
+    // A sync fetches the newest round only. Keep the older rounds the
+    // user already loaded, otherwise every sync would silently undo
+    // "load older transactions".
+    if let Some(previous) = find_record(&state.payload, &meta.id)?
+        .address_state
+        .as_ref()
+    {
+        keep_older_history(&mut watch, previous);
+    }
+    let tx_count_after = watch.txs.len() as u32;
+    let now = now_secs();
+    crate::live::news::record(
+        &mut state.payload,
+        &meta.id,
+        meta.last_sync.is_none(),
+        &moves,
+        now,
+    );
+    crate::live::news::settle(&mut state.payload, &meta.id, &recheck, now);
+    let report = SyncReport {
+        wallet_id: meta.id.clone(),
+        new_tx_count: new_txs.len() as u32,
+        new_txs,
+        confirmed_txs,
+        balance: views::address_balance(&watch),
+        tip_height: watch.tip_height,
+        took_ms: started.elapsed().as_millis() as u64,
+        backend: endpoint.label(),
+    };
+    find_record_mut(&mut state.payload, &meta.id)?.address_state = Some(watch);
+    finish_sync(
+        state,
+        &meta.id,
+        &report,
+        endpoint,
+        tx_count_after,
+        None,
+        complete,
+    )?;
+    Ok(report)
 }
 
 /// The order a sync tries the servers of its backend in. `first`, a
