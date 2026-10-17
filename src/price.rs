@@ -490,7 +490,11 @@ pub(crate) async fn fetch_price_history(
             .await?;
             parse_coingecko_history(&value)?
         }
-        PriceSource::MempoolSpace => mempool_series(currency, proxy).await?.as_ref().clone(),
+        PriceSource::MempoolSpace => {
+            let series = mempool_series(currency, proxy).await?;
+            let now = fetch_price(source, currency, proxy).await.ok();
+            closed_by(&series, now.as_ref())
+        }
     };
     points.retain(|p| p.rate.is_finite() && p.rate > 0.0);
     points.sort_by_key(|p| p.t);
@@ -587,6 +591,20 @@ async fn mempool_series(currency: FiatCurrency, proxy: Option<&str>) -> CoreResu
     let series = std::sync::Arc::new(parse_mempool_history(&value, currency)?);
     MEMPOOL_SERIES.keep(currency, now, series.clone());
     Ok(series)
+}
+
+/// The series with the price now as its last point: mempool.space's
+/// hourly series ends up to an hour before the price shown beside the
+/// chart. A price that did not come leaves the series as it is.
+fn closed_by(series: &[PricePoint], now: Option<&PriceQuote>) -> Vec<PricePoint> {
+    let mut points = series.to_vec();
+    if let Some(now) = now {
+        points.push(PricePoint {
+            t: now.at,
+            rate: now.rate,
+        });
+    }
+    points
 }
 
 /// mempool.space's whole history in the one currency on screen. With no
@@ -857,6 +875,37 @@ mod tests {
         cache.keep(FiatCurrency::Eur, 5_000, newer.clone());
         assert_eq!(cache.fresh(FiatCurrency::Eur, 5_001), Some(newer));
         assert_eq!(cache.0.lock().unwrap().len(), 1);
+    }
+
+    /// The price now closes the series, after its last hourly point.
+    #[test]
+    fn the_price_now_closes_the_series() {
+        let series = [
+            PricePoint {
+                t: 3_600,
+                rate: 1.0,
+            },
+            PricePoint {
+                t: 7_200,
+                rate: 2.0,
+            },
+        ];
+        let now = PriceQuote {
+            rate: 2.5,
+            currency: FiatCurrency::Eur,
+            source: PriceSource::MempoolSpace,
+            at: 9_000,
+        };
+        let closed = closed_by(&series, Some(&now));
+        assert_eq!(
+            closed.last(),
+            Some(&PricePoint {
+                t: 9_000,
+                rate: 2.5
+            })
+        );
+        assert_eq!(closed.len(), 3);
+        assert_eq!(closed_by(&series, None), series);
     }
 
     /// The history is asked in the currency on screen alone.
