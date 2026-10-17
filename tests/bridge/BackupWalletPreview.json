@@ -22,5 +22,18 @@
     },
     "already_watched": true,
     "refused": null
+  },
+  "refused": {
+    "index": 2,
+    "name": "Handed over",
+    "network": "mainnet",
+    "kind": {
+      "type": "descriptors",
+      "external": "wpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/0/*)",
+      "internal": "wpkh(xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw/1/*)",
+      "script": "segwit"
+    },
+    "already_watched": false,
+    "refused": "descriptor error: the change descriptor does not spend under the receive descriptor's keys and conditions: change would go to another wallet"
   }
 }

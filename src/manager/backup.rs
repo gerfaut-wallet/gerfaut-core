@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::backup::{
     self, BACKUP_VERSION, BackupBackendPreview, BackupBundle, BackupOptions, BackupPayload,
-    BackupPreview, BackupWallet, BackupWalletPreview, ImportChoices, ImportReport,
+    BackupPreview, BackupWallet, BackupWalletPreview, ImportChoices, ImportReport, RefusedWallet,
 };
 use crate::chain;
 use crate::error::{CoreError, CoreResult};
@@ -188,6 +188,11 @@ impl WalletManager {
             // descriptor the engine refuses leaves nothing half-restored.
             let mut pending: Vec<(WalletRecord, Option<bdk_wallet::Wallet>)> = Vec::new();
             let mut skipped = (payload.wallets.len() - chosen.len()) as u32;
+            // A restore of every wallet leaves out, and names, one it
+            // cannot watch, as it skips one already watched; one asked for
+            // by index fails the restore, named.
+            let asked_by_index = choices.indexes.is_some();
+            let mut refused = Vec::new();
             for index in chosen {
                 let wallet = &payload.wallets[index];
                 let watched = find_watched(&state.payload, wallet.network, &wallet.kind).is_some()
@@ -214,7 +219,15 @@ impl WalletManager {
                 );
                 meta.labels = wallet.labels.clone();
                 meta.live_pinned = wallet.live_pinned;
-                pending.push(build_record(meta).map_err(|error| refused_wallet(name, error))?);
+                match build_record(meta) {
+                    Ok(record) => pending.push(record),
+                    Err(error) if !asked_by_index => refused.push(RefusedWallet {
+                        index: index as u32,
+                        name: name.to_owned(),
+                        reason: error.to_string(),
+                    }),
+                    Err(error) => return Err(refused_wallet(name, error)),
+                }
             }
 
             // The vault changes as a whole or not at all, and the engines
@@ -255,6 +268,7 @@ impl WalletManager {
                 added,
                 skipped,
                 settings_applied,
+                refused,
             })
         }
         .await;

@@ -44,7 +44,7 @@ use serde::Serialize;
 
 use crate::backup::{
     self, BackupBackendPreview, BackupBundle, BackupOptions, BackupPreview, BackupWalletPreview,
-    ImportChoices, ImportReport,
+    ImportChoices, ImportReport, RefusedWallet,
 };
 use crate::broadcast::{
     self, BroadcastReport, BroadcastStatus, DecodedInput, DecodedTx, InputFacts, OutputFacts,
@@ -1670,6 +1670,16 @@ fn files() -> Vec<Fixture> {
         wallet_count: 2,
         size_bytes: sealed.len() as u32,
     };
+    // The receive branch of one wallet beside the change branch of
+    // another: what a restore refuses, in the words it refuses it with.
+    let handed_over = WalletKind::Descriptors {
+        external: format!("wpkh({KEY_A}/0/*)"),
+        internal: Some(format!("wpkh({KEY_B}/1/*)")),
+        script: ScriptKind::Segwit,
+    };
+    let handed_over_refusal = crate::manager::check_material(&handed_over, Network::Mainnet)
+        .expect_err("two wallets in one pair")
+        .to_string();
     let previews = vec![
         BackupWalletPreview {
             index: 0,
@@ -1692,14 +1702,10 @@ fn files() -> Vec<Fixture> {
         BackupWalletPreview {
             index: 2,
             name: "Handed over".to_owned(),
-            network: Network::Signet,
-            kind: descriptors_kind(),
+            network: Network::Mainnet,
+            kind: handed_over.clone(),
             already_watched: false,
-            refused: Some(
-                "descriptor error: the change descriptor does not spend under the receive \
-                 descriptor's keys and conditions: change would go to another wallet"
-                    .to_owned(),
-            ),
+            refused: Some(handed_over_refusal.clone()),
         },
     ];
     let backend = BackupBackendPreview {
@@ -1742,6 +1748,7 @@ fn files() -> Vec<Fixture> {
             vec![
                 ("new", previews[0].clone()),
                 ("already_watched", previews[1].clone()),
+                ("refused", previews[2].clone()),
             ],
         ),
         fixture("BackupBackendPreview", vec![("electrum", backend.clone())]),
@@ -1791,6 +1798,22 @@ fn files() -> Vec<Fixture> {
                     added: vec![fresh()],
                     skipped: 1,
                     settings_applied: true,
+                    refused: vec![RefusedWallet {
+                        index: 2,
+                        name: "Handed over".to_owned(),
+                        reason: handed_over_refusal.clone(),
+                    }],
+                },
+            )],
+        ),
+        fixture(
+            "RefusedWallet",
+            vec![(
+                "handed_over",
+                RefusedWallet {
+                    index: 2,
+                    name: "Handed over".to_owned(),
+                    reason: handed_over_refusal,
                 },
             )],
         ),

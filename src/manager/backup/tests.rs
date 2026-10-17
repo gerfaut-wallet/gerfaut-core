@@ -489,9 +489,10 @@ async fn a_scanned_backup_never_doubles_a_wallet_already_watched() {
 /// A backup is a file anyone could have written: a wallet in it whose
 /// key takes a hardened step, which miniscript panics on when asked
 /// for an address, or whose descriptor nests past reason, is refused
-/// in words, and the restore leaves the vault as it was.
+/// in words. Asked for by index, it fails the restore, which leaves the
+/// vault as it was; with every wallet, it is left out and named.
 #[tokio::test]
-async fn a_backup_wallet_the_parser_would_refuse_is_not_restored() {
+async fn a_backup_wallet_the_parser_would_refuse_is_left_out() {
     let tpub = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
     let wallet = |external: String| BackupWallet {
         name: "Handed over".to_owned(),
@@ -533,8 +534,21 @@ async fn a_backup_wallet_the_parser_would_refuse_is_not_restored() {
             .await
             .unwrap();
         assert_eq!(preview.wallets.len(), 2);
+        assert!(
+            preview.wallets[1]
+                .refused
+                .as_deref()
+                .is_some_and(|reason| reason.contains(refusal)),
+            "{:?}",
+            preview.wallets[1].refused
+        );
+        // Asked for by index, it fails the restore.
+        let only = ImportChoices {
+            indexes: Some(vec![1]),
+            apply_settings: false,
+        };
         let error = manager
-            .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+            .import_backup(&text, BACKUP_PASSWORD, &only)
             .await
             .unwrap_err();
         assert!(
@@ -542,6 +556,17 @@ async fn a_backup_wallet_the_parser_would_refuse_is_not_restored() {
             "{error}"
         );
         assert!(manager.list_wallets(None).await.is_empty());
+        // With every wallet, it is left out, named, and the other comes in.
+        let report = manager
+            .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+            .await
+            .unwrap();
+        assert_eq!(report.added.len(), 1);
+        assert_eq!(report.refused.len(), 1);
+        assert!(report.refused[0].reason.contains(refusal));
+        for wallet in manager.list_wallets(None).await {
+            manager.remove_wallet(&wallet.id).await.unwrap();
+        }
     }
 }
 
@@ -692,8 +717,13 @@ async fn a_backup_pairing_two_wallets_is_not_restored() {
         "{refused:?}"
     );
 
+    // Asked for by index, it fails the restore, named.
+    let only = ImportChoices {
+        indexes: Some(vec![0]),
+        apply_settings: false,
+    };
     let error = manager
-        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+        .import_backup(&text, BACKUP_PASSWORD, &only)
         .await
         .unwrap_err();
     assert!(
@@ -702,18 +732,31 @@ async fn a_backup_pairing_two_wallets_is_not_restored() {
         "{error}"
     );
     assert!(manager.list_wallets(None).await.is_empty());
-    let choices = ImportChoices {
-        indexes: Some(vec![1]),
-        apply_settings: false,
-    };
+
+    // Every wallet: it is left out, named, the other restored.
     let report = manager
-        .import_backup(&text, BACKUP_PASSWORD, &choices)
+        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
         .await
         .unwrap();
     assert_eq!(report.added.len(), 1);
     assert_eq!(report.added[0].name, "Own");
+    assert_eq!(report.skipped, 0);
+    assert_eq!(report.refused.len(), 1);
+    assert_eq!(
+        (report.refused[0].index, report.refused[0].name.as_str()),
+        (0, "Handed over")
+    );
+    assert!(report.refused[0].reason.contains("another wallet"));
     let restored = manager.list_wallets(None).await;
     assert_eq!(restored.len(), 1);
+
+    // Watched already, it is that and nothing else in the preview.
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    assert!(preview.wallets[1].already_watched);
+    assert_eq!(preview.wallets[1].refused, None);
     manager.remove_wallet(&restored[0].id).await.unwrap();
 
     // The same material as an input the app hands back.
@@ -785,12 +828,12 @@ async fn a_backup_hiding_another_wallet_in_a_raw_hash_is_not_restored() {
         "{:?}",
         preview.wallets[0].refused
     );
-    assert!(
-        manager
-            .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
-            .await
-            .is_err()
-    );
+    let report = manager
+        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+        .await
+        .unwrap();
+    assert!(report.added.is_empty());
+    assert_eq!(report.refused[0].name, "Vault");
     assert!(manager.list_wallets(None).await.is_empty());
 }
 
