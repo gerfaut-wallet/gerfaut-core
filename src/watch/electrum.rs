@@ -142,6 +142,10 @@ struct Session {
     /// the last look began, or the device woke up.
     block_at: Instant,
     look: Look,
+    /// The Tor proxy the session goes through, when its server is an
+    /// onion: the other onion servers of its operator are reached
+    /// through it for their tip.
+    proxy: Option<String>,
 }
 
 pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> Exit {
@@ -161,6 +165,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
     let budget = hub.connect_budget(endpoint);
     let network = hub.config.network;
     let target = target.clone();
+    let session_proxy = proxy.clone();
     let opening = async move { open(&target, proxy.as_deref(), network, budget).await };
     let Opened {
         mut reader,
@@ -192,6 +197,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         tip: None,
         block_at: Instant::now(),
         look: Look::Idle,
+        proxy: session_proxy,
     };
     hub.alive();
     hub.serve(Some(endpoint));
@@ -415,7 +421,7 @@ impl Session {
     fn look_now(&mut self, hub: &Hub) {
         self.look = self
             .tip
-            .and_then(|_| tip_elsewhere(hub, &self.endpoint))
+            .and_then(|_| tip_elsewhere(hub, &self.endpoint, self.proxy.as_deref()))
             .map_or(Look::Idle, Look::Probing);
     }
 
@@ -783,8 +789,10 @@ pub(super) fn siblings(candidates: Vec<Endpoint>, endpoint: &Endpoint) -> Vec<(E
 /// that the operator of `endpoint` runs, one after the other until one
 /// answers, each on a connection of its own that asks for nothing but
 /// the tip; `None` when there is no such server, which leaves the
-/// session as it is. A server being left alone is not asked.
-fn tip_elsewhere(hub: &Hub, endpoint: &Endpoint) -> Option<Probe> {
+/// session as it is. A server being left alone is not asked. `proxy` is
+/// the Tor proxy of the session: the others are onions when its server
+/// is one ([`siblings`]), and go through the same.
+fn tip_elsewhere(hub: &Hub, endpoint: &Endpoint, proxy: Option<&str>) -> Option<Probe> {
     let candidates = super::candidates(&hub.config).unwrap_or_default();
     let others: Vec<(Endpoint, Target, Duration)> = siblings(candidates, endpoint)
         .into_iter()
@@ -798,18 +806,9 @@ fn tip_elsewhere(hub: &Hub, endpoint: &Endpoint) -> Option<Probe> {
         return None;
     }
     let network = hub.config.network;
-    let tor = hub.config.tor.clone();
-    let data_dir = hub.config.data_dir.clone();
+    let proxy = proxy.map(str::to_owned);
     Some(Box::pin(async move {
         for (other, target, budget) in others {
-            let proxy = if other.is_onion() {
-                match crate::chain::tor::resolve(&tor, &data_dir).await {
-                    Ok(route) => Some(route.proxy()),
-                    Err(_) => continue,
-                }
-            } else {
-                None
-            };
             if let Ok(tip) = tip_of(&target, proxy.as_deref(), network, budget).await {
                 return Some((other, tip));
             }
