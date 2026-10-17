@@ -95,11 +95,14 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
             let histories =
                 client.batch_script_get_history(batch.iter().map(|(_, s)| s.as_script()))?;
             for ((index, script), history) in batch.iter().zip(histories) {
-                // Set aside, it may hold something: the scan goes on.
+                // Set aside, it holds something the wallet holds: it is
+                // used, the scan goes on past it, and the wallet reveals
+                // it.
                 let Some(history) = stood_by(client, told, &held, script, history)? else {
                     covered.insert(script.clone());
                     set_aside = true;
                     unused = 0;
+                    last_active.insert(keychain, *index);
                     continue;
                 };
                 if history.is_empty() {
