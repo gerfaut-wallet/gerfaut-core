@@ -831,8 +831,11 @@ pub struct LiveWatch {
     /// a watch that followed no script. The watcher may not have taken
     /// the latest yet.
     setups: std::sync::atomic::AtomicU64,
-    /// Whether the last list of wallets handed over held no script.
-    followed_none: std::sync::atomic::AtomicBool,
+    /// Whether the last list of wallets handed over held no script. Held
+    /// while a setup is counted and sent: two lists handed over at once
+    /// reach the watcher in the order they were counted, and the one that
+    /// opens a pass is the one that comes to a watch that followed none.
+    followed_none: std::sync::Mutex<bool>,
     /// Set once to stop the watcher, whatever it is waiting on.
     halt: watch::Sender<bool>,
     /// What the server of the open session announced of each script.
@@ -852,9 +855,27 @@ pub(crate) struct FirstPass {
     until: Option<Instant>,
 }
 
-/// Whether a list of wallets gives the watch no script to follow.
+/// Whether a list of wallets gives the watch no script to follow: none
+/// it takes ([`watchable`]). The watch takes the first script it can of
+/// any list, whatever its limits, so this is what the watcher finds once
+/// it reads the list ([`Watched::new`]): a list of scripts it cannot
+/// take, which used to count as one to follow, left the next list,
+/// the first it could, without the first pass it opens.
 fn no_scripts(wallets: &[WatchedWallet]) -> bool {
-    wallets.iter().all(|wallet| wallet.scripts.is_empty())
+    wallets.iter().all(|wallet| {
+        wallet
+            .scripts
+            .iter()
+            .all(|listed| !watchable(&listed.script))
+    })
+}
+
+/// Whether the watch takes a script listed, in hex: one no longer than
+/// the consensus allows, and spelled right.
+fn watchable(script: &str) -> bool {
+    !script.is_empty()
+        && script.len() <= 2 * MAX_SCRIPT_BYTES
+        && ScriptBuf::from_hex(script).is_ok()
 }
 
 /// How long a sync waits for the watcher to take a setup just handed to
@@ -950,7 +971,7 @@ impl LiveWatch {
                 held,
                 first_pass,
                 setups: std::sync::atomic::AtomicU64::new(1),
-                followed_none: std::sync::atomic::AtomicBool::new(followed_none),
+                followed_none: std::sync::Mutex::new(followed_none),
                 halt,
                 announced,
             },
@@ -963,10 +984,9 @@ impl LiveWatch {
     pub fn set_wallets(&self, wallets: Vec<WatchedWallet>) {
         // Only wallets coming to a watch that followed no script open a
         // first pass; any other list leaves the syncs as they were.
-        let followed_none = self
-            .followed_none
-            .swap(no_scripts(&wallets), std::sync::atomic::Ordering::SeqCst);
-        let count = followed_none.then(|| self.next_setup());
+        let mut followed_none = self.handing();
+        let had_none = std::mem::replace(&mut *followed_none, no_scripts(&wallets));
+        let count = had_none.then(|| self.next_setup());
         let _ = self.commands.send(Command::Wallets(wallets, count));
     }
 
@@ -980,12 +1000,20 @@ impl LiveWatch {
     /// Another network, another backend, other Tor settings, a newly
     /// accepted certificate: the connection is reopened under them.
     pub fn reconfigure(&self, config: WatchConfig, wallets: Vec<WatchedWallet>) {
-        self.followed_none
-            .store(no_scripts(&wallets), std::sync::atomic::Ordering::SeqCst);
+        let mut followed_none = self.handing();
+        *followed_none = no_scripts(&wallets);
         let count = self.next_setup();
         let _ = self
             .commands
             .send(Command::Reconfigure(Box::new(config), wallets, count));
+    }
+
+    /// The lock under which a setup is counted and sent: see
+    /// [`LiveWatch::followed_none`].
+    fn handing(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.followed_none
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Checks the connection now. For a host whose timers stop while
@@ -1247,7 +1275,7 @@ impl Watched {
                     let Some(listed) = wallets[owner].scripts.get(rank) else {
                         continue;
                     };
-                    if listed.script.len() > 2 * MAX_SCRIPT_BYTES || listed.script.is_empty() {
+                    if !watchable(&listed.script) {
                         continue;
                     }
                     let hex = listed.script.to_ascii_lowercase();
@@ -1892,12 +1920,22 @@ impl Hub {
                     // A watch that had nothing to follow opened no session:
                     // its first one starts now, at once even in a backoff,
                     // and the sync of the wallet just added waits for it.
+                    // A session open already, one that opened on a list
+                    // emptied while it did, hears the new list now: a pass
+                    // opened under it would never end before its deadline,
+                    // no session being left to open.
                     if let Some(count) = count {
-                        if had_none && !self.watched.entries.is_empty() {
+                        let serving = self.serving.borrow().is_some();
+                        if had_none && !self.watched.entries.is_empty() && !serving {
                             self.open_first_pass(count);
                             self.reopened = true;
                         } else {
-                            self.first_pass.send_modify(|pass| pass.setup = count);
+                            self.first_pass.send_modify(|pass| {
+                                pass.setup = count;
+                                if serving {
+                                    pass.until = None;
+                                }
+                            });
                         }
                     }
                     let kept: HashSet<&String> =
