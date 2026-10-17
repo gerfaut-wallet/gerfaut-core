@@ -244,6 +244,7 @@ fn timings() -> crate::watch::Timings {
         limit_kept: Duration::from_secs(3600),
         zero_limit_kept: Duration::from_secs(3600),
         first_session: Duration::from_secs(5),
+        stale: Duration::from_secs(3600),
     }
 }
 

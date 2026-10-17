@@ -619,6 +619,11 @@ pub(crate) struct Timings {
     /// this and `tor_connect`: Tor carries the connections to onion
     /// servers, and to no other.
     pub first_session: Duration,
+    /// How long an Electrum session may go without a new block before
+    /// the tip of another server of the same operator is read: see
+    /// [`electrum`]. Two hours: on mainnet, about one window of two
+    /// hours in 160 000 sees no block.
+    pub stale: Duration,
 }
 
 impl Timings {
@@ -652,6 +657,7 @@ impl Timings {
             limit_kept: Duration::from_secs(24 * 60 * 60),
             zero_limit_kept: Duration::from_secs(60 * 60),
             first_session: Duration::from_secs(20),
+            stale: Duration::from_secs(2 * 60 * 60),
         }
     }
 }
@@ -1869,7 +1875,7 @@ pub(crate) fn servers_for(
                 let host = chain::host_of(&server.url)?;
                 let operator = operators
                     .iter()
-                    .find(|operator| host == **operator || host.ends_with(&format!(".{operator}")))?
+                    .find(|operator| runs(operator, &host))?
                     .clone();
                 let chosen = BackendConfig::Public {
                     server: Some(server.id),
@@ -1894,6 +1900,13 @@ pub(crate) fn servers_for(
         endpoints.splice(0..0, pushing);
     }
     Ok(endpoints)
+}
+
+/// Whether `host` is one the operator of the host `operator` runs: the
+/// same host, or one under it, `electrum.blockstream.info` under
+/// `blockstream.info`.
+pub(super) fn runs(operator: &str, host: &str) -> bool {
+    host == operator || host.ends_with(&format!(".{operator}"))
 }
 
 /// The task of a watcher: the supervisor, cut short the moment the

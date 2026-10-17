@@ -1,4 +1,5 @@
-//! Syncs, against a vault on disk and no server at all.
+//! Syncs, against a vault on disk and no server at all, or the fake
+//! servers of `crate::testkit` where the order of the servers matters.
 
 use super::*;
 use crate::input::parse_input;
@@ -159,4 +160,271 @@ fn the_server_that_answered_is_told_by_protocol_and_port() {
         sync_order(rotation.clone(), Some(&web.key()), Some(electrum.clone())),
         vec![electrum, web, rotation[0].clone(), rotation[2].clone()]
     );
+}
+
+/// The servers of a mainnet rotation, and the Electrum server of its
+/// second operator.
+fn mainnet() -> (Vec<Endpoint>, Endpoint) {
+    let none = chain::TrustedCerts::new();
+    let rotation =
+        chain::endpoints(&chain::BackendConfig::default(), Network::Mainnet, &none).unwrap();
+    let electrum = chain::endpoints(
+        &chain::BackendConfig::Public {
+            server: Some("electrum:blockstream.info".to_owned()),
+        },
+        Network::Mainnet,
+        &none,
+    )
+    .unwrap()
+    .remove(0);
+    (rotation, electrum)
+}
+
+/// A server that failed while a later one answered is tried after the
+/// others for five minutes, then ten, twenty, forty, and an hour at
+/// most, each time it fails so again before it answers; one answer and
+/// it starts over. A failure seen again while it is relegated, by a
+/// sync that started before it was, does not count twice.
+#[tokio::test(start_paused = true)]
+async fn a_server_that_fails_where_another_answers_is_tried_last_for_longer_each_time() {
+    use tokio::time::{Instant, advance};
+    let (rotation, _) = mainnet();
+    let (mempool, blockstream, emzy) = (&rotation[0], &rotation[1], &rotation[2]);
+    let mut relegated = Relegations::default();
+    let order = |relegated: &Relegations| relegated.order(rotation.clone(), None, Instant::now());
+    assert_eq!(order(&relegated), rotation);
+
+    for minutes in [5, 10, 20, 40, 60, 60] {
+        relegated.answered(blockstream, &[mempool], Instant::now());
+        assert_eq!(
+            order(&relegated),
+            [blockstream.clone(), emzy.clone(), mempool.clone()]
+        );
+        relegated.answered(blockstream, &[mempool], Instant::now());
+        advance(Duration::from_secs(minutes * 60 - 1)).await;
+        assert_eq!(order(&relegated)[2], *mempool, "{minutes} min");
+        advance(Duration::from_secs(1)).await;
+        assert_eq!(order(&relegated), rotation, "{minutes} min");
+    }
+
+    relegated.answered(mempool, &[], Instant::now());
+    relegated.answered(emzy, &[mempool, blockstream], Instant::now());
+    assert_eq!(
+        order(&relegated),
+        [emzy.clone(), mempool.clone(), blockstream.clone()]
+    );
+    advance(Duration::from_secs(5 * 60)).await;
+    assert_eq!(order(&relegated), rotation, "back to five minutes");
+}
+
+/// The server of the live watch stays first, whatever it did: behind
+/// another, it would show the wallet to a second operator. The others
+/// are relegated behind it as behind any other.
+#[tokio::test(start_paused = true)]
+async fn the_server_of_the_watch_is_never_put_behind_another() {
+    use tokio::time::Instant;
+    let (rotation, electrum) = mainnet();
+    let mut relegated = Relegations::default();
+    relegated.answered(&rotation[0], &[&electrum, &rotation[1]], Instant::now());
+    let watched = sync_order(rotation.clone(), None, Some(electrum.clone()));
+    assert_eq!(
+        relegated.order(watched, Some(&electrum), Instant::now()),
+        [
+            electrum.clone(),
+            rotation[0].clone(),
+            rotation[2].clone(),
+            rotation[1].clone()
+        ]
+    );
+}
+
+/// A second watched address: the P2WSH test vector of BIP-173.
+const SECOND_ADDRESS: &str = "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7";
+
+/// What the syncs asked of a fake mempool instance so far, forgotten.
+fn asked(server: &crate::testkit::FakeMempool) -> Vec<String> {
+    std::mem::take(&mut server.state.lock().unwrap().paths)
+}
+
+/// The rotation of the automatic backend, one server that is down and
+/// one that answers: the first sync asks both, and the next one, of
+/// another wallet, asks only the one that answered. A server that
+/// refuses one request, here one of another network, is not relegated
+/// for it. When every server is down, none is: the next sync asks them
+/// in their order.
+#[tokio::test]
+async fn a_sync_tries_last_a_server_that_was_down_where_another_answered() {
+    use crate::testkit::FakeMempool;
+    let flaky = FakeMempool::start(false, 0).await;
+    let steady = FakeMempool::start(false, 0).await;
+    let _stand_in = crate::chain::public::stand_in(
+        &[
+            format!("http://{}/api", flaky.address),
+            format!("http://{}/api", steady.address),
+        ],
+        &[],
+    );
+    let watching = |addresses: &'static [&'static str]| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let watcher = manager(dir.path()).await;
+        let mut wallets = Vec::new();
+        for address in addresses {
+            let parsed = parse_input(address).unwrap();
+            let wallet = watcher.add_wallet(address, &parsed, Network::Signet).await;
+            wallets.push(wallet.unwrap().id);
+        }
+        (dir, watcher, wallets)
+    };
+    let both = &[crate::testkit::ADDRESS, SECOND_ADDRESS];
+
+    let (_dir, watcher, wallets) = watching(both).await;
+    flaky.state.lock().unwrap().down = true;
+    watcher.sync_wallet(&wallets[0]).await.unwrap();
+    assert!(!asked(&flaky).is_empty());
+    assert!(!asked(&steady).is_empty());
+    // The other wallet has no server it last synced with.
+    watcher.sync_wallet(&wallets[1]).await.unwrap();
+    assert_eq!(asked(&flaky), Vec::<String>::new());
+    assert!(!asked(&steady).is_empty());
+
+    // A refusal of what was asked: the next wallet asks it first again.
+    let (_dir, watcher, wallets) = watching(both).await;
+    {
+        let mut flaky = flaky.state.lock().unwrap();
+        flaky.down = false;
+        flaky.genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    }
+    watcher.sync_wallet(&wallets[0]).await.unwrap();
+    assert!(!asked(&flaky).is_empty());
+    watcher.sync_wallet(&wallets[1]).await.unwrap();
+    assert!(!asked(&flaky).is_empty(), "relegated for one refusal");
+    flaky.state.lock().unwrap().genesis = None;
+
+    // Every server is down: none is relegated.
+    let (_dir, watcher, wallets) = watching(&[SECOND_ADDRESS]).await;
+    flaky.state.lock().unwrap().down = true;
+    steady.state.lock().unwrap().down = true;
+    assert!(watcher.sync_wallet(&wallets[0]).await.is_err());
+    flaky.state.lock().unwrap().down = false;
+    steady.state.lock().unwrap().down = false;
+    asked(&flaky);
+    asked(&steady);
+    watcher.sync_wallet(&wallets[0]).await.unwrap();
+    assert!(!asked(&flaky).is_empty());
+    assert_eq!(asked(&steady), Vec::<String>::new());
+}
+
+/// A relegation over for an hour is forgotten: the next outage, days
+/// later, relegates the server for five minutes again, not for longer.
+#[tokio::test(start_paused = true)]
+async fn an_old_relegation_is_forgotten() {
+    use tokio::time::{Instant, advance};
+    let (rotation, _) = mainnet();
+    let (mempool, blockstream) = (&rotation[0], &rotation[1]);
+    let mut relegated = Relegations::default();
+    let last = |relegated: &Relegations| {
+        relegated.order(rotation.clone(), None, Instant::now())[2].clone()
+    };
+    for minutes in [5, 10, 20] {
+        relegated.answered(blockstream, &[mempool], Instant::now());
+        advance(Duration::from_secs(minutes * 60)).await;
+    }
+    // Within the hour after the last one: twice as long again.
+    advance(Duration::from_secs(59 * 60)).await;
+    relegated.answered(blockstream, &[mempool], Instant::now());
+    advance(Duration::from_secs(39 * 60)).await;
+    assert_eq!(last(&relegated), *mempool);
+    advance(Duration::from_secs(60)).await;
+    assert_eq!(
+        relegated.order(rotation.clone(), None, Instant::now()),
+        rotation
+    );
+    // Past the hour: five minutes, as the first time.
+    advance(Duration::from_secs(60 * 60)).await;
+    relegated.answered(blockstream, &[mempool], Instant::now());
+    advance(Duration::from_secs(5 * 60)).await;
+    assert_eq!(
+        relegated.order(rotation.clone(), None, Instant::now()),
+        rotation
+    );
+}
+
+/// The older history of a watched address goes first to the server the
+/// watch talks to, as a sync does, and is never put behind another: it
+/// already sees the address.
+#[tokio::test]
+async fn older_history_goes_first_to_the_server_of_the_watch() {
+    use crate::testkit::{FakeElectrum, FakeMempool};
+    let rotation = FakeMempool::start(false, 0).await;
+    let live = FakeElectrum::start().await;
+    let _stand_in = crate::chain::public::stand_in(
+        &[format!("http://{}/api", rotation.address)],
+        &[format!("tcp://{}", live.address)],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let watcher = manager(dir.path()).await;
+    watcher.set_active_network(Network::Signet).await.unwrap();
+    let parsed = parse_input(crate::testkit::ADDRESS).unwrap();
+    let wallet = watcher
+        .add_wallet("Watch", &parsed, Network::Signet)
+        .await
+        .unwrap();
+    let _events = watcher.live_start_with(None).await.unwrap();
+    let started = std::time::Instant::now();
+    while watcher.live_server().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the watch never connected"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (_, served) = watcher.live_server().unwrap();
+    let (config, certs) = watcher.state.lock().await.chain_setup(Network::Signet);
+    let meta = watcher.list_wallets(None).await.remove(0);
+    assert_eq!(meta.id, wallet.id);
+    let order = watcher
+        .sync_endpoints(&meta, &config, &certs, None)
+        .unwrap();
+    assert_eq!(order[0], served);
+    // Down for a sync, it stays first all the same.
+    watcher.answered_after(&order[1], &[&served]);
+    let order = watcher
+        .sync_endpoints(&meta, &config, &certs, None)
+        .unwrap();
+    assert_eq!(order[0], served);
+    watcher.live_stop().await;
+}
+
+/// A sync that fails once the server has answered, the vault not saved,
+/// relegates nothing: what failed may well be this device. The next
+/// wallet asks the first server first.
+#[tokio::test]
+async fn a_sync_that_fails_after_the_answer_relegates_nothing() {
+    use crate::testkit::FakeMempool;
+    let flaky = FakeMempool::start(false, 0).await;
+    let steady = FakeMempool::start(false, 0).await;
+    let _stand_in = crate::chain::public::stand_in(
+        &[
+            format!("http://{}/api", flaky.address),
+            format!("http://{}/api", steady.address),
+        ],
+        &[],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let watcher = manager(dir.path()).await;
+    let mut wallets = Vec::new();
+    for address in [crate::testkit::ADDRESS, SECOND_ADDRESS] {
+        let parsed = parse_input(address).unwrap();
+        let wallet = watcher.add_wallet(address, &parsed, Network::Signet).await;
+        wallets.push(wallet.unwrap().id);
+    }
+    flaky.state.lock().unwrap().down = true;
+    watcher.state.lock().await.vault.fail_saves(true);
+    assert!(watcher.sync_wallet(&wallets[0]).await.is_err());
+    assert!(!asked(&steady).is_empty(), "the other one answered");
+    watcher.state.lock().await.vault.fail_saves(false);
+    flaky.state.lock().unwrap().down = false;
+    asked(&flaky);
+    watcher.sync_wallet(&wallets[1]).await.unwrap();
+    assert!(!asked(&flaky).is_empty(), "relegated by a sync that failed");
 }

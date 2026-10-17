@@ -140,6 +140,8 @@ pub struct Shared {
     /// The wallets a complete sync has read since the vault was opened:
     /// see [`WalletManager::sync_wallet`].
     complete_here: std::sync::Mutex<HashSet<String>>,
+    /// The servers the syncs try after the others for a while.
+    relegated: std::sync::Mutex<sync::Relegations>,
 }
 
 /// The last sync of a wallet to finish, when it started and how far it
@@ -182,6 +184,7 @@ impl WalletManager {
                 notice_budgets: std::sync::Mutex::new(crate::live::notice::Budgets::new()),
                 syncing: std::sync::Mutex::new(HashMap::new()),
                 complete_here: std::sync::Mutex::new(HashSet::new()),
+                relegated: std::sync::Mutex::new(sync::Relegations::default()),
             }),
         })
     }
