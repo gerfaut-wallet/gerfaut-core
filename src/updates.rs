@@ -321,10 +321,11 @@ pub(crate) const GITHUB_API_VERSION: &str = "2026-03-10";
 /// has to go through Tor; the name of the host then goes to the proxy,
 /// never to a resolver.
 ///
-/// A version GitHub no longer supports is answered `410 Gone`: an
-/// install left without updates for years, the one the check is for,
-/// then asks once more without naming one, as GitHub reads it by
-/// default.
+/// A version GitHub no longer supports is answered `410 Gone`, with a
+/// message that says so: an install left without updates for years,
+/// the one the check is for, then asks once more without naming one, as
+/// GitHub reads it by default. A `410` about anything else, a removed
+/// repository say, is a failed check like any other.
 pub(crate) async fn latest_tag(api: &str, repo: &str, proxy: Option<&str>) -> CoreResult<String> {
     let client = client(proxy)?;
     let ask = |version: Option<&'static str>| {
@@ -336,14 +337,30 @@ pub(crate) async fn latest_tag(api: &str, repo: &str, proxy: Option<&str>) -> Co
         }
         request.send()
     };
-    let failed = |e: reqwest::Error| check_error(crate::chain::esplora::describe_failure(&e));
     let mut response = ask(Some(GITHUB_API_VERSION)).await.map_err(failed)?;
     if response.status() == reqwest::StatusCode::GONE {
+        let gone = response.status();
+        if !names_a_version(&body_of(response).await?) {
+            return Err(check_error(format!("http {gone}")));
+        }
         response = ask(None).await.map_err(failed)?;
     }
     if !response.status().is_success() {
         return Err(check_error(format!("http {}", response.status())));
     }
+    let body = body_of(response).await?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| check_error(e.to_string()))?;
+    read_tag(&value)
+}
+
+fn failed(e: reqwest::Error) -> CoreError {
+    check_error(crate::chain::esplora::describe_failure(&e))
+}
+
+/// The body of an answer, read a chunk at a time and refused past
+/// [`MAX_ANSWER`].
+async fn body_of(mut response: reqwest::Response) -> CoreResult<Vec<u8>> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(failed)? {
         if body.len() + chunk.len() > MAX_ANSWER {
@@ -351,9 +368,17 @@ pub(crate) async fn latest_tag(api: &str, repo: &str, proxy: Option<&str>) -> Co
         }
         body.extend_from_slice(&chunk);
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|e| check_error(e.to_string()))?;
-    read_tag(&value)
+    Ok(body)
+}
+
+/// Whether a `410 Gone` is about the version of the API the request
+/// named: GitHub's message says "version", whatever else it says.
+fn names_a_version(body: &[u8]) -> bool {
+    let said = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value["message"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    said.to_lowercase().contains("version")
 }
 
 /// The client the check goes out with: through the Tor proxy when there

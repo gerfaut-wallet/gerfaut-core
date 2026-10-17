@@ -20,14 +20,15 @@ const ONION: &str = "tcp://gerfautexample000000000000000000000000000000000000000
 
 /// Something that answers like the releases API: the tag a test sets,
 /// or a failure when it sets none, and counts who came. Retired, it
-/// answers `410 Gone` to a request that names the API version.
+/// answers `410 Gone` with the message it was given to a request that
+/// names the API version.
 struct Releases {
     api: String,
     visits: Arc<Mutex<u32>>,
     tag: Arc<Mutex<Option<String>>>,
     /// The head of each request, lowercased, in the order they came.
     heads: Arc<Mutex<Vec<String>>>,
-    retired: Arc<Mutex<bool>>,
+    retired: Arc<Mutex<Option<String>>>,
 }
 
 impl Releases {
@@ -37,7 +38,7 @@ impl Releases {
         let visits = Arc::new(Mutex::new(0u32));
         let tag = Arc::new(Mutex::new(Some(tag.to_owned())));
         let heads: Arc<Mutex<Vec<String>>> = Arc::default();
-        let retired = Arc::new(Mutex::new(false));
+        let retired: Arc<Mutex<Option<String>>> = Arc::default();
         let (counted, answered, seen, gone) =
             (visits.clone(), tag.clone(), heads.clone(), retired.clone());
         tokio::spawn(async move {
@@ -48,13 +49,19 @@ impl Releases {
                 let head = String::from_utf8_lossy(&request[..read]).to_lowercase();
                 let versioned = head.contains("\r\nx-github-api-version:");
                 seen.lock().unwrap().push(head);
-                let tag = if versioned && *gone.lock().unwrap() {
-                    let answer = "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\n\
-                                  Connection: close\r\n\r\n";
-                    let _ = stream.write_all(answer.as_bytes()).await;
-                    continue;
-                } else {
-                    answered.lock().unwrap().clone()
+                let gone = gone.lock().unwrap().clone();
+                let tag = match gone {
+                    Some(message) if versioned => {
+                        let body = format!(r#"{{"message":"{message}","status":"410"}}"#);
+                        let answer = format!(
+                            "HTTP/1.1 410 Gone\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(answer.as_bytes()).await;
+                        continue;
+                    }
+                    _ => answered.lock().unwrap().clone(),
                 };
                 let answer = match tag {
                     // The page it names is never the one an app opens.
@@ -84,9 +91,10 @@ impl Releases {
         }
     }
 
-    /// From now on, the version the check names is past its support.
-    fn retire_the_version(&self) {
-        *self.retired.lock().unwrap() = true;
+    /// From now on, a request that names a version is answered `410
+    /// Gone`, with `message`.
+    fn gone_with(&self, message: &str) {
+        *self.retired.lock().unwrap() = Some(message.to_owned());
     }
 
     fn heads(&self) -> Vec<String> {
@@ -201,7 +209,7 @@ async fn the_check_names_the_api_version() {
 #[tokio::test]
 async fn a_retired_api_version_asks_again_without_one() {
     let releases = Releases::start("v0.2.0").await;
-    releases.retire_the_version();
+    releases.gone_with("API version 2026-03-10 is no longer supported.");
     let dir = tempfile::tempdir().unwrap();
     let manager = open(dir.path()).await;
 
@@ -211,6 +219,22 @@ async fn a_retired_api_version_asks_again_without_one() {
     assert_eq!(heads.len(), 2, "one request named the version, one did not");
     assert!(heads[0].contains("\r\nx-github-api-version:"));
     assert!(!heads[1].contains("\r\nx-github-api-version:"));
+}
+
+/// A `410` about anything but the version, a repository taken down
+/// say, fails the check without a second request.
+#[tokio::test]
+async fn another_gone_is_a_failed_check() {
+    let releases = Releases::start("v0.2.0").await;
+    releases.gone_with("Repository access blocked");
+    let dir = tempfile::tempdir().unwrap();
+    let manager = open(dir.path()).await;
+
+    assert!(matches!(
+        releases.button(&manager, "0.1.0").await,
+        Err(CoreError::Sync { .. })
+    ));
+    assert_eq!(releases.heads().len(), 1, "no second request");
 }
 
 /// A clock a year ahead at the first launch, then set right: the first
