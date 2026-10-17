@@ -665,9 +665,34 @@ pub(crate) async fn broadcast(
     let tx = tx.clone();
     let timeout = timeout_for(target);
     on_one(target, proxy, move |client| {
-        patiently(|| client.transaction_broadcast(&tx)).map_err(|e| failure(&e, timeout))
+        patiently(|| client.transaction_broadcast(&tx)).map_err(|e| sent_failure(&e, timeout))
     })
     .await
+}
+
+/// A broadcast that failed, as [`Failure`] reads it: a refusal only when
+/// the server's error is the node's verdict in one of the forms server
+/// software gives it ([`crate::chain::node_verdict`]); anything else, a
+/// server short of memory, "excessive resource usage", a daemon it cannot
+/// reach, an answer that is not the protocol, is the way there failing.
+fn sent_failure(error: &electrum_client::Error, timeout: Duration) -> Failure {
+    match error {
+        electrum_client::Error::AllAttemptsErrored(errors) => match errors.last() {
+            Some(inner) => sent_failure(inner, timeout),
+            None => failure(error, timeout),
+        },
+        electrum_client::Error::Protocol(value) if !out_of_budget(value) => {
+            let message = value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| value.to_string(), str::to_owned);
+            match crate::chain::node_verdict(&message) {
+                Some(words) => Failure::Refused(words),
+                None => failure(error, timeout),
+            }
+        }
+        _ => failure(error, timeout),
+    }
 }
 
 /// `operation`, its own failures as it says them, and the connection's
@@ -684,35 +709,12 @@ async fn on_one<T: Send + 'static>(
     .unwrap_or_else(|text| Err(Failure::Transport(text)))
 }
 
-/// A failed call, as the endpoints of a transaction to send read it
-/// ([`Failure`]). An error the server answers with is its answer, the
-/// refusal of the node behind it among them, in the node's words; but a
-/// server short of memory ([`out_of_budget`]) still after the second try
-/// is one that cannot serve now. An answer that is not the protocol is
-/// the server's too. The rest is the way there failing.
+/// A failed call that is no broadcast, a lookup or the tip, as the
+/// endpoints of a transaction to send read it: nothing such a call gets
+/// back is the node's verdict on a transaction, so whatever fails is the
+/// way there failing, and the next endpoint may be asked.
 fn failure(error: &electrum_client::Error, timeout: Duration) -> Failure {
-    use electrum_client::Error;
-    match error {
-        Error::AllAttemptsErrored(errors) => match errors.last() {
-            Some(inner) => failure(inner, timeout),
-            None => Failure::Transport(describe(error, timeout)),
-        },
-        Error::Protocol(value) if out_of_budget(value) => {
-            Failure::Transport(describe(error, timeout))
-        }
-        Error::Protocol(value) => {
-            let text = value
-                .get("message")
-                .and_then(|m| m.as_str())
-                .map(str::to_owned)
-                .unwrap_or_else(|| value.to_string());
-            Failure::Refused(crate::chain::esplora::node_message(&text))
-        }
-        Error::JSON(_) | Error::Hex(_) | Error::Bitcoin(_) | Error::InvalidResponse(_) => {
-            Failure::Refused(describe(error, timeout))
-        }
-        other => Failure::Transport(describe(other, timeout)),
-    }
+    Failure::Transport(describe(error, timeout))
 }
 
 /// Whether an error says the server has no such transaction, in the
@@ -777,10 +779,10 @@ pub(crate) async fn fetch_prevout(
     let timeout = timeout_for(target);
     on_one(target, proxy, move |client| {
         // Only a server that says it has no such transaction says the
-        // coin is unknown; any other refusal is a refusal, and one short
-        // of memory is asked again.
+        // coin is unknown; anything else that fails is the way there
+        // failing, and one short of memory is asked again first.
         let txout = match patiently(|| client.transaction_get(&outpoint.txid)) {
-            Ok(tx) => crate::chain::output_at(&tx, outpoint).map_err(Failure::Refused)?,
+            Ok(tx) => crate::chain::output_at(&tx, outpoint).map_err(Failure::Transport)?,
             Err(error) if no_such_transaction(&error) => None,
             Err(error) => return Err(failure(&error, timeout)),
         };
@@ -1609,28 +1611,70 @@ mod tests {
         assert_eq!(certificate_key("[2001:db8::1]:50002"), "2001:db8::1:50002");
     }
 
-    /// What an Electrum server answers about a transaction to send is its
-    /// answer, the node's refusal in the node's words; a server still
-    /// short of memory, a connection that fails, is the way there.
+    /// What an Electrum server answers a broadcast with is a refusal only
+    /// when it is the node's verdict, in the forms of ElectrumX, Fulcrum,
+    /// both electrs of Blockstream and mempool.space, and electrs; a
+    /// server short of memory, one that finds the request too costly, a
+    /// daemon it cannot reach, an answer that is not the protocol, a
+    /// connection that fails, is the way there failing.
     #[test]
     fn a_refusal_is_told_from_a_failure_of_the_way_there() {
         use electrum_client::Error;
         use serde_json::json;
-        let refused = Error::Protocol(json!({
-            "code": 2, "message": "sendrawtransaction RPC error -26: min relay fee not met",
-        }));
-        assert_eq!(
-            failure(&refused, TIMEOUT),
-            Failure::Refused("min relay fee not met".to_owned())
-        );
-        let busy = Error::Protocol(json!({
-            "code": 2, "message": "response budget exhausted, retry later",
-        }));
-        assert!(matches!(failure(&busy, TIMEOUT), Failure::Transport(_)));
+        for (code, message, words) in [
+            (
+                1,
+                "the transaction was rejected by network rules.\n\nmin relay fee not met, 0 < 11\n[0200]",
+                "min relay fee not met, 0 < 11",
+            ),
+            (
+                2,
+                "sendrawtransaction RPC error -26: min relay fee not met",
+                "min relay fee not met",
+            ),
+            (
+                -32603,
+                r#"sendrawtransaction RPC error: {"code":-25,"message":"bad-txns-inputs-missingorspent"}"#,
+                "bad-txns-inputs-missingorspent",
+            ),
+            (
+                2,
+                "Transaction outputs already in utxo set",
+                "Transaction outputs already in utxo set",
+            ),
+        ] {
+            let refused = Error::Protocol(json!({ "code": code, "message": message }));
+            assert_eq!(
+                sent_failure(&refused, TIMEOUT),
+                Failure::Refused(words.to_owned()),
+                "{message}"
+            );
+        }
+        for (code, message) in [
+            (2, "response budget exhausted, retry later"),
+            (-101, "excessive resource usage"),
+            (
+                2,
+                "daemon error: DaemonError({'code': -28, 'message': 'Loading block index...'})",
+            ),
+            (2, "Daemon is unavailable: connection refused"),
+            (1, "failed to broadcast transaction: connection refused"),
+        ] {
+            let error = Error::Protocol(json!({ "code": code, "message": message }));
+            assert!(
+                matches!(sent_failure(&error, TIMEOUT), Failure::Transport(_)),
+                "{message}"
+            );
+        }
         let cut = Error::AllAttemptsErrored(vec![Error::IOError(std::io::Error::from(
             std::io::ErrorKind::ConnectionReset,
         ))]);
-        assert!(matches!(failure(&cut, TIMEOUT), Failure::Transport(_)));
+        assert!(matches!(sent_failure(&cut, TIMEOUT), Failure::Transport(_)));
+        let garbled = Error::InvalidResponse(json!("not a txid"));
+        assert!(matches!(
+            sent_failure(&garbled, TIMEOUT),
+            Failure::Transport(_)
+        ));
     }
 
     /// A coin is unknown only when the server says it has no such

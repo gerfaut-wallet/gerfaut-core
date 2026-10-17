@@ -781,16 +781,111 @@ pub(crate) async fn fetch_address_state(
 /// be sent, or being sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Failure {
-    /// The way to the server failed, or the server failed to serve: no
-    /// connection, a time limit, a server error (5xx), a rate limit, a
-    /// server short of memory twice. Nothing was said about the
-    /// transaction, and the next endpoint may be asked.
+    /// Anything but the node's verdict: no connection, a time limit, a
+    /// server error, a rate limit, a server short of memory twice, a
+    /// proxy's page, an answer that is not the protocol, a request the
+    /// server turned away. Nothing was said about the transaction, and
+    /// the next endpoint may be asked.
     Transport(String),
-    /// The server, or the node behind it, answered no, in these words.
-    /// That is the answer: asking another operator would show the
-    /// transaction to a second one, for an answer that changes nothing.
+    /// The node itself turned the transaction down, in these words: a
+    /// verdict recognised as bitcoind's ([`node_verdict`]). That is the
+    /// answer: another operator's node would say the same, and seeing
+    /// the transaction would cost it its privacy for nothing.
     Refused(String),
 }
+
+/// The node's own words when `message` is bitcoind's verdict on a
+/// transaction handed to it, in one of the forms the server software
+/// that relays `sendrawtransaction` gives it; `None` for anything else,
+/// which is then no refusal of the transaction:
+/// - ElectrumX and Fulcrum: "the transaction was rejected by network
+///   rules.", the node's words on the lines after, the transaction last;
+/// - the electrs of Blockstream, over Electrum and its web API:
+///   "sendrawtransaction RPC error -26: …", the code before the words;
+/// - the electrs of mempool.space: "sendrawtransaction RPC error:
+///   {"code":-26,"message":"…"}";
+/// - electrs (romanz): the node's words alone, under code 2, told by the
+///   reasons bitcoind gives ([`REJECT_REASONS`]).
+///
+/// Of bitcoind's codes, only its verdicts on the transaction count:
+/// -25 (an input missing or spent), -26 (rejected by policy or
+/// consensus), -27 (already in the chain). A node warming up (-28) or one
+/// that cannot be reached is the way there failing.
+pub(crate) fn node_verdict(message: &str) -> Option<String> {
+    const VERDICTS: [i64; 3] = [-25, -26, -27];
+    // A body quoted inside another error arrives with its quotes
+    // escaped: read it as if it were not.
+    let message = &message.replace("\\\"", "\"");
+    let lower = message.to_ascii_lowercase();
+    if let Some(at) = lower.find("rejected by network rules") {
+        // The node's words sit between the sentence and the bracketed
+        // transaction ElectrumX echoes back.
+        let rest = &message[at + "rejected by network rules".len()..];
+        let words = rest
+            .lines()
+            .map(|line| line.trim().trim_start_matches('.').trim())
+            .find(|line| !line.is_empty() && !line.starts_with('['))
+            .unwrap_or("the transaction was rejected by network rules");
+        return Some(server_words(words));
+    }
+    if let Some(at) = lower.find("sendrawtransaction rpc error") {
+        let rest = message[at + "sendrawtransaction rpc error".len()..].trim_start();
+        // mempool.space: the node's error object, after a colon.
+        if let Some(object) = rest.strip_prefix(':').map(str::trim)
+            && let Ok(error) = serde_json::from_str::<serde_json::Value>(object)
+        {
+            let code = error.get("code").and_then(serde_json::Value::as_i64)?;
+            let words = error.get("message").and_then(serde_json::Value::as_str)?;
+            return VERDICTS.contains(&code).then(|| server_words(words));
+        }
+        // Blockstream: the code, a colon, the words.
+        let (code, words) = rest.split_once(':')?;
+        let code: i64 = code.trim().parse().ok()?;
+        return VERDICTS.contains(&code).then(|| server_words(words.trim()));
+    }
+    REJECT_REASONS
+        .iter()
+        .any(|reason| lower.starts_with(reason))
+        .then(|| server_words(message.trim()))
+}
+
+/// How bitcoind's refusals of a transaction begin, its reject reasons and
+/// the messages of its codes -25 to -27, in lower case: what tells the
+/// node's words when a server passes them on bare (electrs, romanz).
+const REJECT_REASONS: &[&str] = &[
+    "min relay fee not met",
+    "mempool min fee not met",
+    "mempool full",
+    "insufficient fee",
+    "bad-txns-",
+    "bad-witness-",
+    "txn-mempool-conflict",
+    "txn-already-in-mempool",
+    "txn-already-known",
+    "txn-same-nonwitness-data-in-mempool",
+    "transaction outputs already in utxo set",
+    "transaction already in block chain",
+    "non-mandatory-script-verify-flag",
+    "mandatory-script-verify-flag-failed",
+    "too-long-mempool-chain",
+    "non-final",
+    "non-bip68-final",
+    "dust",
+    "tx-size",
+    "scriptsig-size",
+    "scriptsig-not-pushonly",
+    "scriptpubkey",
+    "bare-multisig",
+    "multi-op-return",
+    "too many potential replacements",
+    "replacement-adds-unconfirmed",
+    "missing inputs",
+    "missing-inputs",
+    "fee exceeds maximum configured",
+    "unspendable output exceeds maximum configured",
+    "max-fee-exceeded",
+    "absurdly-high-fee",
+];
 
 /// What the endpoints are asked for about a transaction to send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -880,13 +975,24 @@ pub(crate) async fn broadcast(
     };
     match answered {
         Ok(answered) if answered == txid => Ok(()),
-        Ok(answered) => Err(Failure::Refused(format!(
+        // No verdict of the node's: a server that says it took another
+        // transaction has not said it took this one.
+        Ok(answered) => Err(Failure::Transport(format!(
             "the server answered with the txid {answered}, not {txid}"
         ))),
+        // The node says it holds it already. The same server is asked for
+        // it: handed over, it is the transaction; not there, the server's
+        // index may not have caught up with its node, whose word stands.
+        // A server that cannot be reached is no answer, and another
+        // transaction under that txid is no answer either.
         Err(Failure::Refused(words)) if already_known(&words) => {
             match fetch_tx(endpoint, txid, proxy).await {
                 Ok(Some(held)) if held.compute_txid() == txid => Ok(()),
-                _ => Err(Failure::Refused(words)),
+                Ok(Some(_)) => Err(Failure::Transport(format!(
+                    "the server handed over another transaction as {txid}"
+                ))),
+                Ok(None) => Ok(()),
+                Err(failure) => Err(failure),
             }
         }
         Err(failure) => Err(failure),
@@ -903,7 +1009,7 @@ async fn fetch_tx(
     match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client(url, proxy).map_err(Failure::Transport)?;
-            client.tx(&txid).await.map_err(esplora::failure)
+            client.tx(&txid).await.map_err(Failure::Transport)
         }
         Endpoint::Electrum(target) => electrum::fetch_tx(target, txid, proxy).await,
     }
@@ -1018,7 +1124,7 @@ pub(crate) async fn tip_height(endpoint: &Endpoint, proxy: Option<&str>) -> Resu
             .map_err(Failure::Transport)?
             .height()
             .await
-            .map_err(esplora::failure),
+            .map_err(Failure::Transport),
         Endpoint::Electrum(target) => electrum::tip_height(target, proxy).await,
     }
 }
@@ -1847,5 +1953,69 @@ mod tests {
         ] {
             assert!(!already_known(words), "{words}");
         }
+    }
+
+    /// bitcoind's verdict on a transaction, in each form the server
+    /// software that relays `sendrawtransaction` gives it, comes back as
+    /// the node's own words; anything else is no verdict, and the next
+    /// endpoint may be asked.
+    #[test]
+    fn only_bitcoinds_verdict_is_a_refusal() {
+        for (message, words) in [
+            // ElectrumX: the node's words, then the transaction echoed.
+            (
+                "the transaction was rejected by network rules.\n\nmin relay fee not met, 0 < 11\n[0200000001ab]",
+                "min relay fee not met, 0 < 11",
+            ),
+            // Fulcrum: the same, without the transaction.
+            (
+                "the transaction was rejected by network rules.\n\nTransaction outputs already in utxo set\n",
+                "Transaction outputs already in utxo set",
+            ),
+            // The electrs of Blockstream, Electrum and web API alike.
+            (
+                "sendrawtransaction RPC error -26: mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)",
+                "mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)",
+            ),
+            (
+                "sendrawtransaction RPC error -25: bad-txns-inputs-missingorspent",
+                "bad-txns-inputs-missingorspent",
+            ),
+            // The electrs of mempool.space, and its body quoted again.
+            (
+                r#"sendrawtransaction RPC error: {"code":-27,"message":"Transaction outputs already in utxo set"}"#,
+                "Transaction outputs already in utxo set",
+            ),
+            (
+                r#"sendrawtransaction RPC error: {\"code\":-26,\"message\":\"bad-txns-inputs-missingorspent\"}"#,
+                "bad-txns-inputs-missingorspent",
+            ),
+            // electrs (romanz): the node's words alone.
+            (
+                "min relay fee not met, 0 < 11",
+                "min relay fee not met, 0 < 11",
+            ),
+            ("txn-mempool-conflict", "txn-mempool-conflict"),
+            ("non-BIP68-final", "non-BIP68-final"),
+        ] {
+            assert_eq!(node_verdict(message).as_deref(), Some(words), "{message}");
+        }
+        for message in [
+            "response budget exhausted, retry later",
+            "excessive resource usage",
+            "daemon error: DaemonError({'code': -28, 'message': 'Loading block index...'})",
+            "Daemon is unavailable: connection refused",
+            "sendrawtransaction RPC error -28: Loading block index...",
+            "sendrawtransaction RPC error -22: TX decode failed",
+            "<html><title>Attention Required! | Cloudflare</title></html>",
+            "unsupported protocol version: 1.2",
+            "failed to broadcast transaction: connection refused",
+            "",
+        ] {
+            assert_eq!(node_verdict(message), None, "{message}");
+        }
+        // The words are the node's, cut to a line a screen holds.
+        let long = node_verdict(&format!("bad-txns-{}", "x".repeat(1 << 20))).unwrap();
+        assert_eq!(long.chars().count(), 201);
     }
 }

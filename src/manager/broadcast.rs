@@ -176,8 +176,10 @@ impl WalletManager {
         // is asked for its height whenever the wallets' would hold the
         // transaction back, or no wallet has one.
         let locktime = decoded.tx.lock_time;
+        // A lock at block 0 holds nothing back, whatever the tip.
         let needs_tip = decoded.tx.is_lock_time_enabled()
             && locktime.is_block_height()
+            && locktime.to_consensus_u32() > 0
             && tip_height.is_none_or(|tip| locktime.to_consensus_u32() > tip);
         // No backend for this network, or a Tor route that cannot be
         // opened, is no answer at all: the coins stay unchecked below,

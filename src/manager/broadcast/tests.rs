@@ -1035,6 +1035,12 @@ enum Takes {
     Holds(&'static str),
     /// Fails with a server error, whatever is asked.
     Down,
+    /// Refuses it in the node's words, then fails with a server error
+    /// when asked for it: a server whose web API stops answering.
+    KnowsThenDown(&'static str),
+    /// A proxy in front of the server turns every request away: a 403
+    /// and a page of HTML, as Cloudflare answers a Tor exit.
+    Walled,
 }
 
 /// An Esplora on loopback that does with every transaction posted to it
@@ -1088,6 +1094,11 @@ async fn esplora_taking(takes: Takes) -> (String, Arc<std::sync::Mutex<Vec<Strin
                 String::from_utf8_lossy(request.get(end + 4..).unwrap_or_default()).into_owned();
             let (status, answer): (&str, Vec<u8>) = match (takes, method) {
                 (Takes::Down, _) => ("503 Service Unavailable", b"down".to_vec()),
+                (Takes::Walled, _) => (
+                    "403 Forbidden",
+                    b"<html><title>Attention Required! | Cloudflare</title></html>".to_vec(),
+                ),
+                (Takes::KnowsThenDown(_), "GET") => ("503 Service Unavailable", b"down".to_vec()),
                 (_, "POST") => {
                     let tx = bdk_wallet::bitcoin::consensus::encode::deserialize_hex::<
                         bdk_wallet::bitcoin::Transaction,
@@ -1102,7 +1113,10 @@ async fn esplora_taking(takes: Takes) -> (String, Arc<std::sync::Mutex<Vec<Strin
                             held = Some(tx);
                             ("400 Bad Request", words.as_bytes().to_vec())
                         }
-                        Takes::Down => unreachable!(),
+                        Takes::KnowsThenDown(words) => {
+                            ("400 Bad Request", words.as_bytes().to_vec())
+                        }
+                        Takes::Down | Takes::Walled => unreachable!(),
                     }
                 }
                 _ => match &held {
@@ -1304,9 +1318,16 @@ async fn a_refusal_ends_the_broadcast_and_only_a_dead_server_passes_it_on() {
     let (refusing, refusing_log) = esplora_taking(Takes::No(refusal)).await;
     let (taking, taking_log) = esplora_taking(Takes::Yes).await;
     let dir = tempfile::tempdir().unwrap();
+    let (walled, walled_log) = esplora_taking(Takes::Walled).await;
     let (_stand_in, manager) = rotating(
         dir.path(),
-        &[nobody_there().await, failing, refusing, taking.clone()],
+        &[
+            nobody_there().await,
+            failing,
+            walled,
+            refusing,
+            taking.clone(),
+        ],
     )
     .await;
     let error = manager
@@ -1318,6 +1339,8 @@ async fn a_refusal_ends_the_broadcast_and_only_a_dead_server_passes_it_on() {
         "{error}"
     );
     assert!(!failing_log.lock().unwrap().is_empty());
+    // A proxy's page is no refusal of the node's: the next one is asked.
+    assert_eq!(walled_log.lock().unwrap().len(), 1);
     assert_eq!(refusing_log.lock().unwrap().len(), 1);
     assert!(
         taking_log.lock().unwrap().is_empty(),
@@ -1368,8 +1391,11 @@ async fn a_txid_the_core_did_not_compute_is_no_send() {
 
 /// A node that says it already holds the transaction did not refuse it:
 /// the same server is asked for it, and when it hands over the very
-/// transaction, the send is done and kept. One that says so and cannot
-/// show it has refused.
+/// transaction, the send is done and kept. One that cannot show it yet,
+/// its index behind its node, leaves the node's word standing: sent all
+/// the same. One that cannot be reached when asked, or hands over another
+/// transaction under that txid, has given no answer, and the next
+/// endpoint is asked.
 #[tokio::test]
 async fn a_transaction_the_node_already_holds_counts_as_sent() {
     for (words, holds) in [
@@ -1378,7 +1404,7 @@ async fn a_transaction_the_node_already_holds_counts_as_sent() {
             true,
         ),
         (
-            "sendrawtransaction RPC error -26: txn-already-in-mempool",
+            r#"sendrawtransaction RPC error: {"code":-26,"message":"txn-already-in-mempool"}"#,
             true,
         ),
         (
@@ -1407,11 +1433,8 @@ async fn a_transaction_the_node_already_holds_counts_as_sent() {
         let sent = manager
             .broadcast_transaction(Network::Regtest, &signed(1))
             .await;
-        assert_eq!(sent.is_ok(), holds, "{words}: {sent:?}");
-        assert_eq!(
-            manager.recent_broadcasts(Network::Regtest).await.len(),
-            usize::from(holds)
-        );
+        assert!(sent.is_ok(), "{words}: {sent:?}");
+        assert_eq!(manager.recent_broadcasts(Network::Regtest).await.len(), 1);
         assert!(
             log.lock()
                 .unwrap()
@@ -1420,6 +1443,20 @@ async fn a_transaction_the_node_already_holds_counts_as_sent() {
             "the server was asked for the transaction"
         );
     }
+
+    // Asked for it, the server is down: no answer, the next one takes it.
+    let (knows, _) = esplora_taking(Takes::KnowsThenDown(
+        "sendrawtransaction RPC error -27: Transaction outputs already in utxo set",
+    ))
+    .await;
+    let (taking, taking_log) = esplora_taking(Takes::Yes).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager) = rotating(dir.path(), &[knows, taking]).await;
+    manager
+        .broadcast_transaction(Network::Regtest, &signed(1))
+        .await
+        .unwrap();
+    assert_eq!(taking_log.lock().unwrap().len(), 1);
 }
 
 /// The same rules on an Electrum server: its txid answer, a server short
@@ -1459,12 +1496,29 @@ async fn electrum_takes_it_after_a_moment_or_already_holds_it() {
         .broadcast_transaction(Network::Regtest, &signed(1))
         .await
         .unwrap();
-    // A refusal that is one stays one.
-    let error = manager
+    // Said of a transaction it cannot show: the node's word stands.
+    manager
         .broadcast_transaction(Network::Regtest, &signed(2))
         .await
+        .unwrap();
+    // A refusal that is one stays one, in the node's words alone.
+    server.state.lock().unwrap().refuse.insert(
+        "blockchain.transaction.broadcast",
+        "the transaction was rejected by network rules.\n\nmin relay fee not met, 0 < 11\n[02]"
+            .to_owned(),
+    );
+    let error = manager
+        .broadcast_transaction(Network::Regtest, &signed(3))
+        .await
         .unwrap_err();
-    assert!(error.to_string().contains("already in utxo set"), "{error}");
+    assert!(
+        error.to_string().contains("min relay fee not met, 0 < 11"),
+        "{error}"
+    );
+    assert!(
+        !error.to_string().contains("rejected by network rules"),
+        "{error}"
+    );
 }
 
 /// An Electrum server that refuses to hand over the transaction behind a
@@ -1516,11 +1570,12 @@ async fn an_electrum_refusal_is_not_an_unknown_coin() {
     }
 }
 
-/// The preview keeps to the first operator that answers: a refusal about
-/// a coin leaves it unchecked rather than taking it to the next, and
-/// only a server that cannot be reached passes its coins on.
+/// The preview keeps to the first operator that answers. A proxy's page
+/// in place of an answer, a 403 turning every request away, or a server
+/// that cannot be reached, passes its coins on to the next one; one that
+/// answers keeps them, and the next one hears of nothing.
 #[tokio::test]
-async fn the_preview_asks_a_second_operator_only_when_the_first_is_down() {
+async fn the_preview_asks_the_next_operator_only_when_one_fails() {
     use crate::broadcast::TxWarningKind;
     use crate::testkit::{nowhere, script, transaction};
     use bdk_wallet::bitcoin::OutPoint;
@@ -1530,29 +1585,9 @@ async fn the_preview_asks_a_second_operator_only_when_the_first_is_down() {
         &[OutPoint::new(funding.compute_txid(), 0)],
         &[(script(9).as_str(), 49_000)],
     );
-    // A server that refuses every request: 403, its answer.
-    let refusing = {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 4096];
-                let _ = stream.read(&mut buf).await;
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .await;
-                let _ = stream.shutdown().await;
-            }
-        });
-        format!("http://{address}/api")
-    };
     let knowing = esplora_knowing(funding.clone(), Unknown::NotFound).await;
-    for (first, answered) in [(refusing, false), (nobody_there().await, true)] {
+    let (walled, _) = esplora_taking(Takes::Walled).await;
+    for first in [walled, nobody_there().await] {
         let dir = tempfile::tempdir().unwrap();
         let (_stand_in, manager) = rotating(dir.path(), &[first, knowing.clone()]).await;
         let preview = manager
@@ -1560,19 +1595,27 @@ async fn the_preview_asks_a_second_operator_only_when_the_first_is_down() {
             .await
             .unwrap();
         assert_eq!(
-            preview.inputs[0].value_sats.is_some(),
-            answered,
+            preview.inputs[0].value_sats,
+            Some(50_000),
             "{:?}",
             preview.warnings
         );
-        assert_eq!(
-            preview
+        assert!(
+            !preview
                 .warnings
                 .iter()
                 .any(|w| w.kind == TxWarningKind::InputUnknown),
-            !answered,
             "{:?}",
             preview.warnings
         );
     }
+    let (next, next_log) = esplora_taking(Takes::Down).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager) = rotating(dir.path(), &[knowing, next]).await;
+    manager
+        .preview_transaction(&witnessed(pasted), Network::Regtest)
+        .await
+        .unwrap();
+    let heard = next_log.lock().unwrap().clone();
+    assert!(heard.is_empty(), "the next operator heard of it: {heard:?}");
 }
