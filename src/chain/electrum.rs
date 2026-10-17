@@ -553,6 +553,15 @@ pub(crate) fn busy_pause() -> Duration {
 /// that limits the rate of requests is asked again once: a second
 /// refusal is the answer. The thread of the sync sleeps meanwhile, its
 /// connection open.
+///
+/// A batch of the client of BDK is asked again whole, ten requests at
+/// most: it ends at the first refusal and drops the answers it had, so
+/// nothing tells which ones went through, where the asynchronous client
+/// ([`rpc::Connection::batch`]) asks again the refused ones alone. And it
+/// reads a refusal only from a server that answers in order: one
+/// answered out of order reaches it as a result it cannot read. The
+/// electrs of Blockstream, the one server that refuses for want of
+/// memory, answers the requests of a connection one after the other.
 pub(crate) fn patiently<T>(
     call: impl FnMut() -> Result<T, electrum_client::Error>,
 ) -> Result<T, electrum_client::Error> {
