@@ -134,6 +134,8 @@ enum Answer {
     Stall,
     /// Bytes without a line end.
     Flood(usize),
+    /// Nothing at all, the connection going on.
+    Nothing,
 }
 
 /// A block header at `height`, in hex, whose time is 1 700 000 000 plus
@@ -257,6 +259,9 @@ pub(crate) struct ElectrumState {
     pub answered_only: HashMap<&'static str, usize>,
     /// A method answered with this many bytes and no line end.
     pub flood: Option<(&'static str, usize)>,
+    /// A method never answered: the request is read and dropped, and
+    /// the connection goes on.
+    pub unanswered: Option<&'static str>,
     /// A method whose answer, read from the state when the request
     /// arrives, is held back until a permit is added here.
     pub gate: Option<(&'static str, Arc<tokio::sync::Semaphore>)>,
@@ -265,6 +270,8 @@ pub(crate) struct ElectrumState {
     pub genesis: Option<bdk_wallet::bitcoin::Network>,
     /// Every method asked for, in order, over every connection.
     pub asked: Vec<String>,
+    /// The same, each with its first parameter as text.
+    pub calls: Vec<(String, String)>,
     /// Connections the client closed.
     pub closed: usize,
     /// What the server says it runs, first in its answer to
@@ -295,7 +302,7 @@ const CHAINED_UP_TO: u32 = 100_000;
 
 impl ElectrumState {
     /// The header at `height`, in hex: see [`Self::header_of`].
-    fn header(&self, height: u32) -> String {
+    pub(crate) fn header(&self, height: u32) -> String {
         serialize_hex(&self.header_of(height))
     }
 
@@ -444,6 +451,11 @@ impl FakeElectrum {
                     let (answer, gate) = {
                         let mut state = state.lock().unwrap();
                         state.asked.push(method.clone());
+                        let about = match &request["params"][0] {
+                            Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        };
+                        state.calls.push((method.clone(), about));
                         if state.silent || stalled {
                             continue;
                         }
@@ -476,6 +488,7 @@ impl FakeElectrum {
                             format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":", request["id"]).into_bytes()
                         }
                         Answer::Flood(size) => vec![b'x'; size],
+                        Answer::Nothing => continue,
                     };
                     if writer.write_all(&bytes).await.is_err() {
                         return;
@@ -497,6 +510,9 @@ impl FakeElectrum {
     fn answer(state: &mut ElectrumState, index: usize, request: &Value, method: &str) -> Answer {
         if state.stall == Some(method) {
             return Answer::Stall;
+        }
+        if state.unanswered == Some(method) {
+            return Answer::Nothing;
         }
         if let Some((flooded, size)) = state.flood
             && flooded == method
@@ -672,6 +688,20 @@ impl FakeElectrum {
     /// Connections the client has closed so far.
     pub(crate) fn closed(&self) -> usize {
         self.state.lock().unwrap().closed
+    }
+
+    /// How many times the history of `script_hex` was asked for.
+    pub(crate) fn histories_of(&self, script_hex: &str) -> usize {
+        let hash = scripthash(script_hex);
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(method, about)| {
+                method == "blockchain.scripthash.get_history" && *about == hash
+            })
+            .count()
     }
 
     /// Whether a request of this method has arrived.
