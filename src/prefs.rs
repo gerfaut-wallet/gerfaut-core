@@ -48,10 +48,10 @@ pub struct Preferences {
     /// The currency of the fiat value. The euro by default.
     pub fiat_currency: FiatCurrency,
     /// Where the price comes from. mempool.space by default, for the
-    /// seven currencies it quotes: it is already among the servers the
-    /// syncs ask, so the price adds no third party. CoinGecko for the
-    /// others. Always one that quotes [`Self::fiat_currency`]: see
-    /// [`Preferences::change`].
+    /// seven currencies it quotes: its terms ask for no credit, and with
+    /// the Automatic server it is one of the operators the syncs may
+    /// already reach. CoinGecko for the others. Always one that quotes
+    /// [`Self::fiat_currency`]: see [`Preferences::change`].
     pub price_source: PriceSource,
     /// A notification when a transaction shows up and when it confirms.
     /// Off by default: watching keeps a connection open, which tells the
