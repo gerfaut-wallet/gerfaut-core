@@ -34,12 +34,12 @@ unused-ignored-advisory = "deny"
 # Each exception names the advisory, why it does not reach this code,
 # and what would end it.
 ignore = [
-    # rsa: Marvin timing attack on RSA decryption and signing. Arti pulls
-    # rsa in to check the RSA signatures of Tor relays and directory
-    # documents, which needs the public key only; a Tor client never
-    # decrypts or signs with an RSA private key, and nothing else here
-    # uses rsa. No fixed release exists: remove this entry once one is in
-    # Cargo.lock.
+    # rsa: Marvin timing attack on RSA decryption and signing. Only arti
+    # pulls rsa in: tor-llcrypto, tor-key-forge, its fork of ssh-key. A
+    # Tor client uses RSA to check the signatures of relays and directory
+    # documents, with their public keys; it never generates, loads or uses
+    # an RSA private key, and this code does not use rsa itself. No fixed
+    # release exists: remove this entry once one is in Cargo.lock.
     { id = "RUSTSEC-2023-0071", reason = "Marvin needs an RSA private-key operation, which a Tor client never performs; no fixed rsa release yet" },
 ]
 
