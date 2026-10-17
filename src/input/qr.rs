@@ -127,25 +127,29 @@ fn announced_parts(first: &str) -> u32 {
 
 /// Assembles the frames scanned so far. Frames may repeat and arrive in
 /// any order; the caller keeps feeding the growing list until
-/// `complete` is true, then hands `text` to the classifier. A list longer
-/// than [`scan_frame_limit`] allows, repeats and blanks counted, is
-/// refused with [`CoreError::TooManyFrames`] before any frame is read:
-/// the scan is over. The apps send each frame once, so the bound is the
-/// distinct frames a scan may bring; whoever sends repeats reaches it
-/// sooner, never later.
+/// `complete` is true, then hands `text` to the classifier. More frames
+/// than [`scan_frame_limit`] allows, repeats counted, blanks not, are
+/// refused with [`CoreError::TooManyFrames`] before any frame is
+/// decoded: the scan is over. The apps send each frame once, so the
+/// bound is the distinct frames a scan may bring; whoever sends repeats
+/// reaches it sooner, never later. The parts it is reckoned from are
+/// those of the first frame, the one both assemblers read the count
+/// from; whatever it announces, the bound stays between
+/// [`MIN_SCAN_FRAMES`] and [`MAX_SCAN_FRAMES`].
 pub fn assemble(frames: &[String]) -> CoreResult<QrProgress> {
-    let Some(first) = frames.iter().map(|f| f.trim()).find(|f| !f.is_empty()) else {
+    let scanned = |frame: &&String| !frame.trim().is_empty();
+    let Some(first) = frames.iter().find(scanned).map(|frame| frame.trim()) else {
         return Err(qr_error("no frame scanned yet"));
     };
-    if frames.len() > scan_frame_limit(announced_parts(first)) {
-        return Err(CoreError::TooManyFrames(frames.len() as u32));
+    let count = frames.iter().filter(scanned).count();
+    if count > scan_frame_limit(announced_parts(first)) {
+        return Err(CoreError::TooManyFrames(count as u32));
     }
     let frames: Vec<&str> = frames
         .iter()
-        .map(|f| f.trim())
-        .filter(|f| !f.is_empty())
+        .filter(scanned)
+        .map(|frame| frame.trim())
         .collect();
-    let first = frames[0];
     if is_ur(first) {
         assemble_ur(&frames)
     } else if first.starts_with("B$") {
@@ -1025,10 +1029,19 @@ mod tests {
         let kept = assemble(&frames[..MIN_SCAN_FRAMES]).unwrap();
         assert!(!kept.complete);
         // Repeats count: a list past the bound is refused whatever it
-        // holds, before a frame of it is read.
+        // holds, before a frame of it is read. Blanks do not, and the
+        // refusal counts frames scanned.
         let repeated = vec![frames[0].clone(); MIN_SCAN_FRAMES + 1];
         assert!(matches!(
             assemble(&repeated),
+            Err(CoreError::TooManyFrames(2_001))
+        ));
+        let mut padded = vec![String::new(); 5_000];
+        padded.extend(frames[..MIN_SCAN_FRAMES].iter().cloned());
+        assert!(assemble(&padded).is_ok());
+        padded.push(frames[MIN_SCAN_FRAMES].clone());
+        assert!(matches!(
+            assemble(&padded),
             Err(CoreError::TooManyFrames(2_001))
         ));
         let refused = assemble(&frames).unwrap_err();
