@@ -311,26 +311,41 @@ impl fmt::Display for Version {
 /// Where the releases are read from.
 pub(crate) const GITHUB_API: &str = "https://api.github.com";
 
+/// The version of GitHub's REST API the check is written against, which
+/// GitHub's documentation asks each request to name: the latest, whose
+/// changes leave the release and its tag as they were.
+pub(crate) const GITHUB_API_VERSION: &str = "2026-03-10";
+
 /// Asks for the latest release of `owner/repo` and gives back its tag.
 /// `proxy` is the Tor SOCKS proxy the manager resolved when the check
 /// has to go through Tor; the name of the host then goes to the proxy,
 /// never to a resolver.
+///
+/// A version GitHub no longer supports is answered `410 Gone`: an
+/// install left without updates for years, the one the check is for,
+/// then asks once more without naming one, as GitHub reads it by
+/// default.
 pub(crate) async fn latest_tag(api: &str, repo: &str, proxy: Option<&str>) -> CoreResult<String> {
-    let mut response = client(proxy)?
-        .get(format!("{api}/repos/{repo}/releases/latest"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| check_error(crate::chain::esplora::describe_failure(&e)))?;
+    let client = client(proxy)?;
+    let ask = |version: Option<&'static str>| {
+        let mut request = client
+            .get(format!("{api}/repos/{repo}/releases/latest"))
+            .header("Accept", "application/vnd.github+json");
+        if let Some(version) = version {
+            request = request.header("X-GitHub-Api-Version", version);
+        }
+        request.send()
+    };
+    let failed = |e: reqwest::Error| check_error(crate::chain::esplora::describe_failure(&e));
+    let mut response = ask(Some(GITHUB_API_VERSION)).await.map_err(failed)?;
+    if response.status() == reqwest::StatusCode::GONE {
+        response = ask(None).await.map_err(failed)?;
+    }
     if !response.status().is_success() {
         return Err(check_error(format!("http {}", response.status())));
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| check_error(crate::chain::esplora::describe_failure(&e)))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(failed)? {
         if body.len() + chunk.len() > MAX_ANSWER {
             return Err(check_error("the answer is far too large".to_owned()));
         }

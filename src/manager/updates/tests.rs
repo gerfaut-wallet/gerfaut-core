@@ -19,11 +19,15 @@ const NOW: u64 = 1_800_000_000;
 const ONION: &str = "tcp://gerfautexample000000000000000000000000000000000000000.onion:50001";
 
 /// Something that answers like the releases API: the tag a test sets,
-/// or a failure when it sets none, and counts who came.
+/// or a failure when it sets none, and counts who came. Retired, it
+/// answers `410 Gone` to a request that names the API version.
 struct Releases {
     api: String,
     visits: Arc<Mutex<u32>>,
     tag: Arc<Mutex<Option<String>>>,
+    /// The head of each request, lowercased, in the order they came.
+    heads: Arc<Mutex<Vec<String>>>,
+    retired: Arc<Mutex<bool>>,
 }
 
 impl Releases {
@@ -32,13 +36,26 @@ impl Releases {
         let address = listener.local_addr().unwrap();
         let visits = Arc::new(Mutex::new(0u32));
         let tag = Arc::new(Mutex::new(Some(tag.to_owned())));
-        let (counted, answered) = (visits.clone(), tag.clone());
+        let heads: Arc<Mutex<Vec<String>>> = Arc::default();
+        let retired = Arc::new(Mutex::new(false));
+        let (counted, answered, seen, gone) =
+            (visits.clone(), tag.clone(), heads.clone(), retired.clone());
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 *counted.lock().unwrap() += 1;
                 let mut request = [0u8; 2048];
-                let _ = stream.read(&mut request).await;
-                let tag = answered.lock().unwrap().clone();
+                let read = stream.read(&mut request).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..read]).to_lowercase();
+                let versioned = head.contains("\r\nx-github-api-version:");
+                seen.lock().unwrap().push(head);
+                let tag = if versioned && *gone.lock().unwrap() {
+                    let answer = "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\n\
+                                  Connection: close\r\n\r\n";
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                    continue;
+                } else {
+                    answered.lock().unwrap().clone()
+                };
                 let answer = match tag {
                     // The page it names is never the one an app opens.
                     Some(tag) => {
@@ -62,7 +79,18 @@ impl Releases {
             api: format!("http://{address}"),
             visits,
             tag,
+            heads,
+            retired,
         }
+    }
+
+    /// From now on, the version the check names is past its support.
+    fn retire_the_version(&self) {
+        *self.retired.lock().unwrap() = true;
+    }
+
+    fn heads(&self) -> Vec<String> {
+        self.heads.lock().unwrap().clone()
     }
 
     /// What the next answers say; `None` makes them fail.
@@ -133,6 +161,56 @@ async fn the_first_day_asks_nothing_and_the_next_one_does() {
     assert_eq!(status.announce.as_deref(), Some("0.2.0"));
     assert_eq!(status.available.as_deref(), Some("0.2.0"));
     assert_eq!(manager.update_status("0.1.0").await, status);
+}
+
+/// The check names the version of the REST API it is written against,
+/// as GitHub's documentation asks, beside its name and the JSON it takes.
+#[tokio::test]
+async fn the_check_names_the_api_version() {
+    let releases = Releases::start("v0.2.0").await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = open(dir.path()).await;
+    releases.button(&manager, "0.1.0").await.unwrap();
+
+    let heads = releases.heads();
+    assert_eq!(heads.len(), 1);
+    let head = &heads[0];
+    assert!(
+        head.starts_with(&format!(
+            "get /repos/{}/releases/latest ",
+            REPO.to_lowercase()
+        )),
+        "{head}"
+    );
+    assert!(
+        head.contains(&format!(
+            "\r\nx-github-api-version: {}\r\n",
+            crate::updates::GITHUB_API_VERSION
+        )),
+        "{head}"
+    );
+    assert!(head.contains("\r\nuser-agent: gerfaut\r\n"), "{head}");
+    assert!(
+        head.contains("\r\naccept: application/vnd.github+json\r\n"),
+        "{head}"
+    );
+}
+
+/// A version GitHub stopped supporting does not end the checks of an
+/// install that went without updates: it asks again without naming one.
+#[tokio::test]
+async fn a_retired_api_version_asks_again_without_one() {
+    let releases = Releases::start("v0.2.0").await;
+    releases.retire_the_version();
+    let dir = tempfile::tempdir().unwrap();
+    let manager = open(dir.path()).await;
+
+    let status = releases.button(&manager, "0.1.0").await.unwrap();
+    assert_eq!(status.available.as_deref(), Some("0.2.0"));
+    let heads = releases.heads();
+    assert_eq!(heads.len(), 2, "one request named the version, one did not");
+    assert!(heads[0].contains("\r\nx-github-api-version:"));
+    assert!(!heads[1].contains("\r\nx-github-api-version:"));
 }
 
 /// A clock a year ahead at the first launch, then set right: the first
