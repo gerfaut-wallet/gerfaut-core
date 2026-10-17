@@ -1366,7 +1366,14 @@ pub(crate) struct TxStanding {
     pub tip_height: u32,
 }
 
-pub(crate) async fn tx_standing(client: &Client, txid: &Txid) -> Result<TxStanding, String> {
+/// A confirmation counts once proven, as a sync's
+/// ([`sync::prove_confirmations`]): one that cannot be leaves the
+/// transaction waiting, and a false proof refuses the server.
+pub(crate) async fn tx_standing(
+    client: &Client,
+    network: Network,
+    txid: &Txid,
+) -> Result<TxStanding, String> {
     let tip_height = client.height().await?;
     let found = client.knows_tx(txid).await?;
     if !found {
@@ -1378,10 +1385,21 @@ pub(crate) async fn tx_standing(client: &Client, txid: &Txid) -> Result<TxStandi
         });
     }
     let status = client.tx_status(txid).await?;
+    let block = match (status.confirmed, status.block_height, status.block_hash) {
+        (true, Some(height), Some(hash)) => Some(bdk_wallet::chain::BlockId { height, hash }),
+        _ => None,
+    };
+    let proven = match block {
+        Some(block) => sync::prove_confirmations(client, network, tip_height, &[(*txid, block)])
+            .await?
+            .first()
+            .is_some_and(Option::is_some),
+        None => false,
+    };
     Ok(TxStanding {
         found: true,
-        confirmed: status.confirmed,
-        block_height: status.block_height,
+        confirmed: proven,
+        block_height: block.filter(|_| proven).map(|block| block.height),
         tip_height,
     })
 }

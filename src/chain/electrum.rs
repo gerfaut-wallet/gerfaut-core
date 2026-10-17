@@ -963,8 +963,14 @@ pub(crate) async fn tip_height(target: &Target, proxy: Option<&str>) -> Result<u
 /// means mempool, a height means confirmed, absence means the server
 /// does not have it. A script whose history the server refuses, one too
 /// long for it, is passed over for the next.
+///
+/// A confirmation counts once proven, as a sync's: its merkle branch
+/// against the header of its block ([`crate::chain::proof`]). A proof
+/// that does not hold refuses the server; one that cannot be had leaves
+/// the transaction waiting.
 pub(crate) async fn tx_standing(
     target: &Target,
+    network: crate::network::Network,
     txid: Txid,
     scripts: Vec<ScriptBuf>,
     proxy: Option<&str>,
@@ -989,13 +995,74 @@ pub(crate) async fn tx_standing(
             let entry = history.iter().find(|entry| entry.tx_hash == txid);
             return Ok(match entry {
                 None => (false, None, tip),
-                Some(entry) if entry.height > 0 => (true, Some(entry.height as u32), tip),
+                Some(entry) if entry.height > 0 => {
+                    let height = entry.height as u32;
+                    let proven = proven_on(client, network, txid, height, tip, &fail)?;
+                    (true, proven.then_some(height), tip)
+                }
                 Some(_) => (true, None, tip),
             });
         }
         Err(refused.map_or_else(|| "the transaction creates nothing".to_owned(), fail))
     })
     .await
+}
+
+/// Whether the server proves that `txid` confirmed at `height`, its tip
+/// at `tip`: see [`crate::chain::proof::check_confirmation`]. `false`
+/// when it is unsure, a block come in since or no branch to be had; an
+/// error, the server's false proof.
+fn proven_on(
+    client: &Connection,
+    network: crate::network::Network,
+    txid: Txid,
+    height: u32,
+    tip: u32,
+    fail: &impl Fn(electrum_client::Error) -> String,
+) -> Result<bool, String> {
+    use crate::chain::proof::{
+        FALSE_PROOF, Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
+        check_confirmation, recheck,
+    };
+    match above_the_tip(height, tip) {
+        Some(Proof::False) => return Err(FALSE_PROOF.to_owned()),
+        Some(_) => return Ok(false),
+        None => {}
+    }
+    let Ok(branch) = patiently(|| client.transaction_get_merkle(&txid, height as usize)) else {
+        return Ok(false);
+    };
+    let header = patiently(|| client.block_header(height as usize)).map_err(fail)?;
+    let proof = match check_confirmation(network, height, &header, txid, &branch) {
+        Proof::Elsewhere => {
+            let again = patiently(|| client.block_header(height as usize)).map_err(fail)?;
+            recheck(network, height, &header, &again, txid, &branch)
+        }
+        verdict => verdict,
+    };
+    match proof {
+        Proof::Holds => {}
+        Proof::Unsure => return Ok(false),
+        Proof::False | Proof::Elsewhere => return Err(FALSE_PROOF.to_owned()),
+    }
+    // A block of an early period of the chain, whose header costs little
+    // to forge, holds only once chained to the checkpoint that ends its
+    // period, as a sync's ([`crate::chain::proof::chained`]).
+    let hash = header.block_hash();
+    let mut read = std::collections::HashMap::new();
+    for (from, count) in chains_to_read(network, &[(height, hash)]) {
+        let Some(headers) = sync::headers_from(client, from, count).map_err(fail)? else {
+            continue;
+        };
+        let hashes =
+            chain_to_checkpoint(network, from, &headers).ok_or_else(|| FALSE_PROOF.to_owned())?;
+        read.insert(from, hashes);
+    }
+    match chained(network, height, hash, &read) {
+        Proof::Holds => Ok(true),
+        Proof::Unsure => Ok(false),
+        Proof::False | Proof::Elsewhere => Err(FALSE_PROOF.to_owned()),
+    }
 }
 
 #[cfg(test)]
@@ -1035,9 +1102,15 @@ mod tests {
             .refused_histories
             .insert(scripthash(&script(1)));
         let target = Target::new(format!("tcp://{}", server.address), None);
-        let standing = tx_standing(&target, tx.compute_txid(), scripts, None)
-            .await
-            .unwrap();
+        let standing = tx_standing(
+            &target,
+            crate::network::Network::Signet,
+            tx.compute_txid(),
+            scripts,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(standing, (true, Some(90), 100));
     }
 
@@ -1882,6 +1955,7 @@ mod tests {
         let target = Target::new(format!("tcp://{}", server.address), None);
         let standing = tx_standing(
             &target,
+            crate::network::Network::Signet,
             tx.compute_txid(),
             crate::chain::lookup_scripts(&tx),
             None,
@@ -1889,5 +1963,30 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(standing, (true, Some(90), 100));
+    }
+
+    /// The standing of a sent transaction takes no confirmation on the
+    /// server's word: one claimed far above the tip it gave is a false
+    /// proof, one a block or two above it waits for the next look.
+    #[tokio::test]
+    async fn a_standing_takes_no_confirmation_on_the_servers_word() {
+        use crate::chain::proof::FALSE_PROOF;
+        use crate::testkit::{FakeElectrum, nowhere, script, transaction};
+        let server = FakeElectrum::start().await;
+        let tx = transaction(&[nowhere(1, 0)], &[(&script(1), 1_000)]);
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        let standing = |height: i64| {
+            server.set_history(&script(1), &[(tx.compute_txid(), height)]);
+            tx_standing(
+                &target,
+                crate::network::Network::Signet,
+                tx.compute_txid(),
+                crate::chain::lookup_scripts(&tx),
+                None,
+            )
+        };
+        assert_eq!(standing(102).await.unwrap(), (true, None, 100));
+        assert_eq!(standing(200).await.unwrap_err(), FALSE_PROOF);
+        assert_eq!(standing(90).await.unwrap(), (true, Some(90), 100));
     }
 }

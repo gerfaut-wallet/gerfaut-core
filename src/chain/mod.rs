@@ -1198,6 +1198,7 @@ pub(crate) struct TxStanding {
 
 pub(crate) async fn tx_standing(
     endpoint: &Endpoint,
+    network: Network,
     txid: Txid,
     scripts: Vec<ScriptBuf>,
     proxy: Option<&str>,
@@ -1205,7 +1206,7 @@ pub(crate) async fn tx_standing(
     match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client(url, proxy)?;
-            let standing = esplora::tx_standing(&client, &txid).await?;
+            let standing = esplora::tx_standing(&client, network, &txid).await?;
             Ok(TxStanding {
                 found: standing.found,
                 block_height: standing
@@ -1217,7 +1218,7 @@ pub(crate) async fn tx_standing(
         }
         Endpoint::Electrum(target) => {
             let (found, block_height, tip_height) =
-                electrum::tx_standing(target, txid, scripts, proxy).await?;
+                electrum::tx_standing(target, network, txid, scripts, proxy).await?;
             Ok(TxStanding {
                 found,
                 block_height,

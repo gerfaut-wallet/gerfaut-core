@@ -481,7 +481,9 @@ impl WalletManager {
         let mut attempts: Vec<String> = Vec::new();
         let mut failures: Vec<(&chain::Endpoint, Failure)> = Vec::new();
         for endpoint in &endpoints {
-            match chain::tx_standing(endpoint, txid, scripts.clone(), proxy.as_deref()).await {
+            match chain::tx_standing(endpoint, network, txid, scripts.clone(), proxy.as_deref())
+                .await
+            {
                 Ok(standing) => {
                     self.note_send(endpoint, &failures);
                     let confirmations = standing
