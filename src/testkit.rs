@@ -161,6 +161,10 @@ pub(crate) struct ElectrumState {
     pub txs: HashMap<Txid, String>,
     /// Methods answered with this error message instead.
     pub refuse: HashMap<&'static str, String>,
+    /// Methods turned down this many times more, each, the way the
+    /// electrs of Blockstream turns a request down when the answers it
+    /// holds take all the memory it allows them.
+    pub busy: HashMap<&'static str, usize>,
     /// Script hashes whose history is refused, as too long.
     pub refused_histories: std::collections::HashSet<String>,
     /// The most subscriptions one connection holds, and the words that
@@ -173,6 +177,9 @@ pub(crate) struct ElectrumState {
     /// A method whose answer starts and never ends: the connection
     /// answers nothing more after it.
     pub stall: Option<&'static str>,
+    /// Methods answered this many times more, each, and then left
+    /// unanswered while every other request still is.
+    pub answered_only: HashMap<&'static str, usize>,
     /// A method answered with this many bytes and no line end.
     pub flood: Option<(&'static str, usize)>,
     /// A method never answered: the request is read and dropped, and
@@ -308,6 +315,12 @@ impl FakeElectrum {
                         if state.silent || stalled {
                             continue;
                         }
+                        if let Some(left) = state.answered_only.get_mut(method.as_str()) {
+                            if *left == 0 {
+                                continue;
+                            }
+                            *left -= 1;
+                        }
                         let gate = state
                             .gate
                             .as_ref()
@@ -370,6 +383,15 @@ impl FakeElectrum {
         };
         if let Some(message) = state.refuse.get(method) {
             return refusal(message);
+        }
+        if let Some(left) = state.busy.get_mut(method)
+            && *left > 0
+        {
+            *left -= 1;
+            return Answer::Line(json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": { "code": 2, "message": "response budget exhausted, retry later" },
+            }));
         }
         if method == "blockchain.scripthash.get_history"
             && request["params"][0]
@@ -580,6 +602,11 @@ pub(crate) struct MempoolState {
     pub address_txs: Vec<Value>,
     /// Pages of that history read so far.
     pub history_pages: usize,
+    /// Every path the REST side was asked for, in order.
+    pub paths: Vec<String>,
+    /// The REST side closes every connection without an answer, a server
+    /// that is down.
+    pub down: bool,
     /// The network whose genesis block the REST side names at height 0,
     /// signet when `None`.
     pub genesis: Option<bdk_wallet::bitcoin::Network>,
@@ -657,6 +684,13 @@ impl FakeMempool {
         };
         let head = String::from_utf8_lossy(&head[..read]).into_owned();
         let path = head.split(' ').nth(1).unwrap_or_default().to_owned();
+        {
+            let mut state = state.lock().unwrap();
+            if state.down {
+                state.paths.push(path);
+                return;
+            }
+        }
         if path.ends_with("/v1/ws") && state.lock().unwrap().websocket {
             Self::websocket(stream, state).await;
         } else {
@@ -717,6 +751,7 @@ impl FakeMempool {
         let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut request).await;
         let (status, body) = {
             let mut state = state.lock().unwrap();
+            state.paths.push(path.to_owned());
             if path.ends_with("/blocks/tip/hash") {
                 state.tips_asked.push(std::time::Instant::now());
                 ("200 OK", format!("{:064x}", state.tip))

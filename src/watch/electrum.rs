@@ -19,6 +19,22 @@
 //! asks for the whole list. What is left after a cut for cost is not:
 //! the whole list would be cut again.
 //!
+//! A server can keep its connection and answer every ping while it no
+//! longer indexes the chain: it then tells of no block, and of no
+//! confirmation, for as long as the session lasts, and the syncs that
+//! follow the watch to it read the same stale state. After two hours
+//! without a block, which happens about once in 160 000 such windows on
+//! mainnet, the server is asked for its tip again, and the tip of
+//! another Electrum server of the same operator is read on a connection
+//! of its own that asks for nothing else. The one of the two that is two
+//! blocks behind or more is left alone for a quarter of an hour: when it
+//! is the session's, the watch moves to the other one. A server that
+//! does not answer for its tip in time is compared on the last one it
+//! gave. A session that opens two blocks below one the watch already
+//! heard of, or a server that goes back, is compared at once. No other
+//! operator is ever asked, since it would learn from which address the
+//! app is used, and an onion server is compared with onion servers only.
+//!
 //! The headers the server sends as its tip are kept in a row, a day of
 //! them, each with the work its network asks for. A status pushed for
 //! a script whose wallet waits for a block is compared with what the
@@ -30,6 +46,8 @@
 //! one does not, or does not come within the time a ping may take.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,7 +64,7 @@ use super::{
 };
 use crate::chain::electrum::status::history_status;
 use crate::chain::electrum::{CLIENT_NAME, Target, parse, words};
-use crate::chain::net::{self, BoxStream, LineReader, Security};
+use crate::chain::net::{self, BoxStream, LineReader};
 use crate::chain::{ANOTHER_NETWORK, Endpoint, has_proof_of_work, is_genesis_of};
 use crate::network::Network;
 
@@ -75,6 +93,10 @@ const STATUS_STEP: u32 = 100;
 /// `unsubscribe`, used when the server has it.
 const PROTOCOL_MIN: &str = "1.4";
 const PROTOCOL_MAX: &str = "1.4.2";
+/// Blocks a server must be behind another of its operator to be taken
+/// for one that stopped: two indexers read a block a few seconds apart,
+/// and one block between them is that.
+const BEHIND: u32 = 2;
 /// Headers kept of the latest blocks the server sent, a day of them: a
 /// confirmation is foretold only for a wallet whose chain they reach.
 const HEADERS_KEPT: usize = 144;
@@ -86,6 +108,8 @@ const PROOFS_KEPT: usize = 1_000;
 
 enum Request {
     Headers,
+    /// The tip asked again, before another server's is read.
+    Tip,
     Subscribe(String),
     /// The proof of a transaction in the block at a height.
     Merkle(Txid, u32),
@@ -105,6 +129,26 @@ struct Proving {
     /// synced.
     deadline: Instant,
 }
+
+/// Where a session stands in comparing its tip with another server's.
+enum Look {
+    /// Nothing under way: the next look is due [`super::Timings::stale`]
+    /// after the last block.
+    Idle,
+    /// The server was asked for its tip again, by request `id`, and has
+    /// until `by` to answer. A deadline that ran out while the device
+    /// slept, or a notification still on its way, says nothing of the
+    /// server: the tip compared is the one it gives now, after whatever
+    /// it sent before. One that does not answer in time, or refuses, is
+    /// compared on the tip it last gave.
+    Asking { id: u64, by: Instant },
+    /// The tip of another server being read.
+    Probing(Probe),
+}
+
+/// The tip another server of the same operator announced, and which
+/// server, read while the session goes on: see [`tip_elsewhere`].
+type Probe = Pin<Box<dyn Future<Output = Option<(Endpoint, u32)>> + Send>>;
 
 struct Session {
     /// The server, whose refusals the hub keeps.
@@ -146,13 +190,19 @@ struct Session {
     proofs: HashMap<(Txid, BlockHash), bool>,
     /// Confirmations foretold waiting for their proofs, by script hash.
     provings: HashMap<String, Proving>,
+    /// The height of the last block the server announced.
+    tip: Option<u32>,
+    /// When it last announced one, or when the session opened, or when
+    /// the last look began.
+    block_at: Instant,
+    look: Look,
+    /// The Tor proxy the session goes through, when its server is an
+    /// onion: the other onion servers of its operator are reached
+    /// through it for their tip.
+    proxy: Option<String>,
 }
 
 pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> Exit {
-    let (tls, host, port) = match parse(&target.url) {
-        Ok(parts) => parts,
-        Err(detail) => return Exit::Unreachable(detail),
-    };
     let label = endpoint.label();
     hub.set_status(|status| {
         if status.state != WatchState::Reconnecting {
@@ -167,57 +217,16 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         Err(exit) => return exit,
     };
     let budget = hub.connect_budget(endpoint);
-    let pin = target.pin.clone();
     let network = hub.config.network;
-    let opening = async move {
-        let security = if tls {
-            Security::Electrum {
-                pin: pin.as_deref(),
-            }
-        } else {
-            Security::Plain
-        };
-        let stream = net::open(&host, port, security, proxy.as_deref(), budget)
-            .await
-            .map_err(Exit::Unreachable)?;
-        let (reader, mut writer) = tokio::io::split(stream);
-        let mut reader = LineReader::new(reader, MAX_LINE);
-        // `server.version` is the first call a server expects, and the
-        // one that fixes the protocol version.
-        let hello = json!({
-            "jsonrpc": "2.0", "id": 0, "method": "server.version",
-            "params": [CLIENT_NAME, [PROTOCOL_MIN, PROTOCOL_MAX]],
-        });
-        send(&mut writer, &hello).await.map_err(Exit::Unreachable)?;
-        let version = answer(&mut reader, 0, budget)
-            .await
-            .map_err(Exit::Unreachable)?;
-        let negotiated = version[1].as_str().unwrap_or_default().to_owned();
-        let software = version[0]
-            .as_str()
-            .map(crate::chain::server_words)
-            .filter(|software| !software.is_empty());
-        // Then its genesis block, before it hears of any script: a
-        // server of another network, a signet port typed for testnet4,
-        // would report changes that never happened on the wallet's.
-        let genesis = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "blockchain.block.header", "params": [0],
-        });
-        send(&mut writer, &genesis)
-            .await
-            .map_err(Exit::Unreachable)?;
-        let genesis = answer(&mut reader, 1, budget)
-            .await
-            .map_err(Exit::Unreachable)?;
-        let genesis = genesis
-            .as_str()
-            .and_then(|hex| deserialize_hex::<Header>(hex).ok());
-        if !genesis.is_some_and(|header| is_genesis_of(network, header.block_hash())) {
-            return Err(Exit::Refused(ANOTHER_NETWORK.to_owned()));
-        }
-        Ok((reader, writer, negotiated, software))
-    };
-    let (mut reader, writer, negotiated, software) = match hub.during(opening).await {
+    let target = target.clone();
+    let session_proxy = proxy.clone();
+    let opening = async move { open(&target, proxy.as_deref(), network, budget).await };
+    let Opened {
+        mut reader,
+        writer,
+        negotiated,
+        software,
+    } = match hub.during(opening).await {
         Ok(Ok(opened)) => opened,
         Ok(Err(exit)) | Err(exit) => return exit,
     };
@@ -244,6 +253,10 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         proofs_asked: HashSet::new(),
         proofs: HashMap::new(),
         provings: HashMap::new(),
+        tip: None,
+        block_at: Instant::now(),
+        look: Look::Idle,
+        proxy: session_proxy,
     };
     hub.alive();
     hub.serve(Some(endpoint));
@@ -272,6 +285,11 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
     loop {
         let pong_by = session.pong_by;
         let proofs_due = session.proofs_due();
+        let stale_at = session.block_at + hub.timings.stale;
+        let asking_by = match session.look {
+            Look::Asking { by, .. } => Some(by),
+            Look::Idle | Look::Probing(_) => None,
+        };
         let outcome: Result<(), String> = tokio::select! {
             line = reader.next_line() => match line {
                 Ok(Some(line)) => {
@@ -303,8 +321,12 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                 Wake::Tick { idle } => {
                     // A deadline set before the device slept says
                     // nothing about the server.
+                    // A look under way began before: it starts over,
+                    // at once if its time came during the sleep. The
+                    // time awake without a block still counts.
                     if idle > hub.timings.keepalive * 2 {
                         session.pong_by = None;
+                        session.look = Look::Idle;
                     }
                     session.ping(hub.pong_budget(endpoint)).await
                 }
@@ -323,6 +345,37 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
             () = super::sleep_until(proofs_due), if proofs_due.is_some() => {
                 session.expire_proofs(hub);
                 session.pump().await
+            }
+            () = tokio::time::sleep_until(stale_at), if matches!(session.look, Look::Idle) => {
+                session.block_at = Instant::now();
+                session.ask_tip(hub.pong_budget(endpoint)).await
+            }
+            () = super::sleep_until(asking_by), if asking_by.is_some() => {
+                session.look_now(hub);
+                Ok(())
+            }
+            found = probed(&mut session.look) => {
+                session.look = Look::Idle;
+                let ours = session.tip;
+                match found.zip(ours) {
+                    Some(((other, tip), ours)) if tip >= ours.saturating_add(BEHIND) => {
+                        // This one is behind: the watch moves on, and
+                        // the syncs with it.
+                        hub.shun(endpoint);
+                        let detail = format!(
+                            "{label} is {} blocks behind {}",
+                            tip - ours,
+                            other.label(),
+                        );
+                        hub.set_status(|status| status.detail = Some(detail));
+                        return Exit::Reprobe;
+                    }
+                    Some(((other, tip), ours)) if ours >= tip.saturating_add(BEHIND) => {
+                        hub.shun(&other);
+                    }
+                    _ => {}
+                }
+                Ok(())
             }
         };
         if let Err(detail) = outcome {
@@ -430,6 +483,26 @@ impl Session {
         self.pump().await
     }
 
+    /// Asks the server for its tip again, to be answered within `within`:
+    /// see [`Look::Asking`].
+    async fn ask_tip(&mut self, within: Duration) -> Result<(), String> {
+        self.look = Look::Asking {
+            id: self.next_id,
+            by: Instant::now() + within,
+        };
+        self.request(Request::Tip, "blockchain.headers.subscribe", json!([]))
+            .await
+    }
+
+    /// Reads the tip of another server of the operator now, to compare
+    /// with the last one this server gave; nothing to do without one.
+    fn look_now(&mut self, hub: &Hub) {
+        self.look = self
+            .tip
+            .and_then(|_| tip_elsewhere(hub, &self.endpoint, self.proxy.as_deref()))
+            .map_or(Look::Idle, Look::Probing);
+    }
+
     async fn ping(&mut self, pong: std::time::Duration) -> Result<(), String> {
         if self.pong_by.is_none() {
             self.pong_by = Some(Instant::now() + pong);
@@ -460,12 +533,50 @@ impl Session {
                 Request::Headers if !refused => {
                     if let Some(height) = height_of(&message["result"]) {
                         self.take_header(hub.config.network, height, &message["result"]);
+                        self.tip = Some(height);
+                        // Behind a block the watch already heard of,
+                        // from the server it left or one before: this
+                        // one may be the one that stopped, and is not
+                        // given two hours to show it.
+                        if hub
+                            .tip
+                            .is_some_and(|heard| height.saturating_add(BEHIND) <= heard)
+                        {
+                            self.look_now(hub);
+                        }
                         hub.new_tip(height, false);
                     }
                 }
                 Request::Merkle(txid, height) => {
                     let branch = (!refused).then(|| &message["result"]);
                     self.proved(hub, txid, height, branch);
+                }
+                Request::Tip => {
+                    // The answer to a look since given up, a block or a
+                    // wake-up after it, is no answer.
+                    if !matches!(self.look, Look::Asking { id: asked, .. } if asked == id) {
+                        return;
+                    }
+                    let height = height_of(&message["result"]).filter(|_| !refused);
+                    if let Some(height) = height {
+                        self.take_header(hub.config.network, height, &message["result"]);
+                    }
+                    match height {
+                        // A block it did not announce: the server moved.
+                        Some(height) if self.tip.is_none_or(|tip| height > tip) => {
+                            self.tip = Some(height);
+                            self.block_at = Instant::now();
+                            self.look = Look::Idle;
+                            hub.new_tip(height, false);
+                        }
+                        // The same tip, or one lower.
+                        Some(height) => {
+                            self.tip = Some(height);
+                            self.look_now(hub);
+                        }
+                        // No tip: compared on the last one it gave.
+                        None => self.look_now(hub),
+                    }
                 }
                 Request::Subscribe(scripthash) if !refused => {
                     self.refused_run.clear();
@@ -508,7 +619,21 @@ impl Session {
             Some("blockchain.headers.subscribe") => {
                 if let Some(height) = height_of(&params[0]) {
                     self.take_header(hub.config.network, height, &params[0]);
+                    let back = self.tip.is_some_and(|tip| height < tip);
+                    self.tip = Some(height);
                     hub.new_tip(height, false);
+                    if back {
+                        // A server that goes back is the most suspect
+                        // of all: it is compared at once.
+                        if !matches!(self.look, Look::Probing(_)) {
+                            self.look_now(hub);
+                        }
+                    } else {
+                        // A block: the server indexes, and no other one
+                        // is asked about it.
+                        self.block_at = Instant::now();
+                        self.look = Look::Idle;
+                    }
                 }
             }
             _ => {}
@@ -887,6 +1012,159 @@ async fn answer(
     tokio::time::timeout(budget, read)
         .await
         .map_err(|_| format!("timed out after {} s", budget.as_secs()))?
+}
+
+/// A connection open, and what the server said opening it.
+struct Opened {
+    reader: LineReader<ReadHalf<BoxStream>>,
+    writer: WriteHalf<BoxStream>,
+    /// The protocol version agreed on.
+    negotiated: String,
+    /// What the server says it runs.
+    software: Option<String>,
+}
+
+/// Opens a connection and asks what comes before anything else:
+/// `server.version`, the first call a server expects and the one that
+/// fixes the protocol version, then its genesis block, before it hears
+/// of any script. A server of another network, a signet port typed for
+/// testnet4, would report changes that never happened on the wallet's.
+async fn open(
+    target: &Target,
+    proxy: Option<&str>,
+    network: Network,
+    budget: Duration,
+) -> Result<Opened, Exit> {
+    let (tls, host, port) = parse(&target.url).map_err(Exit::Unreachable)?;
+    let stream = net::open(&host, port, target.security(tls), proxy, budget)
+        .await
+        .map_err(Exit::Unreachable)?;
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = LineReader::new(reader, MAX_LINE);
+    let hello = json!({
+        "jsonrpc": "2.0", "id": 0, "method": "server.version",
+        "params": [CLIENT_NAME, [PROTOCOL_MIN, PROTOCOL_MAX]],
+    });
+    send(&mut writer, &hello).await.map_err(Exit::Unreachable)?;
+    let version = answer(&mut reader, 0, budget)
+        .await
+        .map_err(Exit::Unreachable)?;
+    let negotiated = version[1].as_str().unwrap_or_default().to_owned();
+    let software = version[0]
+        .as_str()
+        .map(crate::chain::server_words)
+        .filter(|software| !software.is_empty());
+    let genesis = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "blockchain.block.header", "params": [0],
+    });
+    send(&mut writer, &genesis)
+        .await
+        .map_err(Exit::Unreachable)?;
+    let genesis = answer(&mut reader, 1, budget)
+        .await
+        .map_err(Exit::Unreachable)?;
+    let genesis = genesis
+        .as_str()
+        .and_then(|hex| deserialize_hex::<Header>(hex).ok());
+    if !genesis.is_some_and(|header| is_genesis_of(network, header.block_hash())) {
+        return Err(Exit::Refused(ANOTHER_NETWORK.to_owned()));
+    }
+    Ok(Opened {
+        reader,
+        writer,
+        negotiated,
+        software,
+    })
+}
+
+/// The Electrum servers of `candidates` other than `endpoint` that its
+/// operator runs, in their order: through Tor when it is, in the clear
+/// when it is not. One runs the other when its host is the other's, or
+/// one under it ([`super::runs`]), as the watch picks the Electrum
+/// servers of an operator of the rotation.
+pub(super) fn siblings(candidates: Vec<Endpoint>, endpoint: &Endpoint) -> Vec<(Endpoint, Target)> {
+    let ours = endpoint.label();
+    candidates
+        .into_iter()
+        .filter(|other| other != endpoint && other.is_onion() == endpoint.is_onion())
+        .filter(|other| {
+            let theirs = other.label();
+            super::runs(&ours, &theirs) || super::runs(&theirs, &ours)
+        })
+        .filter_map(|other| match &other {
+            Endpoint::Electrum(target) => {
+                let target = target.clone();
+                Some((other, target))
+            }
+            Endpoint::Esplora(_) => None,
+        })
+        .collect()
+}
+
+/// Reads the tip of the other Electrum servers the watch may talk to
+/// that the operator of `endpoint` runs, one after the other until one
+/// answers, each on a connection of its own that asks for nothing but
+/// the tip; `None` when there is no such server, which leaves the
+/// session as it is. A server being left alone is not asked. `proxy` is
+/// the Tor proxy of the session: the others are onions when its server
+/// is one ([`siblings`]), and go through the same.
+fn tip_elsewhere(hub: &Hub, endpoint: &Endpoint, proxy: Option<&str>) -> Option<Probe> {
+    let candidates = super::candidates(&hub.config).unwrap_or_default();
+    let others: Vec<(Endpoint, Target, Duration)> = siblings(candidates, endpoint)
+        .into_iter()
+        .filter(|(other, _)| hub.shunned_until(other).is_none())
+        .map(|(other, target)| {
+            let budget = hub.connect_budget(&other);
+            (other, target, budget)
+        })
+        .collect();
+    if others.is_empty() {
+        return None;
+    }
+    let network = hub.config.network;
+    let proxy = proxy.map(str::to_owned);
+    Some(Box::pin(async move {
+        for (other, target, budget) in others {
+            if let Ok(tip) = tip_of(&target, proxy.as_deref(), network, budget).await {
+                return Some((other, tip));
+            }
+        }
+        None
+    }))
+}
+
+/// The tip a server announces, on a connection that asks for nothing
+/// else and is closed as soon as it answers. A height no chain of the
+/// network can have reached by now is no answer.
+async fn tip_of(
+    target: &Target,
+    proxy: Option<&str>,
+    network: Network,
+    budget: Duration,
+) -> Result<u32, String> {
+    let Opened {
+        mut reader,
+        mut writer,
+        ..
+    } = open(target, proxy, network, budget)
+        .await
+        .map_err(|exit| format!("{exit:?}"))?;
+    let tip = json!({
+        "jsonrpc": "2.0", "id": 2, "method": "blockchain.headers.subscribe", "params": [],
+    });
+    send(&mut writer, &tip).await?;
+    let header = answer(&mut reader, 2, budget).await?;
+    height_of(&header)
+        .filter(|height| *height <= crate::chain::height_limit(network, crate::now_secs()))
+        .ok_or_else(|| "unexpected response".to_owned())
+}
+
+/// What a probe found, once it ends; never, without one.
+async fn probed(look: &mut Look) -> Option<(Endpoint, u32)> {
+    match look {
+        Look::Probing(probe) => probe.await,
+        Look::Idle | Look::Asking { .. } => std::future::pending().await,
+    }
 }
 
 async fn send(writer: &mut WriteHalf<BoxStream>, message: &Value) -> Result<(), String> {

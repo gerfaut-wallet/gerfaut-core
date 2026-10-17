@@ -41,6 +41,7 @@ fn timings() -> Timings {
         refused: Duration::from_millis(600),
         limit_kept: Duration::from_secs(3600),
         zero_limit_kept: Duration::from_secs(3600),
+        stale: Duration::from_secs(3600),
     }
 }
 
@@ -1018,6 +1019,445 @@ async fn a_server_of_another_network_is_refused_and_left_alone() {
     assert!(mempool.state.lock().unwrap().looked_up.is_empty());
     mempool.state.lock().unwrap().genesis = None;
     until(&watch, "polling", |s| s.state == WatchState::Polling).await;
+}
+
+/// A header notification at `height`, as a server pushes a block.
+fn block(server: &FakeElectrum, height: u32) {
+    server.state.lock().unwrap().height = height;
+    let hex = crate::testkit::header_at(height);
+    server.push(
+        json!({
+            "jsonrpc": "2.0", "method": "blockchain.headers.subscribe",
+            "params": [{ "height": height, "hex": hex }],
+        })
+        .to_string(),
+    );
+}
+
+/// The automatic backend of the tests: `electrum` in the catalogue, run
+/// by the operator of the one Esplora server of the rotation, all of
+/// them local.
+fn automatic(rotation: &FakeMempool, electrum: &[&FakeElectrum]) -> crate::chain::public::StandIn {
+    crate::chain::public::stand_in(
+        &[format!("http://{}/api", rotation.address)],
+        &electrum
+            .iter()
+            .map(|server| format!("tcp://{}", server.address))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn electrum_endpoint(server: &FakeElectrum) -> Endpoint {
+    Endpoint::Electrum(crate::chain::electrum::Target::new(
+        format!("tcp://{}", server.address),
+        None,
+    ))
+}
+
+/// The server Live listens to stops seeing blocks while its connection
+/// stays up and answers every ping. Past the wait without a block, the
+/// tip of the other Electrum server of the same operator is read, on a
+/// connection that subscribes nothing: it is ahead, so the watch moves
+/// there, hears of the block, and leaves the first one alone.
+#[tokio::test]
+async fn live_leaves_a_server_that_stopped_seeing_blocks() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (stuck, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    let _stand_in = automatic(&rotation, &[&stuck, &other]);
+    let (watch, mut events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            stale: Duration::from_millis(400),
+            refused: Duration::from_secs(3600),
+            ..timings()
+        }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    assert_eq!(
+        watch.serving().map(|(_, at)| at),
+        Some(electrum_endpoint(&stuck))
+    );
+    other.state.lock().unwrap().height = 102;
+
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock { height: 102 }
+    );
+    assert_eq!(
+        watch.serving().map(|(_, at)| at),
+        Some(electrum_endpoint(&other))
+    );
+    let subscribed = other.subscriptions();
+    assert_eq!(subscribed.len(), 2, "one probe, then the session");
+    assert!(subscribed[0].is_empty(), "the probe subscribed a script");
+    assert_eq!(subscribed[1], vec![scripthash(&script(1))]);
+    // The first one is left alone, and no other operator was asked.
+    stuck.hang_up();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(stuck.subscriptions().len(), 1);
+    assert!(rotation.state.lock().unwrap().paths.is_empty());
+}
+
+/// No block anywhere, a long wait the chain does have once in a while:
+/// the other server's tip is the same, and the session stays where it
+/// is, asking again after the same wait. A block the server announces
+/// puts the next look that much later.
+#[tokio::test]
+async fn live_stays_through_a_long_wait_for_a_block() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (listened, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    let _stand_in = automatic(&rotation, &[&listened, &other]);
+    // Room for a loaded machine: a block comes a quarter of the wait
+    // after the one before.
+    let stale = Duration::from_secs(1);
+    let (watch, mut events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings { stale, ..timings() }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    // Blocks well within the wait: nothing is asked elsewhere.
+    for height in 101..=104 {
+        tokio::time::sleep(stale / 4).await;
+        block(&listened, height);
+        other.state.lock().unwrap().height = height;
+        assert_eq!(
+            next_event(&mut events).await,
+            WatchEvent::NewBlock { height }
+        );
+    }
+    assert!(other.subscriptions().is_empty(), "asked while blocks came");
+    // Then none: the tip is read there, twice, and found level.
+    within("two looks", Duration::from_secs(5), || {
+        other.subscriptions().len() >= 2
+    })
+    .await;
+    assert!(other.subscriptions().iter().all(Vec::is_empty));
+    assert_eq!(listened.subscriptions().len(), 1, "the session moved");
+    assert_eq!(
+        watch.serving().map(|(_, at)| at),
+        Some(electrum_endpoint(&listened))
+    );
+    assert_eq!(watch.status().state, WatchState::Connected);
+}
+
+/// The other server is the one behind: it is left alone, and when the
+/// session ends the watch does not go to it.
+#[tokio::test]
+async fn a_server_found_behind_is_left_alone() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (listened, behind) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    let _stand_in = automatic(&rotation, &[&listened, &behind]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            stale: Duration::from_millis(300),
+            refused: Duration::from_secs(3600),
+            ..timings()
+        }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    behind.state.lock().unwrap().height = 98;
+    within("a look", Duration::from_secs(5), || {
+        !behind.subscriptions().is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    listened.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    listened.hang_up();
+    until(&watch, "polling", |s| s.state == WatchState::Polling).await;
+    assert_eq!(behind.subscriptions().len(), 1, "the watch went to it");
+}
+
+/// A session that opens on a tip below a block the watch already heard
+/// of compares at once, without waiting for the hours without a block:
+/// the server the watch comes back to may be the one that stopped.
+#[tokio::test]
+async fn a_session_that_opens_behind_compares_at_once() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (stuck, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    stuck.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    other.state.lock().unwrap().height = 102;
+    let _stand_in = automatic(&rotation, &[&stuck, &other]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            refused: Duration::from_millis(300),
+            ..timings()
+        }),
+    );
+    // The first one turned away a moment, the watch hears of block 101
+    // from the other.
+    until(&watch, "on the other", |_| {
+        watch.serving().map(|(_, at)| at) == Some(electrum_endpoint(&other))
+    })
+    .await;
+    stuck.state.lock().unwrap().genesis = None;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Back on the first one, at 100.
+    other.hang_up();
+    within("back on the first", WAIT, || {
+        stuck.subscriptions().len() == 2
+    })
+    .await;
+    until(&watch, "on the other again", |_| {
+        watch.serving().map(|(_, at)| at) == Some(electrum_endpoint(&other))
+    })
+    .await;
+    let looked = other.subscriptions();
+    assert_eq!(looked.len(), 3, "the session, a look, the session");
+    assert!(looked[1].is_empty());
+}
+
+/// When the wait without a block runs out, the server is asked for its
+/// tip again before any other is: one that moved without a word, or
+/// whose word is still on its way, is not compared on an old tip.
+#[tokio::test]
+async fn a_stale_tip_is_asked_again_before_it_is_compared() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (listened, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    let _stand_in = automatic(&rotation, &[&listened, &other]);
+    let (watch, mut events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            stale: Duration::from_millis(300),
+            ..timings()
+        }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    listened.state.lock().unwrap().height = 101;
+    other.state.lock().unwrap().height = 101;
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock { height: 101 }
+    );
+    assert!(other.subscriptions().is_empty(), "compared on the old tip");
+    assert_eq!(
+        watch.serving().map(|(_, at)| at),
+        Some(electrum_endpoint(&listened))
+    );
+}
+
+/// A server that tells no tip at all is not compared: there is nothing
+/// to put another one's against.
+#[tokio::test]
+async fn a_server_without_a_tip_is_not_compared() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (silent, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    silent
+        .state
+        .lock()
+        .unwrap()
+        .refuse
+        .insert("blockchain.headers.subscribe", "not now".to_owned());
+    other.state.lock().unwrap().height = 102;
+    let _stand_in = automatic(&rotation, &[&silent, &other]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            stale: Duration::from_millis(200),
+            ..timings()
+        }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(other.subscriptions().is_empty());
+    assert_eq!(
+        watch.serving().map(|(_, at)| at),
+        Some(electrum_endpoint(&silent))
+    );
+}
+
+/// Two servers a block apart are not one behind the other: indexers
+/// read a block a few seconds apart. Neither is left alone, and the
+/// watch stays where it is.
+#[tokio::test]
+async fn a_block_apart_is_not_behind() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (listened, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    other.state.lock().unwrap().height = 101;
+    let _stand_in = automatic(&rotation, &[&listened, &other]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            stale: Duration::from_millis(200),
+            ..timings()
+        }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    within("two looks", WAIT, || other.subscriptions().len() >= 2).await;
+    assert_eq!(listened.subscriptions().len(), 1, "the session moved");
+    assert_eq!(
+        watch.serving().map(|(_, at)| at),
+        Some(electrum_endpoint(&listened))
+    );
+}
+
+/// A server that answers its pings but no longer the request for its
+/// tip is compared on the last tip it gave, once the time to answer has
+/// run out: an indexer that stopped is the case looked for.
+#[tokio::test]
+async fn a_server_that_does_not_say_its_tip_is_compared_on_the_last_one() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (stuck, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    stuck
+        .state
+        .lock()
+        .unwrap()
+        .answered_only
+        .insert("blockchain.headers.subscribe", 1);
+    other.state.lock().unwrap().height = 102;
+    let _stand_in = automatic(&rotation, &[&stuck, &other]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            stale: Duration::from_millis(300),
+            refused: Duration::from_secs(3600),
+            ..timings()
+        }),
+    );
+    until(&watch, "on the other", |_| {
+        watch.serving().map(|(_, at)| at) == Some(electrum_endpoint(&other))
+    })
+    .await;
+    let asked = stuck.state.lock().unwrap().asked.clone();
+    let tips = asked
+        .iter()
+        .filter(|method| *method == "blockchain.headers.subscribe")
+        .count();
+    assert_eq!(tips, 2, "{asked:?}");
+}
+
+/// A server that announces a tip below its last one is compared at
+/// once, without the hours without a block.
+#[tokio::test]
+async fn a_server_that_goes_back_is_compared_at_once() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (back, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    let _stand_in = automatic(&rotation, &[&back, &other]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            refused: Duration::from_secs(3600),
+            ..timings()
+        }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    block(&back, 98);
+    until(&watch, "on the other", |_| {
+        watch.serving().map(|(_, at)| at) == Some(electrum_endpoint(&other))
+    })
+    .await;
+}
+
+/// A host that wakes the watch up more often than the wait without a
+/// block keeps it counting: the time awake adds up, and the server is
+/// asked for its tip once the wait has run out, from one wake-up to the
+/// next.
+#[tokio::test]
+async fn wake_ups_do_not_put_the_look_off() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (quiet, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    let _stand_in = automatic(&rotation, &[&quiet, &other]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            keepalive: Duration::from_millis(100),
+            pong: Duration::from_secs(5),
+            stale: Duration::from_millis(600),
+            ..timings()
+        }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    // Nothing more from the server: each wake-up finds it idle.
+    quiet.state.lock().unwrap().silent = true;
+    let asked_tips = || {
+        let state = quiet.state.lock().unwrap();
+        state
+            .asked
+            .iter()
+            .filter(|method| *method == "blockchain.headers.subscribe")
+            .count()
+    };
+    let started = std::time::Instant::now();
+    while asked_tips() < 2 {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the look never came"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        watch.tick();
+    }
+}
+
+/// The tip of a stale server is read only from another Electrum server
+/// of its operator: on mainnet, Blockstream's other one, and never the
+/// Esplora servers of the rotation, nor an Electrum server of the
+/// catalogue run by someone else. A server of its own has none.
+#[test]
+fn a_stale_server_is_compared_with_its_operator_only() {
+    let mut mainnet = config(BackendConfig::default());
+    mainnet.network = Network::Mainnet;
+    let listed = candidates(&mainnet).unwrap();
+    let others = |endpoint: &Endpoint| -> Vec<String> {
+        electrum::siblings(listed.clone(), endpoint)
+            .iter()
+            .map(|(other, _)| other.label())
+            .collect()
+    };
+    assert_eq!(others(&listed[0]), ["electrum.blockstream.info"]);
+    assert_eq!(others(&listed[1]), ["blockstream.info"]);
+    let diynodes = Endpoint::Electrum(crate::chain::electrum::Target::new(
+        "ssl://electrum.diynodes.com:50022",
+        None,
+    ));
+    let mut with_another = listed.clone();
+    with_another.insert(1, diynodes.clone());
+    let found: Vec<Endpoint> = electrum::siblings(with_another, &listed[0])
+        .into_iter()
+        .map(|(other, _)| other)
+        .collect();
+    assert_eq!(found, [listed[1].clone()]);
+    assert!(electrum::siblings(listed.clone(), &diynodes).is_empty());
+    let own = candidates(&config(BackendConfig::CustomElectrum {
+        url: "ssl://node.example.org:50002".to_owned(),
+        own_node: true,
+    }))
+    .unwrap();
+    assert!(electrum::siblings(own.clone(), &own[0]).is_empty());
 }
 
 /// An onion backend with no Tor to go through: the watcher says why and

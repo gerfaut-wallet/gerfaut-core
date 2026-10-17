@@ -2,8 +2,8 @@
 //! of a wallet at a time, as far as the caller needs; every wallet of a
 //! network in turn; and the older history of a watched address.
 
-use std::collections::HashSet;
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -299,33 +299,7 @@ impl WalletManager {
             let (config, certs) = state.chain_setup(record.meta.network);
             (meta, config, certs)
         };
-        // The server of the watch that asked for this sync: it told of
-        // the change, so it holds what changed. For any other sync, the
-        // server a running watch talks to, or last talked to
-        // (`live_server`): it already sees every script the watch
-        // follows, and a sync there shows the wallet to no second
-        // operator. Only a server a watch of the wallet's own network
-        // may talk to under its backend: the watch may have moved to
-        // another network, or another backend, since the sync was asked
-        // for, and a wallet's addresses never go to a server its backend
-        // does not name.
-        let first = prefer
-            .or_else(|| self.live_server())
-            .filter(|(network, prefer)| {
-                *network == meta.network
-                    && crate::watch::servers_for(&config, meta.network, &certs)
-                        .is_ok_and(|allowed| allowed.contains(prefer))
-            })
-            .map(|(_, prefer)| prefer);
-        let answered = meta
-            .last_sync
-            .as_ref()
-            .and_then(|stamp| stamp.server.as_deref());
-        let endpoints = sync_order(
-            chain::endpoints(&config, meta.network, &certs)?,
-            answered,
-            first,
-        );
+        let endpoints = self.sync_endpoints(&meta, &config, &certs, prefer)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
 
         match &meta.kind {
@@ -360,7 +334,7 @@ impl WalletManager {
         } else {
             reach
         };
-        let mut attempts: Vec<String> = Vec::new();
+        let mut attempts = Attempts::default();
 
         for endpoint in endpoints {
             // Build a fresh plan under the lock (a plan is consumed by
@@ -375,12 +349,13 @@ impl WalletManager {
 
             let response = chain::sync_engine(endpoint, plan, proxy).await;
             match response {
-                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
+                Err(detail) => attempts.failed(endpoint, &detail),
                 Ok(synced) => {
                     let mut state = self.state.lock().await;
                     let (report, complete) =
                         apply_synced(&mut state, meta, synced, endpoint, &reach, &known, started)?;
                     drop(state);
+                    self.answered_after(endpoint, &attempts.down);
                     if complete && let Ok(mut done) = self.complete_here.lock() {
                         done.insert(meta.id.clone());
                     }
@@ -389,7 +364,7 @@ impl WalletManager {
             }
         }
 
-        Err(sync_failure(endpoints, attempts))
+        Err(sync_failure(endpoints, attempts.said))
     }
 
     async fn sync_address_wallet(
@@ -400,7 +375,7 @@ impl WalletManager {
         proxy: Option<&str>,
         started: Instant,
     ) -> CoreResult<(SyncReport, Endpoint)> {
-        let mut attempts: Vec<String> = Vec::new();
+        let mut attempts = Attempts::default();
         // What the wallet holds: what the server lists as it was is not
         // read again.
         let held: Vec<AddressTx> = {
@@ -423,11 +398,13 @@ impl WalletManager {
             )
             .await;
             match fetched {
-                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
+                Err(detail) => attempts.failed(endpoint, &detail),
                 Ok(Some(watch)) => {
                     let mut state = self.state.lock().await;
                     let report =
                         apply_address_state(&mut state, meta, watch, endpoint, started, true)?;
+                    drop(state);
+                    self.answered_after(endpoint, &attempts.down);
                     return Ok((report, endpoint.clone()));
                 }
                 // A history its server's own status disowns: nothing was
@@ -435,6 +412,7 @@ impl WalletManager {
                 // it was. No other server is asked: the one the watch
                 // listens to is the operator that sees the wallet.
                 Ok(None) => {
+                    self.answered_after(endpoint, &attempts.down);
                     return Err(CoreError::Sync {
                         backend: endpoint.label(),
                         detail: NOT_READ.to_owned(),
@@ -442,7 +420,7 @@ impl WalletManager {
                 }
             }
         }
-        Err(sync_failure(endpoints, attempts))
+        Err(sync_failure(endpoints, attempts.said))
     }
 
     /// Fetches an older round of history for a watched address and
@@ -471,10 +449,10 @@ impl WalletManager {
         let Some(cursor) = cursor else {
             return Ok(0);
         };
-        let endpoints = chain::endpoints(&config, meta.network, &certs)?;
+        let endpoints = self.sync_endpoints(&meta, &config, &certs, None)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
 
-        let mut attempts: Vec<String> = Vec::new();
+        let mut attempts = Attempts::default();
         for endpoint in &endpoints {
             match chain::fetch_address_history(
                 endpoint,
@@ -485,7 +463,7 @@ impl WalletManager {
             )
             .await
             {
-                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
+                Err(detail) => attempts.failed(endpoint, &detail),
                 Ok(round) => {
                     let mut state = self.state.lock().await;
                     let record = find_record_mut(&mut state.payload, id)?;
@@ -506,11 +484,74 @@ impl WalletManager {
                     let tx_count = watch.txs.len() as u32;
                     record.meta.cached.tx_count = tx_count;
                     state.vault.save(&state.payload)?;
+                    drop(state);
+                    self.answered_after(endpoint, &attempts.down);
                     return Ok(added);
                 }
             }
         }
-        Err(sync_failure(&endpoints, attempts))
+        Err(sync_failure(&endpoints, attempts.said))
+    }
+
+    /// The servers a sync of the wallet of `meta` tries, in order.
+    ///
+    /// `prefer` is the server of the watch that asked for the sync: it
+    /// told of the change, so it holds what changed. For any other sync,
+    /// and for the older history of a watched address, the server a
+    /// running watch talks to, or last talked to (`live_server`): it
+    /// already sees every script the watch follows, and reading there
+    /// shows the wallet to no second operator. Only a server a watch of
+    /// the wallet's own network may talk to under its backend: the watch
+    /// may have moved to another network, or another backend, since, and
+    /// a wallet's addresses never go to a server its backend does not
+    /// name. Then [`sync_order`], the relegated servers last
+    /// ([`Relegations`]), and never before the server of the watch.
+    fn sync_endpoints(
+        &self,
+        meta: &WalletMeta,
+        config: &chain::BackendConfig,
+        certs: &chain::TrustedCerts,
+        prefer: Option<(Network, Endpoint)>,
+    ) -> CoreResult<Vec<Endpoint>> {
+        let first = prefer
+            .or_else(|| self.live_server())
+            .filter(|(network, prefer)| {
+                *network == meta.network
+                    && crate::watch::servers_for(config, meta.network, certs)
+                        .is_ok_and(|allowed| allowed.contains(prefer))
+            })
+            .map(|(_, prefer)| prefer);
+        let answered = meta
+            .last_sync
+            .as_ref()
+            .and_then(|stamp| stamp.server.as_deref());
+        let endpoints = sync_order(
+            chain::endpoints(config, meta.network, certs)?,
+            answered,
+            first.clone(),
+        );
+        Ok(self.relegated_last(endpoints, first.as_ref()))
+    }
+
+    /// `endpoints` with the ones relegated now tried after the others:
+    /// see [`Relegations`].
+    pub(crate) fn relegated_last(
+        &self,
+        endpoints: Vec<Endpoint>,
+        first: Option<&Endpoint>,
+    ) -> Vec<Endpoint> {
+        match self.relegated.lock() {
+            Ok(relegated) => relegated.order(endpoints, first, tokio::time::Instant::now()),
+            Err(_) => endpoints,
+        }
+    }
+
+    /// `answered` answered after each of `failed` did not: see
+    /// [`Relegations::answered`].
+    pub(crate) fn answered_after(&self, answered: &Endpoint, failed: &[&Endpoint]) {
+        if let Ok(mut relegated) = self.relegated.lock() {
+            relegated.answered(answered, failed, tokio::time::Instant::now());
+        }
     }
 
     /// Syncs every wallet of a network (or all of them), sequentially:
@@ -730,6 +771,110 @@ fn sync_order(
         endpoints.insert(0, first);
     }
     endpoints
+}
+
+/// What the servers a sync tried before one answered said, and those of
+/// them that were down.
+#[derive(Default)]
+struct Attempts<'a> {
+    /// Each server's words, for the error the sync fails with.
+    said: Vec<String>,
+    /// The ones relegated if a later one answers ([`chain::is_outage`]).
+    down: Vec<&'a Endpoint>,
+}
+
+impl<'a> Attempts<'a> {
+    fn failed(&mut self, endpoint: &'a Endpoint, detail: &str) {
+        if chain::is_outage(detail) {
+            self.down.push(endpoint);
+        }
+        self.said.push(format!("{}: {detail}", endpoint.label()));
+    }
+}
+
+/// How long a server that failed while a later one answered is first
+/// tried after the others: five minutes, doubled each time it fails so
+/// again before it answers, up to an hour.
+const RELEGATION_FIRST: Duration = Duration::from_secs(5 * 60);
+const RELEGATION_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// The servers a sync tries after the others for a while. One that is
+/// down where a later one of the same list answers costs its timeout to
+/// every sync that starts with it, wallet after wallet: it is tried last
+/// for [`RELEGATION_FIRST`], then twice as long each time it is so
+/// again, up to [`RELEGATION_MAX`], and no longer once it answers. An
+/// hour past its last relegation, it starts over from the first.
+///
+/// Only an outage counts ([`chain::is_outage`]): a refusal of one
+/// request, a history too long for that server, says nothing of the
+/// next wallet, and relegating the server for it would send that wallet
+/// to the others. When every server fails, the request is at fault, and
+/// none is relegated.
+///
+/// Only the order changes, among the servers the backend names: none
+/// is added, since the more often a sync turns to the others, the more
+/// of them see its addresses over time. Nor is the server of the live
+/// watch ever put behind another: it already sees every script the
+/// watch follows, and a sync there shows the wallet to no second
+/// operator.
+#[derive(Debug, Default)]
+pub(crate) struct Relegations(HashMap<Endpoint, Relegation>);
+
+#[derive(Debug, Clone, Copy)]
+struct Relegation {
+    until: tokio::time::Instant,
+    /// Times it was relegated with no answer in between.
+    count: u32,
+}
+
+impl Relegations {
+    /// `endpoints` in the order a sync tries them: the ones relegated
+    /// at `now` after the others, each part in the order it had. `first`
+    /// stays where it is.
+    fn order(
+        &self,
+        endpoints: Vec<Endpoint>,
+        first: Option<&Endpoint>,
+        now: tokio::time::Instant,
+    ) -> Vec<Endpoint> {
+        let (kept, relegated): (Vec<Endpoint>, Vec<Endpoint>) =
+            endpoints.into_iter().partition(|endpoint| {
+                Some(endpoint) == first
+                    || self
+                        .0
+                        .get(endpoint)
+                        .is_none_or(|relegation| relegation.until <= now)
+            });
+        kept.into_iter().chain(relegated).collect()
+    }
+
+    /// `answered` answered at `now`, after each of `failed` was down:
+    /// those are relegated, unless one already is, by another sync that
+    /// met the same outage, and `answered` is no longer. A relegation
+    /// over for [`RELEGATION_MAX`] is forgotten.
+    fn answered(&mut self, answered: &Endpoint, failed: &[&Endpoint], now: tokio::time::Instant) {
+        self.0
+            .retain(|_, relegation| relegation.until + RELEGATION_MAX > now);
+        self.0.remove(answered);
+        for endpoint in failed {
+            let relegation = self.0.entry((*endpoint).clone()).or_insert(Relegation {
+                until: now,
+                count: 0,
+            });
+            if relegation.until > now {
+                continue;
+            }
+            relegation.until = now + relegation_for(relegation.count);
+            relegation.count = relegation.count.saturating_add(1);
+        }
+    }
+}
+
+/// [`RELEGATION_FIRST`] doubled once for each relegation before it.
+fn relegation_for(before: u32) -> Duration {
+    RELEGATION_FIRST
+        .checked_mul(2u32.saturating_pow(before))
+        .map_or(RELEGATION_MAX, |period| period.min(RELEGATION_MAX))
 }
 
 /// One error covering every endpoint tried, so the user sees each

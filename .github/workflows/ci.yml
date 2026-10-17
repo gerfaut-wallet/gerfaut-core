@@ -24,6 +24,13 @@ jobs:
       - name: Test
         run: cargo test
 
+      # Cargo only warns when a [patch] no longer matches what the
+      # dependencies ask for, and records it in Cargo.lock: the fork of
+      # saturating-time would stop applying, and the Windows hang it
+      # fixes would come back, with every other step green.
+      - name: Check that every patch applies
+        run: if grep -n '^\[\[patch.unused\]\]' Cargo.lock; then exit 1; fi
+
   # Both apps ship with the Tor client compiled in, and nothing above
   # builds that code. Checking it here keeps the shipped configuration
   # honest without paying for a full arti test run on every push.
