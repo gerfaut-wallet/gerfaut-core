@@ -279,30 +279,43 @@ impl WalletManager {
 }
 
 /// The certificates a restore pins, by host, as an acceptance made by
-/// hand stores them. Only those of an Electrum server that a backend of
-/// the same backup names: a pin is a decision about the server the
-/// settings point at, and one for a host the backup's settings never
-/// reach would wait in the vault, unseen, for the day that host is
-/// typed in, and take its certificate as accepted. Each one also passes
-/// the check of the acceptance dialog: a backup must not pin what the
-/// dialog would have refused, nor a fingerprint shaped so that no real
-/// certificate can ever match it and the host becomes permanently
-/// unreachable.
+/// hand stores them. Only those of an Electrum server the settings can
+/// reach without anyone typing it: one a backend of the same backup
+/// names, among those the restore applies (the same reading, through
+/// [`BackendConfig::canonical`]), or one of the public servers of the
+/// catalogue that sign their own certificate, which a person picks from
+/// a list, on a network the backup leaves on its default as on any
+/// other. A pin is a decision about such a server; one for a host
+/// nothing names would wait in the vault, unseen, for the day that host
+/// is typed in, and take its certificate as accepted. Each one also
+/// passes the check of the acceptance dialog: a backup must not pin
+/// what the dialog would have refused, nor a fingerprint shaped so that
+/// no real certificate can ever match it and the host becomes
+/// permanently unreachable.
 fn restorable_certs(payload: &BackupPayload) -> BTreeMap<String, String> {
-    let named: HashSet<String> = payload
+    let applied = payload
         .backends
         .iter()
         .flatten()
+        .filter_map(|(network, config)| Some((*network, config.clone().canonical().ok()?)))
         .filter_map(|(network, config)| {
-            chain::endpoints(config, *network, &chain::TrustedCerts::new()).ok()
+            chain::endpoints(&config, network, &chain::TrustedCerts::new()).ok()
         })
         .flatten()
         .filter_map(|endpoint| match endpoint {
-            chain::Endpoint::Electrum(target) => {
-                Some(chain::electrum::certificate_key(&target.url))
-            }
+            chain::Endpoint::Electrum(target) => Some(target.url.to_string()),
             chain::Endpoint::Esplora(_) => None,
+        });
+    let catalogue = crate::network::Network::ALL
+        .into_iter()
+        .flat_map(chain::public::public_servers)
+        .filter(|server| {
+            server.self_signed && server.protocol == chain::public::ServerProtocol::Electrum
         })
+        .map(|server| server.url);
+    let named: HashSet<String> = applied
+        .chain(catalogue)
+        .map(|url| chain::electrum::certificate_key(&url))
         .collect();
     payload
         .electrum_certs
