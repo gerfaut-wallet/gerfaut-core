@@ -490,10 +490,7 @@ pub(crate) async fn fetch_price_history(
             .await?;
             parse_coingecko_history(&value)?
         }
-        PriceSource::MempoolSpace => {
-            let value = get_json(&mempool_history_url(currency), proxy).await?;
-            parse_mempool_history(&value, currency)?
-        }
+        PriceSource::MempoolSpace => mempool_series(currency, proxy).await?.as_ref().clone(),
     };
     points.retain(|p| p.rate.is_finite() && p.rate > 0.0);
     points.sort_by_key(|p| p.t);
@@ -532,6 +529,64 @@ fn parse_coingecko_history(value: &serde_json::Value) -> CoreResult<Vec<PricePoi
             })
         })
         .collect())
+}
+
+/// How long mempool.space's whole series of a currency is kept: it gains
+/// a point an hour, and its API has no parameter that bounds the period,
+/// so a day or a week of it would otherwise cost the whole series, near
+/// 1.5 MB, at each ask.
+const MEMPOOL_SERIES_SECS: u64 = 3600;
+
+/// The series last read of each currency, with when it was read. In
+/// memory only: what a public endpoint answers everyone.
+static MEMPOOL_SERIES: SeriesCache = SeriesCache::new();
+
+/// A whole series, shared between the cache and its readers.
+type Series = std::sync::Arc<Vec<PricePoint>>;
+
+/// A series per currency, kept [`MEMPOOL_SERIES_SECS`].
+struct SeriesCache(std::sync::Mutex<Vec<(FiatCurrency, u64, Series)>>);
+
+impl SeriesCache {
+    const fn new() -> Self {
+        SeriesCache(std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// The series of `currency`, if read less than the time it is kept
+    /// before `now`.
+    fn fresh(&self, currency: FiatCurrency, now: u64) -> Option<Series> {
+        let held = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.iter()
+            .find(|(kept, at, _)| {
+                *kept == currency && now.saturating_sub(*at) < MEMPOOL_SERIES_SECS
+            })
+            .map(|(_, _, series)| series.clone())
+    }
+
+    fn keep(&self, currency: FiatCurrency, now: u64, series: Series) {
+        let mut held = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.retain(|(kept, _, _)| *kept != currency);
+        held.push((currency, now, series));
+    }
+}
+
+/// mempool.space's whole series in `currency`, from the cache while it
+/// holds, else asked and kept.
+async fn mempool_series(currency: FiatCurrency, proxy: Option<&str>) -> CoreResult<Series> {
+    let now = now_secs();
+    if let Some(series) = MEMPOOL_SERIES.fresh(currency, now) {
+        return Ok(series);
+    }
+    let value = get_json(&mempool_history_url(currency), proxy).await?;
+    let series = std::sync::Arc::new(parse_mempool_history(&value, currency)?);
+    MEMPOOL_SERIES.keep(currency, now, series.clone());
+    Ok(series)
 }
 
 /// mempool.space's whole history in the one currency on screen. With no
@@ -785,6 +840,23 @@ mod tests {
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].t, 1_700_000_000);
         assert_eq!(points[0].rate, 35000.5);
+    }
+
+    /// A currency's series is kept an hour, then asked again; another
+    /// currency's is its own.
+    #[test]
+    fn a_series_is_kept_an_hour() {
+        let cache = SeriesCache::new();
+        let series = std::sync::Arc::new(vec![PricePoint { t: 1, rate: 2.0 }]);
+        cache.keep(FiatCurrency::Eur, 1_000, series.clone());
+        assert_eq!(cache.fresh(FiatCurrency::Eur, 1_000 + 3_599), Some(series));
+        assert_eq!(cache.fresh(FiatCurrency::Eur, 1_000 + 3_600), None);
+        assert_eq!(cache.fresh(FiatCurrency::Usd, 1_000), None);
+        // Kept again, the new one stands alone.
+        let newer = std::sync::Arc::new(vec![PricePoint { t: 2, rate: 3.0 }]);
+        cache.keep(FiatCurrency::Eur, 5_000, newer.clone());
+        assert_eq!(cache.fresh(FiatCurrency::Eur, 5_001), Some(newer));
+        assert_eq!(cache.0.lock().unwrap().len(), 1);
     }
 
     /// The history is asked in the currency on screen alone.
