@@ -870,6 +870,32 @@ mod servers {
                 .any(|(seen, _)| *seen == txid)
         );
 
+        // The header read again refused, or the header refused at once.
+        for stale in [true, false] {
+            let server = signet().await;
+            let payment = pay(&server, 90, |_| true);
+            {
+                let mut state = server.state.lock().unwrap();
+                if stale {
+                    let mut stale = state.header_of(90);
+                    stale.merkle_root = TxMerkleNode::from_byte_array([7; 32]);
+                    state.stale_once.insert(90, stale);
+                }
+                state.refused_headers.insert(90);
+            }
+            let synced = electrum_sync(&server, Network::Signet).await.unwrap();
+            assert_eq!(anchored(&synced), []);
+            let txid = payment.compute_txid();
+            assert!(
+                synced
+                    .update
+                    .tx_update
+                    .seen_ats
+                    .iter()
+                    .any(|(seen, _)| *seen == txid)
+            );
+        }
+
         let server = signet().await;
         let payment = pay(&server, 90, |_| true);
         server.state.lock().unwrap().refuse.insert(

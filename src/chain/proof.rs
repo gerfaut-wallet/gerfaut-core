@@ -117,7 +117,9 @@ pub(crate) enum Proof {
     /// with the work of its height: the transaction confirmed there.
     Holds,
     /// A header without the work of its height, or a branch that is no
-    /// branch of the block: the server is to be refused.
+    /// branch of any block: a position past it, a node paired with a copy
+    /// of itself, more hashes than any block needs. The server is to be
+    /// refused.
     False,
     /// Not proven, and no lie either: a branch for another height than
     /// the one asked about, as a server answers when a block came in

@@ -535,10 +535,11 @@ async fn block_headers(
                     Ok(Ok(header)) => {
                         headers.found.insert(heights[index], header);
                     }
-                    Ok(Err(_)) => {}
-                    Err(error) => {
-                        headers.refused.insert(heights[index], error.to_string());
+                    Err(CallError::Refused(words)) => {
+                        headers.refused.insert(heights[index], words);
                     }
+                    // Not a header: what it would prove is a false proof.
+                    Ok(Err(_)) | Err(_) => {}
                 }
                 Ok(())
             },

@@ -568,12 +568,12 @@ impl FakeElectrum {
             }
             "blockchain.block.header" => {
                 let height = param.as_u64().unwrap_or(0) as u32;
-                if state.refused_headers.contains(&height) {
+                if let Some(stale) = state.stale_once.remove(&height) {
+                    json!(serialize_hex(&stale))
+                } else if state.refused_headers.contains(&height) {
                     return refusal("header not available");
-                }
-                match state.stale_once.remove(&height) {
-                    Some(stale) => json!(serialize_hex(&stale)),
-                    None => json!(state.header(height)),
+                } else {
+                    json!(state.header(height))
                 }
             }
             _ => Value::Null,

@@ -420,9 +420,9 @@ impl Pass<'_> {
     /// cannot back, and the next server is asked instead of this one
     /// being believed on anything else. One that is unsure leaves the
     /// transaction unconfirmed, as seen in the mempool now: among them, a
-    /// branch the server refused, one into a block that replaced the one
-    /// read ([`recheck`]), and one in a block that came in since the tip
-    /// was read ([`above_the_tip`]).
+    /// branch or a header the server refused, one into a block that
+    /// replaced the one read ([`recheck`]), and one in a block that came
+    /// in since the tip was read ([`above_the_tip`]).
     fn prove(
         &mut self,
         client: &impl ElectrumApi,
@@ -449,25 +449,47 @@ impl Pass<'_> {
         missing.sort_unstable();
         missing.dedup();
         for heights in missing.chunks(BATCH) {
-            let headers = client.batch_block_header(heights.iter().copied())?;
-            if headers.len() != heights.len() {
-                return Err(false_proof());
-            }
-            for (height, header) in heights.iter().zip(headers) {
-                chain.headers.insert(*height, header);
+            match client.batch_block_header(heights.iter().copied()) {
+                Ok(headers) if headers.len() == heights.len() => {
+                    for (height, header) in heights.iter().zip(headers) {
+                        chain.headers.insert(*height, header);
+                    }
+                }
+                Ok(_) => return Err(false_proof()),
+                // Refused, as for a block a reorganisation took: each is
+                // asked alone, and one still refused leaves what it would
+                // prove unsure.
+                Err(error) if refused(&error) => {
+                    for height in heights {
+                        match client.block_header(*height as usize) {
+                            Ok(header) => {
+                                chain.headers.insert(*height, header);
+                            }
+                            Err(error) if refused(&error) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
         for batch in to_prove.chunks(BATCH) {
             for ((txid, height), proof) in batch.iter().zip(branches(client, batch)?) {
-                let header = *chain.headers.get(height).ok_or_else(false_proof)?;
+                let Some(header) = chain.headers.get(height).copied() else {
+                    self.update.seen_ats.insert((*txid, self.start_time));
+                    continue;
+                };
                 let verdict = match &proof {
                     None => Proof::Unsure,
                     Some(proof) => {
                         match check_confirmation(network, *height, &header, *txid, proof) {
-                            Proof::Elsewhere => {
-                                let again = client.block_header(*height as usize)?;
-                                recheck(network, *height, &header, &again, *txid, proof)
-                            }
+                            Proof::Elsewhere => match client.block_header(*height as usize) {
+                                Ok(again) => {
+                                    recheck(network, *height, &header, &again, *txid, proof)
+                                }
+                                Err(error) if refused(&error) => Proof::Unsure,
+                                Err(error) => return Err(error),
+                            },
                             verdict => verdict,
                         }
                     }
