@@ -1008,9 +1008,73 @@ fn only_a_wallets_own_fault_leaves_it_out() {
     assert!(is_refusal(&CoreError::PrivateMaterialRejected));
     assert!(is_refusal(&CoreError::NetworkMismatch {
         expected: "signet".to_owned(),
-        found: "descriptor".to_owned(),
+        found: "mainnet".to_owned(),
     }));
     assert!(!is_refusal(&CoreError::Internal(
         "new wallet produced no initial change set".to_owned()
     )));
+}
+
+const TPUB: &str = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
+
+fn signet_wallet(name: &str, branch: u32) -> BackupWallet {
+    BackupWallet {
+        name: name.to_owned(),
+        network: Network::Signet,
+        kind: WalletKind::Descriptors {
+            external: format!("wpkh({TPUB}/{branch}/*)"),
+            internal: None,
+            script: crate::input::ScriptKind::Segwit,
+        },
+        gap_limit: 20,
+        labels: Default::default(),
+        created_at: 1_755_000_000,
+        live_pinned: false,
+    }
+}
+
+/// A wallet whose keys are of another network than the one it says
+/// is refused in words that name the network its keys are for; an
+/// address the same.
+#[tokio::test]
+async fn a_wallet_on_the_wrong_network_names_the_network_of_its_keys() {
+    let mut test_keys = signet_wallet("Test keys", 0);
+    test_keys.network = Network::Mainnet;
+    let mut mainnet_address = signet_wallet("Mainnet address", 0);
+    mainnet_address.kind = WalletKind::SingleAddress {
+        address: "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_owned(),
+    };
+    let mut test_address = signet_wallet("Test address", 0);
+    test_address.network = Network::Mainnet;
+    test_address.kind = WalletKind::SingleAddress {
+        address: ADDRESS.to_owned(),
+    };
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: vec![test_keys, mainnet_address, test_address],
+        backends: None,
+        electrum_certs: None,
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    let reasons: Vec<_> = preview
+        .wallets
+        .iter()
+        .map(|w| w.refused.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            "network mismatch: input is for signet, testnet4 or regtest, expected mainnet",
+            "network mismatch: input is for mainnet, expected signet",
+            "network mismatch: input is for signet or testnet4, expected mainnet",
+        ]
+    );
 }
