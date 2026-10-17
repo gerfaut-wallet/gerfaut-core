@@ -34,6 +34,7 @@ use super::tls::{self, ConnectError, Verdict};
 
 pub(crate) mod address;
 pub(crate) mod rpc;
+pub(crate) mod status;
 pub(crate) mod sync;
 
 /// Socket timeout, each read and each write. Without it a stalled

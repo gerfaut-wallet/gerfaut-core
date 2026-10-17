@@ -1649,7 +1649,8 @@ mod tests {
             masked: true,
             fiat: true,
             fiat_currency: FiatCurrency::Chf,
-            price_source: PriceSource::Kraken,
+            // Kraken left the sources: mempool.space quotes the same.
+            price_source: PriceSource::MempoolSpace,
             notify_new_tx: true,
             explorer_ack: true,
         };
@@ -1702,6 +1703,73 @@ mod tests {
             .insert("display.unit".to_owned(), "sats".to_owned());
         vault.save(&changed).unwrap();
         assert_eq!(vault.load().unwrap().settings.preferences.unit, Unit::Btc);
+    }
+
+    /// A vault whose preferences hold a currency and no source, as a
+    /// record written by hand or by a build that kept no source would,
+    /// opens on a source that quotes it.
+    #[test]
+    fn a_vault_on_a_currency_alone_opens_on_a_source_that_quotes_it() {
+        use crate::price::{FiatCurrency, PriceSource};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
+        vault.save(&payload).unwrap();
+        drop(vault);
+        let plaintext = cipher::unseal(&std::fs::read(&path).unwrap(), &key()).unwrap();
+        let mut written: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        written["settings"]["preferences"] =
+            serde_json::json!({"fiat": true, "fiat_currency": "inr"});
+        let sealed = cipher::seal(&serde_json::to_vec(&written).unwrap(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        let (_, reopened) = Vault::open_or_create(&path, key()).unwrap();
+        let preferences = reopened.settings.preferences;
+        assert!(preferences.fiat);
+        assert_eq!(preferences.fiat_currency, FiatCurrency::Inr);
+        assert_eq!(preferences.price_source, PriceSource::Coingecko);
+    }
+
+    /// A vault whose preferences record names Kraken, which left the
+    /// price sources, opens: the source reads as mempool.space, and
+    /// every other setting it holds stands.
+    #[test]
+    fn a_vault_on_kraken_opens_on_mempool_space() {
+        use crate::prefs::Unit;
+        use crate::price::{FiatCurrency, PriceSource};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let (vault, mut payload) = Vault::open_or_create(&path, key()).unwrap();
+        payload.settings.active_network = Network::Signet;
+        payload.settings.preferences = Preferences {
+            unit: Unit::Sats,
+            masked: true,
+            fiat: true,
+            fiat_currency: FiatCurrency::Gbp,
+            price_source: PriceSource::MempoolSpace,
+            notify_new_tx: true,
+            explorer_ack: true,
+        };
+        payload
+            .settings
+            .app_prefs
+            .insert("desktop.theme".to_owned(), "dark".to_owned());
+        vault.save(&payload).unwrap();
+        drop(vault);
+
+        // What an earlier build wrote: the same record, on Kraken.
+        let plaintext = cipher::unseal(&std::fs::read(&path).unwrap(), &key()).unwrap();
+        let mut written: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        written["settings"]["preferences"]["price_source"] = "kraken".into();
+        let sealed = cipher::seal(&serde_json::to_vec(&written).unwrap(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        let (_, reopened) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(reopened.settings.preferences, payload.settings.preferences);
+        assert_eq!(reopened.settings.app_prefs, payload.settings.app_prefs);
+        assert_eq!(reopened.settings.active_network, Network::Signet);
     }
 
     #[test]

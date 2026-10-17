@@ -34,22 +34,43 @@
 //! heard of, or a server that goes back, is compared at once. No other
 //! operator is ever asked, since it would learn from which address the
 //! app is used, and an onion server is compared with onion servers only.
+//!
+//! The headers the server sends as its tip are kept in a row, a day of
+//! them, each with the work its network asks for. A status pushed for
+//! a script whose wallet waits for a block is compared with what the
+//! wallet's history comes to once the latest of them took what waits
+//! ([`super::confirmed_at`]). When they match, the proof of each of
+//! those transactions in that block is asked for on this connection,
+//! and held to what a sync holds a confirmation to
+//! ([`crate::chain::proof::check_confirmation`]): the script is reported
+//! with the proofs once they all hold ([`super::Proven`]); as any change,
+//! for a sync, when one is unsure, leads to another block, or does not
+//! come within the time a ping may take; and a false one refuses the
+//! server. A block early in the chain, which a header alone does not
+//! prove, is never foretold: the sync chains it to its checkpoint.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bdk_wallet::bitcoin::block::Header;
 use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
+use bdk_wallet::bitcoin::{BlockHash, Txid};
+use electrum_client::GetMerkleRes;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::time::Instant;
 
-use super::{ChangeReason, Exit, Hub, Wake, WatchState, WatchTransport};
+use super::{
+    ChangeReason, Exit, Headers, Hub, Proven, Wake, WatchState, WatchTransport, confirmed_at,
+};
+use crate::chain::electrum::status::history_status;
 use crate::chain::electrum::{CLIENT_NAME, Target, parse, words};
 use crate::chain::net::{self, BoxStream, LineReader};
-use crate::chain::{ANOTHER_NETWORK, Endpoint, is_genesis_of};
+use crate::chain::proof::{FALSE_PROOF, Proof, check_confirmation, checkpoint_for};
+use crate::chain::{ANOTHER_NETWORK, Endpoint, has_proof_of_work, is_genesis_of};
 use crate::network::Network;
 
 /// The longest line read. A status is 64 characters and a header 160;
@@ -81,13 +102,37 @@ const PROTOCOL_MAX: &str = "1.4.2";
 /// for one that stopped: two indexers read a block a few seconds apart,
 /// and one block between them is that.
 const BEHIND: u32 = 2;
+/// Headers kept of the latest blocks the server sent, a day of them: a
+/// confirmation is foretold only for a wallet whose chain they reach.
+const HEADERS_KEPT: usize = 144;
+/// Transactions proven for one confirmation foretold, at most: past
+/// that many, a sync of the script costs less.
+const PROOFS_MAX: usize = 10;
+/// Proofs remembered on one connection, past which they are forgotten.
+const PROOFS_KEPT: usize = 1_000;
 
 enum Request {
     Headers,
     /// The tip asked again, before another server's is read.
     Tip,
     Subscribe(String),
+    /// The proof of a transaction in the block at a height.
+    Merkle(Txid, u32),
     Other,
+}
+
+/// A confirmation foretold, waiting for its proofs: see [`Proven`].
+struct Proving {
+    /// The script, in hex.
+    hex: String,
+    status: String,
+    txids: Vec<Txid>,
+    /// Those whose proof has yet to come.
+    waiting: HashSet<Txid>,
+    headers: Arc<Headers>,
+    /// When the proofs still awaited are given up on, and the script
+    /// synced.
+    deadline: Instant,
 }
 
 /// Where a session stands in comparing its tip with another server's.
@@ -126,6 +171,9 @@ struct Session {
     at_limit: bool,
     /// The server cut the session for what it costs, in these words.
     overloaded: Option<String>,
+    /// The server sent a false proof of a confirmation foretold: it is
+    /// refused, as a sync refuses it ([`FALSE_PROOF`]).
+    false_proof: bool,
     can_unsubscribe: bool,
     /// When the ping in flight, if any, is given up on.
     pong_by: Option<Instant>,
@@ -136,6 +184,20 @@ struct Session {
     /// configuration: a script it had no status for is reported.
     resumed: bool,
     ready_told: bool,
+    /// The latest headers the server sent, in a row: shared with the
+    /// confirmations foretold on them, copied only when a header comes
+    /// while one holds them.
+    headers: Option<Arc<Headers>>,
+    /// Proofs to ask for: txid and height.
+    proofs_queued: VecDeque<(Txid, u32)>,
+    /// Proofs asked for and not answered yet.
+    proofs_asked: HashSet<(Txid, u32)>,
+    /// Whether the proof the server gave of a transaction leads to the
+    /// root of a block, by txid and the block's hash: a block another
+    /// replaced at the same height is not that block.
+    proofs: HashMap<(Txid, BlockHash), bool>,
+    /// Confirmations foretold waiting for their proofs, by script hash.
+    provings: HashMap<String, Proving>,
     /// The height of the last block the server announced.
     tip: Option<u32>,
     /// When it last announced one, or when the session opened, or when
@@ -189,11 +251,17 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         refused_run: Vec::new(),
         at_limit: false,
         overloaded: None,
+        false_proof: false,
         can_unsubscribe: at_least_1_4_2(&negotiated),
         pong_by: None,
         opening: HashSet::new(),
         resumed: hub.caught_up,
         ready_told: false,
+        headers: None,
+        proofs_queued: VecDeque::new(),
+        proofs_asked: HashSet::new(),
+        proofs: HashMap::new(),
+        provings: HashMap::new(),
         tip: None,
         block_at: Instant::now(),
         look: Look::Idle,
@@ -201,6 +269,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
     };
     hub.alive();
     hub.serve(Some(endpoint));
+    hub.announced.open(endpoint);
     hub.set_status(|status| {
         status.state = WatchState::Connected;
         status.transport = Some(WatchTransport::Electrum);
@@ -224,6 +293,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
     let mut next_ping = Instant::now() + hub.timings.keepalive_wait();
     loop {
         let pong_by = session.pong_by;
+        let proofs_due = session.proofs_due();
         let stale_at = session.block_at + hub.timings.stale;
         let asking_by = match session.look {
             Look::Asking { by, .. } => Some(by),
@@ -237,6 +307,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                     session.handle(hub, &line);
                     if let Some(detail) = session.overloaded.take() {
                         return Exit::Refused(detail);
+                    }
+                    if session.false_proof {
+                        return Exit::Refused(FALSE_PROOF.to_owned());
                     }
                     session.check_ready(hub);
                     session.pump().await
@@ -280,6 +353,10 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
             }
             () = super::sleep_until(pong_by), if pong_by.is_some() => {
                 Err("the server stopped answering".to_owned())
+            }
+            () = super::sleep_until(proofs_due), if proofs_due.is_some() => {
+                session.expire_proofs(hub);
+                session.pump().await
             }
             () = tokio::time::sleep_until(stale_at), if matches!(session.look, Look::Idle) => {
                 session.block_at = Instant::now();
@@ -362,9 +439,18 @@ impl Session {
         }
     }
 
-    /// Sends queued subscriptions up to the window.
+    /// Sends queued proofs, then queued subscriptions, up to the window.
     async fn pump(&mut self) -> Result<(), String> {
         while self.in_flight.len() < WINDOW {
+            if let Some((txid, height)) = self.proofs_queued.pop_front() {
+                self.request(
+                    Request::Merkle(txid, height),
+                    "blockchain.transaction.get_merkle",
+                    json!([txid.to_string(), height]),
+                )
+                .await?;
+                continue;
+            }
             let Some(scripthash) = self.queue.pop_front() else {
                 break;
             };
@@ -390,8 +476,12 @@ impl Session {
         for scripthash in gone {
             self.subscribed.remove(&scripthash);
             self.opening.remove(&scripthash);
+            if self.provings.remove(&scripthash).is_some() {
+                self.drop_unawaited_proofs();
+            }
             self.queue.retain(|queued| *queued != scripthash);
             hub.statuses.remove(&scripthash);
+            hub.announced.forget(&scripthash);
             if self.can_unsubscribe {
                 self.request(
                     Request::Other,
@@ -441,8 +531,11 @@ impl Session {
                 return;
             };
             let error = message.get("error").filter(|error| !error.is_null());
+            // A proof refused is a guess given up, whatever the words: it
+            // is asked for nothing the watch needs.
             if let Some(error) = error
                 && costs_too_much(error)
+                && !matches!(request, Request::Merkle(..))
             {
                 self.cut(hub, words(error));
                 return;
@@ -451,6 +544,7 @@ impl Session {
             match request {
                 Request::Headers if !refused => {
                     if let Some(height) = height_of(&message["result"]) {
+                        self.take_header(hub.config.network, height, &message["result"]);
                         self.tip = Some(height);
                         // Behind a block the watch already heard of,
                         // from the server it left or one before: this
@@ -465,13 +559,21 @@ impl Session {
                         hub.new_tip(height, false);
                     }
                 }
+                Request::Merkle(txid, height) => {
+                    let branch = (!refused).then(|| &message["result"]);
+                    self.proved(hub, txid, height, branch);
+                }
                 Request::Tip => {
                     // The answer to a look since given up, a block or a
                     // wake-up after it, is no answer.
                     if !matches!(self.look, Look::Asking { id: asked, .. } if asked == id) {
                         return;
                     }
-                    match height_of(&message["result"]).filter(|_| !refused) {
+                    let height = height_of(&message["result"]).filter(|_| !refused);
+                    if let Some(height) = height {
+                        self.take_header(hub.config.network, height, &message["result"]);
+                    }
+                    match height {
                         // A block it did not announce: the server moved.
                         Some(height) if self.tip.is_none_or(|tip| height > tip) => {
                             self.tip = Some(height);
@@ -528,6 +630,7 @@ impl Session {
             }
             Some("blockchain.headers.subscribe") => {
                 if let Some(height) = height_of(&params[0]) {
+                    self.take_header(hub.config.network, height, &params[0]);
                     let back = self.tip.is_some_and(|tip| height < tip);
                     self.tip = Some(height);
                     hub.new_tip(height, false);
@@ -645,7 +748,18 @@ impl Session {
             .map(|s| s.chars().take(64).collect::<String>());
         let lacking = entry.statuses.iter().any(|held| *held != status);
         let previous = hub.statuses.insert(scripthash.to_owned(), status.clone());
+        hub.announced.set(scripthash, status.clone());
+        if !answer
+            && previous.as_ref() != Some(&status)
+            && self.provings.remove(scripthash).is_some()
+        {
+            // What was being proven of the status before is moot.
+            self.drop_unawaited_proofs();
+        }
         if !lacking || (!answer && previous.as_ref() == Some(&status)) {
+            return;
+        }
+        if !answer && self.foretold(hub, scripthash, status.as_deref()) {
             return;
         }
         let reason = if answer {
@@ -654,6 +768,240 @@ impl Session {
             ChangeReason::Activity
         };
         hub.mark_entry(&hex, reason);
+    }
+
+    /// Takes a header the server sent as its tip at `height`: kept
+    /// after the ones before it when it follows the last of them below
+    /// its height, alone otherwise, and dropped with them when it lacks
+    /// the work its network asks for.
+    fn take_header(&mut self, network: Network, height: u32, sent: &Value) {
+        let header = sent
+            .get("hex")
+            .and_then(Value::as_str)
+            .and_then(|hex| deserialize_hex::<Header>(hex).ok())
+            .filter(|header| has_proof_of_work(network, height, header));
+        let Some(header) = header else {
+            self.headers = None;
+            return;
+        };
+        let alone = || {
+            Arc::new(Headers {
+                first: height,
+                chain: vec![header],
+            })
+        };
+        let mut kept = match self.headers.take() {
+            Some(mut headers)
+                if height > headers.first && height <= headers.last_height().saturating_add(1) =>
+            {
+                let row = Arc::make_mut(&mut headers);
+                row.chain
+                    .truncate(usize::try_from(height - row.first).unwrap_or(usize::MAX));
+                let follows = row
+                    .chain
+                    .last()
+                    .is_some_and(|parent| header.prev_blockhash == parent.block_hash());
+                if follows {
+                    row.chain.push(header);
+                    headers
+                } else {
+                    alone()
+                }
+            }
+            _ => alone(),
+        };
+        if kept.chain.len() > HEADERS_KEPT {
+            let row = Arc::make_mut(&mut kept);
+            let over = row.chain.len() - HEADERS_KEPT;
+            row.chain.drain(..over);
+            row.first = row
+                .first
+                .saturating_add(u32::try_from(over).unwrap_or(u32::MAX));
+        }
+        self.headers = Some(kept);
+    }
+
+    /// Whether a status pushed for a script is what the history each of
+    /// its wallets holds comes to once the latest block the server sent
+    /// takes what waits in it ([`confirmed_at`]). The proof of each of
+    /// those transactions in that block is asked for, and the script is
+    /// reported with them once they all hold ([`Self::proved`]), or for
+    /// a sync when one fails or comes late.
+    fn foretold(&mut self, hub: &mut Hub, scripthash: &str, status: Option<&str>) -> bool {
+        let (Some(status), Some(headers)) = (status, self.headers.as_ref()) else {
+            return false;
+        };
+        let Some(entry) = hub.watched.by_scripthash(scripthash) else {
+            return false;
+        };
+        let height = headers.last_height();
+        let Some(block) = headers.at(height).map(Header::block_hash) else {
+            return false;
+        };
+        // A block in a period whose forged header costs little proves
+        // nothing alone: its chain to the checkpoint is read by the sync
+        // of the script, not foretold here.
+        if checkpoint_for(hub.config.network, height).is_some() {
+            return false;
+        }
+        let mut txids = BTreeSet::new();
+        for held in &entry.histories {
+            match confirmed_at(held, height) {
+                Some(guessed) if history_status(&guessed) == status => {
+                    txids.extend(
+                        held.iter()
+                            .filter(|(_, height)| *height <= 0)
+                            .map(|(txid, _)| *txid),
+                    );
+                }
+                _ => return false,
+            }
+        }
+        if entry.lookahead || txids.is_empty() || txids.len() > PROOFS_MAX {
+            return false;
+        }
+        let proof = |txid: &Txid| self.proofs.get(&(*txid, block)).copied();
+        if txids.iter().any(|txid| proof(txid) == Some(false)) {
+            return false;
+        }
+        let waiting: HashSet<Txid> = txids
+            .iter()
+            .filter(|txid| proof(txid) != Some(true))
+            .copied()
+            .collect();
+        for txid in &waiting {
+            if self.proofs_asked.insert((*txid, height)) {
+                self.proofs_queued.push_back((*txid, height));
+            }
+        }
+        let proving = Proving {
+            hex: entry.hex.clone(),
+            status: status.to_owned(),
+            txids: txids.into_iter().collect(),
+            waiting,
+            headers: Arc::clone(headers),
+            deadline: Instant::now() + hub.pong_budget(&self.endpoint),
+        };
+        if proving.waiting.is_empty() {
+            hub.mark_proven(&self.proven(proving));
+        } else {
+            self.provings.insert(scripthash.to_owned(), proving);
+        }
+        true
+    }
+
+    /// The server answered for the proof of `txid` in the block at
+    /// `height`, with `branch`, or refused. Each confirmation waiting
+    /// on it is reported once all its proofs hold, and its script is
+    /// reported for a sync as soon as one fails.
+    fn proved(&mut self, hub: &mut Hub, txid: Txid, height: u32, branch: Option<&Value>) {
+        self.proofs_asked.remove(&(txid, height));
+        if self.proofs.len() > PROOFS_KEPT {
+            self.proofs.clear();
+        }
+        let branch =
+            branch.and_then(|branch| serde_json::from_value::<GetMerkleRes>(branch.clone()).ok());
+        let network = hub.config.network;
+        let waiting: Vec<String> = self
+            .provings
+            .iter()
+            .filter(|(_, proving)| {
+                proving.headers.last_height() == height && proving.waiting.contains(&txid)
+            })
+            .map(|(scripthash, _)| scripthash.clone())
+            .collect();
+        for scripthash in waiting {
+            let Some(mut proving) = self.provings.remove(&scripthash) else {
+                continue;
+            };
+            let Some(header) = proving.headers.at(height) else {
+                hub.mark_entry(&proving.hex, ChangeReason::Activity);
+                continue;
+            };
+            // Held to what a sync holds a confirmation to. One that
+            // leads elsewhere, a block replaced since the header came, or
+            // one unsure, is left to the sync of the script; a false one
+            // refuses the server, as a sync refuses it.
+            let proof = branch.as_ref().map_or(Proof::Unsure, |branch| {
+                check_confirmation(network, height, header, txid, branch)
+            });
+            match proof {
+                Proof::Holds => {
+                    self.proofs.insert((txid, header.block_hash()), true);
+                }
+                Proof::False => {
+                    self.proofs.insert((txid, header.block_hash()), false);
+                    self.false_proof = true;
+                    hub.mark_entry(&proving.hex, ChangeReason::Activity);
+                    continue;
+                }
+                Proof::Unsure | Proof::Elsewhere => {
+                    hub.mark_entry(&proving.hex, ChangeReason::Activity);
+                    continue;
+                }
+            }
+            proving.waiting.remove(&txid);
+            if proving.waiting.is_empty() {
+                hub.mark_proven(&self.proven(proving));
+            } else {
+                self.provings.insert(scripthash, proving);
+            }
+        }
+    }
+
+    /// When the first proof still awaited is given up on.
+    fn proofs_due(&self) -> Option<Instant> {
+        self.provings.values().map(|proving| proving.deadline).min()
+    }
+
+    /// Gives up on the proofs the server is late with: their scripts are
+    /// reported for a sync.
+    fn expire_proofs(&mut self, hub: &mut Hub) {
+        let now = Instant::now();
+        let late: Vec<String> = self
+            .provings
+            .iter()
+            .filter(|(_, proving)| proving.deadline <= now)
+            .map(|(scripthash, _)| scripthash.clone())
+            .collect();
+        for scripthash in late {
+            if let Some(proving) = self.provings.remove(&scripthash) {
+                hub.mark_entry(&proving.hex, ChangeReason::Activity);
+            }
+        }
+        self.drop_unawaited_proofs();
+    }
+
+    /// Forgets the proofs no confirmation foretold waits on any more:
+    /// asked and never answered, they would hold their place in the
+    /// window of requests in flight for as long as the session lasts,
+    /// and an answer that comes after is not read.
+    fn drop_unawaited_proofs(&mut self) {
+        let awaited: HashSet<(Txid, u32)> = self
+            .provings
+            .values()
+            .flat_map(|proving| {
+                let height = proving.headers.last_height();
+                proving.waiting.iter().map(move |txid| (*txid, height))
+            })
+            .collect();
+        self.in_flight.retain(|_, request| match request {
+            Request::Merkle(txid, height) => awaited.contains(&(*txid, *height)),
+            _ => true,
+        });
+        self.proofs_asked.retain(|asked| awaited.contains(asked));
+        self.proofs_queued.retain(|queued| awaited.contains(queued));
+    }
+
+    /// A confirmation whose proofs all hold, as the wallet takes it.
+    fn proven(&self, proving: Proving) -> Proven {
+        Proven {
+            script: proving.hex,
+            status: proving.status,
+            txids: proving.txids,
+            headers: proving.headers,
+            server: self.endpoint.clone(),
+        }
     }
 
     /// Why a script read on subscribing is reported: the watch starts,

@@ -584,6 +584,11 @@ pub(crate) struct Plan {
     /// way: a history is a list of txids, cheaper than any check.
     pub reading: Reading,
     pub held: Held,
+    /// What the server of a running live watch announced of each script,
+    /// when this plan runs on that server: an Electrum history that does
+    /// not hash to it, and leaves out what the wallet holds there, is set
+    /// aside ([`electrum::status`]).
+    pub told: Option<electrum::status::Told>,
 }
 
 /// The scripts of one keychain, from the first one to read on.
@@ -682,6 +687,9 @@ pub(crate) struct Synced {
     /// The histories an Electrum server listed, in its order, by script:
     /// the order its statuses hash them in.
     pub orders: Vec<(ScriptBuf, Vec<(Txid, i32)>)>,
+    /// A history was set aside unread ([`electrum::status`]): the sync
+    /// did not read every script it was to read.
+    pub set_aside: bool,
 }
 
 /// The most the transactions of one wallet may carry, every output of
@@ -769,14 +777,18 @@ pub(crate) async fn sync_engine(
 /// Fetches the state of a single watched address from one endpoint,
 /// within the deadline of a scan: the same state from an Esplora or an
 /// Electrum server. `held`, what the wallet holds of it, is not read
-/// again where the server lists it as it was.
+/// again where the server lists it as it was. `None` when an Electrum
+/// server listed a history that does not hash to the status it
+/// announced to a running watch (`told`) and leaves out what the wallet
+/// holds: nothing was read.
 pub(crate) async fn fetch_address_state(
     endpoint: &Endpoint,
     address: &str,
     network: Network,
     proxy: Option<&str>,
     held: &[crate::wallet::AddressTx],
-) -> Result<AddressWatchState, String> {
+    told: Option<&electrum::status::Told>,
+) -> Result<Option<AddressWatchState>, String> {
     match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client_for_run(url, proxy)?;
@@ -785,11 +797,12 @@ pub(crate) async fn fetch_address_state(
                 esplora::fetch_address_state(&client, address, network, held),
             )
             .await
+            .map(Some)
         }
         Endpoint::Electrum(target) => {
             within(
                 scan_deadline(endpoint),
-                electrum::address::fetch_state(target, address, network, proxy, held),
+                electrum::address::fetch_state(target, address, network, proxy, held, told),
             )
             .await
         }

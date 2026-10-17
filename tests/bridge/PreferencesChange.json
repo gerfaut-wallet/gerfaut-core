@@ -6,7 +6,7 @@
     "masked": true,
     "fiat": true,
     "fiat_currency": "chf",
-    "price_source": "kraken",
+    "price_source": "mempool_space",
     "notify_new_tx": true,
     "explorer_ack": true
   }

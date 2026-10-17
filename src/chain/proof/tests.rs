@@ -796,6 +796,7 @@ mod servers {
             stop_gap: 20,
             reading: Reading::Complete,
             held: Held::default(),
+            told: None,
         }
     }
 
@@ -1185,7 +1186,9 @@ mod servers {
         network: Network,
     ) -> Result<crate::wallet::AddressWatchState, String> {
         let target = Target::new(format!("tcp://{}", server.address), None);
-        crate::chain::electrum::address::fetch_state(&target, address, network, None, &[]).await
+        crate::chain::electrum::address::fetch_state(&target, address, network, None, &[], None)
+            .await
+            .map(|state| state.expect("nothing is set aside with no status heard"))
     }
 
     /// A payment to the address, with the transaction it spends, listed

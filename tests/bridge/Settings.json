@@ -12,7 +12,7 @@
       "masked": false,
       "fiat": false,
       "fiat_currency": "eur",
-      "price_source": "coingecko",
+      "price_source": "mempool_space",
       "notify_new_tx": false,
       "explorer_ack": false
     }
@@ -39,7 +39,7 @@
       "masked": true,
       "fiat": true,
       "fiat_currency": "chf",
-      "price_source": "kraken",
+      "price_source": "mempool_space",
       "notify_new_tx": true,
       "explorer_ack": true
     }

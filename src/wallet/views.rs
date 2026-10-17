@@ -180,9 +180,10 @@ pub(crate) fn known(wallet: &bdk_wallet::Wallet) -> Known {
 /// reveals an address per invoice, and many are never paid: the oldest
 /// of them never come before its coins. A script past the revealed
 /// range is marked as such. Each comes with the Electrum
-/// status of the history the wallet holds for it, as
-/// [`electrum_statuses`] computes it, and the counters an Esplora server
-/// would keep for that history.
+/// status of the history the wallet holds for it, in the order
+/// [`electrum_histories`] gives, that history itself while a transaction
+/// of it waits for a block, and the counters an Esplora server would
+/// keep for it.
 ///
 /// The list stops at `cap`, all a watch takes of one wallet (see
 /// [`crate::watch::WatchLimits`]), and comes back with the number of
@@ -291,18 +292,20 @@ pub(crate) fn watch_scripts(
     };
     let scripts: Vec<bdk_wallet::bitcoin::ScriptBuf> =
         listed.iter().map(|(script, _)| script.clone()).collect();
-    let statuses = electrum_statuses(wallet, &scripts, orders);
+    let histories = electrum_histories(wallet, &scripts, orders);
     let facts = script_facts(wallet, &scripts);
     let listed = listed
         .into_iter()
-        .zip(statuses)
+        .zip(histories)
         .zip(facts)
         .map(
-            |(((script, lookahead), status), facts)| crate::watch::WatchedScript {
+            |(((script, lookahead), history), facts)| crate::watch::WatchedScript {
                 script: script.to_hex_string(),
                 lookahead,
-                status,
+                status: (!history.is_empty())
+                    .then(|| crate::chain::electrum::status::history_status(&history)),
                 counts: Some(facts.counts),
+                history: waiting(history),
             },
         )
         .collect();
@@ -323,37 +326,52 @@ pub(crate) type HistoryOrders =
 
 /// The Electrum status of the history a watched address holds, the
 /// same way: its transactions by height and txid, then the mempool.
+/// `None` when it holds none, or a txid or a height does not read.
 pub(crate) fn address_status(state: &AddressWatchState) -> Option<String> {
-    let mut history: Vec<(&str, i64)> = state
+    address_entries(state)
+        .filter(|history| !history.is_empty())
+        .map(|history| crate::chain::electrum::status::history_status(&history))
+}
+
+/// The history a watched address holds, in the order its status hashes
+/// it: by height and txid, then the mempool. `None` when a txid or a
+/// height does not read.
+fn address_entries(state: &AddressWatchState) -> Option<Vec<(Txid, i32)>> {
+    let mut history = state
         .txs
         .iter()
-        .map(|tx| (tx.txid.as_str(), tx.height.map_or(0, i64::from)))
-        .collect();
-    if history.is_empty() {
-        return None;
-    }
-    history.sort_by_key(|(txid, height)| (*height <= 0, *height, *txid));
-    Some(electrum_status(
+        .map(|tx| {
+            let txid = tx.txid.parse::<Txid>().ok()?;
+            let height = i32::try_from(tx.height.unwrap_or(0)).ok()?;
+            Some((txid, height))
+        })
+        .collect::<Option<Vec<(Txid, i32)>>>()?;
+    history.sort_by_key(|(txid, height)| (*height <= 0, *height, txid.to_string()));
+    Some(history)
+}
+
+/// The history behind a status, kept when a transaction of it waits
+/// for a block: what the live watch guesses a confirmation from.
+fn waiting(history: Vec<(Txid, i32)>) -> Vec<(Txid, i32)> {
+    if history.iter().any(|(_, height)| *height <= 0) {
         history
-            .iter()
-            .map(|(txid, height)| format!("{txid}:{height}:")),
-    ))
-}
-
-/// The SHA-256 of the parts of a status, in hex.
-fn electrum_status(parts: impl Iterator<Item = String>) -> String {
-    use bdk_wallet::bitcoin::hashes::{Hash, HashEngine, sha256};
-    let mut engine = sha256::Hash::engine();
-    for part in parts {
-        engine.input(part.as_bytes());
+    } else {
+        Vec::new()
     }
-    let digest = sha256::Hash::from_engine(engine).to_byte_array();
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// The Electrum status of the history the wallet holds for each script,
-/// `None` for one it holds nothing for: the SHA-256 of `txid:height:`
-/// for each transaction, in the order the server lists them.
+/// The history behind [`address_status`], when a transaction of it
+/// waits for a block: see [`crate::watch::WatchedScript::history`].
+/// Empty when none does, or a txid or a height does not read.
+pub(crate) fn address_history(state: &AddressWatchState) -> Vec<(Txid, i32)> {
+    address_entries(state).map(waiting).unwrap_or_default()
+}
+
+/// The history the wallet holds for each script, empty for one it holds
+/// nothing for: txids and heights, 0 or -1 for the mempool, in the
+/// order the server lists them. Its Electrum status is the SHA-256 of
+/// `txid:height:` for each, in that order
+/// ([`crate::chain::electrum::status::history_status`]).
 ///
 /// That order is the server's: confirmed transactions by height, then
 /// by their place in the block, which the wallet does not know, then
@@ -362,11 +380,11 @@ fn electrum_status(parts: impl Iterator<Item = String>) -> String {
 /// otherwise the transactions of one block are taken by txid, and a
 /// script with two in one block may get a status no server gives. That
 /// costs a sync of the script when a watch starts, and nothing else.
-pub(crate) fn electrum_statuses(
+pub(crate) fn electrum_histories(
     wallet: &bdk_wallet::Wallet,
     scripts: &[bdk_wallet::bitcoin::ScriptBuf],
     orders: &HistoryOrders,
-) -> Vec<Option<String>> {
+) -> Vec<Vec<(Txid, i32)>> {
     let graph = wallet.tx_graph();
     let position: std::collections::HashMap<&Script, usize> = scripts
         .iter()
@@ -426,24 +444,14 @@ pub(crate) fn electrum_statuses(
     scripts
         .iter()
         .zip(histories)
-        .map(|(script, mut history)| {
-            if history.is_empty() {
-                return None;
-            }
-            let history = match orders.get(script) {
-                Some(order) if content(order) == content(&history) => order.clone(),
-                _ => {
-                    history.sort_by_key(|(txid, height)| {
-                        (*height <= 0, (*height).max(0), txid.to_string())
-                    });
-                    history
-                }
-            };
-            Some(electrum_status(
+        .map(|(script, mut history)| match orders.get(script) {
+            Some(order) if content(order) == content(&history) => order.clone(),
+            _ => {
+                history.sort_by_key(|(txid, height)| {
+                    (*height <= 0, (*height).max(0), txid.to_string())
+                });
                 history
-                    .iter()
-                    .map(|(txid, height)| format!("{txid}:{height}:")),
-            ))
+            }
         })
         .collect()
 }
@@ -1720,8 +1728,8 @@ mod tests {
         assert!(!has_pending(&engine));
         assert!(pending_scripts(&engine).is_empty());
         assert_eq!(
-            electrum_statuses(&engine, std::slice::from_ref(&ours), &HistoryOrders::new()),
-            vec![None]
+            electrum_histories(&engine, std::slice::from_ref(&ours), &HistoryOrders::new()),
+            vec![Vec::new()]
         );
 
         // Listed by a server again, it is expected again.

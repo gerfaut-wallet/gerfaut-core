@@ -29,7 +29,6 @@ use std::collections::{HashMap, HashSet};
 
 use bdk_wallet::bitcoin::block::Header;
 use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
-use bdk_wallet::bitcoin::hashes::{Hash, sha256};
 use bdk_wallet::bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use serde::Deserialize;
 use serde_json::json;
@@ -37,6 +36,7 @@ use serde_json::json;
 use electrum_client::GetMerkleRes;
 
 use super::rpc::{CallError, Connection};
+use super::status::{Check, Told, Verdict, scripthash};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
 use crate::chain::proof::{
@@ -88,24 +88,30 @@ fn height_of(height: i64) -> Option<u32> {
     u32::try_from(height).ok().filter(|height| *height > 0)
 }
 
-/// The Electrum script hash of a script: SHA-256, reversed, in hex.
-fn scripthash(script: &ScriptBuf) -> String {
-    let mut digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
-    digest.reverse();
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 /// Fetches the complete state of a single watched address. `held` is
 /// what the wallet holds of it: a transaction it holds at the height the
 /// server lists it is kept as it is, and only the others are read.
+/// `None` when the history the server listed does not hash to the
+/// status it announced to a running watch (`told`) and leaves out a
+/// transaction of `held`: nothing was read, see [`super::status`].
 pub(crate) async fn fetch_state(
     target: &Target,
     address: &str,
     network: Network,
     proxy: Option<&str>,
     held: &[AddressTx],
-) -> Result<AddressWatchState, String> {
-    state_in_rounds_of(target, address, network, proxy, CONFIRMED_PER_ROUND, held).await
+    told: Option<&Told>,
+) -> Result<Option<AddressWatchState>, String> {
+    state_in_rounds_of(
+        target,
+        address,
+        network,
+        proxy,
+        CONFIRMED_PER_ROUND,
+        held,
+        told,
+    )
+    .await
 }
 
 /// Fetches the next round of older transactions, after `from`.
@@ -126,13 +132,17 @@ async fn state_in_rounds_of(
     proxy: Option<&str>,
     per_round: usize,
     held: &[AddressTx],
-) -> Result<AddressWatchState, String> {
+    told: Option<&Told>,
+) -> Result<Option<AddressWatchState>, String> {
     let ours = parse_address(address, network)?.script_pubkey();
     let hash = scripthash(&ours);
     let mut connection = Connection::open(target, proxy).await?;
     check_network(&mut connection, network).await?;
     let tip = read_tip(&mut connection, network).await?;
     let history = history(&mut connection, &hash).await?;
+    let Some(history) = stood_by(&mut connection, told, held, &ours, &hash, history).await? else {
+        return Ok(None);
+    };
     let unspent: Vec<Unspent> = connection
         .call("blockchain.scripthash.listunspent", json!([hash]))
         .await?;
@@ -185,13 +195,41 @@ async fn state_in_rounds_of(
         tx.timestamp = tx.height.and_then(|height| times.get(&height).copied());
     }
     let utxos = coins(unspent, &listed, &txs, &past, &times)?;
-    Ok(AddressWatchState {
+    Ok(Some(AddressWatchState {
         txs,
         utxos,
         tip_height: tip,
         truncated: cursor.is_some(),
         history_cursor: cursor,
-    })
+    }))
+}
+
+/// The history of the address the server listed, when the sync reads
+/// it: see [`super::sync`], which checks a descriptor wallet's the same
+/// way, `held` being what the wallet expects there. `None` when it is
+/// set aside. A height past what a status can spell is not checked.
+async fn stood_by(
+    connection: &mut Connection,
+    told: Option<&Told>,
+    held: &[AddressTx],
+    ours: &ScriptBuf,
+    hash: &str,
+    history: Vec<Entry>,
+) -> Result<Option<Vec<Entry>>, String> {
+    let expected: HashSet<Txid> = held.iter().filter_map(|tx| tx.txid.parse().ok()).collect();
+    let mut check = Check::new(told, ours, &expected);
+    let mut history = history;
+    loop {
+        let listed: Option<Vec<(Txid, i32)>> = history
+            .iter()
+            .map(|entry| Some((entry.tx_hash, i32::try_from(entry.height).ok()?)))
+            .collect();
+        match check.verdict(listed.as_deref()) {
+            Verdict::Read => return Ok(Some(history)),
+            Verdict::SetAside => return Ok(None),
+            Verdict::AskAgain => history = self::history(connection, hash).await?,
+        }
+    }
 }
 
 async fn history_in_rounds_of(
@@ -1051,6 +1089,20 @@ mod tests {
     use super::*;
     use crate::testkit::{FakeElectrum, nowhere, script, transaction};
 
+    /// The state of the address, read with no status heard: never set
+    /// aside.
+    async fn fetch_state(
+        target: &Target,
+        address: &str,
+        network: Network,
+        proxy: Option<&str>,
+        held: &[AddressTx],
+    ) -> Result<AddressWatchState, String> {
+        super::fetch_state(target, address, network, proxy, held, None)
+            .await
+            .map(|state| state.expect("nothing is set aside with no status heard"))
+    }
+
     /// The BIP-173 test vector address, and its script.
     const ADDRESS: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
     const OURS: &str = "0014751e76e8199196d454941c45d1b3a323f1433bd6";
@@ -1244,8 +1296,9 @@ mod tests {
         let txid = |n: usize| payments[n].compute_txid().to_string();
         let target = target(&server);
 
-        let first = state_in_rounds_of(&target, ADDRESS, Network::Signet, None, 2, &[])
+        let first = state_in_rounds_of(&target, ADDRESS, Network::Signet, None, 2, &[], None)
             .await
+            .unwrap()
             .unwrap();
         let listed: Vec<String> = first.txs.iter().map(|tx| tx.txid.clone()).collect();
         assert_eq!(listed, [txid(4), txid(3)]);
@@ -1353,7 +1406,11 @@ mod tests {
         };
         let state_with = |server: &FakeElectrum, held: Vec<AddressTx>| {
             let target = target(server);
-            async move { state_in_rounds_of(&target, ADDRESS, Network::Signet, None, 1, &held).await }
+            async move {
+                state_in_rounds_of(&target, ADDRESS, Network::Signet, None, 1, &held, None)
+                    .await
+                    .map(|state| state.expect("nothing is set aside with no status heard"))
+            }
         };
         let asked = |server: &FakeElectrum, method: &str| {
             let state = server.state.lock().unwrap();
@@ -1380,10 +1437,19 @@ mod tests {
 
         // Held there, paying it, on another server: nothing read for it.
         let server = start().await;
-        let held = state_in_rounds_of(&target(&server), ADDRESS, Network::Signet, None, 10, &[])
-            .await
-            .unwrap()
-            .txs;
+        let held = state_in_rounds_of(
+            &target(&server),
+            ADDRESS,
+            Network::Signet,
+            None,
+            10,
+            &[],
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .txs;
         let before = reads(&server);
         let state = state_with(&server, held).await.unwrap();
         assert_eq!(state.utxos[0].height, Some(90));
