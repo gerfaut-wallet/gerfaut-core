@@ -223,7 +223,7 @@ impl WalletManager {
                     Err(error) if !asked_by_index && is_refusal(&error) => {
                         refused.push(RefusedWallet {
                             index: index as u32,
-                            name: name.to_owned(),
+                            name: wallet_called(index, name),
                             reason: error.to_string(),
                         })
                     }
@@ -333,11 +333,13 @@ fn restorable_certs(payload: &BackupPayload) -> BTreeMap<String, String> {
 /// words of its own, by its position when it has no name: a backup may
 /// hold many, and the error is all a person who asked for it anyway
 /// sees.
+/// A refusal whose error has no words to add the name to, a network
+/// that does not match or private key material, is said as an input of
+/// the backup refused, in the words of the error.
 fn refused_wallet(index: usize, name: &str, error: CoreError) -> CoreError {
-    let named = if name.is_empty() {
-        format!("Wallet {} of the backup", index + 1)
-    } else {
-        format!("\"{name}\"")
+    let named = match wallet_called(index, name) {
+        called if name.trim().is_empty() => called,
+        called => format!("\"{called}\""),
     };
     match error {
         CoreError::Descriptor(detail) => {
@@ -347,7 +349,22 @@ fn refused_wallet(index: usize, name: &str, error: CoreError) -> CoreError {
             kind,
             detail: format!("{named} cannot be restored: {detail}"),
         },
+        error @ (CoreError::NetworkMismatch { .. } | CoreError::PrivateMaterialRejected) => {
+            CoreError::InvalidInput {
+                kind: "backup",
+                detail: format!("{named} cannot be restored: {error}"),
+            }
+        }
         other => other,
+    }
+}
+
+/// What a wallet of the backup is called in a refusal: its name, or
+/// its place in the backup when it has none.
+fn wallet_called(index: usize, name: &str) -> String {
+    match name.trim() {
+        "" => format!("Wallet {} of the backup", index + 1),
+        name => name.to_owned(),
     }
 }
 

@@ -995,6 +995,7 @@ async fn a_backup_wallet_without_a_name_is_left_out() {
     assert_eq!(report.added[0].name, "Named");
     assert_eq!(report.refused.len(), 1);
     assert_eq!(report.refused[0].index, 0);
+    assert_eq!(report.refused[0].name, "Wallet 1 of the backup");
 }
 
 /// Only what is wrong with a wallet's own name or material leaves it

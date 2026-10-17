@@ -77,7 +77,9 @@ async fn private_keys_never_reach_the_vault() {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, CoreError::PrivateMaterialRejected),
+            matches!(&error, CoreError::InvalidInput { kind: "backup", detail }
+                if detail.starts_with("\"Hot\" cannot be restored")
+                    && detail.contains("private key material")),
             "{error}"
         );
         let report = manager
