@@ -26,8 +26,12 @@ use super::{
 };
 use crate::chain::net::{self, BoxStream, LineReader, LineTooLong, Security};
 
-/// Requests awaiting their answer at any time.
-const WINDOW: usize = 16;
+/// Requests awaiting their answer at any time: as many as the live
+/// watch keeps, and for the same reason. ElectrumX, from 1.18 on, holds
+/// small answers back until a kilobyte of them waits or a second has
+/// passed, and some forty-byte answers fill that kilobyte; fewer would
+/// wait the second at every round.
+const WINDOW: usize = 32;
 /// Lines that answer nothing asked, in a row, before the server is
 /// taken for one that does not speak the protocol.
 const MAX_STRAY: usize = 1_000;
@@ -264,5 +268,29 @@ mod tests {
             "{refused}"
         );
         assert!(answered < 10, "{answered}");
+    }
+
+    /// The requests of a batch go out a window at a time, wide enough to
+    /// fill the kilobyte ElectrumX holds small answers back for: the
+    /// server's wait comes at the end of the batch, not at every round.
+    #[tokio::test]
+    async fn a_batch_fills_what_a_padding_server_holds_back() {
+        let server = FakeElectrum::start().await;
+        server.state.lock().unwrap().hold = Some((1024, std::time::Duration::from_millis(50)));
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        let mut connection = Connection::open(&target, None).await.unwrap();
+        let hashes = (0..100).map(|n| json!([format!("{n:064x}")])).collect();
+        let mut answered = 0;
+        connection
+            .batch::<Value>("blockchain.scripthash.get_history", hashes, |_, answer| {
+                answer?;
+                answered += 1;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(answered, 100);
+        let waits = server.state.lock().unwrap().timed_flushes;
+        assert!(waits <= 2, "{waits} waits");
     }
 }
