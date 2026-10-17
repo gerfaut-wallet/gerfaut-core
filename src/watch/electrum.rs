@@ -26,13 +26,13 @@
 //! without a block, which happens about once in 160 000 such windows on
 //! mainnet, the server is asked for its tip again, and the tip of
 //! another Electrum server of the same operator is read on a connection
-//! of its own that asks for nothing else. The one of the two that is
-//! behind is left alone for a quarter of an hour: when it is the
-//! session's, the watch moves to the other one. A session that opens
-//! on a tip below one the watch already heard of looks at once. No
-//! other operator is ever asked, since it would learn from which address
-//! the app is used, and an onion server is compared with onion servers
-//! only.
+//! of its own that asks for nothing else. The one of the two that is two
+//! blocks behind or more is left alone for a quarter of an hour: when it
+//! is the session's, the watch moves to the other one. A session that
+//! opens two blocks below one the watch already heard of compares at
+//! once. No other operator is ever asked, since it would learn from
+//! which address the app is used, and an onion server is compared with
+//! onion servers only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -76,6 +76,10 @@ const STATUS_STEP: u32 = 100;
 /// `unsubscribe`, used when the server has it.
 const PROTOCOL_MIN: &str = "1.4";
 const PROTOCOL_MAX: &str = "1.4.2";
+/// Blocks a server must be behind another of its operator to be taken
+/// for one that stopped: two indexers read a block a few seconds apart,
+/// and one block between them is that.
+const BEHIND: u32 = 2;
 
 enum Request {
     Headers,
@@ -271,19 +275,19 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                 session.look = Look::Idle;
                 let ours = session.tip;
                 match found.zip(ours) {
-                    Some(((other, tip), ours)) if tip > ours => {
+                    Some(((other, tip), ours)) if tip >= ours.saturating_add(BEHIND) => {
                         // This one is behind: the watch moves on, and
                         // the syncs with it.
                         hub.shun(endpoint);
                         let detail = format!(
-                            "{label} announced no block for {} minutes, and is behind {}",
-                            hub.timings.stale.as_secs() / 60,
+                            "{label} is {} blocks behind {}",
+                            tip - ours,
                             other.label(),
                         );
                         hub.set_status(|status| status.detail = Some(detail));
                         return Exit::Reprobe;
                     }
-                    Some(((other, tip), ours)) if tip < ours => {
+                    Some(((other, tip), ours)) if ours >= tip.saturating_add(BEHIND) => {
                         hub.shun(&other);
                     }
                     _ => {}
@@ -410,11 +414,14 @@ impl Session {
                 Request::Headers if !refused => {
                     if let Some(height) = height_of(&message["result"]) {
                         self.tip = Some(height);
-                        // Below a block the watch already heard of, from
-                        // the server it left or one before: this one may
-                        // be the one that stopped, and is not given two
-                        // hours to show it.
-                        if hub.tip.is_some_and(|heard| height < heard) {
+                        // Behind a block the watch already heard of,
+                        // from the server it left or one before: this
+                        // one may be the one that stopped, and is not
+                        // given two hours to show it.
+                        if hub
+                            .tip
+                            .is_some_and(|heard| height.saturating_add(BEHIND) <= heard)
+                        {
                             self.look = tip_elsewhere(hub, &self.endpoint)
                                 .map_or(Look::Idle, Look::Probing);
                         }

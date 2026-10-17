@@ -1076,11 +1076,11 @@ async fn live_leaves_a_server_that_stopped_seeing_blocks() {
         watch.serving().map(|(_, at)| at),
         Some(electrum_endpoint(&stuck))
     );
-    other.state.lock().unwrap().height = 101;
+    other.state.lock().unwrap().height = 102;
 
     assert_eq!(
         next_event(&mut events).await,
-        WatchEvent::NewBlock { height: 101 }
+        WatchEvent::NewBlock { height: 102 }
     );
     assert_eq!(
         watch.serving().map(|(_, at)| at),
@@ -1161,7 +1161,7 @@ async fn a_server_found_behind_is_left_alone() {
         s.state == WatchState::Connected && s.pushed_scripts == 1
     })
     .await;
-    behind.state.lock().unwrap().height = 99;
+    behind.state.lock().unwrap().height = 98;
     within("a look", Duration::from_secs(5), || {
         !behind.subscriptions().is_empty()
     })
@@ -1181,7 +1181,7 @@ async fn a_session_that_opens_behind_compares_at_once() {
     let rotation = FakeMempool::start(false, 0).await;
     let (stuck, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
     stuck.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
-    other.state.lock().unwrap().height = 101;
+    other.state.lock().unwrap().height = 102;
     let _stand_in = automatic(&rotation, &[&stuck, &other]);
     let (watch, _events) = LiveWatch::start_with(
         config(BackendConfig::default()),
@@ -1259,7 +1259,7 @@ async fn a_server_without_a_tip_is_not_compared() {
         .unwrap()
         .refuse
         .insert("blockchain.headers.subscribe", "not now".to_owned());
-    other.state.lock().unwrap().height = 101;
+    other.state.lock().unwrap().height = 102;
     let _stand_in = automatic(&rotation, &[&silent, &other]);
     let (watch, _events) = LiveWatch::start_with(
         config(BackendConfig::default()),
@@ -1278,6 +1278,35 @@ async fn a_server_without_a_tip_is_not_compared() {
     assert_eq!(
         watch.serving().map(|(_, at)| at),
         Some(electrum_endpoint(&silent))
+    );
+}
+
+/// Two servers a block apart are not one behind the other: indexers
+/// read a block a few seconds apart. Neither is left alone, and the
+/// watch stays where it is.
+#[tokio::test]
+async fn a_block_apart_is_not_behind() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (listened, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    other.state.lock().unwrap().height = 101;
+    let _stand_in = automatic(&rotation, &[&listened, &other]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            stale: Duration::from_millis(200),
+            ..timings()
+        }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    within("two looks", WAIT, || other.subscriptions().len() >= 2).await;
+    assert_eq!(listened.subscriptions().len(), 1, "the session moved");
+    assert_eq!(
+        watch.serving().map(|(_, at)| at),
+        Some(electrum_endpoint(&listened))
     );
 }
 
