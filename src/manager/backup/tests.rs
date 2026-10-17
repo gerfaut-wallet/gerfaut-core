@@ -489,9 +489,10 @@ async fn a_scanned_backup_never_doubles_a_wallet_already_watched() {
 /// A backup is a file anyone could have written: a wallet in it whose
 /// key takes a hardened step, which miniscript panics on when asked
 /// for an address, or whose descriptor nests past reason, is refused
-/// in words, and the restore leaves the vault as it was.
+/// in words. Asked for by index, it fails the restore, which leaves the
+/// vault as it was; with every wallet, it is left out and named.
 #[tokio::test]
-async fn a_backup_wallet_the_parser_would_refuse_is_not_restored() {
+async fn a_backup_wallet_the_parser_would_refuse_is_left_out() {
     let tpub = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
     let wallet = |external: String| BackupWallet {
         name: "Handed over".to_owned(),
@@ -533,8 +534,21 @@ async fn a_backup_wallet_the_parser_would_refuse_is_not_restored() {
             .await
             .unwrap();
         assert_eq!(preview.wallets.len(), 2);
+        assert!(
+            preview.wallets[1]
+                .refused
+                .as_deref()
+                .is_some_and(|reason| reason.contains(refusal)),
+            "{:?}",
+            preview.wallets[1].refused
+        );
+        // Asked for by index, it fails the restore.
+        let only = ImportChoices {
+            indexes: Some(vec![1]),
+            apply_settings: false,
+        };
         let error = manager
-            .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+            .import_backup(&text, BACKUP_PASSWORD, &only)
             .await
             .unwrap_err();
         assert!(
@@ -542,6 +556,17 @@ async fn a_backup_wallet_the_parser_would_refuse_is_not_restored() {
             "{error}"
         );
         assert!(manager.list_wallets(None).await.is_empty());
+        // With every wallet, it is left out, named, and the other comes in.
+        let report = manager
+            .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+            .await
+            .unwrap();
+        assert_eq!(report.added.len(), 1);
+        assert_eq!(report.refused.len(), 1);
+        assert!(report.refused[0].reason.contains(refusal));
+        for wallet in manager.list_wallets(None).await {
+            manager.remove_wallet(&wallet.id).await.unwrap();
+        }
     }
 }
 
@@ -630,4 +655,362 @@ async fn backup_needs_its_password_and_scans_as_a_qr() {
         parse_input(&text),
         Err(CoreError::InvalidInput { kind: "backup", .. })
     ));
+}
+
+/// A backup pairing the receive descriptor of one wallet with the
+/// change descriptor of another, which no export makes: the policy
+/// page would vouch for the first while change went to the second. The
+/// preview marks it, and says why; a restore that asks for it anyway
+/// refuses it, naming it, and leaves the vault as it was, while the
+/// other wallets of the backup restore; the same pair handed back as a
+/// parsed input is refused alike.
+#[tokio::test]
+async fn a_backup_pairing_two_wallets_is_not_restored() {
+    const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+    const XPUB_B: &str = "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw";
+    let kind = WalletKind::Descriptors {
+        external: format!("wpkh({XPUB}/0/*)"),
+        internal: Some(format!("wpkh({XPUB_B}/1/*)")),
+        script: crate::input::ScriptKind::Segwit,
+    };
+    let wallet = |name: &str, kind: WalletKind| BackupWallet {
+        name: name.to_owned(),
+        network: Network::Mainnet,
+        kind,
+        gap_limit: 20,
+        labels: Default::default(),
+        created_at: 1_755_000_000,
+        live_pinned: false,
+    };
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: vec![
+            wallet("Handed over", kind.clone()),
+            wallet(
+                "Own",
+                WalletKind::Descriptors {
+                    external: format!("wpkh({XPUB_B}/0/*)"),
+                    internal: Some(format!("wpkh({XPUB_B}/1/*)")),
+                    script: crate::input::ScriptKind::Segwit,
+                },
+            ),
+        ],
+        backends: None,
+        electrum_certs: None,
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    let refused: Vec<Option<&str>> = preview
+        .wallets
+        .iter()
+        .map(|wallet| wallet.refused.as_deref())
+        .collect();
+    assert!(
+        matches!(refused[..], [Some(reason), None] if reason.contains("another wallet")),
+        "{refused:?}"
+    );
+
+    // Asked for by index, it fails the restore, named.
+    let only = ImportChoices {
+        indexes: Some(vec![0]),
+        apply_settings: false,
+    };
+    let error = manager
+        .import_backup(&text, BACKUP_PASSWORD, &only)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, CoreError::Descriptor(detail)
+            if detail.starts_with("\"Handed over\" cannot be restored") && detail.contains("another wallet")),
+        "{error}"
+    );
+    assert!(manager.list_wallets(None).await.is_empty());
+
+    // Every wallet: it is left out, named, the other restored.
+    let report = manager
+        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+        .await
+        .unwrap();
+    assert_eq!(report.added.len(), 1);
+    assert_eq!(report.added[0].name, "Own");
+    assert_eq!(report.skipped, 0);
+    assert_eq!(report.refused.len(), 1);
+    assert_eq!(
+        (report.refused[0].index, report.refused[0].name.as_str()),
+        (0, "Handed over")
+    );
+    assert!(report.refused[0].reason.contains("another wallet"));
+    let restored = manager.list_wallets(None).await;
+    assert_eq!(restored.len(), 1);
+
+    // Watched already, it is that and nothing else in the preview.
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    assert!(preview.wallets[1].already_watched);
+    assert_eq!(preview.wallets[1].refused, None);
+    manager.remove_wallet(&restored[0].id).await.unwrap();
+
+    // The same material as an input the app hands back.
+    let WalletKind::Descriptors {
+        external, internal, ..
+    } = kind
+    else {
+        unreachable!()
+    };
+    let mut parsed = parse_input(&format!("wpkh({XPUB}/<0;1>/*)")).unwrap();
+    parsed.payload = crate::input::ParsedPayload::Descriptors {
+        external,
+        internal,
+        script: crate::input::ScriptKind::Segwit,
+    };
+    let error = manager
+        .add_wallet("Handed over", &parsed, Network::Mainnet)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, CoreError::Descriptor(detail) if detail.contains("another wallet")),
+        "{error}"
+    );
+    assert!(manager.list_wallets(None).await.is_empty());
+}
+
+/// The same with a change descriptor whose policy does not lift, a raw
+/// hash beside a key of someone else, next to a receive descriptor that
+/// does: still another wallet, refused, not let through as unreadable.
+#[tokio::test]
+async fn a_backup_hiding_another_wallet_in_a_raw_hash_is_not_restored() {
+    const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+    const XPUB_B: &str = "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw";
+    const XPUB_C: &str = "xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ";
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: vec![BackupWallet {
+            name: "Vault".to_owned(),
+            network: Network::Mainnet,
+            kind: WalletKind::Descriptors {
+                external: format!("wsh(multi(2,{XPUB}/0/*,{XPUB_B}/0/*))"),
+                internal: Some(format!(
+                    "wsh(or_d(pk({XPUB_C}/1/*),c:expr_raw_pkh(1234567890123456789012345678901234567890)))"
+                )),
+                script: crate::input::ScriptKind::WitnessScript,
+            },
+            gap_limit: 20,
+            labels: Default::default(),
+            created_at: 1_755_000_000,
+            live_pinned: false,
+        }],
+        backends: None,
+        electrum_certs: None,
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    assert!(
+        preview.wallets[0]
+            .refused
+            .as_deref()
+            .is_some_and(|reason| reason.contains("another wallet")),
+        "{:?}",
+        preview.wallets[0].refused
+    );
+    let report = manager
+        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+        .await
+        .unwrap();
+    assert!(report.added.is_empty());
+    assert_eq!(report.refused[0].name, "Vault");
+    assert!(manager.list_wallets(None).await.is_empty());
+}
+
+/// A certificate in a backup is restored only for an Electrum server the
+/// settings reach without anyone typing it: one a backend of the same
+/// backup names, among those the restore applies, or a public server of
+/// the catalogue that signs its own certificate. A pin for any other
+/// host would wait in the vault for the day that host is typed in. The
+/// preview promises the same hosts the restore pins.
+#[tokio::test]
+async fn a_backup_pins_only_the_servers_its_backends_name() {
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: Vec::new(),
+        backends: Some(
+            [
+                (
+                    Network::Signet,
+                    BackendConfig::CustomElectrum {
+                        url: "ssl://Node.Example.org.:50002".to_owned(),
+                        own_node: false,
+                    },
+                ),
+                (
+                    Network::Mainnet,
+                    BackendConfig::CustomEsplora {
+                        url: "https://esplora.example.org/api".to_owned(),
+                        own_node: false,
+                    },
+                ),
+                // An address the settings screen would refuse: the
+                // restore leaves this backend out, and its pin with it.
+                (
+                    Network::Testnet4,
+                    BackendConfig::CustomElectrum {
+                        url: "tcp://bad.example.org:50001:50002".to_owned(),
+                        own_node: false,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        electrum_certs: Some(
+            [
+                ("node.example.org:50002".to_owned(), fingerprint("aa")),
+                // Pinned once, its backend gone since.
+                ("old.example.org:50002".to_owned(), fingerprint("BB")),
+                // The host of the Esplora backend: no Electrum there.
+                ("esplora.example.org:50002".to_owned(), fingerprint("CC")),
+                ("bad.example.org:50001".to_owned(), fingerprint("DD")),
+                ("bad.example.org:50002".to_owned(), fingerprint("DD")),
+                // A server of the catalogue that signs its own
+                // certificate, accepted once, its network on its default.
+                ("electrum.emzy.de:50002".to_owned(), fingerprint("EE")),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    assert_eq!(
+        preview.electrum_hosts,
+        vec![
+            "electrum.emzy.de:50002".to_owned(),
+            "node.example.org:50002".to_owned()
+        ]
+    );
+
+    let choices = ImportChoices {
+        indexes: None,
+        apply_settings: true,
+    };
+    manager
+        .import_backup(&text, BACKUP_PASSWORD, &choices)
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.settings().await.electrum_certs,
+        [
+            ("electrum.emzy.de:50002".to_owned(), fingerprint("EE")),
+            ("node.example.org:50002".to_owned(), fingerprint("AA"))
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+/// A wallet without a name is refused like one whose material is: the
+/// preview says so, a restore of every wallet leaves it out, named by
+/// its position, and restores the others; asked for by index, it fails
+/// the restore.
+#[tokio::test]
+async fn a_backup_wallet_without_a_name_is_left_out() {
+    let tpub = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
+    let wallet = |name: &str, branch: u32| BackupWallet {
+        name: name.to_owned(),
+        network: Network::Signet,
+        kind: WalletKind::Descriptors {
+            external: format!("wpkh({tpub}/{branch}/*)"),
+            internal: None,
+            script: crate::input::ScriptKind::Segwit,
+        },
+        gap_limit: 20,
+        labels: Default::default(),
+        created_at: 1_755_000_000,
+        live_pinned: false,
+    };
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: vec![wallet("  ", 0), wallet("Named", 1)],
+        backends: None,
+        electrum_certs: None,
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    assert!(
+        preview.wallets[0]
+            .refused
+            .as_deref()
+            .is_some_and(|reason| reason.contains("needs a name"))
+    );
+    assert_eq!(preview.wallets[1].refused, None);
+
+    let only = ImportChoices {
+        indexes: Some(vec![0]),
+        apply_settings: false,
+    };
+    let error = manager
+        .import_backup(&text, BACKUP_PASSWORD, &only)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Wallet 1 of the backup cannot be restored"),
+        "{error}"
+    );
+    let report = manager
+        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+        .await
+        .unwrap();
+    assert_eq!(report.added.len(), 1);
+    assert_eq!(report.added[0].name, "Named");
+    assert_eq!(report.refused.len(), 1);
+    assert_eq!(report.refused[0].index, 0);
+    assert_eq!(report.refused[0].name, "Wallet 1 of the backup");
+}
+
+/// Only what is wrong with a wallet's own name or material leaves it
+/// out of a restore of every wallet; anything else, an error of the
+/// core or of the disk, fails the restore as it is.
+#[test]
+fn only_a_wallets_own_fault_leaves_it_out() {
+    use super::is_refusal;
+    assert!(is_refusal(&CoreError::Descriptor("unreadable".to_owned())));
+    assert!(is_refusal(&CoreError::PrivateMaterialRejected));
+    assert!(is_refusal(&CoreError::NetworkMismatch {
+        expected: "signet".to_owned(),
+        found: "descriptor".to_owned(),
+    }));
+    assert!(!is_refusal(&CoreError::Internal(
+        "new wallet produced no initial change set".to_owned()
+    )));
 }

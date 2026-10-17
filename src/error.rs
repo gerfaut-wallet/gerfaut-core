@@ -159,6 +159,16 @@ pub enum CoreError {
     #[error("invalid qr: this QR code announces {0} parts, more than Gerfaut reads")]
     TooManyParts(u32),
 
+    /// A scan brought more distinct frames than one code of its size
+    /// needs, the count it reached, without coming together: a fountain
+    /// code that never ends, or frames of several codes. Under the same
+    /// code as [`CoreError::TooManyParts`]: to the person, the code has
+    /// more than Gerfaut reads.
+    #[error(
+        "invalid qr: {0} frames scanned without the code coming together, more than Gerfaut reads"
+    )]
+    TooManyFrames(u32),
+
     /// The input belongs to a different network than the requested one.
     #[error("network mismatch: input is for {found}, expected {expected}")]
     NetworkMismatch { expected: String, found: String },
@@ -226,7 +236,7 @@ impl CoreError {
             CoreError::UnrecognizedInput(_) => ErrorCode::UnrecognizedInput,
             CoreError::PrivateMaterialRejected => ErrorCode::PrivateMaterial,
             CoreError::InvalidInput { .. } => ErrorCode::InvalidInput,
-            CoreError::TooManyParts(_) => ErrorCode::TooManyParts,
+            CoreError::TooManyParts(_) | CoreError::TooManyFrames(_) => ErrorCode::TooManyParts,
             CoreError::NetworkMismatch { .. } => ErrorCode::NetworkMismatch,
             CoreError::WalletNotFound(_) => ErrorCode::WalletNotFound,
             CoreError::DuplicateWallet(_) => ErrorCode::DuplicateWallet,
@@ -396,6 +406,7 @@ mod tests {
                 ErrorCode::InvalidInput,
             ),
             (CoreError::TooManyParts(5_001), ErrorCode::TooManyParts),
+            (CoreError::TooManyFrames(2_001), ErrorCode::TooManyParts),
             (
                 CoreError::NetworkMismatch {
                     expected: "signet".to_owned(),

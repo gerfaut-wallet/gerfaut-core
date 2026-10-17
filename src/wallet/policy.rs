@@ -537,30 +537,56 @@ fn lift(descriptor: &Descriptor<DescriptorPublicKey>) -> CoreResult<Semantic> {
 pub(crate) fn policy_by_material(
     descriptor: &Descriptor<DescriptorPublicKey>,
 ) -> CoreResult<Policy<String>> {
-    type Pk = DescriptorPublicKey;
-    struct ByMaterial;
-    impl Translator<Pk, String, Infallible> for ByMaterial {
-        fn pk(&mut self, pk: &Pk) -> Result<String, Infallible> {
-            Ok(material(pk))
-        }
-        fn sha256(&mut self, hash: &<Pk as MiniscriptKey>::Sha256) -> Result<String, Infallible> {
-            Ok(hash.to_string())
-        }
-        fn hash256(&mut self, hash: &<Pk as MiniscriptKey>::Hash256) -> Result<String, Infallible> {
-            Ok(hash.to_string())
-        }
-        fn ripemd160(
-            &mut self,
-            hash: &<Pk as MiniscriptKey>::Ripemd160,
-        ) -> Result<String, Infallible> {
-            Ok(hash.to_string())
-        }
-        fn hash160(&mut self, hash: &<Pk as MiniscriptKey>::Hash160) -> Result<String, Infallible> {
-            Ok(hash.to_string())
-        }
-    }
     let Ok(policy) = lift(descriptor)?.translate_pk(&mut ByMaterial);
     Ok(policy.normalized().sorted())
+}
+
+/// The descriptor itself with every key reduced to its material: two
+/// branches of one wallet, the same script on the same keys on other
+/// paths, come out the same. What holds a pair whose policy does not
+/// lift, which [`policy_by_material`] cannot compare. `None` when the
+/// translation itself fails, which proves nothing alike.
+pub(crate) fn descriptor_by_material(
+    descriptor: &Descriptor<DescriptorPublicKey>,
+) -> Option<String> {
+    use bdk_wallet::miniscript::TranslatePk;
+    descriptor
+        .translate_pk(&mut ByMaterial)
+        .ok()
+        .map(|translated| translated.to_string())
+}
+
+/// Turns each key into its material, and keeps every hash as written.
+struct ByMaterial;
+
+impl Translator<DescriptorPublicKey, String, Infallible> for ByMaterial {
+    fn pk(&mut self, pk: &DescriptorPublicKey) -> Result<String, Infallible> {
+        Ok(material(pk))
+    }
+    fn sha256(
+        &mut self,
+        hash: &<DescriptorPublicKey as MiniscriptKey>::Sha256,
+    ) -> Result<String, Infallible> {
+        Ok(hash.to_string())
+    }
+    fn hash256(
+        &mut self,
+        hash: &<DescriptorPublicKey as MiniscriptKey>::Hash256,
+    ) -> Result<String, Infallible> {
+        Ok(hash.to_string())
+    }
+    fn ripemd160(
+        &mut self,
+        hash: &<DescriptorPublicKey as MiniscriptKey>::Ripemd160,
+    ) -> Result<String, Infallible> {
+        Ok(hash.to_string())
+    }
+    fn hash160(
+        &mut self,
+        hash: &<DescriptorPublicKey as MiniscriptKey>::Hash160,
+    ) -> Result<String, Infallible> {
+        Ok(hash.to_string())
+    }
 }
 
 /// Whether a key is the BIP 341 unspendable point, whatever its form:

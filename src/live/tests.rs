@@ -243,6 +243,7 @@ fn timings() -> crate::watch::Timings {
         refused: Duration::from_millis(600),
         limit_kept: Duration::from_secs(3600),
         zero_limit_kept: Duration::from_secs(3600),
+        first_session: Duration::from_secs(5),
         stale: Duration::from_secs(3600),
     }
 }
@@ -892,10 +893,53 @@ async fn a_sync_goes_first_to_the_server_the_watch_talks_to() {
     manager.live_stop().await;
 }
 
+/// The sync the app runs as it opens races the watch that starts with
+/// it: it waits for the watch's first session, then goes to its server,
+/// not to the head of the rotation, so that opening the app shows the
+/// wallets to one operator only.
+#[tokio::test]
+async fn the_opening_sync_waits_for_the_first_session() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let live = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) = automatic(dir.path(), &rotation, &[&live]).await;
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    live.state.lock().unwrap().gate = Some(("server.version", gate.clone()));
+
+    let _events = manager.live_start_with(Some(timings())).await.unwrap();
+    let opening = {
+        let manager = manager.clone();
+        let wallet = wallet.clone();
+        tokio::spawn(async move { manager.sync_wallet(&wallet).await })
+    };
+    let started = std::time::Instant::now();
+    while !live.was_asked("server.version") {
+        assert!(
+            started.elapsed() < WAIT,
+            "the watch never reached its server"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !opening.is_finished(),
+        "the sync went out before the watch's first session"
+    );
+    gate.add_permits(100);
+    opening.await.unwrap().unwrap();
+    assert_eq!(
+        answered_by(&manager, &wallet).await,
+        Some(format!("electrum 127.0.0.1 {}", live.address.port()))
+    );
+    manager.live_stop().await;
+}
+
 /// A watch that has no session yet, its first server refused and the
 /// next one not answering, sends no sync to either: a server the watch
 /// could not reach, such as one on a port the network drops, would make
-/// every sync wait on it before the next. The syncs keep to their order.
+/// every sync wait on it before the next. The sync waits for the
+/// watch's first session no longer than [`Timings::first_session`],
+/// then keeps to its order.
 #[tokio::test]
 async fn a_sync_never_goes_first_where_the_watch_failed() {
     let rotation = FakeMempool::start(false, 0).await;
@@ -910,6 +954,7 @@ async fn a_sync_never_goes_first_where_the_watch_failed() {
     let pace = crate::watch::Timings {
         connect: Duration::from_secs(60),
         refused: Duration::from_secs(3600),
+        first_session: Duration::from_millis(300),
         ..timings()
     };
     let _events = manager.live_start_with(Some(pace)).await.unwrap();
@@ -941,6 +986,188 @@ async fn a_sync_never_goes_first_where_the_watch_failed() {
         answered_by(&manager, &wallet).await,
         Some(format!("esplora 127.0.0.1 {}", rotation.address.port()))
     );
+    manager.live_stop().await;
+}
+
+/// The first pass has one deadline, counted from the start of the
+/// watch: a server that never answers holds the first sync back once,
+/// not every sync in turn. A new configuration opens a pass of its own,
+/// which the syncs wait out again.
+#[tokio::test]
+async fn the_first_pass_has_one_deadline_per_configuration() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let stalled = FakeElectrum::start().await;
+    stalled.state.lock().unwrap().silent = true;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) = automatic(dir.path(), &rotation, &[&stalled]).await;
+    let budget = Duration::from_millis(800);
+    let pace = crate::watch::Timings {
+        connect: Duration::from_secs(60),
+        first_session: budget,
+        ..timings()
+    };
+    let _events = manager.live_start_with(Some(pace)).await.unwrap();
+    let timed = async || {
+        let started = std::time::Instant::now();
+        manager.sync_wallet(&wallet).await.unwrap();
+        started.elapsed()
+    };
+    let first = timed().await;
+    let second = timed().await;
+    assert!(
+        first >= budget * 3 / 4,
+        "the first sync went out at once: {first:?}"
+    );
+    assert!(
+        second < budget / 2,
+        "the second sync waited again: {second:?}"
+    );
+
+    manager
+        .set_tor_settings(crate::chain::tor::TorSettings {
+            mode: crate::chain::tor::TorMode::System,
+            socks_proxy: None,
+        })
+        .await
+        .unwrap();
+    let third = timed().await;
+    assert!(
+        third >= budget * 3 / 4,
+        "a new configuration was not waited for: {third:?}"
+    );
+    manager.live_stop().await;
+}
+
+/// What does not wait for the first pass: a rescan the person asked
+/// for, and the sync of a wallet of another network than the watch's,
+/// which has no server for it.
+#[tokio::test]
+async fn a_rescan_and_another_network_do_not_wait_for_the_first_pass() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let stalled = FakeElectrum::start().await;
+    stalled.state.lock().unwrap().silent = true;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) = automatic(dir.path(), &rotation, &[&stalled]).await;
+    // A testnet4 wallet, its own server one that refuses at once.
+    manager
+        .set_backend(
+            Network::Testnet4,
+            crate::chain::BackendConfig::CustomEsplora {
+                url: "http://127.0.0.1:9".to_owned(),
+                own_node: false,
+            },
+        )
+        .await
+        .unwrap();
+    let parsed = crate::input::parse_input(
+        "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)",
+    )
+    .unwrap();
+    let elsewhere = manager
+        .add_wallet("Elsewhere", &parsed, Network::Testnet4)
+        .await
+        .unwrap()
+        .id;
+    let budget = Duration::from_secs(2);
+    let pace = crate::watch::Timings {
+        connect: Duration::from_secs(60),
+        first_session: budget,
+        ..timings()
+    };
+    let _events = manager.live_start_with(Some(pace)).await.unwrap();
+
+    let started = std::time::Instant::now();
+    manager.rescan_wallet(&wallet).await.unwrap();
+    let rescan = started.elapsed();
+    let started = std::time::Instant::now();
+    let _ = manager.sync_wallet(&elsewhere).await;
+    let other = started.elapsed();
+    assert!(rescan < budget / 2, "the rescan waited: {rescan:?}");
+    assert!(
+        other < budget / 2,
+        "a testnet4 sync waited for a signet watch: {other:?}"
+    );
+    manager.live_stop().await;
+}
+
+/// A watch started on an empty vault has no session to open, and its
+/// first pass is over at once; the first wallet added opens one, which
+/// the sync of that wallet waits for, instead of going to the head of
+/// the rotation while the watch reaches its operator.
+#[tokio::test]
+async fn the_first_wallet_of_an_empty_watch_waits_for_its_session() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let stalled = FakeElectrum::start().await;
+    stalled.state.lock().unwrap().silent = true;
+    let _stand_in = crate::chain::public::stand_in(
+        &[format!("http://{}/api", rotation.address)],
+        &[format!("tcp://{}", stalled.address)],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let manager = WalletManager::open(dir.path(), key()).unwrap();
+    manager.set_active_network(Network::Signet).await.unwrap();
+    let budget = Duration::from_millis(800);
+    let pace = crate::watch::Timings {
+        connect: Duration::from_secs(60),
+        first_session: budget,
+        ..timings()
+    };
+    let _events = manager.live_start_with(Some(pace)).await.unwrap();
+    // Past the deadline of the empty start, whatever it was.
+    tokio::time::sleep(budget * 2).await;
+
+    let parsed = crate::input::parse_input(ADDRESS).unwrap();
+    let wallet = manager
+        .add_wallet("Watched", &parsed, Network::Signet)
+        .await
+        .unwrap()
+        .id;
+    let started = std::time::Instant::now();
+    manager.sync_wallet(&wallet).await.unwrap();
+    let first = started.elapsed();
+    assert!(
+        first >= budget * 3 / 4,
+        "the first sync of the first wallet went out at once: {first:?}"
+    );
+    manager.live_stop().await;
+}
+
+/// A sync that arrives while the watch is being started waits for that
+/// start, then for the first pass of the watch it starts, instead of
+/// going out before the watch exists.
+#[tokio::test]
+async fn a_sync_waits_for_a_start_under_way() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) = automatic(dir.path(), &rotation, &[]).await;
+    let starting = Starting::begin(&manager.live_starting);
+    let sync = {
+        let manager = manager.clone();
+        let wallet = wallet.clone();
+        tokio::spawn(async move { manager.sync_wallet(&wallet).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!sync.is_finished(), "the sync went out during the start");
+    drop(starting);
+    sync.await.unwrap().unwrap();
+}
+
+/// Once the first pass is over, the lists of wallets the syncs hand the
+/// watch make no later sync wait.
+#[tokio::test]
+async fn syncs_after_the_first_pass_do_not_wait() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let live = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) = automatic(dir.path(), &rotation, &[&live]).await;
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    let started = std::time::Instant::now();
+    for _ in 0..5 {
+        manager.sync_wallet(&wallet).await.unwrap();
+    }
+    let five = started.elapsed();
+    assert!(five < Duration::from_secs(2), "five syncs took {five:?}");
     manager.live_stop().await;
 }
 
