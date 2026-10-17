@@ -318,10 +318,15 @@ impl WalletManager {
         // another network, or another backend, since the sync was asked
         // for, and a wallet's addresses never go to a server its backend
         // does not name.
-        let allowed = crate::watch::servers_for(&config, meta.network, &certs).unwrap_or_default();
+        // The servers the backend allows are listed only when there is a
+        // server to check against them.
         let first = prefer
             .or_else(|| self.live_server())
-            .filter(|(network, prefer)| *network == meta.network && allowed.contains(prefer))
+            .filter(|(network, prefer)| {
+                *network == meta.network
+                    && crate::watch::servers_for(&config, meta.network, &certs)
+                        .is_ok_and(|allowed| allowed.contains(prefer))
+            })
             .map(|(_, prefer)| prefer);
         let answered = meta
             .last_sync
