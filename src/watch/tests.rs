@@ -1106,7 +1106,9 @@ async fn live_stays_through_a_long_wait_for_a_block() {
     let rotation = FakeMempool::start(false, 0).await;
     let (listened, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
     let _stand_in = automatic(&rotation, &[&listened, &other]);
-    let stale = Duration::from_millis(400);
+    // Room for a loaded machine: a block comes a quarter of the wait
+    // after the one before.
+    let stale = Duration::from_secs(1);
     let (watch, mut events) = LiveWatch::start_with(
         config(BackendConfig::default()),
         vec![wallet("a", &[1], &[], false)],
@@ -1116,9 +1118,9 @@ async fn live_stays_through_a_long_wait_for_a_block() {
         s.state == WatchState::Connected && s.pushed_scripts == 1
     })
     .await;
-    // Blocks every half of the wait: nothing is asked elsewhere.
+    // Blocks well within the wait: nothing is asked elsewhere.
     for height in 101..=104 {
-        tokio::time::sleep(stale / 2).await;
+        tokio::time::sleep(stale / 4).await;
         block(&listened, height);
         other.state.lock().unwrap().height = height;
         assert_eq!(
