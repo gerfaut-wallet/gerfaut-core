@@ -470,6 +470,31 @@ async fn electrum_keeps_a_wider_window_on_the_users_node() {
     }
 }
 
+/// Busy words from a server that is not ElectrumX refusing for cost, a
+/// node that starts or indexes, keep the ordinary backoff: the watch
+/// comes back as soon as after any other failure.
+#[tokio::test]
+async fn electrum_comes_back_soon_to_a_server_merely_busy() {
+    for refusal in [(1, "server busy, indexing"), (-32603, "Server busy")] {
+        let server = FakeElectrum::start().await;
+        server
+            .state
+            .lock()
+            .unwrap()
+            .refuse_coded
+            .insert("server.version", refusal);
+        let (_watch, _events) = LiveWatch::start_with(
+            config(server.backend()),
+            vec![wallet("a", &[1, 2], &[], false)],
+            Some(timings()),
+        );
+        // The backoff comes back within 100 ms; being left alone, not
+        // before 480.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(asked(&server, "server.version") >= 2, "{refusal:?}");
+    }
+}
+
 /// ElectrumX keeps the cost of a session it cut against the address,
 /// and refuses a client that comes back too early at its first request:
 /// the watch leaves the server alone, as after a cut, instead of
@@ -481,8 +506,8 @@ async fn electrum_leaves_alone_a_server_that_refuses_the_hello_for_cost() {
         .state
         .lock()
         .unwrap()
-        .refuse
-        .insert("server.version", "excessive resource usage".to_owned());
+        .refuse_coded
+        .insert("server.version", (-101, "excessive resource usage"));
     let (watch, _events) = LiveWatch::start_with(
         config(server.backend()),
         vec![wallet("a", &[1, 2], &[], false)],

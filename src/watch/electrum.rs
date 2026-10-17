@@ -55,10 +55,10 @@ pub(super) const WINDOW: usize = 32;
 /// on a session it slows down, two hundred and fifty-six in flight time
 /// out, and the session is cut.
 pub(super) const OWN_NODE_WINDOW: usize = 256;
-/// The codes aiorpcx, under ElectrumX, refuses a request with when the
-/// session costs the server too much, before it closes it: excessive
-/// resource usage, and server busy.
-const COSTLY: [i64; 2] = [-101, -102];
+/// The refusals of aiorpcx, under ElectrumX, for what a session costs,
+/// code and the start of its words: excessive resource usage, before it
+/// closes the connection, and a request that waited its turn too long.
+const COSTLY: [(i64, &str); 2] = [(-101, "excessive resource usage"), (-102, "server busy")];
 /// Subscriptions refused in a row, in words that do not say why, before
 /// the server is taken to be at its limit and the rest of the queue is
 /// given up: a server at its limit refuses them all, and asking on only
@@ -622,15 +622,21 @@ fn height_of(header: &Value) -> Option<u32> {
         .and_then(|height| u32::try_from(height).ok())
 }
 
-/// Whether an error is a server cutting the session for what it costs:
-/// see [`COSTLY`].
+/// Whether an error is ElectrumX refusing a request for what the session
+/// costs it, in its own code and words: see [`COSTLY`]. Busy words from
+/// another server, a node that starts or indexes, are not: the watch
+/// would leave it alone a quarter of an hour for nothing.
 fn costs_too_much(error: &Value) -> bool {
-    let coded = error
-        .get("code")
-        .and_then(Value::as_i64)
-        .is_some_and(|code| COSTLY.contains(&code));
-    let words = words(error).to_lowercase();
-    coded || words.contains("excessive resource usage") || words.contains("server busy")
+    let code = error.get("code").and_then(Value::as_i64);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    COSTLY
+        .iter()
+        .any(|(costly, words)| code == Some(*costly) && message.starts_with(words))
 }
 
 /// Whether a refusal says the server takes no more subscriptions on the

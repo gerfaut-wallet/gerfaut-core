@@ -159,6 +159,8 @@ pub(crate) struct ElectrumState {
     pub txs: HashMap<Txid, String>,
     /// Methods answered with this error message instead.
     pub refuse: HashMap<&'static str, String>,
+    /// Methods answered with this error code and message instead.
+    pub refuse_coded: HashMap<&'static str, (i64, &'static str)>,
     /// Script hashes whose history is refused, as too long.
     pub refused_histories: std::collections::HashSet<String>,
     /// The most subscriptions one connection holds, and the words that
@@ -406,6 +408,11 @@ impl FakeElectrum {
         };
         if let Some(message) = state.refuse.get(method) {
             return refusal(message);
+        }
+        if let Some((code, message)) = state.refuse_coded.get(method) {
+            return Answer::Line(json!({
+                "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message },
+            }));
         }
         if method == "blockchain.scripthash.get_history"
             && request["params"][0]
