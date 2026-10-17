@@ -492,4 +492,40 @@ mod tests {
         };
         assert_eq!(estimated(&spk, &foreign), None);
     }
+
+    /// A leaf counted here weighs what miniscript's own count gives for
+    /// the same tree: the satisfaction, the script, the control block,
+    /// and the number of witness elements, which miniscript already
+    /// makes include the script.
+    #[test]
+    fn a_leaf_weighs_what_miniscript_counts_for_its_tree() {
+        use bdk_wallet::bitcoin::taproot::{LeafVersion, TaprootBuilder};
+        use std::str::FromStr;
+        let secp = Secp256k1::verification_only();
+        let key: PublicKey = ANY_KEY.parse().unwrap();
+        let internal = XOnlyPublicKey::from(key.inner);
+        let policy = format!("and_v(v:pk({internal}),older(144))");
+        let leaf = Miniscript::<XOnlyPublicKey, Tap>::from_str_insane(&policy)
+            .unwrap()
+            .encode();
+        let info = TaprootBuilder::new()
+            .add_leaf(0, leaf.clone())
+            .unwrap()
+            .finalize(&secp, internal)
+            .unwrap();
+        let control = info
+            .control_block(&(leaf.clone(), LeafVersion::TapScript))
+            .unwrap();
+        let ours = estimated(
+            &ScriptBuf::new_p2tr_tweaked(info.output_key()),
+            &SigningHints {
+                tap_leaves: vec![(leaf, control)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tree =
+            Descriptor::<XOnlyPublicKey>::from_str(&format!("tr({internal},{policy})")).unwrap();
+        assert_eq!(ours.weight, tree.max_weight_to_satisfy().unwrap().to_wu());
+    }
 }
