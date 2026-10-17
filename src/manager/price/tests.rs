@@ -133,9 +133,16 @@ async fn with_an_onion_backend_the_price_goes_through_tor() {
         let error = manager.fetch_price().await.unwrap_err();
         assert!(is_price_failure(&error), "{source:?}: {error}");
     }
+    // Each source's history too.
     price_by(&manager, PriceSource::MempoolSpace, FiatCurrency::Usd).await;
     let error = manager
         .fetch_price_history(PriceRange::Year)
+        .await
+        .unwrap_err();
+    assert!(is_price_failure(&error), "{error}");
+    price_by(&manager, PriceSource::Coingecko, FiatCurrency::Usd).await;
+    let error = manager
+        .fetch_price_history(PriceRange::Week)
         .await
         .unwrap_err();
     assert!(is_price_failure(&error), "{error}");
@@ -146,6 +153,7 @@ async fn with_an_onion_backend_the_price_goes_through_tor() {
             ("mempool.space".to_owned(), 443),
             ("api.coingecko.com".to_owned(), 443),
             ("mempool.space".to_owned(), 443),
+            ("api.coingecko.com".to_owned(), 443),
         ],
         "every host went to the proxy, by name, and nowhere else"
     );
