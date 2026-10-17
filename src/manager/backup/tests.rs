@@ -907,3 +907,87 @@ async fn a_backup_pins_only_the_servers_its_backends_name() {
             .collect()
     );
 }
+
+/// A wallet without a name is refused like one whose material is: the
+/// preview says so, a restore of every wallet leaves it out, named by
+/// its position, and restores the others; asked for by index, it fails
+/// the restore.
+#[tokio::test]
+async fn a_backup_wallet_without_a_name_is_left_out() {
+    let tpub = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
+    let wallet = |name: &str, branch: u32| BackupWallet {
+        name: name.to_owned(),
+        network: Network::Signet,
+        kind: WalletKind::Descriptors {
+            external: format!("wpkh({tpub}/{branch}/*)"),
+            internal: None,
+            script: crate::input::ScriptKind::Segwit,
+        },
+        gap_limit: 20,
+        labels: Default::default(),
+        created_at: 1_755_000_000,
+        live_pinned: false,
+    };
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: vec![wallet("  ", 0), wallet("Named", 1)],
+        backends: None,
+        electrum_certs: None,
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    assert!(
+        preview.wallets[0]
+            .refused
+            .as_deref()
+            .is_some_and(|reason| reason.contains("needs a name"))
+    );
+    assert_eq!(preview.wallets[1].refused, None);
+
+    let only = ImportChoices {
+        indexes: Some(vec![0]),
+        apply_settings: false,
+    };
+    let error = manager
+        .import_backup(&text, BACKUP_PASSWORD, &only)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Wallet 1 of the backup cannot be restored"),
+        "{error}"
+    );
+    let report = manager
+        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+        .await
+        .unwrap();
+    assert_eq!(report.added.len(), 1);
+    assert_eq!(report.added[0].name, "Named");
+    assert_eq!(report.refused.len(), 1);
+    assert_eq!(report.refused[0].index, 0);
+}
+
+/// Only what is wrong with a wallet's own name or material leaves it
+/// out of a restore of every wallet; anything else, an error of the
+/// core or of the disk, fails the restore as it is.
+#[test]
+fn only_a_wallets_own_fault_leaves_it_out() {
+    use super::is_refusal;
+    assert!(is_refusal(&CoreError::Descriptor("unreadable".to_owned())));
+    assert!(is_refusal(&CoreError::PrivateMaterialRejected));
+    assert!(is_refusal(&CoreError::NetworkMismatch {
+        expected: "signet".to_owned(),
+        found: "descriptor".to_owned(),
+    }));
+    assert!(!is_refusal(&CoreError::Internal(
+        "new wallet produced no initial change set".to_owned()
+    )));
+}

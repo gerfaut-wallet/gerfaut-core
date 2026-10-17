@@ -120,7 +120,7 @@ impl WalletManager {
                     // refuse. One already watched is skipped before that:
                     // a single state, the one that happens.
                     let refused = (!already_watched)
-                        .then(|| check_material(&wallet.kind, wallet.network).err())
+                        .then(|| check_restorable(wallet).err())
                         .flatten()
                         .map(|error| error.to_string());
                     BackupWalletPreview {
@@ -190,7 +190,9 @@ impl WalletManager {
             let mut skipped = (payload.wallets.len() - chosen.len()) as u32;
             // A restore of every wallet leaves out, and names, one it
             // cannot watch, as it skips one already watched; one asked for
-            // by index fails the restore, named.
+            // by index fails the restore, named. Only what the wallet's
+            // own material or name is refused for: anything else fails
+            // the restore as it is.
             let asked_by_index = choices.indexes.is_some();
             let mut refused = Vec::new();
             for index in chosen {
@@ -204,29 +206,28 @@ impl WalletManager {
                     continue;
                 }
                 let name = wallet.name.trim();
-                if name.is_empty() {
-                    return Err(CoreError::InvalidInput {
-                        kind: "wallet name",
-                        detail: "a wallet needs a name".to_owned(),
-                    });
-                }
-                let mut meta = fresh_meta(
-                    name,
-                    wallet.network,
-                    wallet.kind.clone(),
-                    recognized_kind(&wallet.kind),
-                    gap_limit,
-                );
-                meta.labels = wallet.labels.clone();
-                meta.live_pinned = wallet.live_pinned;
-                match build_record(meta) {
+                let built = check_name(name).and_then(|()| {
+                    let mut meta = fresh_meta(
+                        name,
+                        wallet.network,
+                        wallet.kind.clone(),
+                        recognized_kind(&wallet.kind),
+                        gap_limit,
+                    );
+                    meta.labels = wallet.labels.clone();
+                    meta.live_pinned = wallet.live_pinned;
+                    build_record(meta)
+                });
+                match built {
                     Ok(record) => pending.push(record),
-                    Err(error) if !asked_by_index => refused.push(RefusedWallet {
-                        index: index as u32,
-                        name: name.to_owned(),
-                        reason: error.to_string(),
-                    }),
-                    Err(error) => return Err(refused_wallet(name, error)),
+                    Err(error) if !asked_by_index && is_refusal(&error) => {
+                        refused.push(RefusedWallet {
+                            index: index as u32,
+                            name: name.to_owned(),
+                            reason: error.to_string(),
+                        })
+                    }
+                    Err(error) => return Err(refused_wallet(index, name, error)),
                 }
             }
 
@@ -316,19 +317,56 @@ fn restorable_certs(payload: &BackupPayload) -> BTreeMap<String, String> {
 }
 
 /// A wallet of the backup a restore refused, named where the error has
-/// words of its own: a backup may hold many, and the error is all a
-/// person who asked for it anyway sees.
-fn refused_wallet(name: &str, error: CoreError) -> CoreError {
+/// words of its own, by its position when it has no name: a backup may
+/// hold many, and the error is all a person who asked for it anyway
+/// sees.
+fn refused_wallet(index: usize, name: &str, error: CoreError) -> CoreError {
+    let named = if name.is_empty() {
+        format!("Wallet {} of the backup", index + 1)
+    } else {
+        format!("\"{name}\"")
+    };
     match error {
         CoreError::Descriptor(detail) => {
-            CoreError::Descriptor(format!("\"{name}\" cannot be restored: {detail}"))
+            CoreError::Descriptor(format!("{named} cannot be restored: {detail}"))
         }
         CoreError::InvalidInput { kind, detail } => CoreError::InvalidInput {
             kind,
-            detail: format!("\"{name}\" cannot be restored: {detail}"),
+            detail: format!("{named} cannot be restored: {detail}"),
         },
         other => other,
     }
+}
+
+/// Refuses a wallet without a name, as adding one does.
+fn check_name(name: &str) -> CoreResult<()> {
+    if name.trim().is_empty() {
+        return Err(CoreError::InvalidInput {
+            kind: "wallet name",
+            detail: "a wallet needs a name".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// What a restore refuses a wallet of the backup for, read without
+/// building its engine: its name, then its material.
+fn check_restorable(wallet: &BackupWallet) -> CoreResult<()> {
+    check_name(&wallet.name)?;
+    check_material(&wallet.kind, wallet.network)
+}
+
+/// Whether a restore that failed on one wallet failed on that wallet's
+/// name or material, which a restore of every wallet leaves out and
+/// names, rather than on anything else, which fails it as it is.
+fn is_refusal(error: &CoreError) -> bool {
+    matches!(
+        error,
+        CoreError::Descriptor(_)
+            | CoreError::InvalidInput { .. }
+            | CoreError::PrivateMaterialRejected
+            | CoreError::NetworkMismatch { .. }
+    )
 }
 
 /// What the import screen would have recognized a restored wallet as:
