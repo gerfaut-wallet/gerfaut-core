@@ -92,18 +92,64 @@ pub(crate) fn opened_once(text: String) -> CoreResult<String> {
     Ok(text)
 }
 
+/// The fewest distinct frames a scan may bring before a code is refused
+/// as more than Gerfaut reads, whatever it announces.
+pub const MIN_SCAN_FRAMES: usize = 2_000;
+/// The most distinct frames any scan may bring.
+pub const MAX_SCAN_FRAMES: usize = 10_000;
+
+/// The distinct frames a scan of a code that announces `total` parts
+/// may bring: three times as many, within [`MIN_SCAN_FRAMES`] and
+/// [`MAX_SCAN_FRAMES`]. A camera that misses half the frames of a
+/// fountain code needs about twice as many as it has parts, and a large
+/// PSBT shown at low density runs to well over a thousand. Past that,
+/// the scan is refused: every new frame has the whole collection read
+/// again, and a fountain code never runs out of new frames.
+pub fn scan_frame_limit(total: u32) -> usize {
+    (total as usize)
+        .saturating_mul(3)
+        .clamp(MIN_SCAN_FRAMES, MAX_SCAN_FRAMES)
+}
+
+/// The parts the first frame of a multi-part code announces; 0 when it
+/// announces none.
+fn announced_parts(first: &str) -> u32 {
+    if is_ur(first) {
+        return ur_header(first)
+            .ok()
+            .and_then(|(_, total)| total)
+            .unwrap_or(0);
+    }
+    bbqr_header(first)
+        .map(|(header, _)| header.total)
+        .unwrap_or(0)
+}
+
 /// Assembles the frames scanned so far. Frames may repeat and arrive in
 /// any order; the caller keeps feeding the growing list until
-/// `complete` is true, then hands `text` to the classifier.
+/// `complete` is true, then hands `text` to the classifier. More frames
+/// than [`scan_frame_limit`] allows, repeats counted, blanks not, are
+/// refused with [`CoreError::TooManyFrames`] before any frame is
+/// decoded: the scan is over. The apps send each frame once, so the
+/// bound is the distinct frames a scan may bring; whoever sends repeats
+/// reaches it sooner, never later. The parts it is reckoned from are
+/// those of the first frame, the one both assemblers read the count
+/// from; whatever it announces, the bound stays between
+/// [`MIN_SCAN_FRAMES`] and [`MAX_SCAN_FRAMES`].
 pub fn assemble(frames: &[String]) -> CoreResult<QrProgress> {
-    let frames: Vec<&str> = frames
-        .iter()
-        .map(|f| f.trim())
-        .filter(|f| !f.is_empty())
-        .collect();
-    let Some(first) = frames.first() else {
+    let scanned = |frame: &&String| !frame.trim().is_empty();
+    let Some(first) = frames.iter().find(scanned).map(|frame| frame.trim()) else {
         return Err(qr_error("no frame scanned yet"));
     };
+    let count = frames.iter().filter(scanned).count();
+    if count > scan_frame_limit(announced_parts(first)) {
+        return Err(CoreError::TooManyFrames(count as u32));
+    }
+    let frames: Vec<&str> = frames
+        .iter()
+        .filter(scanned)
+        .map(|frame| frame.trim())
+        .collect();
     if is_ur(first) {
         assemble_ur(&frames)
     } else if first.starts_with("B$") {
@@ -114,7 +160,7 @@ pub fn assemble(frames: &[String]) -> CoreResult<QrProgress> {
             received: 1,
             total: 1,
             complete: true,
-            text: Some((*first).to_owned()),
+            text: Some(first.to_owned()),
             warnings: Vec::new(),
         })
     }
@@ -962,6 +1008,48 @@ mod tests {
         ciborium::into_writer(&part, &mut cbor).unwrap();
         let words = ur::bytewords::encode(&cbor, ur::bytewords::Style::Minimal);
         format!("ur:{ur_type}/{seq}-{total}/{words}")
+    }
+
+    /// A scan brings three times the parts its code announces at most,
+    /// two thousand whatever it announces and ten thousand whatever it
+    /// does: past that, a fountain code that never comes together is
+    /// refused, under the code of a code too large to read.
+    #[test]
+    fn a_scan_past_its_frames_is_refused() {
+        assert_eq!(scan_frame_limit(0), MIN_SCAN_FRAMES);
+        assert_eq!(scan_frame_limit(3), MIN_SCAN_FRAMES);
+        assert_eq!(scan_frame_limit(1_000), 3_000);
+        assert_eq!(scan_frame_limit(5_000), MAX_SCAN_FRAMES);
+
+        // Frames of a 600-part code the decoder cannot read: the scan
+        // never comes together.
+        let frames: Vec<String> = (1..=MIN_SCAN_FRAMES + 1)
+            .map(|seq| format!("ur:bytes/{seq}-600/damaged"))
+            .collect();
+        let kept = assemble(&frames[..MIN_SCAN_FRAMES]).unwrap();
+        assert!(!kept.complete);
+        // Repeats count: a list past the bound is refused whatever it
+        // holds, before a frame of it is read. Blanks do not, and the
+        // refusal counts frames scanned.
+        let repeated = vec![frames[0].clone(); MIN_SCAN_FRAMES + 1];
+        assert!(matches!(
+            assemble(&repeated),
+            Err(CoreError::TooManyFrames(2_001))
+        ));
+        let mut padded = vec![String::new(); 5_000];
+        padded.extend(frames[..MIN_SCAN_FRAMES].iter().cloned());
+        assert!(assemble(&padded).is_ok());
+        padded.push(frames[MIN_SCAN_FRAMES].clone());
+        assert!(matches!(
+            assemble(&padded),
+            Err(CoreError::TooManyFrames(2_001))
+        ));
+        let refused = assemble(&frames).unwrap_err();
+        assert!(
+            matches!(refused, CoreError::TooManyFrames(2_001)),
+            "{refused:?}"
+        );
+        assert_eq!(refused.code(), crate::error::ErrorCode::TooManyParts);
     }
 
     /// A count past what anyone scans is refused before the decoder

@@ -165,6 +165,14 @@ pub struct BackupWalletPreview {
     /// A wallet watching the same thing on the same network exists
     /// already; restoring it would be skipped.
     pub already_watched: bool,
+    /// Why a restore cannot take this wallet, in the core's words: its
+    /// material does not read as a wallet to watch, or its two
+    /// descriptors are not one wallet. A restore of every wallet leaves
+    /// it out and names it ([`ImportReport::refused`]); one that asks for
+    /// it by index fails, and names it. `None` for a wallet a restore
+    /// takes, and for one already watched, which a restore skips anyway.
+    #[serde(default)]
+    pub refused: Option<String>,
 }
 
 /// What to restore out of a backup.
@@ -185,6 +193,20 @@ pub struct ImportReport {
     /// Wallets left out: not chosen, or already watched.
     pub skipped: u32,
     pub settings_applied: bool,
+    /// Wallets a restore of every wallet left out because it cannot
+    /// watch them, as the preview marked them: not in `skipped`.
+    #[serde(default)]
+    pub refused: Vec<RefusedWallet>,
+}
+
+/// A wallet of a backup a restore left out because it cannot watch it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedWallet {
+    /// Its position in the backup, as in the preview.
+    pub index: u32,
+    pub name: String,
+    /// Why, in the core's words.
+    pub reason: String,
 }
 
 /// The refusal of what cannot be read as a backup, whatever it turns
