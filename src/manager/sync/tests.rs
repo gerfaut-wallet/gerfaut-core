@@ -313,3 +313,38 @@ async fn a_sync_tries_last_a_server_that_was_down_where_another_answered() {
     assert!(!asked(&flaky).is_empty());
     assert_eq!(asked(&steady), Vec::<String>::new());
 }
+
+/// A relegation over for an hour is forgotten: the next outage, days
+/// later, relegates the server for five minutes again, not for longer.
+#[tokio::test(start_paused = true)]
+async fn an_old_relegation_is_forgotten() {
+    use tokio::time::{Instant, advance};
+    let (rotation, _) = mainnet();
+    let (mempool, blockstream) = (&rotation[0], &rotation[1]);
+    let mut relegated = Relegations::default();
+    let last = |relegated: &Relegations| {
+        relegated.order(rotation.clone(), None, Instant::now())[2].clone()
+    };
+    for minutes in [5, 10, 20] {
+        relegated.answered(blockstream, &[mempool], Instant::now());
+        advance(Duration::from_secs(minutes * 60)).await;
+    }
+    // Within the hour after the last one: twice as long again.
+    advance(Duration::from_secs(59 * 60)).await;
+    relegated.answered(blockstream, &[mempool], Instant::now());
+    advance(Duration::from_secs(39 * 60)).await;
+    assert_eq!(last(&relegated), *mempool);
+    advance(Duration::from_secs(60)).await;
+    assert_eq!(
+        relegated.order(rotation.clone(), None, Instant::now()),
+        rotation
+    );
+    // Past the hour: five minutes, as the first time.
+    advance(Duration::from_secs(60 * 60)).await;
+    relegated.answered(blockstream, &[mempool], Instant::now());
+    advance(Duration::from_secs(5 * 60)).await;
+    assert_eq!(
+        relegated.order(rotation.clone(), None, Instant::now()),
+        rotation
+    );
+}

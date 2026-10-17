@@ -700,7 +700,8 @@ const RELEGATION_MAX: Duration = Duration::from_secs(60 * 60);
 /// down where a later one of the same list answers costs its timeout to
 /// every sync that starts with it, wallet after wallet: it is tried last
 /// for [`RELEGATION_FIRST`], then twice as long each time it is so
-/// again, up to [`RELEGATION_MAX`], and no longer once it answers.
+/// again, up to [`RELEGATION_MAX`], and no longer once it answers. An
+/// hour past its last relegation, it starts over from the first.
 ///
 /// Only an outage counts ([`chain::is_outage`]): a refusal of one
 /// request, a history too long for that server, says nothing of the
@@ -747,8 +748,11 @@ impl Relegations {
 
     /// `answered` answered at `now`, after each of `failed` was down:
     /// those are relegated, unless one already is, by another sync that
-    /// met the same outage, and `answered` is no longer.
+    /// met the same outage, and `answered` is no longer. A relegation
+    /// over for [`RELEGATION_MAX`] is forgotten.
     fn answered(&mut self, answered: &Endpoint, failed: &[&Endpoint], now: tokio::time::Instant) {
+        self.0
+            .retain(|_, relegation| relegation.until + RELEGATION_MAX > now);
         self.0.remove(answered);
         for endpoint in failed {
             let relegation = self.0.entry((*endpoint).clone()).or_insert(Relegation {
