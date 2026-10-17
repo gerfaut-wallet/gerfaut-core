@@ -1369,7 +1369,7 @@ mod servers {
     fn asked(server: &FakeMempool, part: &str) -> usize {
         let state = server.state.lock().unwrap();
         state
-            .requests
+            .paths
             .iter()
             .filter(|path| path.contains(part))
             .count()
@@ -1607,7 +1607,7 @@ mod servers {
         };
         let synced = esplora_sync(&server, plan).await.unwrap();
         assert_eq!(synced.update.tx_update.anchors.len(), 500);
-        let total = server.state.lock().unwrap().requests.len();
+        let total = server.state.lock().unwrap().paths.len();
         let (branches, headers) = (asked(&server, "/merkle-proof"), asked(&server, "/header"));
         println!(
             "first sync of 500 confirmations in 250 blocks: {total} requests, of which {branches} \

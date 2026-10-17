@@ -71,7 +71,9 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
 
     let mut covered: HashSet<ScriptBuf> = scripts.iter().cloned().collect();
     for batch in scripts.chunks(BATCH) {
-        let histories = client.batch_script_get_history(batch.iter().map(|s| s.as_script()))?;
+        let histories = super::patiently(|| {
+            client.batch_script_get_history(batch.iter().map(|s| s.as_script()))
+        })?;
         for (script, history) in batch.iter().zip(histories) {
             pass.take(script, &history, &chain);
         }
@@ -85,8 +87,9 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
             if batch.is_empty() {
                 break;
             }
-            let histories =
-                client.batch_script_get_history(batch.iter().map(|(_, s)| s.as_script()))?;
+            let histories = super::patiently(|| {
+                client.batch_script_get_history(batch.iter().map(|(_, s)| s.as_script()))
+            })?;
             for ((index, script), history) in batch.iter().zip(histories) {
                 if history.is_empty() {
                     unused = unused.saturating_add(1);
@@ -107,7 +110,9 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
     // whatever the plan: see [`Held::reorganised`].
     let moved = held.reorganised(chain.agreement, &covered);
     for batch in moved.chunks(BATCH) {
-        let histories = client.batch_script_get_history(batch.iter().map(|s| s.as_script()))?;
+        let histories = super::patiently(|| {
+            client.batch_script_get_history(batch.iter().map(|s| s.as_script()))
+        })?;
         for (script, history) in batch.iter().zip(histories) {
             pass.take(script, &history, &chain);
         }
@@ -650,7 +655,7 @@ fn fetch_txs(
 ) -> Result<HashMap<Txid, Arc<Transaction>>, Error> {
     let mut found = HashMap::new();
     for batch in txids.chunks(BATCH) {
-        let txs = client.batch_transaction_get(batch.iter())?;
+        let txs = super::patiently(|| client.batch_transaction_get(batch.iter()))?;
         for (txid, tx) in batch.iter().zip(txs) {
             if tx.compute_txid() != *txid {
                 return Err(Error::Message(

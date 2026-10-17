@@ -99,19 +99,25 @@ impl Client {
     /// little later each time. One that limits the rate of requests is
     /// asked again once, after the wait it named, five seconds at least
     /// and a little more so that clients do not come back together, when
-    /// that wait is a minute at most.
+    /// that wait is a minute at most. One that closed the connection
+    /// before it answered is asked again at once, a single time: a
+    /// connection kept open for the next request, which the server
+    /// closes as that request goes out, is the lot of every client.
     async fn open(&self, path: &str) -> Result<Option<reqwest::Response>, String> {
         let url = format!("{}{path}", self.base);
         let mut wait = Duration::from_millis(250);
         let mut tries = 1;
         let mut limited = false;
+        let mut reopened = false;
         let response = loop {
-            let response = self
-                .http
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| describe_request(&e, self.budget))?;
+            let response = match self.http.get(&url).send().await {
+                Ok(response) => response,
+                Err(error) if !reopened && closed_early(&error) => {
+                    reopened = true;
+                    continue;
+                }
+                Err(error) => return Err(describe_request(&error, self.budget)),
+            };
             let status = response.status().as_u16();
             if status == 429 {
                 let named = retry_after(response.headers()).unwrap_or_default();
@@ -630,7 +636,32 @@ pub(crate) fn describe_failure(error: &reqwest::Error) -> String {
     if error.is_body() || error.is_decode() {
         return "unexpected response".to_owned();
     }
+    if closed_early(error) {
+        return "the connection was closed".to_owned();
+    }
     "request failed".to_owned()
+}
+
+/// Whether the server hung up before it answered, once connected: a
+/// reset, or a connection that ended first, in the words of hyper.
+fn closed_early(error: &reqwest::Error) -> bool {
+    use std::io::ErrorKind;
+    !error.is_connect()
+        && !error.is_timeout()
+        && find_cause(error, &mut |cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::UnexpectedEof
+                )
+            }) || cause
+                .to_string()
+                .starts_with("connection closed before message completed")
+        })
+        .is_some()
 }
 
 /// The first error for which `matches` holds, among the error itself,
@@ -1405,6 +1436,52 @@ mod error_tests {
         let client = build(&format!("http://{address}"), None, BUDGET).unwrap();
         let error = client.height().await.unwrap_err();
         assert_eq!(error, "timed out after 1 s");
+        assert!(crate::chain::is_outage(&error));
+    }
+
+    /// A server that hangs up before it answers, having read the request
+    /// or not, is asked again once, on another connection: the second
+    /// time, the connection was closed, and that is an outage.
+    #[tokio::test]
+    async fn a_server_that_hangs_up_closed_the_connection() {
+        for read_first in [true, false] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = accepted.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if read_first {
+                        let mut request = [0u8; 1024];
+                        let _ = stream.read(&mut request).await;
+                    }
+                }
+            });
+            let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
+            let error = client.height().await.unwrap_err();
+            assert_eq!(
+                error, "the connection was closed",
+                "read first: {read_first}"
+            );
+            assert!(crate::chain::is_outage(&error));
+            assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+    }
+
+    /// A connection the server closes as a request goes out, the race of
+    /// a connection kept open for the next request, costs nothing: the
+    /// request is asked again on another one.
+    #[tokio::test]
+    async fn a_connection_closed_under_a_request_is_asked_again() {
+        let (address, asked) = answering(vec![
+            String::new(),
+            "HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\n812345".to_owned(),
+        ])
+        .await;
+        let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
+        assert_eq!(client.height().await.unwrap(), 812_345);
+        assert_eq!(*asked.lock().unwrap(), 2);
     }
 
     #[tokio::test]
@@ -1415,6 +1492,7 @@ mod error_tests {
         let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
         let error = client.height().await.unwrap_err();
         assert_eq!(error, "could not connect");
+        assert!(crate::chain::is_outage(&error));
     }
 
     #[tokio::test]
@@ -1423,6 +1501,7 @@ mod error_tests {
         let client = build("http://esplora.invalid", None, PATIENT).unwrap();
         let error = client.height().await.unwrap_err();
         assert_eq!(error, "host not found");
+        assert!(crate::chain::is_outage(&error));
     }
 
     /// A server that answers the handshake with something that is not
@@ -1455,6 +1534,7 @@ mod error_tests {
             described.starts_with("TLS handshake failed: received corrupt message"),
             "{described}"
         );
+        assert!(crate::chain::is_outage(&described));
     }
 
     /// A proxy that turns the handshake down: the SOCKS client's own
@@ -1480,6 +1560,8 @@ mod error_tests {
             error,
             "could not connect through Tor: server does not support user/pass authentication"
         );
+        // The route, not the server: it relegates nothing.
+        assert!(!crate::chain::is_outage(&error));
     }
 
     /// A server that answers with `status` and `body` gzipped, whatever
@@ -1615,6 +1697,18 @@ mod error_tests {
         assert_eq!(*asked_short.lock().unwrap(), 2);
         assert_eq!(*asked_again.lock().unwrap(), 2);
         assert_eq!(short.take_rate_limit(), Some(RATE_WAIT_MIN));
+    }
+
+    /// A server error or a limited rate is an outage, in the words this
+    /// client puts them in; a request the server finds bad is not.
+    #[test]
+    fn server_errors_and_limited_rates_are_outages() {
+        use crate::chain::is_outage;
+        assert!(is_outage(&describe_status(500)));
+        assert!(is_outage(&describe_status(503)));
+        assert!(is_outage(&rate_limited(RATE_WAIT_MIN)));
+        assert!(!is_outage(&describe_status(400)));
+        assert!(!is_outage(&describe_status(404)));
     }
 
     /// `Retry-After` names a wait in seconds, or the date to come back at.
