@@ -5,8 +5,8 @@ name: Upstream
 # fork goes once a release of the crate itself carries a fix. Every
 # Monday, and on demand, this looks for a release on crates.io newer than
 # the fork and not listed in REVIEWED below, and fails when there is one;
-# GitHub then notifies whoever last edited the cron line. Never run on a
-# pull request: a release upstream says nothing about a change here.
+# GitHub then notifies whoever last edited the cron line. A pull request
+# runs it only when it edits this workflow or its script.
 #
 # Read the new release's find_limit. If it stops on a step that does not
 # move the value, and arti accepts that release, remove the
@@ -19,6 +19,10 @@ on:
   schedule:
     - cron: '41 5 * * 1'
   workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/upstream.yml
+      - .github/saturating-time-upstream.py
 
 permissions:
   contents: read
