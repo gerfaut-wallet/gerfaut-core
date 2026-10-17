@@ -443,6 +443,19 @@ impl Pass<'_> {
     ) -> Result<(), Error> {
         let false_proof = || Error::Message(FALSE_PROOF.to_owned());
         let mut to_prove = std::mem::take(&mut self.to_prove);
+        // A long sync may have seen blocks come in since the tip was
+        // read: the tip is read again before anything is refused for it.
+        if to_prove
+            .iter()
+            .any(|(_, height)| above_the_tip(*height, chain.server_tip) == Some(Proof::False))
+        {
+            let again = client.block_headers_subscribe()?;
+            if let Ok(height) = u32::try_from(again.height)
+                && height <= height_limit(network, self.start_time)
+            {
+                chain.server_tip = chain.server_tip.max(height);
+            }
+        }
         for (txid, height) in &to_prove {
             match above_the_tip(*height, chain.server_tip) {
                 Some(Proof::False) => return Err(false_proof()),

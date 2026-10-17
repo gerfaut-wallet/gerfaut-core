@@ -547,10 +547,21 @@ pub(crate) async fn prove_confirmations(
     tip: u32,
     claimed: &[(Txid, BlockId)],
 ) -> Result<Vec<Option<u64>>, String> {
-    if claimed
-        .iter()
-        .any(|(_, block)| above_the_tip(block.height, tip) == Some(Proof::False))
-    {
+    let too_high = |tip: u32| {
+        claimed
+            .iter()
+            .any(|(_, block)| above_the_tip(block.height, tip) == Some(Proof::False))
+    };
+    // A long sync may have seen blocks come in since the tip was read:
+    // the tip is read again before anything is refused for it.
+    let mut tip = tip;
+    if too_high(tip) {
+        let again = client.height().await?;
+        if again <= height_limit(network, crate::now_secs()) {
+            tip = tip.max(again);
+        }
+    }
+    if too_high(tip) {
         return Err(FALSE_PROOF.to_owned());
     }
     let below: Vec<(Txid, BlockId)> = claimed

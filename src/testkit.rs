@@ -282,6 +282,9 @@ pub(crate) struct ElectrumState {
     pub stale_once: HashMap<u32, bdk_wallet::bitcoin::block::Header>,
     /// Heights whose header is refused.
     pub refused_headers: std::collections::HashSet<u32>,
+    /// The tip the server moves to once it has given its tip once: blocks
+    /// that come in while a client reads.
+    pub tip_later: Option<u32>,
 }
 
 /// Heights past which the fake Electrum server makes a header up on the
@@ -545,7 +548,11 @@ impl FakeElectrum {
         let result = match method {
             "server.version" => json!([state.software, state.version]),
             "blockchain.headers.subscribe" => {
-                json!({ "height": state.height, "hex": state.header(state.height) })
+                let answer = json!({ "height": state.height, "hex": state.header(state.height) });
+                if let Some(later) = state.tip_later.take() {
+                    state.height = later;
+                }
+                answer
             }
             "blockchain.block.headers" => {
                 let start = param.as_u64().unwrap_or(0) as u32;

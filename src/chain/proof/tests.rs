@@ -1036,6 +1036,14 @@ mod servers {
     /// above, unsure, further, the server is refused, on every path.
     #[tokio::test]
     async fn a_confirmation_above_the_tip_is_refused() {
+        // Blocks that came in while the sync read: the tip read again
+        // holds the confirmation, which is proven.
+        let server = signet().await;
+        let payment = pay(&server, 110, |_| true);
+        server.state.lock().unwrap().tip_later = Some(110);
+        let synced = electrum_sync(&server, Network::Signet).await.unwrap();
+        assert_eq!(anchored(&synced)[0].0, payment.compute_txid());
+
         // A descriptor wallet over Electrum, tip at 100.
         for (height, refused) in [(102, false), (110, true)] {
             let server = signet().await;
