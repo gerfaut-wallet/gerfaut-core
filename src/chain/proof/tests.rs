@@ -1,6 +1,7 @@
 //! The proof of a confirmation, against real mainnet headers and a real
 //! branch, and against the forgeries each check is there for.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use bdk_wallet::bitcoin::consensus::encode::{deserialize_hex, serialize};
@@ -145,6 +146,13 @@ fn the_target_table() {
     let (height, hash) = targets::LAST_CHECKPOINT;
     assert_eq!(height + 1, (table.len() as u32 - 1) * RETARGET_PERIOD);
     assert_eq!(hash, REAL[3].1);
+    let ends = targets::MAINNET_ENDS;
+    assert_eq!(ends.len(), table.len() - 1);
+    assert_eq!(ends.last(), Some(&hash));
+    assert!(ends.iter().all(|end| end.parse::<BlockHash>().is_ok()));
+    for (height, hash, _) in REAL {
+        assert_eq!(ends[(height / RETARGET_PERIOD) as usize], hash, "{height}");
+    }
     assert_eq!(targets::SOURCE.len(), 40);
 }
 
@@ -237,6 +245,16 @@ pub(super) const MAINNET_BITS: &[u32] = &[
             })
             .collect();
         out.push_str(&format!("    {},\n", row.join(", ")));
+    }
+    out.push_str("];\n");
+    out.push_str(
+        "\n/// The hash of the last block of each period that has one in the\n\
+         /// checkpoints, period 0 first: what the headers of a period chain to.\n\
+         #[rustfmt::skip]\n\
+         pub(super) const MAINNET_ENDS: &[&str] = &[\n",
+    );
+    for (hash, _) in &entries {
+        out.push_str(&format!("    \"{hash}\",\n"));
     }
     out.push_str("];\n");
     let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/chain/proof/targets.rs");
@@ -498,6 +516,89 @@ fn a_branch_into_another_block_is_read_again() {
     assert_eq!(
         recheck(Network::Mainnet, 963_647, &stale, &unmined, txid, &proven),
         Proof::False
+    );
+}
+
+/// Every period with a checkpoint is chained over Electrum today, as
+/// the difficulty under which a forged header costs less than a million
+/// dollars is above all of them; past the checkpoints, nothing is to
+/// chain to, and other networks chain nothing.
+#[test]
+fn early_periods_chain_to_their_checkpoint() {
+    let ends = targets::MAINNET_ENDS;
+    let genesis_end: BlockHash = ends[0].parse().unwrap();
+    assert_eq!(
+        checkpoint_for(Network::Mainnet, 1_000),
+        Some((2_015, genesis_end))
+    );
+    assert_eq!(
+        checkpoint_for(Network::Mainnet, 963_640),
+        Some((963_647, REAL[3].1.parse().unwrap()))
+    );
+    assert_eq!(checkpoint_for(Network::Mainnet, 963_648), None);
+    assert_eq!(checkpoint_for(Network::Signet, 1_000), None);
+    assert_eq!(checkpoint_for(Network::Testnet4, 1_000), None);
+
+    // The real headers under the last checkpoint chain to it.
+    let real: Vec<Header> = BELOW_LAST
+        .iter()
+        .map(|hex| header(hex))
+        .chain([last_checkpoint()])
+        .collect();
+    let hashes = chain_to_checkpoint(Network::Mainnet, 963_640, &real).unwrap();
+    assert_eq!(hashes.len(), 8);
+    let read = HashMap::from([(963_640, hashes)]);
+    let at = |height: u32| real[(height - 963_640) as usize].block_hash();
+    assert_eq!(
+        chained(Network::Mainnet, 963_643, at(963_643), &read),
+        Proof::Holds
+    );
+    assert_eq!(
+        chained(Network::Mainnet, 963_643, at(963_644), &read),
+        Proof::False
+    );
+    // One short, one out of order, one forged: no chain.
+    assert_eq!(
+        chain_to_checkpoint(Network::Mainnet, 963_640, &real[1..]),
+        None
+    );
+    let mut swapped = real.clone();
+    swapped.swap(2, 3);
+    assert_eq!(
+        chain_to_checkpoint(Network::Mainnet, 963_640, &swapped),
+        None
+    );
+    let mut forged = real.clone();
+    forged[7].nonce ^= 1;
+    assert_eq!(
+        chain_to_checkpoint(Network::Mainnet, 963_640, &forged),
+        None
+    );
+    // What the session read vouches for later syncs, below where it
+    // starts it does not.
+    assert_eq!(
+        chained(Network::Mainnet, 963_645, at(963_645), &HashMap::new()),
+        Proof::Holds
+    );
+    assert_eq!(
+        chained(Network::Mainnet, 963_639, at(963_640), &HashMap::new()),
+        Proof::Unsure
+    );
+    assert_eq!(
+        chains_to_read(Network::Mainnet, &[(963_645, at(963_645))]),
+        []
+    );
+    assert_eq!(
+        chains_to_read(
+            Network::Mainnet,
+            &[(1_000, genesis_end), (1_500, genesis_end)]
+        ),
+        [(1_000, 1_016)]
+    );
+    // A period past the checkpoints needs no chain.
+    assert_eq!(
+        chained(Network::Mainnet, 963_648, at(963_640), &HashMap::new()),
+        Proof::Holds
     );
 }
 
@@ -963,6 +1064,40 @@ mod servers {
         assert!(refused.contains(crate::chain::IMPOSSIBLE_TIP), "{refused}");
     }
 
+    /// The genesis block's own transaction, claimed confirmed at height
+    /// 1,000 under the genesis header: a header of the first period, the
+    /// work of difficulty one, which a server mines in seconds. Over
+    /// Electrum, its block does not chain to the checkpoint of its period,
+    /// and the server is refused, for a descriptor wallet and a watched
+    /// address alike, where the header's work alone let it through.
+    #[tokio::test]
+    async fn an_early_electrum_confirmation_must_chain_to_its_checkpoint() {
+        let genesis = bdk_wallet::bitcoin::constants::genesis_block(Network::Mainnet.to_bitcoin());
+        let coinbase = genesis.txdata[0].clone();
+        let early = || async {
+            let server = mainnet().await;
+            server.add_tx(&coinbase);
+            server
+                .state
+                .lock()
+                .unwrap()
+                .served
+                .insert(1_000, genesis.header);
+            server
+        };
+        let server = early().await;
+        server.set_history(&ours(), &[(coinbase.compute_txid(), 1_000)]);
+        let refused = refusal(electrum_sync(&server, Network::Mainnet).await);
+        assert!(refused.contains(FALSE_PROOF), "{refused}");
+
+        let server = early().await;
+        server.set_history(ADDRESS_SCRIPT, &[(coinbase.compute_txid(), 1_000)]);
+        let refused = address_state(&server, MAINNET_ADDRESS, Network::Mainnet)
+            .await
+            .unwrap_err();
+        assert!(refused.contains(FALSE_PROOF), "{refused}");
+    }
+
     /// On mainnet, a real transaction of the last checkpoint's block is
     /// proven by its real branch; a payment in a header that commits to
     /// it and that no one mined refuses the server, where it used to
@@ -1348,6 +1483,50 @@ mod servers {
         server.state.lock().unwrap().tip = 4_000_000_000;
         let refused = esplora_address(&server, Network::Signet).await.unwrap_err();
         assert!(refused.contains(crate::chain::IMPOSSIBLE_TIP), "{refused}");
+    }
+
+    /// The limit of Esplora, pinned: no run of headers to chain to the
+    /// checkpoints, so the genesis block's own transaction, claimed
+    /// confirmed at height 1,000 under the genesis header, is taken on
+    /// that header's work alone, which Electrum refuses
+    /// ([`an_early_electrum_confirmation_must_chain_to_its_checkpoint`]).
+    /// A header of an early period is cheap to forge: over Esplora, an
+    /// early confirmation costs what that header costs.
+    #[tokio::test]
+    async fn an_early_esplora_confirmation_stands_on_its_header_alone() {
+        let genesis = bdk_wallet::bitcoin::constants::genesis_block(Network::Mainnet.to_bitcoin());
+        let coinbase = &genesis.txdata[0];
+        let server = mempool(Network::Mainnet).await;
+        let listed = serde_json::json!({
+            "txid": coinbase.compute_txid().to_string(), "version": 1, "locktime": 0,
+            "size": coinbase.total_size(), "weight": coinbase.weight().to_wu(), "fee": 0,
+            "vin": [{
+                "txid": "00".repeat(32), "vout": u32::MAX, "is_coinbase": true,
+                "scriptsig": serialize_hex_of(&coinbase.input[0].script_sig),
+                "sequence": coinbase.input[0].sequence.0, "prevout": null,
+            }],
+            "vout": [{
+                "scriptpubkey": serialize_hex_of(&coinbase.output[0].script_pubkey),
+                "value": coinbase.output[0].value.to_sat(),
+            }],
+            "status": {
+                "confirmed": true, "block_height": 1_000, "block_hash": "00".repeat(32),
+                "block_time": genesis.header.time,
+            },
+        });
+        {
+            let mut state = server.state.lock().unwrap();
+            state.tip = 2_000;
+            state.served.insert(1_000, genesis.header);
+            state.address_txs = vec![listed];
+        }
+        let state = esplora_address(&server, Network::Mainnet).await.unwrap();
+        assert_eq!(state.txs[0].height, Some(1_000));
+    }
+
+    /// A script in hex.
+    fn serialize_hex_of(script: &bdk_wallet::bitcoin::Script) -> String {
+        script.to_hex_string()
     }
 
     /// On mainnet, a confirmation in a header no one mined refuses the

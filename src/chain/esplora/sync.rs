@@ -535,6 +535,12 @@ async fn prove(
 /// one that replaced the block named leaves the confirmation unsure. One
 /// above `tip`, the tip the server gave before, is weighed by
 /// [`above_the_tip`] without a request.
+///
+/// What Esplora cannot prove: it sends no run of headers, short of one
+/// request a block, so no block is chained to its checkpoint as over
+/// Electrum. A confirmation stands on its header's work alone, and one
+/// claimed in an early period of the chain costs what a header of that
+/// period costs to forge, little (see [`crate::chain::proof`]).
 pub(crate) async fn prove_confirmations(
     client: &Client,
     network: Network,

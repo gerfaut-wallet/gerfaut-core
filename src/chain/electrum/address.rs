@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 use bdk_wallet::bitcoin::block::Header;
 use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
-use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bdk_wallet::bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -40,8 +40,8 @@ use super::rpc::{CallError, Connection};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
 use crate::chain::proof::{
-    FALSE_PROOF, Proof, ProvenCoin, above_the_tip, check_confirmation, proven_coin, recheck,
-    remember_coin,
+    FALSE_PROOF, Proof, ProvenCoin, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
+    check_confirmation, proven_coin, recheck, remember_coin,
 };
 use crate::chain::{IMPOSSIBLE_TIP, KEEP_MAX, Kept, height_limit};
 use crate::network::Network;
@@ -575,7 +575,10 @@ fn unproven(round: &[Picked], held: &[AddressTx]) -> Vec<(Txid, u32)> {
 /// listed the history, those whose branch leads into a block that
 /// replaced the one read ([`recheck`]), and those in a block that came in
 /// since the server gave `tip` ([`above_the_tip`]). One further above it
-/// refuses the server.
+/// refuses the server. An early confirmation is then chained to its
+/// checkpoint ([`chains_to_read`]): a chain that does not end there, or
+/// holds another block, refuses the server; one it would not send leaves
+/// the confirmation unsure.
 async fn prove(
     connection: &mut Connection,
     network: Network,
@@ -584,6 +587,7 @@ async fn prove(
     headers: &Headers,
 ) -> Result<HashSet<String>, String> {
     let mut unsure = HashSet::new();
+    let mut proven: Vec<(Txid, u32, BlockHash)> = Vec::new();
     for (txid, height) in unproven {
         match above_the_tip(*height, tip) {
             Some(Proof::False) => return Err(FALSE_PROOF.to_owned()),
@@ -637,7 +641,31 @@ async fn prove(
             }
             (verdict, _, _) => verdict,
         };
-        match verdict {
+        match (verdict, headers.found.get(height)) {
+            (Proof::Holds, Some(header)) => proven.push((*txid, *height, header.block_hash())),
+            (Proof::Unsure, _) => {
+                unsure.insert(txid.to_string());
+            }
+            _ => return Err(FALSE_PROOF.to_owned()),
+        }
+    }
+
+    // Then the chains to the checkpoints the early ones need.
+    let blocks: Vec<(u32, BlockHash)> = proven
+        .iter()
+        .map(|(_, height, hash)| (*height, *hash))
+        .collect();
+    let mut read = HashMap::new();
+    for (from, count) in chains_to_read(network, &blocks) {
+        let Some(headers) = headers_from(connection, from, count).await? else {
+            continue;
+        };
+        let hashes =
+            chain_to_checkpoint(network, from, &headers).ok_or_else(|| FALSE_PROOF.to_owned())?;
+        read.insert(from, hashes);
+    }
+    for (txid, height, hash) in proven {
+        match chained(network, height, hash, &read) {
             Proof::Holds => {}
             Proof::Unsure => {
                 unsure.insert(txid.to_string());
@@ -646,6 +674,48 @@ async fn prove(
         }
     }
     Ok(unsure)
+}
+
+/// What `blockchain.block.headers` answers: so many headers, end to end
+/// in one hex string.
+#[derive(Deserialize)]
+struct HeadersAnswer {
+    hex: String,
+}
+
+/// The `count` headers from `from`, asked as many times as the server's
+/// own limit takes; `None` when it refuses them.
+async fn headers_from(
+    connection: &mut Connection,
+    from: u32,
+    count: u32,
+) -> Result<Option<Vec<Header>>, String> {
+    let mut headers: Vec<Header> = Vec::with_capacity(count as usize);
+    while (headers.len() as u32) < count {
+        let next = from + headers.len() as u32;
+        let left = count - headers.len() as u32;
+        let answer = match connection
+            .call::<HeadersAnswer>("blockchain.block.headers", json!([next, left]))
+            .await
+        {
+            Ok(answer) => answer,
+            Err(CallError::Refused(_)) => return Ok(None),
+            Err(other) => return Err(other.into()),
+        };
+        let bytes = data_encoding::HEXLOWER_PERMISSIVE
+            .decode(answer.hex.as_bytes())
+            .map_err(|_| "unexpected response".to_owned())?;
+        if bytes.is_empty() || bytes.len() % 80 != 0 {
+            break;
+        }
+        for chunk in bytes.chunks(80) {
+            let header: Header = bdk_wallet::bitcoin::consensus::encode::deserialize(chunk)
+                .map_err(|_| "unexpected response".to_owned())?;
+            headers.push(header);
+        }
+    }
+    headers.truncate(count as usize);
+    Ok(Some(headers))
 }
 
 /// The server's tip, refused past any height a chain of `network` can

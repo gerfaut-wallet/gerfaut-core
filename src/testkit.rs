@@ -289,6 +289,37 @@ impl ElectrumState {
         serialize_hex(&self.header_of(height))
     }
 
+    /// The headers from `start` up to `end`, excluded, as
+    /// [`Self::header_of`] makes them, the chain built once.
+    fn headers_between(&self, start: u32, end: u32) -> Vec<bdk_wallet::bitcoin::block::Header> {
+        if start > CHAINED_UP_TO || end <= start {
+            return (start..end).map(|height| self.header_of(height)).collect();
+        }
+        let mut headers = Vec::new();
+        let mut below = self.header_of(start);
+        headers.push(below);
+        for height in start + 1..end {
+            let header = if height > CHAINED_UP_TO || self.served.contains_key(&height) {
+                self.header_of(height)
+            } else {
+                use bdk_wallet::bitcoin::TxMerkleNode;
+                use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
+                use bdk_wallet::bitcoin::hashes::Hash;
+                let mut next: bdk_wallet::bitcoin::block::Header =
+                    deserialize_hex(&header_at(height)).unwrap();
+                next.prev_blockhash = below.block_hash();
+                let mined = self.mined_at(i64::from(height));
+                if !mined.is_empty() {
+                    next.merkle_root = TxMerkleNode::from_byte_array(merkle_of(&mined, 0).0);
+                }
+                next
+            };
+            headers.push(header);
+            below = header;
+        }
+        headers
+    }
+
     /// The transactions the histories put at `height`, in the order
     /// their block holds them: by txid.
     fn mined_at(&self, height: i64) -> Vec<Txid> {
@@ -498,7 +529,11 @@ impl FakeElectrum {
                 let start = param.as_u64().unwrap_or(0) as u32;
                 let count = request["params"][1].as_u64().unwrap_or(0) as u32;
                 let end = start.saturating_add(count).min(state.height + 1);
-                let hex: String = (start..end).map(|height| state.header(height)).collect();
+                let hex: String = state
+                    .headers_between(start, end)
+                    .iter()
+                    .map(serialize_hex)
+                    .collect();
                 json!({ "count": end.saturating_sub(start), "hex": hex, "max": 2016 })
             }
             // Its branch in the block the histories make of its height,

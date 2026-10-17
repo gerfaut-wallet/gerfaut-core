@@ -14,9 +14,35 @@
 //! word, and a bound that kept loosening with it would reach the easiest
 //! target two dozen periods on, a height any server can claim. A header
 //! for a recent block then costs what a block costs a miner, a sixteenth
-//! of it at least. The header is not chained to the others, which would
-//! take every header of its period: one claimed in a period of the first
-//! years of the chain costs that period's work, and no more.
+//! of it at least.
+//!
+//! A header alone costs only its period's work, and a server picks the
+//! height it claims: in the first years of the chain that work is close
+//! to nothing. So over Electrum, a confirmation in a period whose forged
+//! header would cost less than [`CHAIN_BELOW_DIFFICULTY`] is chained: the
+//! headers from its block to the end of its period, one request of 2,016
+//! headers at most, must follow one another up to the hash the
+//! checkpoints give for that block ([`chain_to_checkpoint`]). The periods
+//! read are kept for the session. Esplora has no way to send a run of
+//! headers short of one request per block: over Esplora, a confirmation
+//! is taken on its header's work alone, and one claimed in an early
+//! period costs what forging a header of that period costs. Past the last
+//! checkpoint, there is no hash to chain to either way, and the work of a
+//! recent block is the price of a forged confirmation, as it is for any
+//! wallet that reads headers.
+//!
+//! The table is written again before each release, from the checkpoints
+//! of the latest Electrum release:
+//!
+//! ```text
+//! curl -sSfLo /tmp/checkpoints.json https://raw.githubusercontent.com/spesmilo/electrum/<commit>/electrum/chains/mainnet/checkpoints.json
+//! GERFAUT_WRITE_TARGETS=/tmp/checkpoints.json GERFAUT_TARGETS_COMMIT=<commit> cargo test --lib the_target_table
+//! cargo test --lib chain::proof
+//! ```
+//!
+//! Confirmations a wallet stored before these checks are kept as they
+//! are, never proven again: no release read them the old way, only the
+//! testers' vaults of the unpublished 0.1.0.
 //!
 //! Testnet4 and signet keep the check they had, the easiest target of
 //! the network: a testnet4 block may be mined at that target twenty
@@ -43,7 +69,7 @@ use bdk_wallet::bitcoin::consensus::encode::deserialize;
 use bdk_wallet::bitcoin::hashes::{Hash, sha256d};
 use bdk_wallet::bitcoin::params::Params;
 use bdk_wallet::bitcoin::{
-    CompactTarget, OutPoint, Script, ScriptBuf, Target, Transaction, TxMerkleNode, Txid,
+    BlockHash, CompactTarget, OutPoint, Script, ScriptBuf, Target, Transaction, TxMerkleNode, Txid,
 };
 use electrum_client::GetMerkleRes;
 
@@ -316,4 +342,142 @@ pub(crate) fn forget_proven_coins(server: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     proven.retain(|(_, at, _), _| !at.contains(server));
+}
+
+/// The difficulty under which a header alone does not prove a
+/// confirmation over Electrum, and its block is chained to its period's
+/// checkpoint ([`chain_to_checkpoint`]): 4 × 10^14.
+///
+/// A forged header costs its difficulty times 2^32 hashes. Hashrate rents
+/// for about $50 a day per PH/s, what mining earns at the time of writing
+/// (October 2026: some 3.2 BTC a block at about $100,000, over some
+/// 900 EH/s), which puts 2^32 hashes at about $2.5 × 10^-9, and a header
+/// of this difficulty at about $1,000,000. Every period that has a
+/// checkpoint is easier than that today, the last at 1.26 × 10^14.
+const CHAIN_BELOW_DIFFICULTY: u128 = 400_000_000_000_000;
+
+/// The checkpoint a confirmation at `height` must chain to over
+/// Electrum, when one is needed ([`CHAIN_BELOW_DIFFICULTY`]): the height
+/// and hash of the last block of its period. None on another network
+/// than mainnet, in a period past the checkpoints, or in a period whose
+/// work proves enough.
+pub(crate) fn checkpoint_for(network: Network, height: u32) -> Option<(u32, BlockHash)> {
+    if network != Network::Mainnet {
+        return None;
+    }
+    let period = (height / RETARGET_PERIOD) as usize;
+    let end = targets::MAINNET_ENDS.get(period)?.parse().ok()?;
+    let bits = CompactTarget::from_consensus(targets::MAINNET_BITS[period]);
+    let params = Params::new(network.to_bitcoin());
+    (Target::from_compact(bits).difficulty(&params) < CHAIN_BELOW_DIFFICULTY)
+        .then_some(((period as u32 + 1) * RETARGET_PERIOD - 1, end))
+}
+
+/// The hashes of the blocks from `from` to the end of its period, read
+/// from `headers`, when they follow one another up to the hash the
+/// checkpoints give for that end ([`checkpoint_for`]): the real blocks,
+/// which no amount of work can stand in for. Remembered for the session.
+/// `None` when they do not, or when no checkpoint applies.
+pub(crate) fn chain_to_checkpoint(
+    network: Network,
+    from: u32,
+    headers: &[Header],
+) -> Option<Vec<BlockHash>> {
+    let (end, end_hash) = checkpoint_for(network, from)?;
+    if u32::try_from(headers.len()).ok()? != end.checked_sub(from)? + 1 {
+        return None;
+    }
+    let hashes: Vec<BlockHash> = headers.iter().map(Header::block_hash).collect();
+    let chained = headers
+        .windows(2)
+        .all(|pair| pair[1].prev_blockhash == pair[0].block_hash());
+    if !chained || hashes.last() != Some(&end_hash) {
+        return None;
+    }
+    remember_chained(from, &hashes);
+    Some(hashes)
+}
+
+/// What chaining says of a confirmation proven in the block `hash` at
+/// `height`: [`Proof::Holds`] when no chaining is needed or the block is
+/// the one the chain to the checkpoint holds there, [`Proof::False`] when
+/// it holds another, [`Proof::Unsure`] when that chain could not be read.
+/// `read` holds the chains this sync read, by the height they start at
+/// ([`chain_to_checkpoint`]); the session's are asked too.
+pub(crate) fn chained(
+    network: Network,
+    height: u32,
+    hash: BlockHash,
+    read: &HashMap<u32, Vec<BlockHash>>,
+) -> Proof {
+    let Some((end, _)) = checkpoint_for(network, height) else {
+        return Proof::Holds;
+    };
+    let in_read = read.iter().find_map(|(from, hashes)| {
+        let in_period = *from <= height && from + hashes.len() as u32 - 1 == end;
+        in_period.then(|| hashes[(height - from) as usize])
+    });
+    match in_read.or_else(|| chained_before(height)) {
+        Some(real) if real == hash => Proof::Holds,
+        Some(_) => Proof::False,
+        None => Proof::Unsure,
+    }
+}
+
+/// The chains to the checkpoints that the confirmations of `proven`,
+/// blocks proven at their heights, need and this session has not read:
+/// for each period, the lowest height to read from, and how many headers.
+pub(crate) fn chains_to_read(network: Network, proven: &[(u32, BlockHash)]) -> Vec<(u32, u32)> {
+    let mut lowest: HashMap<u32, (u32, u32)> = HashMap::new();
+    for (height, _) in proven {
+        let Some((end, _)) = checkpoint_for(network, *height) else {
+            continue;
+        };
+        if chained_before(*height).is_some() {
+            continue;
+        }
+        let entry = lowest.entry(end).or_insert((*height, end));
+        entry.0 = entry.0.min(*height);
+    }
+    let mut reads: Vec<(u32, u32)> = lowest
+        .into_values()
+        .map(|(from, end)| (from, end - from + 1))
+        .collect();
+    reads.sort_unstable();
+    reads
+}
+
+/// A chain to a checkpoint: the height it starts at, and the hashes from
+/// there to the end of the period.
+type Chain = (u32, Vec<BlockHash>);
+
+/// The chains to the checkpoints read in this session, by period.
+static CHAINED: LazyLock<Mutex<HashMap<u32, Chain>>> = LazyLock::new(Default::default);
+
+/// Periods kept chained at most: some 64 KiB each.
+const CHAINED_MAX: usize = 64;
+
+/// The block the session's chain to the checkpoints holds at `height`.
+fn chained_before(height: u32) -> Option<BlockHash> {
+    let chained = CHAINED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (from, hashes) = chained.get(&(height / RETARGET_PERIOD))?;
+    hashes.get(height.checked_sub(*from)? as usize).copied()
+}
+
+/// Keeps a chain to a checkpoint for the session, unless one that starts
+/// lower is kept already.
+fn remember_chained(from: u32, hashes: &[BlockHash]) {
+    let mut chained = CHAINED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let period = from / RETARGET_PERIOD;
+    if chained.get(&period).is_some_and(|(kept, _)| *kept <= from) {
+        return;
+    }
+    if chained.len() >= CHAINED_MAX {
+        chained.clear();
+    }
+    chained.insert(period, (from, hashes.to_vec()));
 }
