@@ -21,6 +21,15 @@ use bdk_wallet::miniscript::{Descriptor, Legacy, Miniscript, Segwitv0, Tap};
 /// weight of a signature by any compressed key is the same.
 const ANY_KEY: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
+/// The heaviest standard signature script there is, 1,650 bytes, at four
+/// weight units a byte: more than any multisig a signing device makes,
+/// legacy or segwit. What an input whose signatures weigh what nobody can
+/// tell is counted at, for the least its fee rate can plausibly be.
+pub const PLAUSIBLE_HEAVIEST: Satisfaction = Satisfaction {
+    weight: 4 * 1_650,
+    witness: false,
+};
+
 /// What signing adds to one input: its weight, counted the way
 /// miniscript's `max_weight_to_satisfy` counts it (the input as a segwit
 /// transaction serializes it, from an empty script and an empty

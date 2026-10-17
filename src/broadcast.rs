@@ -910,16 +910,24 @@ pub fn build_preview(
     // signatures are weight still to come: counted in when every input
     // says what it will take, and otherwise the rate on the skeleton is
     // the most it can be.
-    let (signed_vsize, fee_rate_basis) = if decoded.ready {
-        (vsize, FeeRateBasis::Exact)
+    // Past that ceiling, the least the rate can plausibly be: each input
+    // whose signatures weigh what nobody can tell counted at the heaviest
+    // standard signature script there is. A fee far above what the chain
+    // asks for even then is one to say.
+    let missing = missing_signatures(decoded, input_facts, &spent);
+    let (signed_vsize, fee_rate_basis, plausible_vsize) = if decoded.ready {
+        (vsize, FeeRateBasis::Exact, vsize)
+    } else if missing.iter().all(Option::is_some) {
+        let known: Vec<Option<Satisfaction>> = missing.into_iter().flatten().collect();
+        let once_signed = signing::weight_once_signed(tx, &known).to_vbytes_ceil();
+        (once_signed, FeeRateBasis::Estimated, once_signed)
     } else {
-        match missing_signatures(decoded, input_facts, &spent) {
-            Some(missing) => (
-                signing::weight_once_signed(tx, &missing).to_vbytes_ceil(),
-                FeeRateBasis::Estimated,
-            ),
-            None => (vsize, FeeRateBasis::UpperBound),
-        }
+        let heaviest: Vec<Option<Satisfaction>> = missing
+            .into_iter()
+            .map(|need| need.unwrap_or(Some(signing::PLAUSIBLE_HEAVIEST)))
+            .collect();
+        let plausible = signing::weight_once_signed(tx, &heaviest).to_vbytes_ceil();
+        (vsize, FeeRateBasis::UpperBound, plausible)
     };
     let fee_rate_sat_vb = fee_sats.map(|fee| fee as f64 / signed_vsize as f64);
 
@@ -1182,14 +1190,17 @@ pub fn build_preview(
         )),
         (Some(fee), Some(rate), Some(total)) => {
             // A rate read on a skeleton whose signatures weigh what nobody
-            // can tell is only a ceiling: too loose to call anything far
-            // above. The share of the inputs still speaks for the fee.
-            let measured = match fee_rate_basis {
-                FeeRateBasis::Exact => Some(format!("{rate:.0} sat/vB")),
-                FeeRateBasis::Estimated => Some(format!("about {rate:.0} sat/vB once signed")),
-                FeeRateBasis::UpperBound => None,
+            // can tell is only a ceiling: the caution goes by the least it
+            // can plausibly be once signed, and says so.
+            let (judged, measured) = match fee_rate_basis {
+                FeeRateBasis::Exact => (rate, format!("{rate:.0} sat/vB")),
+                FeeRateBasis::Estimated => (rate, format!("about {rate:.0} sat/vB once signed")),
+                FeeRateBasis::UpperBound => {
+                    let least = fee as f64 / plausible_vsize as f64;
+                    (least, format!("at least {least:.0} sat/vB once signed"))
+                }
             };
-            if let Some(measured) = measured.filter(|_| rate > HIGH_FEE_RATE_SAT_VB) {
+            if judged > HIGH_FEE_RATE_SAT_VB {
                 warnings.push(TxWarning::new(
                     TxWarningKind::HighFeeRate,
                     format!(
@@ -1306,15 +1317,15 @@ pub fn build_preview(
 }
 
 /// What each input still lacks before the transaction is the one the
-/// network takes: `None` for an input that carries it already, and no
-/// list at all when one input's lack cannot be told. A finalized input
-/// counts as it is; a watched wallet's coin, as its descriptor allows;
-/// any other, by its script and what the PSBT carries about it.
+/// network takes: `Some(None)` for an input that carries it already,
+/// `None` for one whose lack cannot be told. A finalized input counts as
+/// it is; a watched wallet's coin, as its descriptor allows; any other,
+/// by its script and what the PSBT carries about it.
 fn missing_signatures(
     decoded: &DecodedTx,
     input_facts: &[InputFacts],
     spent: &[Option<TxOut>],
-) -> Option<Vec<Option<Satisfaction>>> {
+) -> Vec<Option<Option<Satisfaction>>> {
     decoded
         .tx
         .input
@@ -3554,6 +3565,50 @@ mod tests {
                 .all(|w| w.severity == TxSeverity::Info),
             "{:?}",
             preview.warnings
+        );
+    }
+
+    /// A ceiling is no reason to keep quiet about a rate no signature can
+    /// bring down to sense: counted at the heaviest standard signature
+    /// script, the least the rate can be is still far above what the chain
+    /// asks for, and the caution says so, as the least it can be.
+    #[test]
+    fn a_ceiling_far_above_reason_is_still_called_out() {
+        let p2wsh = ScriptBuf::new_p2wsh(&bdk_wallet::bitcoin::WScriptHash::from_byte_array(
+            [0x55; 32],
+        ));
+        let mut tx = unsigned_tx();
+        tx.output.truncate(1);
+        tx.output[0].value = Amount::from_sat(10_000);
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(10_000_000),
+            script_pubkey: p2wsh,
+        });
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        let preview = build_preview(
+            &decoded,
+            Network::Signet,
+            &[InputFacts::default()],
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(preview.fee_rate_basis, FeeRateBasis::UpperBound);
+        let high = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::HighFeeRate)
+            .expect("even the least it can be is far too high");
+        // A signature script, no witness: the skeleton's weight and its own.
+        let skeleton = decoded.tx.weight().to_wu();
+        let least =
+            9_990_000.0 / ((skeleton + signing::PLAUSIBLE_HEAVIEST.weight).div_ceil(4)) as f64;
+        assert!(
+            high.message
+                .contains(&format!("at least {least:.0} sat/vB once signed")),
+            "{}",
+            high.message
         );
     }
 }
