@@ -12,6 +12,7 @@ pub(crate) mod sync;
 
 use page::PageTx;
 
+use crate::chain::Failure;
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
 use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
@@ -357,22 +358,37 @@ impl Client {
             .await
     }
 
-    /// Hands a transaction to the server. The node's refusal comes back
-    /// as the error, from a body held to a few kilobytes.
-    async fn post_tx(&self, tx: &Transaction) -> Result<(), String> {
+    /// Hands a transaction to the server, and returns the txid it
+    /// answers with. The node's refusal comes back as a refusal, from a
+    /// body held to a few kilobytes; a rate limit or a server error, as a
+    /// failure of the way there.
+    async fn post_tx(&self, tx: &Transaction) -> Result<Txid, Failure> {
         let response = self
             .http
             .post(format!("{}/tx", self.base))
             .body(bdk_wallet::bitcoin::consensus::encode::serialize_hex(tx))
             .send()
             .await
-            .map_err(|e| describe_request(&e, self.budget))?;
-        // Accepted: whatever else the server says is not read.
-        if response.status().is_success() {
-            return Ok(());
+            .map_err(|e| Failure::Transport(describe_request(&e, self.budget)))?;
+        let status = response.status().as_u16();
+        let body = self
+            .body(response, REFUSAL_MAX)
+            .await
+            .map_err(Failure::Transport)?;
+        let text = String::from_utf8_lossy(&body);
+        if (200..300).contains(&status) {
+            // Esplora answers with the txid, and nothing else.
+            return text.trim().parse().map_err(|_| {
+                Failure::Refused(format!(
+                    "the server answered {} instead of a txid",
+                    crate::chain::server_words(text.trim())
+                ))
+            });
         }
-        let body = self.body(response, REFUSAL_MAX).await?;
-        Err(node_message(&String::from_utf8_lossy(&body)))
+        if passing(status) {
+            return Err(Failure::Transport(describe_status(status)));
+        }
+        Err(Failure::Refused(node_message(&text)))
     }
 }
 
@@ -568,6 +584,30 @@ fn rate_limited(pause: Duration) -> String {
         describe_status(429),
         pause.as_secs()
     )
+}
+
+/// Whether a status says the server could not serve now, rather than
+/// what it thinks of the request: a rate limit or a server error. The
+/// next endpoint may be asked then, and only then.
+fn passing(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
+/// A request that failed, as the endpoints of a transaction to send read
+/// it ([`Failure`]): a status of the server that is not a passing one
+/// ([`passing`]), a 403 or a 400, is its answer; anything else, a
+/// connection, a time limit, a server error or a rate limit, is the way
+/// there failing. `text` is what this client said of the failure, and
+/// a status is spelled the way [`describe_status`] spells it.
+pub(crate) fn failure(text: String) -> Failure {
+    let status = text
+        .strip_prefix("HTTP ")
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse::<u16>().ok());
+    match status {
+        Some(status) if !passing(status) => Failure::Refused(text),
+        _ => Failure::Transport(text),
+    }
 }
 
 fn describe_status(status: u16) -> String {
@@ -995,7 +1035,7 @@ pub(crate) fn script_address(
 /// mempool instances) or `sendrawtransaction RPC error -26: ...`
 /// (blockstream.info). The message is kept, the wrapping dropped.
 /// Anything else is a failure to reach the node, described as such.
-pub(crate) async fn broadcast(client: &Client, tx: &Transaction) -> Result<(), String> {
+pub(crate) async fn broadcast(client: &Client, tx: &Transaction) -> Result<Txid, Failure> {
     client.post_tx(tx).await
 }
 
@@ -1040,8 +1080,8 @@ pub(crate) struct PrevoutFacts {
 pub(crate) async fn fetch_prevout(
     client: &Client,
     outpoint: OutPoint,
-) -> Result<PrevoutFacts, String> {
-    let tx = client.tx(&outpoint.txid).await?;
+) -> Result<PrevoutFacts, Failure> {
+    let tx = client.tx(&outpoint.txid).await.map_err(failure)?;
     let Some(tx) = tx else {
         return Ok(PrevoutFacts {
             txout: None,
@@ -1049,7 +1089,7 @@ pub(crate) async fn fetch_prevout(
             spent_by: None,
         });
     };
-    let txout = crate::chain::output_at(&tx, outpoint)?;
+    let txout = crate::chain::output_at(&tx, outpoint).map_err(Failure::Refused)?;
     let status = client
         .output_status(&outpoint.txid, outpoint.vout)
         .await
@@ -1127,6 +1167,39 @@ mod error_tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    /// A status the server answers a transaction with is its answer, a
+    /// 400 or a 403; a rate limit or a server error is the way there
+    /// failing, and so is anything that is no status at all.
+    #[test]
+    fn only_a_passing_status_is_a_failure_of_the_way_there() {
+        for status in [400, 401, 403, 404, 409] {
+            assert_eq!(
+                failure(describe_status(status)),
+                Failure::Refused(describe_status(status))
+            );
+        }
+        for status in [429, 500, 502, 503, 504] {
+            assert_eq!(
+                failure(describe_status(status)),
+                Failure::Transport(describe_status(status))
+            );
+        }
+        assert_eq!(
+            failure(rate_limited(Duration::from_secs(120))),
+            Failure::Transport(rate_limited(Duration::from_secs(120)))
+        );
+        for text in [
+            "could not connect",
+            "timed out after 60 s",
+            "host not found",
+        ] {
+            assert_eq!(
+                failure(text.to_owned()),
+                Failure::Transport(text.to_owned())
+            );
+        }
+    }
 
     /// Budgets short enough to test: the connection has five seconds,
     /// the whole request one.
@@ -1322,7 +1395,7 @@ mod error_tests {
         };
         assert_eq!(
             broadcast(&client, &tx).await.unwrap_err(),
-            "the server sent an answer longer than 64 KiB"
+            Failure::Transport("the server sent an answer longer than 64 KiB".to_owned())
         );
     }
 

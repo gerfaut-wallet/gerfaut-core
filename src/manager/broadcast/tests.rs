@@ -2,6 +2,8 @@
 //! for, against an Esplora on loopback or none at all; and the
 //! broadcasts the vault keeps once the network took them.
 
+use std::sync::Arc;
+
 use super::*;
 use crate::chain::BackendConfig;
 use crate::manager::tests::support::manager;
@@ -1019,63 +1021,120 @@ async fn a_height_lock_is_judged_on_the_backends_tip() {
 
 // --- recent broadcasts ---------------------------------------------------
 
-/// An Esplora on loopback that takes every transaction posted to it, or
-/// refuses each in the node's words when `refusal` says so.
-async fn esplora_taking(refusal: Option<&'static str>) -> String {
+/// What the loopback Esplora below does with a transaction posted to it.
+#[derive(Clone, Copy)]
+enum Takes {
+    /// Takes it, and answers with its txid, as Esplora does.
+    Yes,
+    /// Takes it, and answers with a txid it does not hash to.
+    WrongTxid,
+    /// Refuses it, in the node's words.
+    No(&'static str),
+    /// Refuses it in the node's words, and hands it over when asked: a
+    /// node that already holds it.
+    Holds(&'static str),
+    /// Fails with a server error, whatever is asked.
+    Down,
+}
+
+/// An Esplora on loopback that does with every transaction posted to it
+/// what `takes` says, and hands over the last one posted when asked for
+/// it by txid if it holds it. Returns its address and every request it
+/// had, as `METHOD path`.
+async fn esplora_taking(takes: Takes) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = asked.clone();
     tokio::spawn(async move {
+        let mut held: Option<bdk_wallet::bitcoin::Transaction> = None;
         while let Ok((mut stream, _)) = listener.accept().await {
             // The whole request, its body too: an answer sent over bytes
             // left unread would go with a reset.
             let mut request = Vec::new();
             let mut buf = [0u8; 4096];
+            let mut end = 0;
             loop {
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 if n == 0 {
                     break;
                 }
                 request.extend_from_slice(&buf[..n]);
-                let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                let Some(found) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
                     continue;
                 };
-                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                end = found;
+                let head = String::from_utf8_lossy(&request[..found]).to_ascii_lowercase();
                 let length: usize = head
                     .lines()
                     .find_map(|line| line.strip_prefix("content-length:"))
                     .and_then(|value| value.trim().parse().ok())
                     .unwrap_or(0);
-                if request.len() >= end + 4 + length {
+                if request.len() >= found + 4 + length {
                     break;
                 }
             }
-            let (status, body) = match refusal {
-                None => ("200 OK", "accepted"),
-                Some(words) => ("400 Bad Request", words),
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
-                 Connection: close\r\n\r\n{body}",
-                body.len()
+            let head = String::from_utf8_lossy(&request[..end]).into_owned();
+            let line: Vec<&str> = head.split_whitespace().take(2).collect();
+            let (method, path) = (
+                line.first().copied().unwrap_or(""),
+                line.get(1).copied().unwrap_or(""),
             );
-            let _ = stream.write_all(response.as_bytes()).await;
+            log.lock().unwrap().push(format!("{method} {path}"));
+            let body =
+                String::from_utf8_lossy(request.get(end + 4..).unwrap_or_default()).into_owned();
+            let (status, answer): (&str, Vec<u8>) = match (takes, method) {
+                (Takes::Down, _) => ("503 Service Unavailable", b"down".to_vec()),
+                (_, "POST") => {
+                    let tx = bdk_wallet::bitcoin::consensus::encode::deserialize_hex::<
+                        bdk_wallet::bitcoin::Transaction,
+                    >(body.trim())
+                    .unwrap();
+                    let txid = tx.compute_txid().to_string();
+                    match takes {
+                        Takes::Yes => ("200 OK", txid.into_bytes()),
+                        Takes::WrongTxid => ("200 OK", "77".repeat(32).into_bytes()),
+                        Takes::No(words) => ("400 Bad Request", words.as_bytes().to_vec()),
+                        Takes::Holds(words) => {
+                            held = Some(tx);
+                            ("400 Bad Request", words.as_bytes().to_vec())
+                        }
+                        Takes::Down => unreachable!(),
+                    }
+                }
+                _ => match &held {
+                    Some(tx) if path == format!("/api/tx/{}/raw", tx.compute_txid()) => {
+                        ("200 OK", bdk_wallet::bitcoin::consensus::serialize(tx))
+                    }
+                    _ => ("404 Not Found", b"not found".to_vec()),
+                },
+            };
+            let mut response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                answer.len()
+            )
+            .into_bytes();
+            response.extend(answer);
+            let _ = stream.write_all(&response).await;
             let _ = stream.shutdown().await;
         }
     });
-    format!("http://{address}/api")
+    (format!("http://{address}/api"), asked)
 }
 
 /// A manager whose regtest backend is [`esplora_taking`].
 async fn sending(dir: &std::path::Path, refusal: Option<&'static str>) -> WalletManager {
     let manager = manager(dir).await;
+    let takes = refusal.map_or(Takes::Yes, Takes::No);
     manager
         .set_backend(
             Network::Regtest,
             BackendConfig::CustomEsplora {
-                url: esplora_taking(refusal).await,
+                url: esplora_taking(takes).await.0,
                 own_node: false,
             },
         )
@@ -1206,4 +1265,314 @@ async fn a_broadcast_kept_where_no_save_goes_through_is_still_answered() {
     let kept = reopened.recent_broadcasts(Network::Regtest).await;
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].txid, report.txid);
+}
+
+// --- one operator for what is sent -----------------------------------------
+
+/// A manager on regtest whose backend is the automatic one, its rotation
+/// `urls` in that order, and the stand-in that keeps it so.
+async fn rotating(
+    dir: &std::path::Path,
+    urls: &[String],
+) -> (crate::chain::public::StandIn, WalletManager) {
+    let stand_in = crate::chain::public::stand_in(urls, &[]);
+    let manager = manager(dir).await;
+    manager
+        .set_backend(Network::Regtest, BackendConfig::Public { server: None })
+        .await
+        .unwrap();
+    (stand_in, manager)
+}
+
+/// An address on loopback nothing listens on: a server that is down.
+async fn nobody_there() -> String {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{address}/api")
+}
+
+/// A node's refusal is the answer: the broadcast stops there, says it,
+/// and the next operator never sees the transaction. A server that
+/// cannot be reached, or fails to serve, passes it on.
+#[tokio::test]
+async fn a_refusal_ends_the_broadcast_and_only_a_dead_server_passes_it_on() {
+    let refusal = "sendrawtransaction RPC error -26: min relay fee not met";
+    let (failing, failing_log) = esplora_taking(Takes::Down).await;
+    let (refusing, refusing_log) = esplora_taking(Takes::No(refusal)).await;
+    let (taking, taking_log) = esplora_taking(Takes::Yes).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager) = rotating(
+        dir.path(),
+        &[nobody_there().await, failing, refusing, taking.clone()],
+    )
+    .await;
+    let error = manager
+        .broadcast_transaction(Network::Regtest, &signed(1))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("min relay fee not met"),
+        "{error}"
+    );
+    assert!(!failing_log.lock().unwrap().is_empty());
+    assert_eq!(refusing_log.lock().unwrap().len(), 1);
+    assert!(
+        taking_log.lock().unwrap().is_empty(),
+        "a refused transaction went to a second operator"
+    );
+    assert!(manager.recent_broadcasts(Network::Regtest).await.is_empty());
+
+    // Nothing refuses it: the first server that answers takes it.
+    let dir = tempfile::tempdir().unwrap();
+    drop(_stand_in);
+    let (_stand_in, manager) = rotating(dir.path(), &[nobody_there().await, taking]).await;
+    let report = manager
+        .broadcast_transaction(Network::Regtest, &signed(1))
+        .await
+        .unwrap();
+    assert_eq!(report.backend, "127.0.0.1");
+    assert_eq!(taking_log.lock().unwrap().len(), 1);
+}
+
+/// A server that answers with a txid the transaction does not hash to
+/// did not say it took that transaction: no send, nothing kept, and the
+/// answer is said.
+#[tokio::test]
+async fn a_txid_the_core_did_not_compute_is_no_send() {
+    let (url, _) = esplora_taking(Takes::WrongTxid).await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    manager
+        .set_backend(
+            Network::Regtest,
+            BackendConfig::CustomEsplora {
+                url,
+                own_node: false,
+            },
+        )
+        .await
+        .unwrap();
+    let error = manager
+        .broadcast_transaction(Network::Regtest, &signed(1))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("answered with the txid"),
+        "{error}"
+    );
+    assert!(manager.recent_broadcasts(Network::Regtest).await.is_empty());
+}
+
+/// A node that says it already holds the transaction did not refuse it:
+/// the same server is asked for it, and when it hands over the very
+/// transaction, the send is done and kept. One that says so and cannot
+/// show it has refused.
+#[tokio::test]
+async fn a_transaction_the_node_already_holds_counts_as_sent() {
+    for (words, holds) in [
+        (
+            "sendrawtransaction RPC error -27: Transaction outputs already in utxo set",
+            true,
+        ),
+        (
+            "sendrawtransaction RPC error -26: txn-already-in-mempool",
+            true,
+        ),
+        (
+            "sendrawtransaction RPC error -26: txn-already-in-mempool",
+            false,
+        ),
+    ] {
+        let (url, log) = esplora_taking(if holds {
+            Takes::Holds(words)
+        } else {
+            Takes::No(words)
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        manager
+            .set_backend(
+                Network::Regtest,
+                BackendConfig::CustomEsplora {
+                    url,
+                    own_node: false,
+                },
+            )
+            .await
+            .unwrap();
+        let sent = manager
+            .broadcast_transaction(Network::Regtest, &signed(1))
+            .await;
+        assert_eq!(sent.is_ok(), holds, "{words}: {sent:?}");
+        assert_eq!(
+            manager.recent_broadcasts(Network::Regtest).await.len(),
+            usize::from(holds)
+        );
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.starts_with("GET /api/tx/")),
+            "the server was asked for the transaction"
+        );
+    }
+}
+
+/// The same rules on an Electrum server: its txid answer, a server short
+/// of memory asked again after a moment rather than read as a refusal,
+/// and a transaction it already holds counted as sent.
+#[tokio::test]
+async fn electrum_takes_it_after_a_moment_or_already_holds_it() {
+    use crate::testkit::FakeElectrum;
+
+    let server = FakeElectrum::start().await;
+    server
+        .state
+        .lock()
+        .unwrap()
+        .busy
+        .insert("blockchain.transaction.broadcast", 1);
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    manager
+        .set_backend(Network::Regtest, server.backend())
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let report = manager
+        .broadcast_transaction(Network::Regtest, &signed(1))
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+    assert_eq!(report.backend, "127.0.0.1");
+
+    // Already in a block: the server holds it and hands it over.
+    server.state.lock().unwrap().refuse.insert(
+        "blockchain.transaction.broadcast",
+        "sendrawtransaction RPC error -27: Transaction outputs already in utxo set".to_owned(),
+    );
+    manager
+        .broadcast_transaction(Network::Regtest, &signed(1))
+        .await
+        .unwrap();
+    // A refusal that is one stays one.
+    let error = manager
+        .broadcast_transaction(Network::Regtest, &signed(2))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("already in utxo set"), "{error}");
+}
+
+/// An Electrum server that refuses to hand over the transaction behind a
+/// coin, for any reason but not having it, has not said the coin is
+/// unknown: it stays unchecked. One that says it has no such
+/// transaction has.
+#[tokio::test]
+async fn an_electrum_refusal_is_not_an_unknown_coin() {
+    use crate::broadcast::TxWarningKind;
+    use crate::testkit::FakeElectrum;
+
+    for (refusal, unknown) in [(Some("history too large"), false), (None, true)] {
+        let server = FakeElectrum::start().await;
+        if let Some(words) = refusal {
+            server
+                .state
+                .lock()
+                .unwrap()
+                .refuse
+                .insert("blockchain.transaction.get", words.to_owned());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let manager = manager(dir.path()).await;
+        manager
+            .set_backend(Network::Regtest, server.backend())
+            .await
+            .unwrap();
+        let preview = manager
+            .preview_transaction(&signed(1), Network::Regtest)
+            .await
+            .unwrap();
+        let caution = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InputUnknown)
+            .expect("the coin is named");
+        assert_eq!(
+            caution.message.contains("was not found"),
+            unknown,
+            "{}",
+            caution.message
+        );
+        assert_eq!(
+            caution.message.contains("could not be checked"),
+            !unknown,
+            "{}",
+            caution.message
+        );
+    }
+}
+
+/// The preview keeps to the first operator that answers: a refusal about
+/// a coin leaves it unchecked rather than taking it to the next, and
+/// only a server that cannot be reached passes its coins on.
+#[tokio::test]
+async fn the_preview_asks_a_second_operator_only_when_the_first_is_down() {
+    use crate::broadcast::TxWarningKind;
+    use crate::testkit::{nowhere, script, transaction};
+    use bdk_wallet::bitcoin::OutPoint;
+
+    let funding = transaction(&[nowhere(1, 0)], &[(script(3).as_str(), 50_000)]);
+    let pasted = transaction(
+        &[OutPoint::new(funding.compute_txid(), 0)],
+        &[(script(9).as_str(), 49_000)],
+    );
+    // A server that refuses every request: 403, its answer.
+    let refusing = {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        format!("http://{address}/api")
+    };
+    let knowing = esplora_knowing(funding.clone(), Unknown::NotFound).await;
+    for (first, answered) in [(refusing, false), (nobody_there().await, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_stand_in, manager) = rotating(dir.path(), &[first, knowing.clone()]).await;
+        let preview = manager
+            .preview_transaction(&witnessed(pasted.clone()), Network::Regtest)
+            .await
+            .unwrap();
+        assert_eq!(
+            preview.inputs[0].value_sats.is_some(),
+            answered,
+            "{:?}",
+            preview.warnings
+        );
+        assert_eq!(
+            preview
+                .warnings
+                .iter()
+                .any(|w| w.kind == TxWarningKind::InputUnknown),
+            !answered,
+            "{:?}",
+            preview.warnings
+        );
+    }
 }

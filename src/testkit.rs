@@ -449,6 +449,23 @@ impl FakeElectrum {
                     })
                     .collect(),
             ),
+            // Taken, and held from then on: its txid is the answer.
+            "blockchain.transaction.broadcast" => {
+                let tx = param
+                    .as_str()
+                    .and_then(|hex| {
+                        bdk_wallet::bitcoin::consensus::encode::deserialize_hex::<Transaction>(hex)
+                            .ok()
+                    });
+                match tx {
+                    Some(tx) => {
+                        let txid = tx.compute_txid();
+                        state.txs.insert(txid, serialize_hex(&tx));
+                        json!(txid.to_string())
+                    }
+                    None => return refusal("TX decode failed"),
+                }
+            }
             "blockchain.transaction.get" => {
                 let found = param
                     .as_str()

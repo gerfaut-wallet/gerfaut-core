@@ -29,6 +29,7 @@ use electrum_client::raw_client::RawClient;
 use electrum_client::socks::Socks5Stream;
 use electrum_client::{self, ElectrumApi, Param};
 
+use super::Failure;
 use super::tls::{self, ConnectError, Verdict};
 
 pub(crate) mod address;
@@ -654,36 +655,106 @@ fn describe_io(error: &std::io::Error, timeout: Duration) -> String {
 
 // --- broadcast ------------------------------------------------------------
 
+/// Hands a transaction to the server, and returns the txid it answers
+/// with. A server short of memory is asked again once ([`patiently`]).
 pub(crate) async fn broadcast(
     target: &Target,
     tx: &Transaction,
     proxy: Option<&str>,
-) -> Result<Txid, String> {
+) -> Result<Txid, Failure> {
     let tx = tx.clone();
     let timeout = timeout_for(target);
-    run(target, proxy, call_deadline(target), move |client| {
-        client
-            .transaction_broadcast(&tx)
-            .map_err(|e| broadcast_error(timeout, &e))
+    on_one(target, proxy, move |client| {
+        patiently(|| client.transaction_broadcast(&tx)).map_err(|e| failure(&e, timeout))
     })
     .await
 }
 
-/// Electrum returns the node's refusal as a protocol error whose
-/// message is the reason; keep that. Anything else is a failure to
-/// reach the node, described as such.
-fn broadcast_error(timeout: Duration, error: &electrum_client::Error) -> String {
+/// `operation`, its own failures as it says them, and the connection's
+/// as failures of the way there.
+async fn on_one<T: Send + 'static>(
+    target: &Target,
+    proxy: Option<&str>,
+    operation: impl FnOnce(&Connection) -> Result<T, Failure> + Send + 'static,
+) -> Result<T, Failure> {
+    run(target, proxy, call_deadline(target), move |client| {
+        Ok(operation(client))
+    })
+    .await
+    .unwrap_or_else(|text| Err(Failure::Transport(text)))
+}
+
+/// A failed call, as the endpoints of a transaction to send read it
+/// ([`Failure`]). An error the server answers with is its answer, the
+/// refusal of the node behind it among them, in the node's words; but a
+/// server short of memory ([`out_of_budget`]) still after the second try
+/// is one that cannot serve now. An answer that is not the protocol is
+/// the server's too. The rest is the way there failing.
+fn failure(error: &electrum_client::Error, timeout: Duration) -> Failure {
+    use electrum_client::Error;
     match error {
-        electrum_client::Error::Protocol(value) => {
+        Error::AllAttemptsErrored(errors) => match errors.last() {
+            Some(inner) => failure(inner, timeout),
+            None => Failure::Transport(describe(error, timeout)),
+        },
+        Error::Protocol(value) if out_of_budget(value) => {
+            Failure::Transport(describe(error, timeout))
+        }
+        Error::Protocol(value) => {
             let text = value
                 .get("message")
                 .and_then(|m| m.as_str())
                 .map(str::to_owned)
                 .unwrap_or_else(|| value.to_string());
-            crate::chain::esplora::node_message(&text)
+            Failure::Refused(crate::chain::esplora::node_message(&text))
         }
-        other => describe(other, timeout),
+        Error::JSON(_) | Error::Hex(_) | Error::Bitcoin(_) | Error::InvalidResponse(_) => {
+            Failure::Refused(describe(error, timeout))
+        }
+        other => Failure::Transport(describe(other, timeout)),
     }
+}
+
+/// Whether an error says the server has no such transaction, in the
+/// words of the servers there are: Fulcrum, ElectrumX and electrs pass
+/// on the node's "No such mempool or blockchain transaction", the electrs
+/// of Blockstream and mempool.space say "missing transaction" or "not
+/// found". Any other refusal is not that.
+fn no_such_transaction(error: &electrum_client::Error) -> bool {
+    match error {
+        electrum_client::Error::AllAttemptsErrored(errors) => {
+            errors.last().is_some_and(no_such_transaction)
+        }
+        electrum_client::Error::Protocol(value) => {
+            let words = words(value).to_ascii_lowercase();
+            [
+                "no such mempool or blockchain transaction",
+                "missing transaction",
+                "not found",
+            ]
+            .iter()
+            .any(|phrase| words.contains(phrase))
+        }
+        _ => false,
+    }
+}
+
+/// The transaction `txid` as the server holds it, `None` when it says it
+/// has no such transaction.
+pub(crate) async fn fetch_tx(
+    target: &Target,
+    txid: Txid,
+    proxy: Option<&str>,
+) -> Result<Option<Transaction>, Failure> {
+    let timeout = timeout_for(target);
+    on_one(target, proxy, move |client| {
+        match patiently(|| client.transaction_get(&txid)) {
+            Ok(tx) => Ok(Some(tx)),
+            Err(error) if no_such_transaction(&error) => Ok(None),
+            Err(error) => Err(failure(&error, timeout)),
+        }
+    })
+    .await
 }
 
 /// Transactions of a script's history read, at most, to find the one
@@ -702,13 +773,16 @@ pub(crate) async fn fetch_prevout(
     target: &Target,
     outpoint: OutPoint,
     proxy: Option<&str>,
-) -> Result<crate::chain::PrevoutFacts, String> {
-    let fail = failed(target);
-    run(target, proxy, call_deadline(target), move |client| {
-        let txout = match client.transaction_get(&outpoint.txid) {
-            Ok(tx) => crate::chain::output_at(&tx, outpoint)?,
-            Err(electrum_client::Error::Protocol(_)) => None,
-            Err(error) => return Err(fail(error)),
+) -> Result<crate::chain::PrevoutFacts, Failure> {
+    let timeout = timeout_for(target);
+    on_one(target, proxy, move |client| {
+        // Only a server that says it has no such transaction says the
+        // coin is unknown; any other refusal is a refusal, and one short
+        // of memory is asked again.
+        let txout = match patiently(|| client.transaction_get(&outpoint.txid)) {
+            Ok(tx) => crate::chain::output_at(&tx, outpoint).map_err(Failure::Refused)?,
+            Err(error) if no_such_transaction(&error) => None,
+            Err(error) => return Err(failure(&error, timeout)),
         };
         let (spent, spent_by) = match &txout {
             Some(txout) => spent_status(client, outpoint, &txout.script_pubkey),
@@ -732,7 +806,7 @@ fn spent_status(
     outpoint: OutPoint,
     script: &bdk_wallet::bitcoin::Script,
 ) -> (Option<bool>, Option<crate::broadcast::SpentBy>) {
-    let Ok(coins) = client.script_list_unspent(script) else {
+    let Ok(coins) = patiently(|| client.script_list_unspent(script)) else {
         return (None, None);
     };
     if coins
@@ -741,7 +815,7 @@ fn spent_status(
     {
         return (Some(false), None);
     }
-    let Ok(history) = client.script_get_history(script) else {
+    let Ok(history) = patiently(|| client.script_get_history(script)) else {
         return (None, None);
     };
     // The newest first: a coin a preview finds spent is most often spent
@@ -753,7 +827,8 @@ fn spent_status(
         .map(|entry| (entry.tx_hash, entry.height))
         .collect();
     let read = candidates.len().min(SPENDER_LOOKUPS);
-    let Ok(txs) = client.batch_transaction_get(candidates[..read].iter().map(|(txid, _)| txid))
+    let Ok(txs) =
+        patiently(|| client.batch_transaction_get(candidates[..read].iter().map(|(txid, _)| txid)))
     else {
         return (None, None);
     };
@@ -782,13 +857,12 @@ fn spent_status(
 }
 
 /// The height of the server's tip.
-pub(crate) async fn tip_height(target: &Target, proxy: Option<&str>) -> Result<u32, String> {
-    let fail = failed(target);
-    run(target, proxy, call_deadline(target), move |client| {
-        client
-            .block_headers_subscribe()
+pub(crate) async fn tip_height(target: &Target, proxy: Option<&str>) -> Result<u32, Failure> {
+    let timeout = timeout_for(target);
+    on_one(target, proxy, move |client| {
+        patiently(|| client.block_headers_subscribe())
             .map(|header| header.height as u32)
-            .map_err(fail)
+            .map_err(|e| failure(&e, timeout))
     })
     .await
 }
@@ -806,10 +880,14 @@ pub(crate) async fn tx_standing(
 ) -> Result<(bool, Option<u32>, u32), String> {
     let fail = failed(target);
     run(target, proxy, call_deadline(target), move |client| {
-        let tip = client.block_headers_subscribe().map_err(&fail)?.height as u32;
+        let tip = patiently(|| client.block_headers_subscribe())
+            .map_err(&fail)?
+            .height as u32;
         let mut refused = None;
         for script in &scripts {
-            let history = match client.script_get_history(script) {
+            // A server short of memory is asked again first: the next
+            // script is for one that refuses this script's history.
+            let history = match patiently(|| client.script_get_history(script)) {
                 Ok(history) => history,
                 Err(error @ electrum_client::Error::Protocol(_)) => {
                     refused = Some(error);
@@ -1529,5 +1607,80 @@ mod tests {
             "2001:db8::1:50002"
         );
         assert_eq!(certificate_key("[2001:db8::1]:50002"), "2001:db8::1:50002");
+    }
+
+    /// What an Electrum server answers about a transaction to send is its
+    /// answer, the node's refusal in the node's words; a server still
+    /// short of memory, a connection that fails, is the way there.
+    #[test]
+    fn a_refusal_is_told_from_a_failure_of_the_way_there() {
+        use electrum_client::Error;
+        use serde_json::json;
+        let refused = Error::Protocol(json!({
+            "code": 2, "message": "sendrawtransaction RPC error -26: min relay fee not met",
+        }));
+        assert_eq!(
+            failure(&refused, TIMEOUT),
+            Failure::Refused("min relay fee not met".to_owned())
+        );
+        let busy = Error::Protocol(json!({
+            "code": 2, "message": "response budget exhausted, retry later",
+        }));
+        assert!(matches!(failure(&busy, TIMEOUT), Failure::Transport(_)));
+        let cut = Error::AllAttemptsErrored(vec![Error::IOError(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        ))]);
+        assert!(matches!(failure(&cut, TIMEOUT), Failure::Transport(_)));
+    }
+
+    /// A coin is unknown only when the server says it has no such
+    /// transaction, in the words of the servers there are; a server that
+    /// refuses for another reason has said nothing of the coin.
+    #[test]
+    fn only_no_such_transaction_makes_a_coin_unknown() {
+        use electrum_client::Error;
+        use serde_json::json;
+        for message in [
+            "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.",
+            "daemon error: DaemonError({'code': -5, 'message': 'No such mempool or blockchain transaction. Use gettransaction for wallet transactions.'})",
+            "missing transaction",
+            "tx not found",
+        ] {
+            let error = Error::Protocol(json!({ "code": 1, "message": message }));
+            assert!(no_such_transaction(&error), "{message}");
+        }
+        for message in [
+            "response budget exhausted, retry later",
+            "excessive resource usage",
+        ] {
+            let error = Error::Protocol(json!({ "code": 2, "message": message }));
+            assert!(!no_such_transaction(&error), "{message}");
+        }
+    }
+
+    /// The standing of a sent transaction: a history the server turns
+    /// down for want of memory is asked again, not passed over.
+    #[tokio::test]
+    async fn a_standing_asks_again_a_server_short_of_memory() {
+        use crate::testkit::{FakeElectrum, nowhere, script, transaction};
+        let server = FakeElectrum::start().await;
+        let tx = transaction(&[nowhere(1, 0)], &[(&script(1), 1_000)]);
+        server.set_history(&script(1), &[(tx.compute_txid(), 90)]);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .busy
+            .insert("blockchain.scripthash.get_history", 1);
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        let standing = tx_standing(
+            &target,
+            tx.compute_txid(),
+            crate::chain::lookup_scripts(&tx),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(standing, (true, Some(90), 100));
     }
 }

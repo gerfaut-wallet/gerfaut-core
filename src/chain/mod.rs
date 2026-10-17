@@ -775,19 +775,137 @@ pub(crate) async fn fetch_address_state(
     }
 }
 
-/// Hands a signed transaction to one endpoint. Returns the host that
-/// accepted it; the node's refusal comes back as the error text.
+// --- what is sent ----------------------------------------------------------
+
+/// Why one endpoint gave no answer to use about a transaction about to
+/// be sent, or being sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Failure {
+    /// The way to the server failed, or the server failed to serve: no
+    /// connection, a time limit, a server error (5xx), a rate limit, a
+    /// server short of memory twice. Nothing was said about the
+    /// transaction, and the next endpoint may be asked.
+    Transport(String),
+    /// The server, or the node behind it, answered no, in these words.
+    /// That is the answer: asking another operator would show the
+    /// transaction to a second one, for an answer that changes nothing.
+    Refused(String),
+}
+
+/// What the endpoints are asked for about a transaction to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Purpose {
+    /// The preview: the coins it spends, whether they are spent, the tip.
+    Preview,
+    /// The broadcast itself.
+    Broadcast,
+}
+
+/// The endpoints asked about a transaction to send, in the order they
+/// are tried. With a live watch on one of the backend's servers, its
+/// operator comes first, the operator that already sees every script
+/// the wallets hold, so the transaction and its inputs go to no other
+/// unless that one stops answering. For a preview, its web API before
+/// its Electrum server: the web API says in one request whether a coin
+/// is spent, and by what. For a broadcast, the server of the watch,
+/// then its operator's web API. The rest after them, in the backend's
+/// order.
+pub(crate) fn send_order(
+    mut endpoints: Vec<Endpoint>,
+    live: Option<Endpoint>,
+    purpose: Purpose,
+) -> Vec<Endpoint> {
+    let Some(live) = live else {
+        return endpoints;
+    };
+    endpoints.retain(|endpoint| *endpoint != live);
+    let live_host = host_of(live.url());
+    let web = endpoints.iter().position(|endpoint| {
+        matches!(endpoint, Endpoint::Esplora(_))
+            && live_host
+                .as_deref()
+                .is_some_and(|host| same_operator(host, &endpoint.label()))
+    });
+    let web = web.map(|position| endpoints.remove(position));
+    let first: Vec<Endpoint> = match (purpose, web) {
+        (Purpose::Preview, Some(web)) => vec![web, live],
+        (Purpose::Broadcast, Some(web)) => vec![live, web],
+        (_, None) => vec![live],
+    };
+    endpoints.splice(0..0, first);
+    endpoints
+}
+
+/// Whether a host belongs to the operator whose web API is at
+/// `operator`: the same host, or one under it
+/// (`electrum.blockstream.info` and `blockstream.info`).
+fn same_operator(host: &str, operator: &str) -> bool {
+    host == operator || host.ends_with(&format!(".{operator}"))
+}
+
+/// Whether a node's refusal says it already holds the transaction: in
+/// its mempool (`txn-already-in-mempool`, `txn-already-known`, "already
+/// known") or in a block ("Transaction outputs already in utxo set",
+/// "Transaction already in block chain"). A broadcast that hears this
+/// was not refused: the same server is asked for the transaction.
+pub(crate) fn already_known(words: &str) -> bool {
+    let words = words.to_ascii_lowercase();
+    [
+        "already known",
+        "txn-already-known",
+        "txn-already-in-mempool",
+        "already in utxo set",
+        "already in block chain",
+    ]
+    .iter()
+    .any(|phrase| words.contains(phrase))
+}
+
+/// Hands a signed transaction to one endpoint. Sent means the server
+/// answered with the txid the transaction hashes to; another txid is a
+/// failure. A node that says it already holds the transaction did not
+/// refuse it when the same server hands it over, hashing to that txid.
 pub(crate) async fn broadcast(
     endpoint: &Endpoint,
     tx: &Transaction,
     proxy: Option<&str>,
-) -> Result<(), String> {
-    match endpoint {
+) -> Result<(), Failure> {
+    let txid = tx.compute_txid();
+    let answered = match endpoint {
         Endpoint::Esplora(url) => {
-            let client = esplora::client(url, proxy)?;
+            let client = esplora::client(url, proxy).map_err(Failure::Transport)?;
             esplora::broadcast(&client, tx).await
         }
-        Endpoint::Electrum(target) => electrum::broadcast(target, tx, proxy).await.map(|_| ()),
+        Endpoint::Electrum(target) => electrum::broadcast(target, tx, proxy).await,
+    };
+    match answered {
+        Ok(answered) if answered == txid => Ok(()),
+        Ok(answered) => Err(Failure::Refused(format!(
+            "the server answered with the txid {answered}, not {txid}"
+        ))),
+        Err(Failure::Refused(words)) if already_known(&words) => {
+            match fetch_tx(endpoint, txid, proxy).await {
+                Ok(Some(held)) if held.compute_txid() == txid => Ok(()),
+                _ => Err(Failure::Refused(words)),
+            }
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
+/// The transaction `txid` as one endpoint holds it, `None` when it does
+/// not: the caller checks what it hashes to.
+async fn fetch_tx(
+    endpoint: &Endpoint,
+    txid: Txid,
+    proxy: Option<&str>,
+) -> Result<Option<Transaction>, Failure> {
+    match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = esplora::client(url, proxy).map_err(Failure::Transport)?;
+            client.tx(&txid).await.map_err(esplora::failure)
+        }
+        Endpoint::Electrum(target) => electrum::fetch_tx(target, txid, proxy).await,
     }
 }
 
@@ -877,10 +995,10 @@ pub(crate) async fn fetch_prevout(
     endpoint: &Endpoint,
     outpoint: OutPoint,
     proxy: Option<&str>,
-) -> Result<PrevoutFacts, String> {
+) -> Result<PrevoutFacts, Failure> {
     match endpoint {
         Endpoint::Esplora(url) => {
-            let client = esplora::client(url, proxy)?;
+            let client = esplora::client(url, proxy).map_err(Failure::Transport)?;
             let facts = esplora::fetch_prevout(&client, outpoint).await?;
             Ok(PrevoutFacts {
                 txout: facts.txout,
@@ -894,9 +1012,13 @@ pub(crate) async fn fetch_prevout(
 
 /// The height of the endpoint's tip: the one a time lock is judged
 /// against when the transaction reaches that node.
-pub(crate) async fn tip_height(endpoint: &Endpoint, proxy: Option<&str>) -> Result<u32, String> {
+pub(crate) async fn tip_height(endpoint: &Endpoint, proxy: Option<&str>) -> Result<u32, Failure> {
     match endpoint {
-        Endpoint::Esplora(url) => esplora::client(url, proxy)?.height().await,
+        Endpoint::Esplora(url) => esplora::client(url, proxy)
+            .map_err(Failure::Transport)?
+            .height()
+            .await
+            .map_err(esplora::failure),
         Endpoint::Electrum(target) => electrum::tip_height(target, proxy).await,
     }
 }
@@ -1647,5 +1769,83 @@ mod tests {
             None
         );
         assert!(output_at(&forged, outpoint).is_err());
+    }
+
+    /// With a live watch, its operator first, the rest in the backend's
+    /// order behind it: for a preview its web API, which says in one
+    /// request whether a coin is spent, then the watch's own server; for
+    /// a broadcast the watch's server, then the web API. Without one, the
+    /// backend's order as it is.
+    #[test]
+    fn what_is_sent_goes_to_the_operator_of_the_watch_first() {
+        let esplora = |host: &str| Endpoint::Esplora(format!("https://{host}/api"));
+        let live = Endpoint::Electrum(electrum::Target::new(
+            "ssl://electrum.blockstream.info:50002",
+            None,
+        ));
+        let rotation = vec![
+            esplora("mempool.space"),
+            esplora("blockstream.info"),
+            esplora("mempool.emzy.de"),
+        ];
+        assert_eq!(
+            send_order(rotation.clone(), Some(live.clone()), Purpose::Preview),
+            [
+                esplora("blockstream.info"),
+                live.clone(),
+                esplora("mempool.space"),
+                esplora("mempool.emzy.de"),
+            ]
+        );
+        assert_eq!(
+            send_order(rotation.clone(), Some(live.clone()), Purpose::Broadcast),
+            [
+                live.clone(),
+                esplora("blockstream.info"),
+                esplora("mempool.space"),
+                esplora("mempool.emzy.de"),
+            ]
+        );
+        assert_eq!(
+            send_order(rotation.clone(), None, Purpose::Broadcast),
+            rotation
+        );
+        // A host that only ends like the operator's is another operator.
+        let elsewhere = Endpoint::Electrum(electrum::Target::new(
+            "ssl://notblockstream.info:50002",
+            None,
+        ));
+        assert_eq!(
+            send_order(rotation.clone(), Some(elsewhere.clone()), Purpose::Preview)[1..],
+            rotation[..]
+        );
+        // An Electrum server of one's own is its own operator: alone.
+        assert_eq!(
+            send_order(vec![live.clone()], Some(live.clone()), Purpose::Preview),
+            [live]
+        );
+    }
+
+    /// The node's words for a transaction it already holds, in its
+    /// mempool or in a block, whichever server passes them on; any other
+    /// refusal is not that.
+    #[test]
+    fn a_node_that_already_holds_the_transaction_is_told_by_its_words() {
+        for words in [
+            "sendrawtransaction RPC error -26: txn-already-in-mempool",
+            "txn-already-known",
+            "Transaction already known",
+            "sendrawtransaction RPC error -27: Transaction outputs already in utxo set",
+            "Transaction already in block chain",
+        ] {
+            assert!(already_known(words), "{words}");
+        }
+        for words in [
+            "sendrawtransaction RPC error -26: min relay fee not met",
+            "bad-txns-inputs-missingorspent",
+            "txn-mempool-conflict",
+        ] {
+            assert!(!already_known(words), "{words}");
+        }
     }
 }

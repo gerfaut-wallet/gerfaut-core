@@ -1673,3 +1673,120 @@ fn a_batch_of_several_wallets_is_said_under_each_name() {
     );
     assert_ne!(said[0].id, said[1].id);
 }
+
+/// An Esplora on loopback, reached as `localhost`, that knows one
+/// transaction and says its first output unspent; its address, and every
+/// request it had as `METHOD path`.
+async fn web_api_knowing(
+    tx: bdk_wallet::bitcoin::Transaction,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = asked.clone();
+    let txid = tx.compute_txid();
+    let raw = bdk_wallet::bitcoin::consensus::serialize(&tx);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let line: Vec<&str> = head.split_whitespace().take(2).collect();
+            let path = line.get(1).copied().unwrap_or_default().to_owned();
+            log.lock().unwrap().push(line.join(" "));
+            let (status, body) = if path == format!("/api/tx/{txid}/raw") {
+                ("200 OK", raw.clone())
+            } else if path == format!("/api/tx/{txid}/outspend/0") {
+                ("200 OK", br#"{"spent":false}"#.to_vec())
+            } else {
+                ("404 Not Found", b"not found".to_vec())
+            };
+            let mut response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend(body);
+            let _ = stream.write_all(&response).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    (format!("http://localhost:{port}/api"), asked)
+}
+
+/// With the watch on the Electrum server of one operator, what is sent
+/// goes to that operator: the preview to its web API, which says
+/// in one request whether a coin is spent, and the broadcast to the
+/// watch's own server. The head of the rotation, another operator, hears
+/// of neither.
+#[tokio::test]
+async fn what_is_sent_goes_to_the_operator_of_the_watch() {
+    use crate::testkit::{nowhere, script, transaction};
+    use bdk_wallet::bitcoin::OutPoint;
+
+    let rotation = FakeMempool::start(false, 0).await;
+    let live = FakeElectrum::start().await;
+    let funding = transaction(&[nowhere(1, 0)], &[(script(3).as_str(), 50_000)]);
+    let (web, web_asked) = web_api_knowing(funding.clone()).await;
+    let _stand_in = crate::chain::public::stand_in(
+        &[format!("http://{}/api", rotation.address), web],
+        &[format!("tcp://localhost:{}", live.address.port())],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), crate::chain::BackendConfig::default()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+
+    let mut pasted = transaction(
+        &[OutPoint::new(funding.compute_txid(), 0)],
+        &[(script(9).as_str(), 49_000)],
+    );
+    pasted.input[0].witness.push([0x30; 71]);
+    pasted.input[0].witness.push([0x02; 33]);
+    let hex = bdk_wallet::bitcoin::consensus::encode::serialize_hex(&pasted);
+
+    let preview = manager
+        .preview_transaction(&hex, Network::Signet)
+        .await
+        .unwrap();
+    assert_eq!(
+        preview.inputs[0].value_sats,
+        Some(50_000),
+        "{:?}",
+        preview.warnings
+    );
+    assert!(
+        web_asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line == &format!("GET /api/tx/{}/raw", funding.compute_txid())),
+    );
+    assert!(!live.was_asked("blockchain.transaction.get"));
+
+    let report = manager
+        .broadcast_transaction(Network::Signet, &hex)
+        .await
+        .unwrap();
+    assert_eq!(report.backend, "localhost");
+    assert!(live.was_asked("blockchain.transaction.broadcast"));
+    assert!(
+        !web_asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.starts_with("POST")),
+        "the watch's own server took it"
+    );
+    // Where it stands is asked of the same operator.
+    let standing = manager
+        .transaction_status(Network::Signet, &hex)
+        .await
+        .unwrap();
+    assert_eq!(standing.backend, "localhost");
+    manager.live_stop().await;
+}

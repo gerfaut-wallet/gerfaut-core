@@ -13,7 +13,7 @@ use crate::broadcast::{
     self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, RecentBroadcast, Satisfaction,
     SpentBy, TxPreview, WalletRef,
 };
-use crate::chain;
+use crate::chain::{self, Failure, Purpose};
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
 use crate::now_secs;
@@ -184,7 +184,13 @@ impl WalletManager {
         // the same as when every endpoint stopped answering. Without
         // this the PSBT's word went through unconfronted and unmarked.
         let route = if needs_chain || needs_tip {
-            match chain::endpoints(&config, network, &certs) {
+            match chain::endpoints(&config, network, &certs).map(|endpoints| {
+                chain::send_order(
+                    endpoints,
+                    self.live_endpoint(network, &config, &certs),
+                    Purpose::Preview,
+                )
+            }) {
                 Ok(endpoints) => match self.tor_proxy_for(&endpoints).await {
                     Ok(proxy) => Some((endpoints, proxy)),
                     Err(_) => None,
@@ -195,19 +201,23 @@ impl WalletManager {
             None
         };
         if let Some((endpoints, proxy)) = route {
-            // A coin is settled once an endpoint has spoken for it:
-            // either it handed the output over, or it said it has no
-            // such outpoint. Anything else is still an open question,
-            // and an open question goes to the next endpoint.
-            let settled =
-                |f: &broadcast::InputFacts| (f.prevout.is_some() && f.spent.is_some()) || f.unknown;
+            // A coin is settled once an endpoint has spoken for it: it
+            // handed the output over, said it has no such outpoint, or
+            // refused to say. What it left open, whether the coin is
+            // spent, stays open: the next endpoint is another operator,
+            // asked only when this one stops answering.
+            let mut settled: Vec<bool> = input_facts
+                .iter()
+                .map(|f| (f.prevout.is_some() && f.spent.is_some() && !f.listed) || f.unknown)
+                .collect();
             for endpoint in &endpoints {
                 for (i, facts) in input_facts.iter_mut().enumerate() {
-                    if settled(facts) {
+                    if settled[i] {
                         continue;
                     }
                     match chain::fetch_prevout(endpoint, outpoints[i], proxy.as_deref()).await {
                         Ok(chain_facts) => {
+                            settled[i] = true;
                             if facts.prevout.is_none() || facts.listed {
                                 match chain_facts.txout {
                                     Some(txout) => backed(facts, txout),
@@ -219,23 +229,30 @@ impl WalletManager {
                                 facts.spent_by = chain_facts.spent_by;
                             }
                         }
+                        // Its answer, a refusal: the coin stays unchecked,
+                        // and no other operator hears of it.
+                        Err(Failure::Refused(_)) => settled[i] = true,
                         // This one has stopped answering — throttled,
                         // timed out, cut off. Asking it about the coins
                         // it has not been asked about yet would only
                         // make that worse, so they go to the next
                         // endpoint instead of being dropped.
-                        Err(_) => break,
+                        Err(Failure::Transport(_)) => break,
                     }
                 }
-                if input_facts.iter().all(settled) {
+                if settled.iter().all(|&settled| settled) {
                     break;
                 }
             }
             if needs_tip {
                 for endpoint in &endpoints {
-                    if let Ok(height) = chain::tip_height(endpoint, proxy.as_deref()).await {
-                        tip_height = Some(height);
-                        break;
+                    match chain::tip_height(endpoint, proxy.as_deref()).await {
+                        Ok(height) => {
+                            tip_height = Some(height);
+                            break;
+                        }
+                        Err(Failure::Transport(_)) => continue,
+                        Err(Failure::Refused(_)) => break,
                     }
                 }
             }
@@ -266,10 +283,14 @@ impl WalletManager {
     }
 
     /// Hands a signed transaction to the network through the backend
-    /// configured for it. Every endpoint is tried in turn; the node's
-    /// own refusal (a missing signature, a spent input, a fee below the
-    /// floor) is returned verbatim. A transaction the network took is
-    /// kept among the [`Self::recent_broadcasts`].
+    /// configured for it, its endpoints in the order of
+    /// [`chain::send_order`]: the operator of the live watch first. The
+    /// next endpoint is tried only when one cannot be reached; the
+    /// node's own refusal (a missing signature, a spent input, a fee
+    /// below the floor) ends it, and is returned verbatim. Sent means
+    /// the server answered with the txid the transaction hashes to, or
+    /// said it already held it and handed it over. A transaction the
+    /// network took is kept among the [`Self::recent_broadcasts`].
     pub async fn broadcast_transaction(
         &self,
         network: Network,
@@ -283,7 +304,11 @@ impl WalletManager {
             });
         }
         let (config, certs) = self.state.lock().await.chain_setup(network);
-        let endpoints = chain::endpoints(&config, network, &certs)?;
+        let endpoints = chain::send_order(
+            chain::endpoints(&config, network, &certs)?,
+            self.live_endpoint(network, &config, &certs),
+            Purpose::Broadcast,
+        );
         let proxy = self.tor_proxy_for(&endpoints).await?;
         let mut refusals: Vec<(String, String)> = Vec::new();
         for endpoint in &endpoints {
@@ -297,10 +322,32 @@ impl WalletManager {
                     self.remember_broadcast(network, &decoded.tx, &report).await;
                     return Ok(report);
                 }
-                Err(detail) => refusals.push((endpoint.label(), detail)),
+                Err(Failure::Transport(detail)) => refusals.push((endpoint.label(), detail)),
+                Err(Failure::Refused(detail)) => {
+                    refusals.push((endpoint.label(), detail));
+                    break;
+                }
             }
         }
         Err(broadcast_failure(refusals))
+    }
+
+    /// The server the live watch has on `network`, when the backend
+    /// names it: the one the preview and the broadcast go to first
+    /// ([`chain::send_order`]), the same rule as the syncs'.
+    fn live_endpoint(
+        &self,
+        network: Network,
+        config: &crate::chain::BackendConfig,
+        certs: &crate::chain::TrustedCerts,
+    ) -> Option<chain::Endpoint> {
+        self.live_server()
+            .filter(|(on, server)| {
+                *on == network
+                    && crate::watch::servers_for(config, network, certs)
+                        .is_ok_and(|allowed| allowed.contains(server))
+            })
+            .map(|(_, server)| server)
     }
 
     /// Keeps a transaction the network just took at the head of the
@@ -364,7 +411,9 @@ impl WalletManager {
 
     /// Where a broadcast transaction stands now. `hex` is the transaction
     /// itself: Electrum can only look a transaction up through one of
-    /// its scripts, and the apps already hold the bytes.
+    /// its scripts, and the apps already hold the bytes. Asked in the
+    /// order of a broadcast ([`chain::send_order`]): the operator the
+    /// transaction went to, not the head of the rotation.
     pub async fn transaction_status(
         &self,
         network: Network,
@@ -380,7 +429,11 @@ impl WalletManager {
             });
         }
         let (config, certs) = self.state.lock().await.chain_setup(network);
-        let endpoints = chain::endpoints(&config, network, &certs)?;
+        let endpoints = chain::send_order(
+            chain::endpoints(&config, network, &certs)?,
+            self.live_endpoint(network, &config, &certs),
+            Purpose::Broadcast,
+        );
         let proxy = self.tor_proxy_for(&endpoints).await?;
         let mut attempts: Vec<String> = Vec::new();
         for endpoint in &endpoints {
