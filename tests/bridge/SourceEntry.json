@@ -4,11 +4,6 @@
     "label": "CoinGecko",
     "ranges": ["day", "week", "month", "year"]
   },
-  "kraken": {
-    "source": "kraken",
-    "label": "Kraken",
-    "ranges": ["day", "week", "month", "year", "max"]
-  },
   "mempool_space": {
     "source": "mempool_space",
     "label": "mempool.space",

@@ -2094,7 +2094,7 @@ fn settings() -> Vec<Fixture> {
         masked: true,
         fiat: true,
         fiat_currency: FiatCurrency::Chf,
-        price_source: PriceSource::Kraken,
+        price_source: PriceSource::MempoolSpace,
         notify_new_tx: true,
         explorer_ack: true,
     };
@@ -2207,7 +2207,7 @@ fn settings() -> Vec<Fixture> {
                         masked: Some(true),
                         fiat: Some(true),
                         fiat_currency: Some(FiatCurrency::Chf),
-                        price_source: Some(PriceSource::Kraken),
+                        price_source: Some(PriceSource::MempoolSpace),
                         notify_new_tx: Some(true),
                         explorer_ack: Some(true),
                     },
@@ -2299,7 +2299,6 @@ fn prices() -> Vec<Fixture> {
             "PriceSource",
             every!(PriceSource {
                 Coingecko,
-                Kraken,
                 MempoolSpace,
             }),
         ),
@@ -2350,7 +2349,7 @@ fn prices() -> Vec<Fixture> {
                 PriceHistory {
                     points,
                     currency: FiatCurrency::Eur,
-                    source: PriceSource::Kraken,
+                    source: PriceSource::Coingecko,
                     range: PriceRange::Day,
                     at: NOW,
                 },

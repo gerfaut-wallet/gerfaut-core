@@ -6,7 +6,7 @@
       {"t": 1750000000, "rate": 92034.25}
     ],
     "currency": "eur",
-    "source": "kraken",
+    "source": "coingecko",
     "range": "day",
     "at": 1750000000
   }

@@ -101,7 +101,7 @@ impl Preferences {
     /// These preferences with `change` applied, and the pair of currency
     /// and source made one that exists: the currency wins, the source
     /// follows. A currency only CoinGecko publishes, picked while the
-    /// source is Kraken, moves the source to CoinGecko rather than leave
+    /// source is mempool.space, moves the source to CoinGecko rather than leave
     /// a pair that no source can quote; a source picked that does not
     /// quote the currency gives way the same.
     pub fn change(mut self, change: &PreferencesChange) -> Self {
@@ -275,6 +275,33 @@ mod tests {
         );
     }
 
+    /// A record that names Kraken, which left the sources, reads as
+    /// mempool.space, and every other preference it holds stands.
+    #[test]
+    fn a_record_on_kraken_reads_as_mempool_space() {
+        let stored: Preferences = serde_json::from_str(
+            r#"{"unit":"sats","masked":true,"fiat":true,"fiat_currency":"jpy",
+                "price_source":"kraken","notify_new_tx":true,"explorer_ack":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stored,
+            Preferences {
+                unit: Unit::Sats,
+                masked: true,
+                fiat: true,
+                fiat_currency: FiatCurrency::Jpy,
+                price_source: PriceSource::MempoolSpace,
+                notify_new_tx: true,
+                explorer_ack: true,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(stored).unwrap()["price_source"],
+            "mempool_space"
+        );
+    }
+
     /// A change names what it changes, and nothing else moves.
     #[test]
     fn a_change_moves_what_it_names_alone() {
@@ -308,21 +335,23 @@ mod tests {
     /// meant would otherwise go nowhere and say nothing.
     #[test]
     fn a_change_with_a_field_nobody_knows_is_refused() {
-        assert!(serde_json::from_str::<PreferencesChange>(r#"{"fiat_source":"kraken"}"#).is_err());
+        assert!(
+            serde_json::from_str::<PreferencesChange>(r#"{"fiat_source":"coingecko"}"#).is_err()
+        );
     }
 
     /// The currency wins, the source follows: whatever is changed, the
     /// pair kept is one a source quotes.
     #[test]
     fn the_currency_wins_and_the_source_follows() {
-        let on_kraken = Preferences::default().change(&PreferencesChange {
-            price_source: Some(PriceSource::Kraken),
+        let on_mempool = Preferences::default().change(&PreferencesChange {
+            price_source: Some(PriceSource::MempoolSpace),
             ..PreferencesChange::default()
         });
-        assert_eq!(on_kraken.price_source, PriceSource::Kraken);
+        assert_eq!(on_mempool.price_source, PriceSource::MempoolSpace);
 
-        // A currency Kraken does not quote takes the source with it.
-        let inr = on_kraken.change(&PreferencesChange {
+        // A currency mempool.space does not quote takes the source with it.
+        let inr = on_mempool.change(&PreferencesChange {
             fiat_currency: Some(FiatCurrency::Inr),
             ..PreferencesChange::default()
         });
@@ -330,11 +359,11 @@ mod tests {
         assert_eq!(inr.price_source, PriceSource::Coingecko);
 
         // One it quotes leaves the source where it is.
-        let usd = on_kraken.change(&PreferencesChange {
+        let usd = on_mempool.change(&PreferencesChange {
             fiat_currency: Some(FiatCurrency::Usd),
             ..PreferencesChange::default()
         });
-        assert_eq!(usd.price_source, PriceSource::Kraken);
+        assert_eq!(usd.price_source, PriceSource::MempoolSpace);
 
         // A source that does not quote the currency gives way to it.
         let refused = inr.change(&PreferencesChange {
@@ -395,7 +424,8 @@ mod tests {
                 masked: true,
                 fiat: true,
                 fiat_currency: FiatCurrency::Usd,
-                price_source: PriceSource::Kraken,
+                // Kraken left the sources: mempool.space quotes the same.
+                price_source: PriceSource::MempoolSpace,
                 notify_new_tx: true,
                 explorer_ack: true,
             }

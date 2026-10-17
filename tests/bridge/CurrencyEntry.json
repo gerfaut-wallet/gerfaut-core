@@ -4,7 +4,7 @@
     "code": "EUR",
     "name": "Euro",
     "reach": "every",
-    "sources": ["coingecko", "kraken", "mempool_space"]
+    "sources": ["coingecko", "mempool_space"]
   },
   "coingecko_only": {
     "currency": "inr",

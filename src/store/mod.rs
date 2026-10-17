@@ -1571,7 +1571,8 @@ mod tests {
             masked: true,
             fiat: true,
             fiat_currency: FiatCurrency::Chf,
-            price_source: PriceSource::Kraken,
+            // Kraken left the sources: mempool.space quotes the same.
+            price_source: PriceSource::MempoolSpace,
             notify_new_tx: true,
             explorer_ack: true,
         };
@@ -1624,6 +1625,47 @@ mod tests {
             .insert("display.unit".to_owned(), "sats".to_owned());
         vault.save(&changed).unwrap();
         assert_eq!(vault.load().unwrap().settings.preferences.unit, Unit::Btc);
+    }
+
+    /// A vault whose preferences record names Kraken, which left the
+    /// price sources, opens: the source reads as mempool.space, and
+    /// every other setting it holds stands.
+    #[test]
+    fn a_vault_on_kraken_opens_on_mempool_space() {
+        use crate::prefs::Unit;
+        use crate::price::{FiatCurrency, PriceSource};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let (vault, mut payload) = Vault::open_or_create(&path, key()).unwrap();
+        payload.settings.active_network = Network::Signet;
+        payload.settings.preferences = Preferences {
+            unit: Unit::Sats,
+            masked: true,
+            fiat: true,
+            fiat_currency: FiatCurrency::Gbp,
+            price_source: PriceSource::MempoolSpace,
+            notify_new_tx: true,
+            explorer_ack: true,
+        };
+        payload
+            .settings
+            .app_prefs
+            .insert("desktop.theme".to_owned(), "dark".to_owned());
+        vault.save(&payload).unwrap();
+        drop(vault);
+
+        // What an earlier build wrote: the same record, on Kraken.
+        let plaintext = cipher::unseal(&std::fs::read(&path).unwrap(), &key()).unwrap();
+        let mut written: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        written["settings"]["preferences"]["price_source"] = "kraken".into();
+        let sealed = cipher::seal(&serde_json::to_vec(&written).unwrap(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        let (_, reopened) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(reopened.settings.preferences, payload.settings.preferences);
+        assert_eq!(reopened.settings.app_prefs, payload.settings.app_prefs);
+        assert_eq!(reopened.settings.active_network, Network::Signet);
     }
 
     #[test]

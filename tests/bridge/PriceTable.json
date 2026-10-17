@@ -6,49 +6,49 @@
         "code": "EUR",
         "name": "Euro",
         "reach": "every",
-        "sources": ["coingecko", "kraken", "mempool_space"]
+        "sources": ["coingecko", "mempool_space"]
       },
       {
         "currency": "usd",
         "code": "USD",
         "name": "US dollar",
         "reach": "every",
-        "sources": ["coingecko", "kraken", "mempool_space"]
+        "sources": ["coingecko", "mempool_space"]
       },
       {
         "currency": "gbp",
         "code": "GBP",
         "name": "Pound sterling",
         "reach": "every",
-        "sources": ["coingecko", "kraken", "mempool_space"]
+        "sources": ["coingecko", "mempool_space"]
       },
       {
         "currency": "chf",
         "code": "CHF",
         "name": "Swiss franc",
         "reach": "every",
-        "sources": ["coingecko", "kraken", "mempool_space"]
+        "sources": ["coingecko", "mempool_space"]
       },
       {
         "currency": "jpy",
         "code": "JPY",
         "name": "Japanese yen",
         "reach": "every",
-        "sources": ["coingecko", "kraken", "mempool_space"]
+        "sources": ["coingecko", "mempool_space"]
       },
       {
         "currency": "cad",
         "code": "CAD",
         "name": "Canadian dollar",
         "reach": "every",
-        "sources": ["coingecko", "kraken", "mempool_space"]
+        "sources": ["coingecko", "mempool_space"]
       },
       {
         "currency": "aud",
         "code": "AUD",
         "name": "Australian dollar",
         "reach": "every",
-        "sources": ["coingecko", "kraken", "mempool_space"]
+        "sources": ["coingecko", "mempool_space"]
       },
       {
         "currency": "inr",
@@ -217,11 +217,6 @@
         "source": "coingecko",
         "label": "CoinGecko",
         "ranges": ["day", "week", "month", "year"]
-      },
-      {
-        "source": "kraken",
-        "label": "Kraken",
-        "ranges": ["day", "week", "month", "year", "max"]
       },
       {
         "source": "mempool_space",
