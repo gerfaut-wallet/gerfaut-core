@@ -33,9 +33,8 @@ use crate::chain::{
 };
 use crate::network::Network;
 
-/// Requests per batch while walking a keychain: the walk stops a batch
-/// at most past the gap, and every script asked for is one more the
-/// server learns of the wallet.
+/// The fewest requests per batch while walking a keychain: see
+/// [`walk_batch`].
 const BATCH: usize = 10;
 /// Requests per batch for a list known in full: the scripts revealed,
 /// and the headers and proofs they call for. ElectrumX, from 1.18 on,
@@ -101,7 +100,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
     for Scan { keychain, mut spks } in scans {
         let mut unused = 0usize;
         'scan: loop {
-            let batch: Vec<(u32, ScriptBuf)> = spks.by_ref().take(BATCH).collect();
+            let batch: Vec<(u32, ScriptBuf)> = spks.by_ref().take(walk_batch(stop_gap)).collect();
             if batch.is_empty() {
                 break;
             }
@@ -146,6 +145,20 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
         orders: pass.orders,
         drop_above: chain.dropped,
     })
+}
+
+/// Requests per batch while walking a keychain: as many as the gap, so
+/// that a walk that finds nothing past the last address used reads that
+/// gap in one batch, as ElectrumX, which waits a second at the end of
+/// each, would have it; never fewer than [`BATCH`] nor more than
+/// [`LIST_BATCH`]. The walk stops within a batch past the gap: every
+/// script asked for is an address the server learns before it is used,
+/// and the gap is how many the user lets it learn, so it learns at most
+/// twice that many.
+fn walk_batch(stop_gap: u32) -> usize {
+    usize::try_from(stop_gap)
+        .unwrap_or(usize::MAX)
+        .clamp(BATCH, LIST_BATCH)
 }
 
 /// The server's chain against the wallet's.
