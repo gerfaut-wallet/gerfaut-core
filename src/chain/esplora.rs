@@ -947,7 +947,8 @@ async fn history_round(
                 confirmed += 1;
                 last_seen = Some(tx.txid);
             }
-            if tx.to_tx().compute_txid() != tx.txid {
+            let whole = tx.to_tx();
+            if whole.compute_txid() != tx.txid {
                 return Err(
                     "the server answered with another transaction than the one it listed"
                         .to_owned(),
@@ -964,7 +965,7 @@ async fn history_round(
                     claimed.push((tx.txid, block));
                 }
             }
-            let tx = to_address_tx(tx, our_script, network);
+            let tx = to_address_tx(tx, &whole, our_script, network);
             all_held &= known.get(tx.txid.as_str()) == Some(&tx.height);
             client.keep(crate::chain::held_by(&tx))?;
             txs.push(tx);
@@ -1075,9 +1076,11 @@ fn fill_from_held(
 /// history, a script's or an address's.
 const PAGE: usize = 25;
 
-/// One esplora transaction as seen from the watched address.
+/// One esplora transaction as seen from the watched address. `whole` is
+/// the transaction itself, as [`PageTx::to_tx`] builds it.
 fn to_address_tx(
     tx: PageTx,
+    whole: &Transaction,
     our_script: &bdk_wallet::bitcoin::ScriptBuf,
     network: Network,
 ) -> AddressTx {
@@ -1144,7 +1147,7 @@ fn to_address_tx(
             })
         })
         .collect();
-    let extras = tx_extras::analyze(&tx.to_tx(), |op| prevouts.get(op).cloned());
+    let extras = tx_extras::analyze(whole, |op| prevouts.get(op).cloned());
     AddressTx {
         txid: tx.txid.to_string(),
         net_sats: crate::chain::net_sats(received, spent),
@@ -1731,7 +1734,8 @@ mod error_tests {
         );
         let page: PageTx = serde_json::from_str(&listed).unwrap();
         let ours = ScriptBuf::from_hex(ADDRESS_SCRIPT).unwrap();
-        let read = to_address_tx(page, &ours, Network::Signet);
+        let whole = page.to_tx();
+        let read = to_address_tx(page, &whole, &ours, Network::Signet);
         assert_eq!(read.net_sats, i64::MAX);
         assert_eq!(crate::chain::net_sats(0, u64::MAX), -i64::MAX);
     }
