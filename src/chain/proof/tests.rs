@@ -614,6 +614,22 @@ fn a_confirmation_above_the_tip_is_weighed() {
     assert_eq!(above_the_tip(u32::MAX, u32::MAX - 1), Some(Proof::Unsure));
 }
 
+/// A false proof is the core's word: the same words in a server's own
+/// refusal do not make the error one.
+#[test]
+fn a_server_does_not_choose_the_false_proof_code() {
+    assert!(is_false_proof(&format!(
+        "electrum.example.org: {FALSE_PROOF}"
+    )));
+    assert!(is_false_proof(&format!(
+        "a: could not connect; b: {COIN_NOT_PAID}"
+    )));
+    assert!(!is_false_proof(&format!(
+        "electrum.example.org: the server refused the request: {FALSE_PROOF}"
+    )));
+    assert!(!is_false_proof("electrum.example.org: could not connect"));
+}
+
 /// The two halves of a transaction of 64 bytes, as they are hashed: the
 /// first one read as a txid, the second as its sibling.
 pub(super) fn halves_of_64_bytes(first: [u8; 32]) -> (Txid, [u8; 32], Transaction) {

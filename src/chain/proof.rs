@@ -90,9 +90,19 @@ pub(crate) const FALSE_PROOF: &str = "the server sent a false proof of a confirm
 pub(crate) const COIN_NOT_PAID: &str = "the server listed a coin its transaction does not pay";
 
 /// Whether a server was refused, in `detail`, for a proof that does not
-/// hold: [`FALSE_PROOF`] or [`COIN_NOT_PAID`].
+/// hold: [`FALSE_PROOF`] or [`COIN_NOT_PAID`], said by the core. The same
+/// words in a server's own refusal, which a sync quotes after
+/// "refused the request", do not count: a server does not choose the
+/// code it is refused with.
 pub(crate) fn is_false_proof(detail: &str) -> bool {
-    detail.contains(FALSE_PROOF) || detail.contains(COIN_NOT_PAID)
+    [FALSE_PROOF, COIN_NOT_PAID].iter().any(|said| {
+        detail.match_indices(said).any(|(at, _)| {
+            !detail[..at]
+                .trim_end()
+                .trim_end_matches(':')
+                .ends_with("refused the request")
+        })
+    })
 }
 
 /// Blocks between two retargets.
