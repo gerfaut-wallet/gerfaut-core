@@ -132,8 +132,10 @@ struct Session {
     /// configuration: a script it had no status for is reported.
     resumed: bool,
     ready_told: bool,
-    /// The latest headers the server sent, in a row.
-    headers: Option<Headers>,
+    /// The latest headers the server sent, in a row: shared with the
+    /// confirmations foretold on them, copied only when a header comes
+    /// while one holds them.
+    headers: Option<Arc<Headers>>,
     /// Proofs to ask for: txid and height.
     proofs_queued: VecDeque<(Txid, u32)>,
     /// Proofs asked for and not answered yet.
@@ -645,34 +647,37 @@ impl Session {
             self.headers = None;
             return;
         };
-        let alone = Headers {
-            first: height,
-            chain: vec![header],
+        let alone = || {
+            Arc::new(Headers {
+                first: height,
+                chain: vec![header],
+            })
         };
         let mut kept = match self.headers.take() {
             Some(mut headers)
                 if height > headers.first && height <= headers.last_height().saturating_add(1) =>
             {
-                headers
-                    .chain
-                    .truncate(usize::try_from(height - headers.first).unwrap_or(usize::MAX));
-                let follows = headers
+                let row = Arc::make_mut(&mut headers);
+                row.chain
+                    .truncate(usize::try_from(height - row.first).unwrap_or(usize::MAX));
+                let follows = row
                     .chain
                     .last()
                     .is_some_and(|parent| header.prev_blockhash == parent.block_hash());
                 if follows {
-                    headers.chain.push(header);
+                    row.chain.push(header);
                     headers
                 } else {
-                    alone
+                    alone()
                 }
             }
-            _ => alone,
+            _ => alone(),
         };
         if kept.chain.len() > HEADERS_KEPT {
-            let over = kept.chain.len() - HEADERS_KEPT;
-            kept.chain.drain(..over);
-            kept.first = kept
+            let row = Arc::make_mut(&mut kept);
+            let over = row.chain.len() - HEADERS_KEPT;
+            row.chain.drain(..over);
+            row.first = row
                 .first
                 .saturating_add(u32::try_from(over).unwrap_or(u32::MAX));
         }
@@ -731,7 +736,7 @@ impl Session {
             status: status.to_owned(),
             txids: txids.into_iter().collect(),
             waiting,
-            headers: Arc::new(headers.clone()),
+            headers: Arc::clone(headers),
             deadline: Instant::now() + hub.pong_budget(&self.endpoint),
         };
         if proving.waiting.is_empty() {
