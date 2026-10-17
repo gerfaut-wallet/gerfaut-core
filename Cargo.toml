@@ -2,7 +2,7 @@
 name = "gerfaut-core"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.92"
 description = "Core library of Gerfaut, a Bitcoin watch-only wallet"
 repository = "https://github.com/gerfaut-wallet/gerfaut-core"
 license = "AGPL-3.0-only"
@@ -85,12 +85,12 @@ data-encoding = "2"
 # Embedded Tor. The rustls runtime keeps the tree free of OpenSSL, the
 # bundled sqlite keeps it free of system libraries, and the onion
 # service client is what a .onion backend needs.
-arti-client = { version = "0.45", default-features = false, features = ["tokio", "rustls", "compression", "flowctl-cc", "onion-service-client", "vanguards", "static-sqlite"], optional = true }
-tor-rtcompat = { version = "0.45", default-features = false, features = ["tokio", "rustls"], optional = true }
+arti-client = { version = "0.47", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "vanguards", "static-sqlite"], optional = true }
+tor-rtcompat = { version = "0.47", default-features = false, features = ["tokio", "rustls"], optional = true }
 # Names the channel padding level, which arti-client takes and does not
 # re-export. The version arti already pulls in, so nothing new is
 # compiled.
-tor-config = { version = "0.45", default-features = false, optional = true }
+tor-config = { version = "0.47", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # The flags an old vault is opened with to close it to others: never
@@ -108,8 +108,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 # arti pulls in `saturating-time`, whose limit search never terminates
 # on a clock coarser than a nanosecond: Windows counts 100 ns intervals,
 # so adding 1 ns returns the same value and the loop takes that for
-# progress (arti #2678). The fork pins the three-line fix; drop it once
-# a release carries one. Every manifest that builds this crate needs the
-# same section: Cargo only honours [patch] in the root manifest.
+# progress (arti #2678). 0.5.0, the version arti 0.47 asks for, still
+# has the bug; the fork is that release with the three-line fix, on its
+# gerfaut-0.5.0 branch. A patch that no longer matches the version arti
+# asks for is skipped without an error, so the next arti that moves to
+# another version of this crate needs the fix carried over again; drop
+# it once a release carries one. Every manifest that builds this crate
+# needs the same section: Cargo only honours [patch] in the root
+# manifest.
 [patch.crates-io]
-saturating-time = { git = "https://github.com/gerfaut-wallet/saturating-time", rev = "7bef6ba00f3adaa6aff7e68966614c9d55bb60ec" }
+saturating-time = { git = "https://github.com/gerfaut-wallet/saturating-time", rev = "185ef6a4a1647adac291bd43bb9fd2821e73b9bc" }
