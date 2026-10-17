@@ -68,17 +68,13 @@ impl PriceSource {
 
     /// Chart ranges this source can serve without an API key.
     ///
-    /// CoinGecko caps keyless history at 365 days; mempool.space only
-    /// publishes daily closes, too coarse under a month.
+    /// CoinGecko caps keyless history at 365 days. mempool.space serves
+    /// its whole history, a point an hour over the last years and a day
+    /// before: as fine for a day as for a lifetime.
     pub fn supports(self, range: PriceRange) -> bool {
         match self {
             PriceSource::Coingecko => range != PriceRange::Max,
-            PriceSource::MempoolSpace => {
-                matches!(
-                    range,
-                    PriceRange::Month | PriceRange::Year | PriceRange::Max
-                )
-            }
+            PriceSource::MempoolSpace => true,
         }
     }
 }
@@ -689,10 +685,7 @@ mod tests {
         assert_eq!(sources, PriceSource::ALL);
         let mempool = &table.sources[0];
         assert_eq!(mempool.label, "mempool.space");
-        assert_eq!(
-            mempool.ranges,
-            [PriceRange::Month, PriceRange::Year, PriceRange::Max]
-        );
+        assert_eq!(mempool.ranges, PriceRange::ALL);
         assert_eq!(
             serde_json::to_value(&table.currencies[0]).unwrap(),
             serde_json::json!({
@@ -775,9 +768,9 @@ mod tests {
         }
         assert!(PriceSource::Coingecko.supports(PriceRange::Day));
         assert!(!PriceSource::Coingecko.supports(PriceRange::Max));
-        assert!(!PriceSource::MempoolSpace.supports(PriceRange::Day));
-        assert!(!PriceSource::MempoolSpace.supports(PriceRange::Week));
-        assert!(PriceSource::MempoolSpace.supports(PriceRange::Max));
+        for range in PriceRange::ALL {
+            assert!(PriceSource::MempoolSpace.supports(range), "{range:?}");
+        }
     }
 
     #[test]

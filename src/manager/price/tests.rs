@@ -202,10 +202,10 @@ async fn an_unserved_range_is_refused_before_any_route() {
     let (proxy, asked) = refusing_tor().await;
     let dir = tempfile::tempdir().unwrap();
     let manager = onion_manager(dir.path(), proxy).await;
-    price_by(&manager, PriceSource::MempoolSpace, FiatCurrency::Usd).await;
+    price_by(&manager, PriceSource::Coingecko, FiatCurrency::Usd).await;
 
     let error = manager
-        .fetch_price_history(PriceRange::Day)
+        .fetch_price_history(PriceRange::Max)
         .await
         .unwrap_err();
     assert!(is_price_failure(&error), "{error}");

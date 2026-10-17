@@ -2,7 +2,7 @@
   "mempool_space": {
     "source": "mempool_space",
     "label": "mempool.space",
-    "ranges": ["month", "year", "max"]
+    "ranges": ["day", "week", "month", "year", "max"]
   },
   "coingecko": {
     "source": "coingecko",
