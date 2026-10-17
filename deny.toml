@@ -1,0 +1,96 @@
+# cargo-deny: known advisories, licenses and sources of every crate in
+# Cargo.lock that the targets below compile. Run by
+# .github/workflows/dependencies.yml; locally, from this folder:
+#
+#   cargo deny --locked check advisories licenses sources
+#
+# Duplicate versions are not checked: arti and its dependencies pull in
+# several on purpose, and none of them is a defect.
+
+[graph]
+# What ships this crate: the desktop app (Linux, Windows, both Macs) and
+# the Android app (three ABIs).
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "x86_64-linux-android",
+]
+# The built-in Tor client is a feature, and both apps turn it on.
+all-features = true
+
+[advisories]
+# Every vulnerability fails the check, and so does every unsound crate.
+# An unmaintained crate fails only when this crate depends on it
+# directly, the one case where replacing it is in our hands.
+unmaintained = "workspace"
+unsound = "all"
+yanked = "deny"
+# An exception that no longer matches anything has to go.
+unused-ignored-advisory = "deny"
+# Each exception names the advisory, why it does not reach this code,
+# and what would end it.
+ignore = [
+    # rsa: Marvin timing attack on RSA decryption and signing. Only arti
+    # pulls rsa in: tor-llcrypto, tor-key-forge, its fork of ssh-key. A
+    # Tor client uses RSA to check the signatures of relays and directory
+    # documents, with their public keys; it never generates, loads or uses
+    # an RSA private key, and this code does not use rsa itself. No fixed
+    # release exists: remove this entry once one is in Cargo.lock.
+    { id = "RUSTSEC-2023-0071", reason = "Marvin needs an RSA private-key operation, which a Tor client never performs; no fixed rsa release yet" },
+]
+
+[licenses]
+# Licenses that can be combined with AGPL-3.0-only: the permissive ones,
+# and MPL-2.0, whose section 3.3 allows it alongside the GNU licenses.
+# A crate offered under several licenses passes when one of them is here.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.93
+# The same list in the three workspaces that build this crate, so one
+# that none of its crates uses here is not an error.
+unused-allowed-license = "allow"
+# Rarer permissive licenses, each allowed for the one crate that uses it.
+exceptions = [
+    # MIT plus a clause against misrepresenting modified versions, the
+    # kind of term section 7(c) of the GPLv3 and AGPLv3 permits.
+    { allow = ["MITNFA"], crate = "hex_lit" },
+    # Permissive, with a patent grant, and no condition beyond keeping
+    # the notice.
+    { allow = ["BlueOak-1.0.0"], crate = "minicbor" },
+    # The Mozilla root certificates as data, under a license that puts no
+    # condition on the program that uses them.
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
+]
+
+# This crate itself (publish = false) is AGPL-3.0-only.
+[licenses.private]
+ignore = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# A git dependency has to name a commit, never a branch or a tag.
+required-git-spec = "rev"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The fork of saturating-time that the [patch.crates-io] section of
+# Cargo.toml pins.
+allow-git = ["https://github.com/gerfaut-wallet/saturating-time"]
