@@ -845,6 +845,43 @@ async fn a_server_that_took_none_is_asked_again_sooner() {
     no_event(&mut events, Duration::from_millis(300)).await;
 }
 
+/// The user's own node that refuses the watch for what it costs, at the
+/// handshake or during a session, is tried again at the ordinary pace:
+/// its limits are the user's to raise, and a node that restarts must
+/// not keep Live off a quarter of an hour.
+#[tokio::test]
+async fn the_users_node_refusing_for_cost_is_tried_again_soon() {
+    for at_hello in [true, false] {
+        let server = FakeElectrum::start().await;
+        {
+            let mut state = server.state.lock().unwrap();
+            if at_hello {
+                state
+                    .refuse_coded
+                    .insert("server.version", (-101, "excessive resource usage"));
+            } else {
+                state.cost_cut = Some(3);
+            }
+        }
+        let BackendConfig::CustomElectrum { url, .. } = server.backend() else {
+            unreachable!()
+        };
+        let all: Vec<u8> = (1..=10).collect();
+        let (_watch, _events) = LiveWatch::start_with(
+            config(BackendConfig::CustomElectrum {
+                url,
+                own_node: true,
+            }),
+            vec![wallet("a", &all, &[], false)],
+            Some(timings()),
+        );
+        // The backoff comes back within 100 ms; being left alone, not
+        // before 480.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(asked(&server, "server.version") >= 2, "at hello {at_hello}");
+    }
+}
+
 /// A server that cuts the watch for what it costs, ElectrumX past its
 /// budget, is left alone a long while, and asked for half as many
 /// scripts when the watch comes back to it. Each script that leaves

@@ -142,7 +142,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         };
         let stream = net::open(&host, port, security, proxy.as_deref(), budget)
             .await
-            .map_err(Exit::Unreachable)?;
+            .map_err(Unopened::unreachable)?;
         let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = LineReader::new(reader, MAX_LINE);
         // `server.version` is the first call a server expects, and the
@@ -151,7 +151,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
             "jsonrpc": "2.0", "id": 0, "method": "server.version",
             "params": [CLIENT_NAME, [PROTOCOL_MIN, PROTOCOL_MAX]],
         });
-        send(&mut writer, &hello).await.map_err(Exit::Unreachable)?;
+        send(&mut writer, &hello)
+            .await
+            .map_err(Unopened::unreachable)?;
         let version = answer(&mut reader, 0, budget).await?;
         let negotiated = version[1].as_str().unwrap_or_default().to_owned();
         let software = version[0]
@@ -166,19 +168,20 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         });
         send(&mut writer, &genesis)
             .await
-            .map_err(Exit::Unreachable)?;
+            .map_err(Unopened::unreachable)?;
         let genesis = answer(&mut reader, 1, budget).await?;
         let genesis = genesis
             .as_str()
             .and_then(|hex| deserialize_hex::<Header>(hex).ok());
         if !genesis.is_some_and(|header| is_genesis_of(network, header.block_hash())) {
-            return Err(Exit::Refused(ANOTHER_NETWORK.to_owned()));
+            return Err(Unopened::Exit(Exit::Refused(ANOTHER_NETWORK.to_owned())));
         }
         Ok((reader, writer, negotiated, software))
     };
     let (mut reader, writer, negotiated, software) = match hub.during(opening).await {
         Ok(Ok(opened)) => opened,
-        Ok(Err(exit)) | Err(exit) => return exit,
+        Ok(Err(Unopened::Exit(exit))) | Err(exit) => return exit,
+        Ok(Err(Unopened::Costly(detail))) => return cost_exit(hub, detail, false),
     };
 
     hub.retry_limit(endpoint);
@@ -232,7 +235,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                     session.pong_by = None;
                     session.handle(hub, &line);
                     if let Some(detail) = session.overloaded.take() {
-                        return Exit::Refused(detail);
+                        return cost_exit(hub, detail, true);
                     }
                     session.check_ready(hub);
                     session.pump().await
@@ -560,35 +563,46 @@ impl Session {
     }
 }
 
+/// Why the opening of a session came to nothing.
+enum Unopened {
+    Exit(Exit),
+    /// The server refused the handshake for what the watch costs it,
+    /// in these words: ElectrumX still holding the cost of an earlier
+    /// session against the address.
+    Costly(String),
+}
+
+impl Unopened {
+    fn unreachable(detail: String) -> Unopened {
+        Unopened::Exit(Exit::Unreachable(detail))
+    }
+}
+
 /// The result of the request numbered `id`, past whatever the server
-/// says before it, within `budget`. A refusal for cost is the server
-/// cutting the watch before it has asked for anything, ElectrumX still
-/// holding the cost of the last session against the address: the
-/// server is left alone as after a cut ([`Exit::Refused`]), not tried
-/// again at every backoff, each try adding to what it holds.
+/// says before it, within `budget`.
 async fn answer(
     reader: &mut LineReader<ReadHalf<BoxStream>>,
     id: u64,
     budget: Duration,
-) -> Result<Value, Exit> {
+) -> Result<Value, Unopened> {
     let read = async {
         loop {
             let line = reader
                 .next_line()
                 .await
-                .map_err(|e| Exit::Unreachable(e.to_string()))?
-                .ok_or_else(|| Exit::Unreachable("the connection was closed".to_owned()))?;
+                .map_err(|e| Unopened::unreachable(e.to_string()))?
+                .ok_or_else(|| Unopened::unreachable("the connection was closed".to_owned()))?;
             let Ok(mut message) = serde_json::from_slice::<Value>(&line) else {
-                return Err(Exit::Unreachable("unexpected response".to_owned()));
+                return Err(Unopened::unreachable("unexpected response".to_owned()));
             };
             if message.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
             if let Some(error) = message.get("error").filter(|e| !e.is_null()) {
                 if costs_too_much(error) {
-                    return Err(Exit::Refused(words(error)));
+                    return Err(Unopened::Costly(words(error)));
                 }
-                return Err(Exit::Unreachable(format!(
+                return Err(Unopened::unreachable(format!(
                     "the server refused the request: {}",
                     words(error)
                 )));
@@ -598,7 +612,24 @@ async fn answer(
     };
     tokio::time::timeout(budget, read)
         .await
-        .map_err(|_| Exit::Unreachable(format!("timed out after {} s", budget.as_secs())))?
+        .map_err(|_| Unopened::unreachable(format!("timed out after {} s", budget.as_secs())))?
+}
+
+/// How the watch leaves a server that refused it for what it costs,
+/// before a session (`opened` false) or during one. Someone else's is
+/// left alone as after a cut ([`Exit::Refused`]), not tried again at
+/// every backoff, each try adding to what it holds against the address.
+/// The user's own node is tried again at the ordinary pace: its limits
+/// are theirs to raise, and a node that restarts must not keep Live off
+/// a quarter of an hour after it is back.
+fn cost_exit(hub: &Hub, detail: String, opened: bool) -> Exit {
+    if !hub.config.backend.is_own_node() {
+        Exit::Refused(detail)
+    } else if opened {
+        Exit::Lost(detail)
+    } else {
+        Exit::Unreachable(detail)
+    }
 }
 
 async fn send(writer: &mut WriteHalf<BoxStream>, message: &Value) -> Result<(), String> {
