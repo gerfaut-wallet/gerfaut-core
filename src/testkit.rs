@@ -269,6 +269,12 @@ pub(crate) struct ElectrumState {
     /// The merkle branch sent for a transaction, as hashes in hex and a
     /// position, in place of the empty one.
     pub branches: HashMap<Txid, (Vec<String>, usize)>,
+    /// A header sent once for its height, the first time a header is
+    /// asked for there, and the chain's after it: the block a
+    /// reorganisation replaced while a client was reading.
+    pub stale_once: HashMap<u32, bdk_wallet::bitcoin::block::Header>,
+    /// Heights whose header is refused.
+    pub refused_headers: std::collections::HashSet<u32>,
 }
 
 /// Heights past which the fake Electrum server makes a header up on the
@@ -560,7 +566,16 @@ impl FakeElectrum {
                     None => return refusal("No such mempool or blockchain transaction"),
                 }
             }
-            "blockchain.block.header" => json!(state.header(param.as_u64().unwrap_or(0) as u32)),
+            "blockchain.block.header" => {
+                let height = param.as_u64().unwrap_or(0) as u32;
+                if state.refused_headers.contains(&height) {
+                    return refusal("header not available");
+                }
+                match state.stale_once.remove(&height) {
+                    Some(stale) => json!(serialize_hex(&stale)),
+                    None => json!(state.header(height)),
+                }
+            }
             _ => Value::Null,
         };
         Answer::Line(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
@@ -684,6 +699,11 @@ pub(crate) struct MempoolState {
     /// Whether the REST side has lost the headers of its blocks, as a
     /// server has those of a block a reorganisation left behind.
     pub headerless: bool,
+    /// Blocks a reorganisation replaced, by height: the statuses of the
+    /// transactions confirmed there still name them, and their headers
+    /// are still served, while the chain and the branches are the new
+    /// block's.
+    pub stale: HashMap<u32, bdk_wallet::bitcoin::block::Header>,
 }
 
 /// The headers of the chain the fake mempool serves, by height: see
@@ -826,7 +846,10 @@ impl MempoolState {
             && tx["status"].get("block_hash").is_some()
             && let Some(height) = tx["status"]["block_height"].as_u64()
         {
-            let header = self.header_in(chain, height as u32);
+            let header = match self.stale.get(&(height as u32)) {
+                Some(stale) => *stale,
+                None => self.header_in(chain, height as u32),
+            };
             tx["status"]["block_hash"] = json!(header.block_hash().to_string());
             tx["status"]["block_time"] = json!(header.time);
         }
@@ -1009,6 +1032,7 @@ impl FakeMempool {
             {
                 let header = chain
                     .values()
+                    .chain(state.stale.values())
                     .find(|header| header.block_hash().to_string() == hash)
                     .copied()
                     .or_else(|| {
@@ -1152,6 +1176,14 @@ impl FakeMempool {
         .into_bytes();
         answer.extend_from_slice(&body);
         let _ = stream.write_all(&answer).await;
+    }
+
+    /// The header of the chain the REST side serves at `height`.
+    pub(crate) fn header_at_height(
+        state: &MempoolState,
+        height: u32,
+    ) -> bdk_wallet::bitcoin::block::Header {
+        state.header_in(&state.chain(), height)
     }
 
     pub(crate) fn backend(&self) -> BackendConfig {

@@ -27,7 +27,7 @@ use bdk_wallet::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use electrum_client::{self, ElectrumApi, GetHistoryRes};
 
-use crate::chain::proof::{FALSE_PROOF, Proof, check_confirmation};
+use crate::chain::proof::{FALSE_PROOF, Proof, check_confirmation, recheck};
 use crate::chain::{
     ANOTHER_NETWORK, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX, has_proof_of_work,
     height_limit,
@@ -414,7 +414,9 @@ impl Pass<'_> {
     /// refuses the server ([`FALSE_PROOF`]): it named a confirmation it
     /// cannot back, and the next server is asked instead of this one
     /// being believed on anything else. One that is unsure leaves the
-    /// transaction unconfirmed, as seen in the mempool now.
+    /// transaction unconfirmed, as seen in the mempool now: among them, a
+    /// branch the server refused, and one into a block that replaced the
+    /// one read ([`recheck`]).
     fn prove(
         &mut self,
         client: &impl ElectrumApi,
@@ -440,20 +442,27 @@ impl Pass<'_> {
             }
         }
         for batch in to_prove.chunks(BATCH) {
-            let proofs = client
-                .batch_transaction_get_merkle(batch.iter().map(|(txid, h)| (*txid, *h as usize)))?;
-            if proofs.len() != batch.len() {
-                return Err(false_proof());
-            }
-            for ((txid, height), proof) in batch.iter().zip(proofs) {
-                let header = chain.headers.get(height).ok_or_else(false_proof)?;
-                match check_confirmation(network, *height, header, *txid, &proof) {
+            for ((txid, height), proof) in batch.iter().zip(branches(client, batch)?) {
+                let header = *chain.headers.get(height).ok_or_else(false_proof)?;
+                let verdict = match &proof {
+                    None => Proof::Unsure,
+                    Some(proof) => {
+                        match check_confirmation(network, *height, &header, *txid, proof) {
+                            Proof::Elsewhere => {
+                                let again = client.block_header(*height as usize)?;
+                                recheck(network, *height, &header, &again, *txid, proof)
+                            }
+                            verdict => verdict,
+                        }
+                    }
+                };
+                match verdict {
                     Proof::Holds => {}
                     Proof::Unsure => {
                         self.update.seen_ats.insert((*txid, self.start_time));
                         continue;
                     }
-                    Proof::False => return Err(false_proof()),
+                    Proof::False | Proof::Elsewhere => return Err(false_proof()),
                 }
                 self.update.anchors.insert((
                     ConfirmationBlockTime {
@@ -503,6 +512,42 @@ impl Pass<'_> {
             self.update.txouts.insert(outpoint, txout.clone());
         }
         Ok(())
+    }
+}
+
+/// The merkle branches of a batch of confirmations, in its order: `None`
+/// for one the server refused, as it does when a block came in since it
+/// listed the history and the transaction is no longer where it said.
+/// The batch is asked as one; refused, each is asked alone.
+fn branches(
+    client: &impl ElectrumApi,
+    batch: &[(Txid, u32)],
+) -> Result<Vec<Option<electrum_client::GetMerkleRes>>, Error> {
+    let asked = batch.iter().map(|(txid, height)| (*txid, *height as usize));
+    match client.batch_transaction_get_merkle(asked) {
+        Ok(proofs) if proofs.len() == batch.len() => Ok(proofs.into_iter().map(Some).collect()),
+        Ok(_) => Err(Error::Message(FALSE_PROOF.to_owned())),
+        Err(error) if refused(&error) => batch
+            .iter()
+            .map(
+                |(txid, height)| match client.transaction_get_merkle(txid, *height as usize) {
+                    Ok(proof) => Ok(Some(proof)),
+                    Err(error) if refused(&error) => Ok(None),
+                    Err(error) => Err(error),
+                },
+            )
+            .collect(),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether the server answered with an error of its own, rather than
+/// failing to answer at all.
+fn refused(error: &Error) -> bool {
+    match error {
+        Error::Protocol(_) => true,
+        Error::AllAttemptsErrored(errors) => errors.last().is_some_and(refused),
+        _ => false,
     }
 }
 

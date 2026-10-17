@@ -451,6 +451,56 @@ fn a_real_branch_proves_its_transaction() {
     ));
 }
 
+/// A sound branch that leads to another root than the header read leads
+/// to the header read again: a block that moved, and that the branch
+/// proves the transaction in, is a reorganisation in between, unsure; the
+/// same block again, or a branch that proves nothing in the new one, is a
+/// false proof.
+#[test]
+fn a_branch_into_another_block_is_read_again() {
+    let txid: Txid = REAL_TXID.parse().unwrap();
+    let proven = branch(963_647, REAL_POS, &REAL_BRANCH);
+    let real = last_checkpoint();
+    // The block first read: the real one, another root in it.
+    let stale = Header {
+        merkle_root: TxMerkleNode::from_byte_array([9; 32]),
+        ..real
+    };
+    assert_eq!(
+        check_confirmation(Network::Signet, 963_647, &stale, txid, &proven),
+        Proof::Elsewhere
+    );
+    assert_eq!(
+        recheck(Network::Signet, 963_647, &stale, &real, txid, &proven),
+        Proof::Unsure
+    );
+    assert_eq!(
+        recheck(Network::Signet, 963_647, &stale, &stale, txid, &proven),
+        Proof::False
+    );
+    let other = Header {
+        merkle_root: TxMerkleNode::from_byte_array([8; 32]),
+        ..real
+    };
+    assert_eq!(
+        recheck(Network::Signet, 963_647, &stale, &other, txid, &proven),
+        Proof::False
+    );
+    // On mainnet, the block read again must carry the work too.
+    assert_eq!(
+        recheck(Network::Mainnet, 963_647, &stale, &real, txid, &proven),
+        Proof::Unsure
+    );
+    let unmined = Header {
+        nonce: real.nonce.wrapping_add(1),
+        ..real
+    };
+    assert_eq!(
+        recheck(Network::Mainnet, 963_647, &stale, &unmined, txid, &proven),
+        Proof::False
+    );
+}
+
 /// The two halves of a transaction of 64 bytes, as they are hashed: the
 /// first one read as a txid, the second as its sibling.
 pub(super) fn halves_of_64_bytes(first: [u8; 32]) -> (Txid, [u8; 32], Transaction) {
@@ -781,6 +831,52 @@ mod servers {
         assert!(refused.contains(FALSE_PROOF), "{refused}");
     }
 
+    /// A block that replaced the one first read, between the header and
+    /// the branch: the payment is left unconfirmed, as seen in the
+    /// mempool, and the server is not refused, where it used to be taken
+    /// for a liar. A branch the server refuses, as one does when the
+    /// transaction is no longer in the block it listed, does the same.
+    #[tokio::test]
+    async fn an_electrum_reorganisation_leaves_a_payment_unsure() {
+        let server = signet().await;
+        let payment = pay(&server, 90, |_| true);
+        let txid = payment.compute_txid();
+        {
+            let mut state = server.state.lock().unwrap();
+            let mut stale = state.header_of(90);
+            stale.merkle_root = TxMerkleNode::from_byte_array([7; 32]);
+            state.stale_once.insert(90, stale);
+        }
+        let synced = electrum_sync(&server, Network::Signet).await.unwrap();
+        assert_eq!(anchored(&synced), []);
+        assert!(
+            synced
+                .update
+                .tx_update
+                .seen_ats
+                .iter()
+                .any(|(seen, _)| *seen == txid)
+        );
+
+        let server = signet().await;
+        let payment = pay(&server, 90, |_| true);
+        server.state.lock().unwrap().refuse.insert(
+            "blockchain.transaction.get_merkle",
+            "tx not in block".to_owned(),
+        );
+        let synced = electrum_sync(&server, Network::Signet).await.unwrap();
+        assert_eq!(anchored(&synced), []);
+        let txid = payment.compute_txid();
+        assert!(
+            synced
+                .update
+                .tx_update
+                .seen_ats
+                .iter()
+                .any(|(seen, _)| *seen == txid)
+        );
+    }
+
     /// On mainnet, a real transaction of the last checkpoint's block is
     /// proven by its real branch; a payment in a header that commits to
     /// it and that no one mined refuses the server, where it used to
@@ -883,6 +979,34 @@ mod servers {
             .await
             .unwrap_err();
         assert!(refused.contains(FALSE_PROOF), "{refused}");
+    }
+
+    /// A watched address: a block that replaced the one first read, and a
+    /// header the server refuses for one height, leave the payment
+    /// unconfirmed, the rest of the address read, where either used to
+    /// fail the sync.
+    #[tokio::test]
+    async fn an_address_reorganisation_leaves_a_payment_unsure() {
+        let server = signet().await;
+        pay_address(&server, 90);
+        {
+            let mut state = server.state.lock().unwrap();
+            let mut stale = state.header_of(90);
+            stale.merkle_root = TxMerkleNode::from_byte_array([7; 32]);
+            state.stale_once.insert(90, stale);
+        }
+        let state = address_state(&server, SIGNET_ADDRESS, Network::Signet)
+            .await
+            .unwrap();
+        assert_eq!(state.txs[0].height, None);
+
+        let server = signet().await;
+        pay_address(&server, 90);
+        server.state.lock().unwrap().refused_headers.insert(90);
+        let state = address_state(&server, SIGNET_ADDRESS, Network::Signet)
+            .await
+            .unwrap();
+        assert_eq!(state.txs[0].height, None);
     }
 
     /// On mainnet, a real confirmation of the last checkpoint's block is
@@ -1072,6 +1196,34 @@ mod servers {
             .await
             .unwrap();
         let txid: Txid = crate::testkit::esplora_txid(0x3d).parse().unwrap();
+        assert!(synced.update.tx_update.anchors.is_empty());
+        assert!(
+            synced
+                .update
+                .tx_update
+                .seen_ats
+                .iter()
+                .any(|(seen, _)| *seen == txid)
+        );
+    }
+
+    /// A status that names a block a reorganisation replaced, its branch
+    /// into the new one: the payment is left unconfirmed and the server is
+    /// not refused, where it used to be taken for a liar.
+    #[tokio::test]
+    async fn an_esplora_reorganisation_leaves_a_payment_unsure() {
+        let server = mempool(Network::Signet).await;
+        list(&server, vec![esplora_payment(0x3e, 0x4e, 50_000, true)]);
+        {
+            let mut state = server.state.lock().unwrap();
+            let mut stale = crate::testkit::FakeMempool::header_at_height(&state, 501);
+            stale.merkle_root = TxMerkleNode::from_byte_array([7; 32]);
+            state.stale.insert(501, stale);
+        }
+        let synced = esplora_sync(&server, address_plan(Network::Signet, Held::default()))
+            .await
+            .unwrap();
+        let txid: Txid = crate::testkit::esplora_txid(0x3e).parse().unwrap();
         assert!(synced.update.tx_update.anchors.is_empty());
         assert!(
             synced

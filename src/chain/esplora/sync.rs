@@ -45,7 +45,7 @@ use futures_util::future::try_join_all;
 
 use super::page::PageTx;
 use super::{Client, Counts, PAGE, PARALLEL_REQUESTS};
-use crate::chain::proof::{FALSE_PROOF, Proof, check_confirmation};
+use crate::chain::proof::{FALSE_PROOF, Proof, check_confirmation, recheck};
 use crate::chain::{
     Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX, height_limit,
 };
@@ -529,7 +529,9 @@ async fn prove(
 /// proven, `None` when the proof is unsure, or when the server has no
 /// branch or no header for it, as when a block came in since it listed
 /// it. A proof that does not hold refuses the server ([`FALSE_PROOF`]),
-/// and so does a header that is not the block named.
+/// and so does a header that is not the block named. A sound branch into
+/// another block has the block at its height read again ([`recheck`]):
+/// one that replaced the block named leaves the confirmation unsure.
 pub(crate) async fn prove_confirmations(
     client: &Client,
     network: Network,
@@ -557,14 +559,22 @@ pub(crate) async fn prove_confirmations(
         for ((txid, block), branch) in chunk.iter().zip(branches) {
             let proof = match (branch, headers.get(&block.hash)) {
                 (Some(branch), Some(header)) => {
-                    check_confirmation(network, block.height, header, *txid, &branch)
+                    match check_confirmation(network, block.height, header, *txid, &branch) {
+                        Proof::Elsewhere => match block_at_height(client, block.height).await? {
+                            Some(again) => {
+                                recheck(network, block.height, header, &again, *txid, &branch)
+                            }
+                            None => Proof::Unsure,
+                        },
+                        verdict => verdict,
+                    }
                 }
                 _ => Proof::Unsure,
             };
             match proof {
                 Proof::Holds => times.push(Some(u64::from(headers[&block.hash].time))),
                 Proof::Unsure => times.push(None),
-                Proof::False => return Err(FALSE_PROOF.to_owned()),
+                Proof::False | Proof::Elsewhere => return Err(FALSE_PROOF.to_owned()),
             }
         }
     }
@@ -586,6 +596,22 @@ async fn block_header(client: &Client, hash: BlockHash) -> Result<Option<Header>
         .filter(|header| header.block_hash() == hash)
         .map(Some)
         .ok_or_else(|| FALSE_PROOF.to_owned())
+}
+
+/// The header of the block the server has at `height` now; `None` when
+/// it has none there.
+async fn block_at_height(client: &Client, height: u32) -> Result<Option<Header>, String> {
+    let Some(text) = client
+        .fetch(&format!("/block-height/{height}"), 1 << 10)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let hash: BlockHash = std::str::from_utf8(&text)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .ok_or_else(|| "unexpected response".to_owned())?;
+    block_header(client, hash).await
 }
 
 /// The latest blocks, by height: ten on the instances there are,

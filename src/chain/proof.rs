@@ -124,6 +124,11 @@ pub(crate) enum Proof {
     /// between, or one through an inner node that reads as a transaction.
     /// The transaction is left unconfirmed, as it was.
     Unsure,
+    /// A sound branch that leads to another root than the header's: the
+    /// block at that height may have changed since the header was read,
+    /// a reorganisation in between. Read the header again, once, and ask
+    /// [`recheck`].
+    Elsewhere,
 }
 
 /// What `branch` proves of `txid` in the block of `header`, at `height`:
@@ -144,8 +149,31 @@ pub(crate) fn check_confirmation(
     }
     match merkle_root(txid, branch.pos, &branch.merkle) {
         Ok(root) if root == header.merkle_root => Proof::Holds,
+        Ok(_) => Proof::Elsewhere,
         Err(Fault::Transaction) => Proof::Unsure,
-        Ok(_) | Err(Fault::Shape) => Proof::False,
+        Err(Fault::Shape) => Proof::False,
+    }
+}
+
+/// What a branch that led elsewhere ([`Proof::Elsewhere`]) proves once
+/// the header at its height is read `again`: a block that is not the one
+/// first read, which the branch proves the transaction in, says a
+/// reorganisation came in between, and the confirmation is unsure. The
+/// same block, or a branch that proves nothing in the new one, is a
+/// false proof.
+pub(crate) fn recheck(
+    network: Network,
+    height: u32,
+    first: &Header,
+    again: &Header,
+    txid: Txid,
+    branch: &GetMerkleRes,
+) -> Proof {
+    let moved = again.block_hash() != first.block_hash();
+    if moved && check_confirmation(network, height, again, txid, branch) == Proof::Holds {
+        Proof::Unsure
+    } else {
+        Proof::False
     }
 }
 

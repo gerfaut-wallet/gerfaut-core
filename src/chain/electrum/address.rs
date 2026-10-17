@@ -40,7 +40,7 @@ use super::rpc::{CallError, Connection};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
 use crate::chain::proof::{
-    FALSE_PROOF, Proof, ProvenCoin, check_confirmation, proven_coin, remember_coin,
+    FALSE_PROOF, Proof, ProvenCoin, check_confirmation, proven_coin, recheck, remember_coin,
 };
 use crate::chain::{KEEP_MAX, Kept};
 use crate::network::Network;
@@ -565,25 +565,21 @@ fn unproven(round: &[Picked], held: &[AddressTx]) -> Vec<(Txid, u32)> {
 
 /// Proves each of `unproven` in the block at its height: its merkle
 /// branch, against the header `headers` holds for it
-/// ([`check_confirmation`]). One the server cannot prove, or proves with
-/// a branch or a header that does not hold, refuses the server; the
-/// server's refusal of a header it was asked for is said in its words.
-/// Returns the txids of the confirmations left unsure, which stay
-/// unconfirmed: among them, those whose header was past what a round
-/// reads ([`MAX_HEADERS`]).
+/// ([`check_confirmation`]). One the server proves with a branch or a
+/// header that does not hold refuses the server. Returns the txids of the
+/// confirmations left unsure, which stay unconfirmed: those whose header
+/// was past what a round reads ([`MAX_HEADERS`]) or refused, those whose
+/// branch the server refused, as it does when a block came in since it
+/// listed the history, and those whose branch leads into a block that
+/// replaced the one read ([`recheck`]).
 async fn prove(
     connection: &mut Connection,
     network: Network,
     unproven: &[(Txid, u32)],
     headers: &Headers,
 ) -> Result<HashSet<String>, String> {
-    if let Some(words) = unproven
-        .iter()
-        .find_map(|(_, height)| headers.refused.get(height))
-    {
-        return Err(words.clone());
-    }
-    let mut proofs = vec![Proof::False; unproven.len()];
+    let mut verdicts: Vec<(Proof, Option<GetMerkleRes>)> =
+        vec![(Proof::False, None); unproven.len()];
     connection
         .batch::<GetMerkleRes>(
             "blockchain.transaction.get_merkle",
@@ -593,29 +589,57 @@ async fn prove(
                 .collect(),
             |index, answer| {
                 let (txid, height) = unproven[index];
-                proofs[index] = match (answer, headers.found.get(&height)) {
-                    _ if !headers.asked.contains(&height) => Proof::Unsure,
-                    (Ok(branch), Some(header)) => {
-                        check_confirmation(network, height, header, txid, &branch)
+                verdicts[index] = match (answer, headers.found.get(&height)) {
+                    _ if !headers.asked.contains(&height)
+                        || headers.refused.contains_key(&height) =>
+                    {
+                        (Proof::Unsure, None)
                     }
-                    // What a server answers when a block came in since
-                    // it listed the history.
-                    (Err(CallError::Refused(_)), _) => Proof::Unsure,
-                    _ => Proof::False,
+                    (Ok(branch), Some(header)) => (
+                        check_confirmation(network, height, header, txid, &branch),
+                        Some(branch),
+                    ),
+                    (Err(CallError::Refused(_)), _) => (Proof::Unsure, None),
+                    _ => (Proof::False, None),
                 };
                 Ok(())
             },
         )
         .await?;
-    if proofs.contains(&Proof::False) {
-        return Err(FALSE_PROOF.to_owned());
+    let mut unsure = HashSet::new();
+    for ((txid, height), (verdict, branch)) in unproven.iter().zip(verdicts) {
+        let verdict = match (verdict, branch, headers.found.get(height)) {
+            (Proof::Elsewhere, Some(branch), Some(first)) => {
+                match header_again(connection, *height).await? {
+                    Some(again) => recheck(network, *height, first, &again, *txid, &branch),
+                    None => Proof::Unsure,
+                }
+            }
+            (verdict, _, _) => verdict,
+        };
+        match verdict {
+            Proof::Holds => {}
+            Proof::Unsure => {
+                unsure.insert(txid.to_string());
+            }
+            Proof::False | Proof::Elsewhere => return Err(FALSE_PROOF.to_owned()),
+        }
     }
-    Ok(unproven
-        .iter()
-        .zip(proofs)
-        .filter(|(_, proof)| *proof == Proof::Unsure)
-        .map(|((txid, _), _)| txid.to_string())
-        .collect())
+    Ok(unsure)
+}
+
+/// The header at `height`, read again; `None` when the server refuses it.
+async fn header_again(connection: &mut Connection, height: u32) -> Result<Option<Header>, String> {
+    match connection
+        .call::<String>("blockchain.block.header", json!([height]))
+        .await
+    {
+        Ok(hex) => deserialize_hex::<Header>(&hex)
+            .map(Some)
+            .map_err(|_| "unexpected response".to_owned()),
+        Err(CallError::Refused(_)) => Ok(None),
+        Err(other) => Err(other.into()),
+    }
 }
 
 /// The height the history first lists each transaction at: the one
