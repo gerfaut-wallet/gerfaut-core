@@ -238,6 +238,8 @@ pub(crate) struct ElectrumState {
     pub txs: HashMap<Txid, String>,
     /// Methods answered with this error message instead.
     pub refuse: HashMap<&'static str, String>,
+    /// Methods answered with this error code and message instead.
+    pub refuse_coded: HashMap<&'static str, (i64, &'static str)>,
     /// Methods turned down this many times more, each, the way the
     /// electrs of Blockstream turns a request down when the answers it
     /// holds take all the memory it allows them.
@@ -277,6 +279,21 @@ pub(crate) struct ElectrumState {
     /// What the server says it runs, first in its answer to
     /// `server.version`.
     pub software: &'static str,
+    /// Answers held back, as ElectrumX holds them from 1.18 on against
+    /// traffic analysis, until this many bytes of them wait or this long
+    /// has passed since the last write; the first kilobyte goes out at
+    /// once, for the handshake.
+    pub hold: Option<(usize, std::time::Duration)>,
+    /// The most answers held back at once on a connection: what the
+    /// client had sent and was waiting on.
+    pub held_most: usize,
+    /// How many times held answers went out because the wait was over,
+    /// not because a kilobyte of them was ready.
+    pub timed_flushes: usize,
+    /// While answers are held, a subscription that finds this many held
+    /// before it is refused as ElectrumX refuses a request that waited
+    /// its turn too long on a session it slows down.
+    pub busy_past: Option<usize>,
     /// Headers served as they are at their height, whatever the chain
     /// below them: real ones, or forged.
     pub served: HashMap<u32, bdk_wallet::bitcoin::block::Header>,
@@ -390,6 +407,24 @@ impl ElectrumState {
     }
 }
 
+/// What goes out now of `bytes`, with whatever was held before them,
+/// or nothing, all of it held: see [`ElectrumState::hold`].
+fn hold_back(
+    hold: Option<(usize, std::time::Duration)>,
+    held: &mut Vec<u8>,
+    written: usize,
+    bytes: Vec<u8>,
+) -> Option<Vec<u8>> {
+    let Some((size, _)) = hold else {
+        return Some(bytes);
+    };
+    held.extend_from_slice(&bytes);
+    if held.len() < size && written >= 1024 {
+        return None;
+    }
+    Some(std::mem::take(held))
+}
+
 #[derive(Clone)]
 pub(crate) struct FakeElectrum {
     pub address: SocketAddr,
@@ -432,8 +467,33 @@ impl FakeElectrum {
         // another test just closed, and a client of that test, still
         // trying it, is neither answered nor counted.
         let mut spoke = false;
+        let hold = state.lock().unwrap().hold;
+        let mut held: Vec<u8> = Vec::new();
+        let mut held_answers = 0usize;
+        let mut last_write = tokio::time::Instant::now();
+        // What was written, the first kilobyte of which goes out at once
+        // so that the handshake is not held back.
+        let mut written = 0usize;
         loop {
+            let flush_at = hold
+                .filter(|_| !held.is_empty())
+                .map(|(_, wait)| last_write + wait);
             tokio::select! {
+                () = async {
+                    match flush_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let bytes = std::mem::take(&mut held);
+                    held_answers = 0;
+                    state.lock().unwrap().timed_flushes += 1;
+                    if writer.write_all(&bytes).await.is_err() {
+                        return;
+                    }
+                    written += bytes.len();
+                    last_write = tokio::time::Instant::now();
+                }
                 line = lines.next_line() => {
                     let Ok(Some(line)) = line else {
                         if spoke {
@@ -470,7 +530,18 @@ impl FakeElectrum {
                             .as_ref()
                             .filter(|(gated, _)| *gated == method)
                             .map(|(_, gate)| gate.clone());
-                        (Self::answer(&mut state, index, &request, &method), gate)
+                        let busy = method == "blockchain.scripthash.subscribe"
+                            && written >= 1024
+                            && state.busy_past.is_some_and(|most| held_answers >= most);
+                        let answer = if busy {
+                            Answer::Line(json!({
+                                "jsonrpc": "2.0", "id": request["id"],
+                                "error": { "code": -102, "message": "server busy - request timed out" },
+                            }))
+                        } else {
+                            Self::answer(&mut state, index, &request, &method)
+                        };
+                        (answer, gate)
                     };
                     if let Some(gate) = gate
                         && let Ok(permit) = gate.acquire().await
@@ -479,8 +550,11 @@ impl FakeElectrum {
                     }
                     let bytes = match answer {
                         Answer::Line(answer) => format!("{answer}\n").into_bytes(),
+                        // Whatever is held goes out first, as ElectrumX
+                        // sends what it holds before it closes.
                         Answer::Last(answer) => {
-                            let _ = writer.write_all(format!("{answer}\n").as_bytes()).await;
+                            held.extend_from_slice(format!("{answer}\n").as_bytes());
+                            let _ = writer.write_all(&held).await;
                             return;
                         }
                         Answer::Stall => {
@@ -490,15 +564,32 @@ impl FakeElectrum {
                         Answer::Flood(size) => vec![b'x'; size],
                         Answer::Nothing => continue,
                     };
+                    let Some(bytes) = hold_back(hold, &mut held, written, bytes) else {
+                        held_answers += 1;
+                        let mut state = state.lock().unwrap();
+                        state.held_most = state.held_most.max(held_answers);
+                        continue;
+                    };
+                    held_answers = 0;
                     if writer.write_all(&bytes).await.is_err() {
                         return;
                     }
+                    written += bytes.len();
+                    last_write = tokio::time::Instant::now();
                 }
                 pushed = pushed.recv() => match pushed {
+                    // Held with the answers, in the order they come.
                     Some(Some(line)) => {
-                        if writer.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                        let line = format!("{line}\n").into_bytes();
+                        let Some(bytes) = hold_back(hold, &mut held, written, line) else {
+                            continue;
+                        };
+                        held_answers = 0;
+                        if writer.write_all(&bytes).await.is_err() {
                             return;
                         }
+                        written += bytes.len();
+                        last_write = tokio::time::Instant::now();
                     }
                     // Hang up.
                     _ => return,
@@ -527,6 +618,11 @@ impl FakeElectrum {
         };
         if let Some(message) = state.refuse.get(method) {
             return refusal(message);
+        }
+        if let Some((code, message)) = state.refuse_coded.get(method) {
+            return Answer::Line(json!({
+                "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message },
+            }));
         }
         if let Some(left) = state.busy.get_mut(method)
             && *left > 0
@@ -1327,5 +1423,45 @@ impl FakeMempool {
             .decode(script_hex.as_bytes())
             .unwrap();
         data_encoding::HEXLOWER.encode(&sha256::Hash::hash(&bytes).to_byte_array())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A notification is held with the answers before it, and goes out
+    /// after them, as ElectrumX sends it.
+    #[tokio::test]
+    async fn a_held_notification_follows_the_answers_held_before_it() {
+        let server = FakeElectrum::start().await;
+        server.state.lock().unwrap().hold =
+            Some((usize::MAX, std::time::Duration::from_millis(200)));
+        let stream = TcpStream::connect(server.address).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        // Past the first kilobyte, which goes out at once.
+        let headers = json!({ "id": 0, "method": "blockchain.block.headers", "params": [0, 10] });
+        writer
+            .write_all(format!("{headers}\n").as_bytes())
+            .await
+            .unwrap();
+        let first: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(first["id"], 0);
+        let subscribe =
+            json!({ "id": 1, "method": "blockchain.scripthash.subscribe", "params": ["00"] });
+        writer
+            .write_all(format!("{subscribe}\n").as_bytes())
+            .await
+            .unwrap();
+        while server.state.lock().unwrap().asked.len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        server.push(json!({ "method": "blockchain.headers.subscribe", "params": [] }).to_string());
+        let next: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(next["id"], 1);
+        let last: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(last["method"], "blockchain.headers.subscribe");
     }
 }

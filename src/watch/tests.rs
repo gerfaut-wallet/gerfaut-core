@@ -396,6 +396,161 @@ async fn a_script_the_server_refused_is_left_to_the_syncs() {
     no_event(&mut events, Duration::from_millis(300)).await;
 }
 
+/// ElectrumX, from 1.18 on, holds small answers back until a kilobyte
+/// of them waits, or a second has passed since it last wrote. The watch
+/// keeps enough subscriptions awaiting their answer to fill that
+/// kilobyte, so the server's wait comes once, at the end of the list,
+/// not every few subscriptions: ten at a time went through at ten a
+/// second.
+#[tokio::test]
+async fn electrum_fills_what_a_padding_server_holds_back() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().hold = Some((1024, Duration::from_secs(3)));
+    let all: Vec<u8> = (0..200).collect();
+    let started = std::time::Instant::now();
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            // Pings answered within the hold.
+            keepalive: Duration::from_secs(60),
+            pong: Duration::from_secs(10),
+            ..timings()
+        }),
+    );
+    until(&watch, "half subscribed", |s| s.pushed_scripts >= 100).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "held back: {:?}",
+        started.elapsed()
+    );
+}
+
+/// The watch keeps a window of subscriptions awaiting their answer, a
+/// wider one on the user's own node, where electrs, as its author
+/// publishes it, looks at every subscription again after each round;
+/// not on ElectrumX, where requests that wait too long are errors that
+/// cost the session. The lists are longer than either window, and every
+/// answer is held a moment: what the server holds at most is what the
+/// watch kept waiting on.
+#[tokio::test]
+async fn electrum_keeps_a_wider_window_on_the_users_node() {
+    // A script of each of `n` distinct values, past the 256 of `script`.
+    let wide = |n: usize| -> WatchedWallet {
+        WatchedWallet {
+            wallet_id: "a".to_owned(),
+            scripts: (0..n)
+                .map(|i| WatchedScript {
+                    script: format!("0014{i:04x}{}", "ab".repeat(18)),
+                    lookahead: false,
+                    status: None,
+                    counts: None,
+                    history: Vec::new(),
+                })
+                .collect(),
+            has_pending: false,
+            pinned: false,
+            holds_coins: false,
+            unlisted: 0,
+        }
+    };
+    let own = 2 * electrum::OWN_NODE_WINDOW + 50;
+    for (own_node, software, window, scripts) in [
+        (
+            false,
+            "electrs/0.12.0",
+            electrum::WINDOW,
+            MAX_SCRIPTS_PER_WALLET,
+        ),
+        (true, "electrs/0.12.0", electrum::OWN_NODE_WINDOW, own),
+        (true, "ElectrumX 1.18.0", electrum::WINDOW, own),
+        (true, " ElectrumX 2.0.0", electrum::WINDOW, own),
+    ] {
+        let server = FakeElectrum::start().await;
+        {
+            let mut state = server.state.lock().unwrap();
+            state.software = software;
+            state.hold = Some((usize::MAX, Duration::from_millis(100)));
+        }
+        let BackendConfig::CustomElectrum { url, .. } = server.backend() else {
+            unreachable!()
+        };
+        let (watch, _events) = LiveWatch::start_with(
+            config(BackendConfig::CustomElectrum { url, own_node }),
+            vec![wide(scripts)],
+            Some(Timings {
+                keepalive: Duration::from_secs(60),
+                pong: Duration::from_secs(10),
+                ..timings()
+            }),
+        );
+        until(&watch, "subscribed", |s| {
+            s.pushed_scripts as usize == scripts
+        })
+        .await;
+        assert_eq!(
+            server.state.lock().unwrap().held_most,
+            window,
+            "own node {own_node}, {software:?}"
+        );
+    }
+}
+
+/// Busy words from a server that is not ElectrumX refusing for cost, a
+/// node that starts or indexes, keep the ordinary backoff: the watch
+/// comes back as soon as after any other failure.
+#[tokio::test]
+async fn electrum_comes_back_soon_to_a_server_merely_busy() {
+    for refusal in [(1, "server busy, indexing"), (-32603, "Server busy")] {
+        let server = FakeElectrum::start().await;
+        server
+            .state
+            .lock()
+            .unwrap()
+            .refuse_coded
+            .insert("server.version", refusal);
+        let (_watch, _events) = LiveWatch::start_with(
+            config(server.backend()),
+            vec![wallet("a", &[1, 2], &[], false)],
+            Some(timings()),
+        );
+        // The backoff comes back within 100 ms; being left alone, not
+        // before 480.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(asked(&server, "server.version") >= 2, "{refusal:?}");
+    }
+}
+
+/// ElectrumX keeps the cost of a session it cut against the address,
+/// and refuses a client that comes back too early at its first request:
+/// the watch leaves the server alone, as after a cut, instead of
+/// knocking again at every backoff, each knock adding to that cost.
+#[tokio::test]
+async fn electrum_leaves_alone_a_server_that_refuses_the_hello_for_cost() {
+    let server = FakeElectrum::start().await;
+    server
+        .state
+        .lock()
+        .unwrap()
+        .refuse_coded
+        .insert("server.version", (-101, "excessive resource usage"));
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &[1, 2], &[], false)],
+        Some(timings()),
+    );
+    until(&watch, "refused", |s| {
+        s.detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("excessive resource usage"))
+    })
+    .await;
+    // Left alone for at least 480 ms; the backoff alone would have come
+    // back within 100.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(asked(&server, "server.version"), 1);
+}
+
 /// A server that takes so many subscriptions on one connection and no
 /// more, whether its refusal says so or it only refuses one after the
 /// other: what it took is watched, and every script past it is reported
@@ -714,6 +869,141 @@ async fn a_server_that_took_none_is_asked_again_sooner() {
     let status = until(&watch, "heard whole", |s| s.pushed_scripts == 10).await;
     assert_eq!(status.wallets[0].coverage, Coverage::Live);
     no_event(&mut events, Duration::from_millis(300)).await;
+}
+
+/// On a session ElectrumX slows down for what it costs, subscriptions
+/// past the few it serves at once wait their turn too long and are
+/// refused: the watch narrows its window and sends them again, instead
+/// of cutting a session that ten at a time would only have slowed down.
+#[tokio::test]
+async fn electrum_narrows_its_window_when_subscriptions_wait_too_long() {
+    let server = FakeElectrum::start().await;
+    {
+        let mut state = server.state.lock().unwrap();
+        state.hold = Some((usize::MAX, Duration::from_millis(50)));
+        state.busy_past = Some(10);
+    }
+    let all: Vec<u8> = (0..100).collect();
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            keepalive: Duration::from_secs(60),
+            pong: Duration::from_secs(10),
+            ..timings()
+        }),
+    );
+    let status = until(&watch, "subscribed", |s| s.pushed_scripts == 100).await;
+    assert_eq!(status.state, WatchState::Connected);
+    assert_eq!(asked(&server, "server.version"), 1);
+
+    // Refused again once narrowed: the session is cut.
+    let server = FakeElectrum::start().await;
+    {
+        let mut state = server.state.lock().unwrap();
+        state.hold = Some((usize::MAX, Duration::from_millis(50)));
+        state.busy_past = Some(0);
+    }
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            keepalive: Duration::from_secs(60),
+            pong: Duration::from_secs(10),
+            ..timings()
+        }),
+    );
+    let status = until(&watch, "cut", |s| s.state == WatchState::Reconnecting).await;
+    assert_eq!(
+        status.detail.as_deref(),
+        Some("server busy - request timed out")
+    );
+}
+
+/// ElectrumX that refuses the handshake for what the watch costs it
+/// still holds the cost of an earlier session against the address: when
+/// the watch comes back, it asks for half the list, and reports the rest
+/// once for the syncs.
+#[tokio::test]
+async fn a_server_refusing_the_hello_for_cost_is_asked_less() {
+    let server = FakeElectrum::start().await;
+    server
+        .state
+        .lock()
+        .unwrap()
+        .refuse_coded
+        .insert("server.version", (-101, "excessive resource usage"));
+    let all: Vec<u8> = (1..=10).collect();
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            refused: Duration::from_millis(300),
+            ..timings()
+        }),
+    );
+    // Statuses keep coming while the server refuses: the wait is on the
+    // whole of it.
+    let reported = tokio::time::timeout(WAIT, async {
+        let mut reported = BTreeSet::new();
+        while reported.len() < 5 {
+            match next_event(&mut events).await {
+                WatchEvent::WalletChanged {
+                    reason, scripts, ..
+                } => {
+                    assert_eq!(reason, ChangeReason::Started);
+                    reported.extend(scripts);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        reported
+    })
+    .await
+    .expect("the scripts past the half reported");
+    assert_eq!(reported, (6..=10).map(script).collect::<BTreeSet<_>>());
+    server.state.lock().unwrap().refuse_coded.clear();
+    let status = until(&watch, "half heard", |s| s.pushed_scripts == 5).await;
+    assert_eq!(status.left_out_scripts, 5);
+    assert_eq!(server.subscriptions().last().map(Vec::len), Some(5));
+    no_event(&mut events, Duration::from_millis(300)).await;
+}
+
+/// The user's own node that refuses the watch for what it costs, at the
+/// handshake or during a session, is tried again at the ordinary pace:
+/// its limits are the user's to raise, and a node that restarts must
+/// not keep Live off a quarter of an hour.
+#[tokio::test]
+async fn the_users_node_refusing_for_cost_is_tried_again_soon() {
+    for at_hello in [true, false] {
+        let server = FakeElectrum::start().await;
+        {
+            let mut state = server.state.lock().unwrap();
+            if at_hello {
+                state
+                    .refuse_coded
+                    .insert("server.version", (-101, "excessive resource usage"));
+            } else {
+                state.cost_cut = Some(3);
+            }
+        }
+        let BackendConfig::CustomElectrum { url, .. } = server.backend() else {
+            unreachable!()
+        };
+        let all: Vec<u8> = (1..=10).collect();
+        let (_watch, _events) = LiveWatch::start_with(
+            config(BackendConfig::CustomElectrum {
+                url,
+                own_node: true,
+            }),
+            vec![wallet("a", &all, &[], false)],
+            Some(timings()),
+        );
+        // The backoff comes back within 100 ms; being left alone, not
+        // before 480.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(asked(&server, "server.version") >= 2, "at hello {at_hello}");
+    }
 }
 
 /// A server that cuts the watch for what it costs, ElectrumX past its
@@ -2193,6 +2483,31 @@ fn a_node_is_told_the_setting_of_its_software() {
     // Anything else, or nothing said: a limit to raise, unnamed.
     assert_eq!(raise(Some("SomethingElse 2.0")), Some((None, Vec::new())));
     assert_eq!(raise(None), Some((None, Vec::new())));
+}
+
+/// What a server says it runs is read one way for all it decides: an
+/// ElectrumX that puts a space before its name is told its own setting
+/// and keeps the narrow window on the user's node, as any ElectrumX.
+#[test]
+fn a_server_is_read_the_same_way_for_its_setting_and_its_window() {
+    for words in ["ElectrumX 1.18.0", " ElectrumX 1.18.0", "electrumx 2.0.0\t"] {
+        assert_eq!(
+            Software::of(Some(words)),
+            Software::Named(ServerSoftware::ElectrumX),
+            "{words:?}"
+        );
+        assert_eq!(electrum::window_for(true, Some(words)), electrum::WINDOW);
+    }
+    assert_eq!(Software::of(Some(" electrs/0.12.0")), Software::Electrs);
+    assert_eq!(
+        electrum::window_for(true, Some(" electrs/0.12.0")),
+        electrum::OWN_NODE_WINDOW
+    );
+    assert_eq!(
+        electrum::window_for(false, Some("electrs/0.12.0")),
+        electrum::WINDOW
+    );
+    assert_eq!(Software::of(None), Software::Unknown);
 }
 
 /// The verdict: the server as soon as it refused a script, the limits of

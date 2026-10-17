@@ -42,8 +42,31 @@ use crate::chain::{
 };
 use crate::network::Network;
 
-/// Requests per batch.
+/// The fewest requests per batch while walking a keychain: see
+/// [`walk_batch`].
 const BATCH: usize = 10;
+/// Requests per batch for a list known in full: the scripts revealed,
+/// and the headers and proofs they call for. ElectrumX, from 1.18 on,
+/// holds small answers back until a kilobyte of them waits or a second
+/// has passed, so the end of every batch waits that second: ten at a
+/// time, a wallet of a hundred addresses took forty-five seconds to
+/// sync. No more than fifty: on a session it slows down, ElectrumX
+/// serves a few requests at a time, one every two seconds or so, and a
+/// request still waiting after thirty is an error that costs the session
+/// a hundred; a hundred in a batch would wait that long well before the
+/// session is cut for what it costs.
+const LIST_BATCH: usize = 50;
+/// The same for transactions, which Fulcrum reads from bitcoind: kept
+/// under [`FULCRUM_BITCOIND_BURST`].
+const TX_BATCH: usize = 40;
+/// Requests of one client waiting on bitcoind past which Fulcrum holds
+/// the client back for at least 200 ms (`bitcoind_throttle`, fifty by
+/// default).
+const FULCRUM_BITCOIND_BURST: usize = 50;
+const _: () = assert!(
+    TX_BATCH < FULCRUM_BITCOIND_BURST,
+    "a batch of transactions would hold the client back at Fulcrum"
+);
 /// The latest blocks read with the tip, as the engine of BDK reads them:
 /// a reorganisation that deep is met without a request per block.
 const CHAIN_SUFFIX: u32 = 8;
@@ -78,7 +101,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
 
     let mut covered: HashSet<ScriptBuf> = scripts.iter().cloned().collect();
     let mut set_aside = false;
-    for batch in scripts.chunks(BATCH) {
+    for batch in scripts.chunks(LIST_BATCH) {
         let histories = super::patiently(|| {
             client.batch_script_get_history(batch.iter().map(|s| s.as_script()))
         })?;
@@ -94,7 +117,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
     for Scan { keychain, mut spks } in scans {
         let mut unused = 0usize;
         'scan: loop {
-            let batch: Vec<(u32, ScriptBuf)> = spks.by_ref().take(BATCH).collect();
+            let batch: Vec<(u32, ScriptBuf)> = spks.by_ref().take(walk_batch(stop_gap)).collect();
             if batch.is_empty() {
                 break;
             }
@@ -130,7 +153,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
     // The scripts of the confirmations a reorganisation moved, read
     // whatever the plan: see [`Held::reorganised`].
     let moved = held.reorganised(chain.agreement, &covered);
-    for batch in moved.chunks(BATCH) {
+    for batch in moved.chunks(LIST_BATCH) {
         let histories = super::patiently(|| {
             client.batch_script_get_history(batch.iter().map(|s| s.as_script()))
         })?;
@@ -156,6 +179,20 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
         drop_above: chain.dropped,
         set_aside,
     })
+}
+
+/// Requests per batch while walking a keychain: as many as the gap, so
+/// that a walk that finds nothing past the last address used reads that
+/// gap in one batch, as ElectrumX, which waits a second at the end of
+/// each, would have it; never fewer than [`BATCH`] nor more than
+/// [`LIST_BATCH`]. The walk stops within a batch past the gap: every
+/// script asked for is an address the server learns before it is used,
+/// and the gap is how many the user lets it learn, so it learns at most
+/// twice that many.
+fn walk_batch(stop_gap: u32) -> usize {
+    usize::try_from(stop_gap)
+        .unwrap_or(usize::MAX)
+        .clamp(BATCH, LIST_BATCH)
 }
 
 /// The history of `script` the server listed, when the sync reads it:
@@ -529,7 +566,7 @@ impl Pass<'_> {
             .collect();
         missing.sort_unstable();
         missing.dedup();
-        for heights in missing.chunks(BATCH) {
+        for heights in missing.chunks(LIST_BATCH) {
             match client.batch_block_header(heights.iter().copied()) {
                 Ok(headers) if headers.len() == heights.len() => {
                     for (height, header) in heights.iter().zip(headers) {
@@ -555,7 +592,7 @@ impl Pass<'_> {
             }
         }
         let mut proven: Vec<(Txid, u32, Header)> = Vec::new();
-        for batch in to_prove.chunks(BATCH) {
+        for batch in to_prove.chunks(LIST_BATCH) {
             for ((txid, height), proof) in batch.iter().zip(branches(client, batch)?) {
                 let Some(header) = chain.headers.get(height).copied() else {
                     self.update.seen_ats.insert((*txid, self.start_time));
@@ -723,7 +760,7 @@ fn fetch_txs(
     txids: &[Txid],
 ) -> Result<HashMap<Txid, Arc<Transaction>>, Error> {
     let mut found = HashMap::new();
-    for batch in txids.chunks(BATCH) {
+    for batch in txids.chunks(TX_BATCH) {
         let txs = super::patiently(|| client.batch_transaction_get(batch.iter()))?;
         for (txid, tx) in batch.iter().zip(txs) {
             if tx.compute_txid() != *txid {

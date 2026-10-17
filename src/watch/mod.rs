@@ -541,26 +541,65 @@ pub enum ServerSoftware {
     MempoolElectrs,
 }
 
+impl ServerSoftware {
+    /// The settings that raise its limit.
+    fn settings(self) -> &'static [&'static str] {
+        match self {
+            ServerSoftware::Fulcrum => &["max_subs_per_ip"],
+            ServerSoftware::ElectrumX => &["COST_SOFT_LIMIT", "COST_HARD_LIMIT"],
+            ServerSoftware::ElectrsEsplora => &["--electrum-subscription-limit"],
+            ServerSoftware::MempoolElectrs => &["--electrum-max-subscriptions"],
+        }
+    }
+}
+
+/// What an Electrum server says it runs, first in its answer to
+/// `server.version`, read in this one place for every use the watch has
+/// of it: the setting that raises its limit, and how many subscriptions
+/// a session keeps awaiting their answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Software {
+    /// One whose limit the watch knows how to name.
+    Named(ServerSoftware),
+    /// electrs as its author publishes it (`electrs/0.10.9`), which caps
+    /// nothing.
+    Electrs,
+    /// Anything else, or nothing said.
+    Unknown,
+}
+
+impl Software {
+    pub(crate) fn of(words: Option<&str>) -> Software {
+        use ServerSoftware::*;
+        let name = words.unwrap_or_default().trim().to_ascii_lowercase();
+        let named = if name.starts_with("fulcrum") {
+            Fulcrum
+        } else if name.starts_with("electrumx") {
+            ElectrumX
+        } else if name.starts_with("electrs-esplora") {
+            ElectrsEsplora
+        } else if name.starts_with("mempool-electrs") {
+            MempoolElectrs
+        } else if name.starts_with("electrs/") {
+            return Software::Electrs;
+        } else {
+            return Software::Unknown;
+        };
+        Software::Named(named)
+    }
+}
+
 impl Remedy {
     /// What raises the limit of the user's own node, by what it says it
-    /// runs. electrs as its author publishes it (`electrs/0.10.9`) caps
-    /// nothing, so there is nothing to raise.
+    /// runs. electrs as its author publishes it caps nothing, so there is
+    /// nothing to raise.
     fn raise(software: Option<&str>) -> Option<Remedy> {
-        use ServerSoftware::*;
-        let name = software.unwrap_or_default().trim().to_ascii_lowercase();
-        let (server, settings): (_, &[&str]) = if name.starts_with("fulcrum") {
-            (Some(Fulcrum), &["max_subs_per_ip"])
-        } else if name.starts_with("electrumx") {
-            (Some(ElectrumX), &["COST_SOFT_LIMIT", "COST_HARD_LIMIT"])
-        } else if name.starts_with("electrs-esplora") {
-            (Some(ElectrsEsplora), &["--electrum-subscription-limit"])
-        } else if name.starts_with("mempool-electrs") {
-            (Some(MempoolElectrs), &["--electrum-max-subscriptions"])
-        } else if name.starts_with("electrs/") {
-            return None;
-        } else {
-            (None, &[])
+        let server = match Software::of(software) {
+            Software::Named(server) => Some(server),
+            Software::Electrs => return None,
+            Software::Unknown => None,
         };
+        let settings = server.map_or(&[][..], ServerSoftware::settings);
         Some(Remedy::RaiseServerLimit {
             server,
             settings: settings.iter().map(|&setting| setting.to_owned()).collect(),

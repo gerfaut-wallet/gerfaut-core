@@ -64,7 +64,8 @@ use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::time::Instant;
 
 use super::{
-    ChangeReason, Exit, Headers, Hub, Proven, Wake, WatchState, WatchTransport, confirmed_at,
+    ChangeReason, Exit, Headers, Hub, Proven, ServerSoftware, Software, Wake, WatchState,
+    WatchTransport, confirmed_at,
 };
 use crate::chain::electrum::status::history_status;
 use crate::chain::electrum::{CLIENT_NAME, Target, parse, words};
@@ -76,14 +77,36 @@ use crate::network::Network;
 /// The longest line read. A status is 64 characters and a header 160;
 /// a server sending more than this is not speaking the protocol.
 const MAX_LINE: usize = 64 * 1024;
-/// Subscriptions awaiting their answer at any time: as many as ElectrumX
-/// serves at once before it slows a session down. More go no faster, and
-/// are already sent when the server starts refusing.
-const WINDOW: usize = 10;
-/// The codes aiorpcx, under ElectrumX, refuses a request with when the
-/// session costs the server too much, before it closes it: excessive
-/// resource usage, and server busy.
-const COSTLY: [i64; 2] = [-101, -102];
+/// Subscriptions awaiting their answer at any time. ElectrumX, from 1.18
+/// on, holds small answers back until a kilobyte of them waits, or a
+/// second has passed since it last wrote: the answer for a script
+/// without history is about forty bytes, so a window under twenty-five
+/// or so waits that second at every round. Thirty-two fill it.
+/// ElectrumX works through ten at a time and queues the rest at no cost
+/// to the session, and a server at its limit refuses the few already
+/// sent.
+pub(super) const WINDOW: usize = 32;
+/// The same on the user's own node. electrs, as its author publishes
+/// it, looks at every subscription of a connection again each time it
+/// has answered all it was sent: twenty thousand subscriptions cost it
+/// four minutes of processor ten at a time, close to one thirty-two at
+/// a time, and six seconds two hundred and fifty-six at a time. Not on
+/// ElectrumX, which works through ten at a time and turns a request that
+/// waited thirty seconds into an error that costs the session a hundred:
+/// on a session it slows down, two hundred and fifty-six in flight time
+/// out, and the session is cut.
+pub(super) const OWN_NODE_WINDOW: usize = 256;
+/// The window once ElectrumX has let a subscription wait its turn too
+/// long: as many as it serves at once on a session it does not slow
+/// down, and few enough to be served within its thirty seconds on one it
+/// slows down to its last notch.
+const NARROW_WINDOW: usize = 10;
+/// The refusals of aiorpcx, under ElectrumX, for what a session costs,
+/// code and the start of its words: excessive resource usage, before it
+/// closes the connection, and a request that waited its turn too long.
+const COSTLY: [(i64, &str); 2] = [(-101, "excessive resource usage"), (BUSY, "server busy")];
+/// The code of a request that waited its turn too long.
+const BUSY: i64 = -102;
 /// Subscriptions refused in a row, in words that do not say why, before
 /// the server is taken to be at its limit and the rest of the queue is
 /// given up: a server at its limit refuses them all, and asking on only
@@ -158,6 +181,9 @@ type Probe = Pin<Box<dyn Future<Output = Option<(Endpoint, u32)>> + Send>>;
 struct Session {
     /// The server, whose refusals the hub keeps.
     endpoint: Endpoint,
+    /// Subscriptions awaiting their answer at most: [`WINDOW`], or
+    /// [`OWN_NODE_WINDOW`].
+    window: usize,
     writer: WriteHalf<BoxStream>,
     next_id: u64,
     in_flight: HashMap<u64, Request>,
@@ -169,6 +195,9 @@ struct Session {
     refused_run: Vec<String>,
     /// The server takes no more on this connection.
     at_limit: bool,
+    /// The id of the first request sent once the window narrowed after a
+    /// subscription waited too long ([`Session::narrow`]).
+    narrowed_at: Option<u64>,
     /// The server cut the session for what it costs, in these words.
     overloaded: Option<String>,
     /// The server sent a false proof of a confirmation foretold: it is
@@ -236,12 +265,14 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         software,
     } = match hub.during(opening).await {
         Ok(Ok(opened)) => opened,
-        Ok(Err(exit)) | Err(exit) => return exit,
+        Ok(Err(Unopened::Exit(exit))) | Err(exit) => return exit,
+        Ok(Err(Unopened::Costly(detail))) => return refused_at_hello(hub, endpoint, detail),
     };
 
     hub.retry_limit(endpoint);
     let mut session = Session {
         endpoint: endpoint.clone(),
+        window: window_for(hub.config.backend.is_own_node(), software.as_deref()),
         writer,
         next_id: 2,
         in_flight: HashMap::new(),
@@ -250,6 +281,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         acknowledged: 0,
         refused_run: Vec::new(),
         at_limit: false,
+        narrowed_at: None,
         overloaded: None,
         false_proof: false,
         can_unsubscribe: at_least_1_4_2(&negotiated),
@@ -306,7 +338,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                     session.pong_by = None;
                     session.handle(hub, &line);
                     if let Some(detail) = session.overloaded.take() {
-                        return Exit::Refused(detail);
+                        return cost_exit(hub, detail, true);
                     }
                     if session.false_proof {
                         return Exit::Refused(FALSE_PROOF.to_owned());
@@ -439,29 +471,41 @@ impl Session {
         }
     }
 
-    /// Sends queued proofs, then queued subscriptions, up to the window.
+    /// Sends queued proofs, then queued subscriptions, up to the window,
+    /// in one write and one flush: a flush each would cost a TLS record,
+    /// or a Tor cell, each.
     async fn pump(&mut self) -> Result<(), String> {
-        while self.in_flight.len() < WINDOW {
+        let mut lines = Vec::new();
+        while self.in_flight.len() < self.window {
             if let Some((txid, height)) = self.proofs_queued.pop_front() {
-                self.request(
-                    Request::Merkle(txid, height),
-                    "blockchain.transaction.get_merkle",
-                    json!([txid.to_string(), height]),
-                )
-                .await?;
+                let id = self.next_id;
+                self.next_id += 1;
+                let message = json!({
+                    "jsonrpc": "2.0", "id": id, "method": "blockchain.transaction.get_merkle",
+                    "params": [txid.to_string(), height],
+                });
+                self.in_flight.insert(id, Request::Merkle(txid, height));
+                lines.extend(message.to_string().into_bytes());
+                lines.push(b'\n');
                 continue;
             }
             let Some(scripthash) = self.queue.pop_front() else {
                 break;
             };
-            self.request(
-                Request::Subscribe(scripthash.clone()),
-                "blockchain.scripthash.subscribe",
-                json!([scripthash]),
-            )
-            .await?;
+            let id = self.next_id;
+            self.next_id += 1;
+            let message = json!({
+                "jsonrpc": "2.0", "id": id, "method": "blockchain.scripthash.subscribe",
+                "params": [scripthash],
+            });
+            self.in_flight.insert(id, Request::Subscribe(scripthash));
+            lines.extend(message.to_string().into_bytes());
+            lines.push(b'\n');
         }
-        Ok(())
+        if lines.is_empty() {
+            return Ok(());
+        }
+        write_lines(&mut self.writer, &lines).await
     }
 
     /// The list changed: new scripts are subscribed, and the ones that
@@ -537,7 +581,9 @@ impl Session {
                 && costs_too_much(error)
                 && !matches!(request, Request::Merkle(..))
             {
-                self.cut(hub, words(error));
+                if !self.narrow(id, &request, error) {
+                    self.cut(hub, words(error));
+                }
                 return;
             }
             let refused = error.is_some();
@@ -698,38 +744,38 @@ impl Session {
         }
     }
 
+    /// ElectrumX let a subscription wait its turn too long and refused it,
+    /// on a session it slows down for what it costs: each such refusal
+    /// costs the session more, and enough of them cut it. The first time,
+    /// the window narrows to [`NARROW_WINDOW`], and every subscription
+    /// already sent and refused the same way is sent again later; one
+    /// sent after, refused the same way, is a session the server is about
+    /// to cut, and it is cut ([`Session::cut`]).
+    fn narrow(&mut self, id: u64, request: &Request, error: &Value) -> bool {
+        let Request::Subscribe(scripthash) = request else {
+            return false;
+        };
+        if error.get("code").and_then(Value::as_i64) != Some(BUSY) {
+            return false;
+        }
+        let narrowed_at = *self.narrowed_at.get_or_insert(self.next_id);
+        if id >= narrowed_at {
+            return false;
+        }
+        self.window = self.window.min(NARROW_WINDOW);
+        self.queue.push_front(scripthash.clone());
+        true
+    }
+
     /// The server refused a request for what the session costs it,
     /// ElectrumX past its budget, and is closing the connection. It
     /// keeps that cost against the address for a while, and coming back
     /// at once with the same burst would only be cut again: the session
-    /// ends, the server is left alone ([`Exit::Refused`]), and the next
-    /// session there asks for half as many scripts as this one took.
-    /// The scripts that leaves out are not asked for again, so each is
-    /// reported once, as a script given up on a refusal is: what it did
-    /// from the cut on, nothing will tell.
+    /// ends ([`cost_exit`]), and the next session there asks for half as
+    /// many scripts as this one took ([`ask_less`]).
     fn cut(&mut self, hub: &mut Hub, detail: String) {
         let half = self.acknowledged as usize / 2;
-        if half > 0 {
-            let refusals = hub.refusals.get(&self.endpoint);
-            let kept = refusals
-                .and_then(|refusals| refusals.limit)
-                .map_or(half, |limit| limit.min(half));
-            let past: Vec<String> = hub
-                .watched
-                .heard(refusals)
-                .skip(kept)
-                .filter(|entry| refusals.is_none_or(|r| !r.left_out.contains(&entry.scripthash)))
-                .map(|entry| entry.hex.clone())
-                .collect();
-            hub.refusals
-                .entry(self.endpoint.clone())
-                .or_default()
-                .learn_cut(kept);
-            let reason = self.opening_reason();
-            for hex in &past {
-                hub.mark_entry(hex, reason);
-            }
-        }
+        ask_less(hub, &self.endpoint, half, self.opening_reason());
         self.overloaded = Some(detail);
     }
 
@@ -1015,35 +1061,131 @@ impl Session {
     }
 }
 
+/// Why the opening of a session came to nothing.
+enum Unopened {
+    Exit(Exit),
+    /// The server refused the handshake for what the watch costs it,
+    /// in these words: ElectrumX still holding the cost of an earlier
+    /// session against the address.
+    Costly(String),
+}
+
+impl Unopened {
+    fn unreachable(detail: String) -> Unopened {
+        Unopened::Exit(Exit::Unreachable(detail))
+    }
+
+    /// What went wrong, in words, for a caller that only tells it.
+    fn into_words(self) -> String {
+        match self {
+            Unopened::Exit(Exit::Unreachable(detail)) | Unopened::Costly(detail) => detail,
+            Unopened::Exit(exit) => format!("{exit:?}"),
+        }
+    }
+}
+
 /// The result of the request numbered `id`, past whatever the server
 /// says before it, within `budget`.
 async fn answer(
     reader: &mut LineReader<ReadHalf<BoxStream>>,
     id: u64,
     budget: Duration,
-) -> Result<Value, String> {
+) -> Result<Value, Unopened> {
     let read = async {
         loop {
             let line = reader
                 .next_line()
                 .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "the connection was closed".to_owned())?;
+                .map_err(|e| Unopened::unreachable(e.to_string()))?
+                .ok_or_else(|| Unopened::unreachable("the connection was closed".to_owned()))?;
             let Ok(mut message) = serde_json::from_slice::<Value>(&line) else {
-                return Err("unexpected response".to_owned());
+                return Err(Unopened::unreachable("unexpected response".to_owned()));
             };
             if message.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
             if let Some(error) = message.get("error").filter(|e| !e.is_null()) {
-                return Err(format!("the server refused the request: {}", words(error)));
+                if costs_too_much(error) {
+                    return Err(Unopened::Costly(words(error)));
+                }
+                return Err(Unopened::unreachable(format!(
+                    "the server refused the request: {}",
+                    words(error)
+                )));
             }
             return Ok(message["result"].take());
         }
     };
     tokio::time::timeout(budget, read)
         .await
-        .map_err(|_| format!("timed out after {} s", budget.as_secs()))?
+        .map_err(|_| Unopened::unreachable(format!("timed out after {} s", budget.as_secs())))?
+}
+
+/// The next session on `endpoint` asks for `kept` scripts at most, the
+/// limit a cut for cost leaves, which holds for the configuration. The
+/// scripts that leaves out are not asked for again, so each is reported
+/// once, for a sync of its own, as a script given up on a refusal is:
+/// what it does from now on, nothing will tell. None kept is no cut: a
+/// watch that asks for nothing would never learn more.
+fn ask_less(hub: &mut Hub, endpoint: &Endpoint, kept: usize, reason: ChangeReason) {
+    if kept == 0 {
+        return;
+    }
+    let refusals = hub.refusals.get(endpoint);
+    let kept = refusals
+        .and_then(|refusals| refusals.limit)
+        .map_or(kept, |limit| limit.min(kept));
+    let past: Vec<String> = hub
+        .watched
+        .heard(refusals)
+        .skip(kept)
+        .filter(|entry| refusals.is_none_or(|r| !r.left_out.contains(&entry.scripthash)))
+        .map(|entry| entry.hex.clone())
+        .collect();
+    hub.refusals
+        .entry(endpoint.clone())
+        .or_default()
+        .learn_cut(kept);
+    for hex in &past {
+        hub.mark_entry(hex, reason);
+    }
+}
+
+/// The server refused the handshake for what the watch costs it, before
+/// it heard of a script: ElectrumX still holds the cost of an earlier
+/// session against the address. Asked for the same list once that wears
+/// off, it would cut the watch again: the next session asks for half of
+/// what this one was to ask, unless a cut already halved it, since the
+/// list is not what a refusal at the handshake measures.
+fn refused_at_hello(hub: &mut Hub, endpoint: &Endpoint, detail: String) -> Exit {
+    let refusals = hub.refusals.get(endpoint);
+    if !refusals.is_some_and(|refusals| refusals.cut) {
+        let asked = hub.watched.heard(refusals).count();
+        let reason = if hub.caught_up {
+            ChangeReason::Reconnected
+        } else {
+            ChangeReason::Started
+        };
+        ask_less(hub, endpoint, asked / 2, reason);
+    }
+    cost_exit(hub, detail, false)
+}
+
+/// How the watch leaves a server that refused it for what it costs,
+/// before a session (`opened` false) or during one. Someone else's is
+/// left alone as after a cut ([`Exit::Refused`]), not tried again at
+/// every backoff, each try adding to what it holds against the address.
+/// The user's own node is tried again at the ordinary pace: its limits
+/// are theirs to raise, and a node that restarts must not keep Live off
+/// a quarter of an hour after it is back.
+fn cost_exit(hub: &Hub, detail: String, opened: bool) -> Exit {
+    if !hub.config.backend.is_own_node() {
+        Exit::Refused(detail)
+    } else if opened {
+        Exit::Lost(detail)
+    } else {
+        Exit::Unreachable(detail)
+    }
 }
 
 /// A connection open, and what the server said opening it.
@@ -1066,21 +1208,21 @@ async fn open(
     proxy: Option<&str>,
     network: Network,
     budget: Duration,
-) -> Result<Opened, Exit> {
-    let (tls, host, port) = parse(&target.url).map_err(Exit::Unreachable)?;
+) -> Result<Opened, Unopened> {
+    let (tls, host, port) = parse(&target.url).map_err(Unopened::unreachable)?;
     let stream = net::open(&host, port, target.security(tls), proxy, budget)
         .await
-        .map_err(Exit::Unreachable)?;
+        .map_err(Unopened::unreachable)?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = LineReader::new(reader, MAX_LINE);
     let hello = json!({
         "jsonrpc": "2.0", "id": 0, "method": "server.version",
         "params": [CLIENT_NAME, [PROTOCOL_MIN, PROTOCOL_MAX]],
     });
-    send(&mut writer, &hello).await.map_err(Exit::Unreachable)?;
-    let version = answer(&mut reader, 0, budget)
+    send(&mut writer, &hello)
         .await
-        .map_err(Exit::Unreachable)?;
+        .map_err(Unopened::unreachable)?;
+    let version = answer(&mut reader, 0, budget).await?;
     let negotiated = version[1].as_str().unwrap_or_default().to_owned();
     let software = version[0]
         .as_str()
@@ -1091,15 +1233,13 @@ async fn open(
     });
     send(&mut writer, &genesis)
         .await
-        .map_err(Exit::Unreachable)?;
-    let genesis = answer(&mut reader, 1, budget)
-        .await
-        .map_err(Exit::Unreachable)?;
+        .map_err(Unopened::unreachable)?;
+    let genesis = answer(&mut reader, 1, budget).await?;
     let genesis = genesis
         .as_str()
         .and_then(|hex| deserialize_hex::<Header>(hex).ok());
     if !genesis.is_some_and(|header| is_genesis_of(network, header.block_hash())) {
-        return Err(Exit::Refused(ANOTHER_NETWORK.to_owned()));
+        return Err(Unopened::Exit(Exit::Refused(ANOTHER_NETWORK.to_owned())));
     }
     Ok(Opened {
         reader,
@@ -1181,12 +1321,17 @@ async fn tip_of(
         ..
     } = open(target, proxy, network, budget)
         .await
-        .map_err(|exit| format!("{exit:?}"))?;
+        .map_err(|unopened| match unopened {
+            Unopened::Exit(exit) => format!("{exit:?}"),
+            Unopened::Costly(detail) => detail,
+        })?;
     let tip = json!({
         "jsonrpc": "2.0", "id": 2, "method": "blockchain.headers.subscribe", "params": [],
     });
     send(&mut writer, &tip).await?;
-    let header = answer(&mut reader, 2, budget).await?;
+    let header = answer(&mut reader, 2, budget)
+        .await
+        .map_err(Unopened::into_words)?;
     height_of(&header)
         .filter(|height| *height <= crate::chain::height_limit(network, crate::now_secs()))
         .ok_or_else(|| "unexpected response".to_owned())
@@ -1203,8 +1348,13 @@ async fn probed(look: &mut Look) -> Option<(Endpoint, u32)> {
 async fn send(writer: &mut WriteHalf<BoxStream>, message: &Value) -> Result<(), String> {
     let mut line = message.to_string().into_bytes();
     line.push(b'\n');
+    write_lines(writer, &line).await
+}
+
+/// Writes whole lines, then flushes once.
+async fn write_lines(writer: &mut WriteHalf<BoxStream>, lines: &[u8]) -> Result<(), String> {
     let write = async {
-        writer.write_all(&line).await?;
+        writer.write_all(lines).await?;
         writer.flush().await
     };
     match tokio::time::timeout(std::time::Duration::from_secs(20), write).await {
@@ -1221,15 +1371,21 @@ fn height_of(header: &Value) -> Option<u32> {
         .and_then(|height| u32::try_from(height).ok())
 }
 
-/// Whether an error is a server cutting the session for what it costs:
-/// see [`COSTLY`].
+/// Whether an error is ElectrumX refusing a request for what the session
+/// costs it, in its own code and words: see [`COSTLY`]. Busy words from
+/// another server, a node that starts or indexes, are not: the watch
+/// would leave it alone a quarter of an hour for nothing.
 fn costs_too_much(error: &Value) -> bool {
-    let coded = error
-        .get("code")
-        .and_then(Value::as_i64)
-        .is_some_and(|code| COSTLY.contains(&code));
-    let words = words(error).to_lowercase();
-    coded || words.contains("excessive resource usage") || words.contains("server busy")
+    let code = error.get("code").and_then(Value::as_i64);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    COSTLY
+        .iter()
+        .any(|(costly, words)| code == Some(*costly) && message.starts_with(words))
 }
 
 /// Whether a refusal says the server takes no more subscriptions on the
@@ -1239,6 +1395,17 @@ fn costs_too_much(error: &Value) -> bool {
 fn names_a_limit(refusal: &str) -> bool {
     let refusal = refusal.to_lowercase();
     refusal.contains("subscription") && (refusal.contains("limit") || refusal.contains("too many"))
+}
+
+/// The window of a session: [`OWN_NODE_WINDOW`] on the user's own node,
+/// unless it runs ElectrumX, and [`WINDOW`] everywhere else.
+pub(super) fn window_for(own_node: bool, software: Option<&str>) -> usize {
+    let electrumx = Software::of(software) == Software::Named(ServerSoftware::ElectrumX);
+    if own_node && !electrumx {
+        OWN_NODE_WINDOW
+    } else {
+        WINDOW
+    }
 }
 
 fn at_least_1_4_2(version: &str) -> bool {
@@ -1251,4 +1418,104 @@ fn at_least_1_4_2(version: &str) -> bool {
         parts.next().unwrap_or(0),
     );
     version >= (1, 4, 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    use super::*;
+
+    /// A stream that keeps what is written and counts the flushes, and
+    /// never has anything to read.
+    #[derive(Clone, Default)]
+    struct Counting {
+        written: Arc<Mutex<Vec<u8>>>,
+        flushes: Arc<Mutex<usize>>,
+    }
+
+    impl AsyncRead for Counting {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for Counting {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.written.lock().unwrap().extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            *self.flushes.lock().unwrap() += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A window of subscriptions goes out in one write and one flush.
+    #[tokio::test]
+    async fn a_window_of_subscriptions_is_flushed_once() {
+        let stream = Counting::default();
+        let (_reader, writer) = tokio::io::split(Box::new(stream.clone()) as BoxStream);
+        let mut session = Session {
+            endpoint: Endpoint::Electrum(Target::new("tcp://127.0.0.1:1", None)),
+            window: WINDOW,
+            writer,
+            next_id: 2,
+            in_flight: HashMap::new(),
+            queue: (0..40).map(|n| format!("{n:064x}")).collect(),
+            subscribed: HashSet::new(),
+            acknowledged: 0,
+            refused_run: Vec::new(),
+            at_limit: false,
+            narrowed_at: None,
+            overloaded: None,
+            can_unsubscribe: false,
+            pong_by: None,
+            opening: HashSet::new(),
+            resumed: false,
+            ready_told: false,
+            false_proof: false,
+            headers: None,
+            proofs_queued: VecDeque::new(),
+            proofs_asked: HashSet::new(),
+            proofs: HashMap::new(),
+            provings: HashMap::new(),
+            tip: None,
+            block_at: Instant::now(),
+            look: Look::Idle,
+            proxy: None,
+        };
+        session.pump().await.unwrap();
+        assert_eq!(*stream.flushes.lock().unwrap(), 1);
+        let written = stream.written.lock().unwrap().clone();
+        let lines: Vec<Value> = written
+            .split(|&byte| byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), WINDOW);
+        assert_eq!(lines[0]["method"], "blockchain.scripthash.subscribe");
+        assert_eq!(lines[0]["id"], 2);
+        assert_eq!(session.queue.len(), 40 - WINDOW);
+        // Nothing more goes out while the window is full.
+        session.pump().await.unwrap();
+        assert_eq!(*stream.flushes.lock().unwrap(), 1);
+    }
 }
