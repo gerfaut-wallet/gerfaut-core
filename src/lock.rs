@@ -232,23 +232,26 @@ impl LockAttempts {
 
 fn write_whole(path: &Path, stored: &StoredAttempts) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(stored).map_err(std::io::Error::other)?;
-    let tmp = temporary_path(path);
+    write_through(path, &temporary_path(path), &bytes)
+}
+
+/// Writes `bytes` to the new file `tmp`, then renames it over `path`.
+/// A new file of its own, its owner's alone: a name no other write
+/// picks, so two writers never truncate, remove or rename each other's
+/// file, and one that already stands there, a link planted there among
+/// others, fails the write instead of being followed.
+fn write_through(path: &Path, tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let written = (|| {
         use std::io::Write;
-        // A new file of its own, its owner's alone: a name no other
-        // write picks, so two writers never truncate, remove or rename
-        // each other's file, and one that already stands there, a link
-        // planted there among others, fails the write instead of being
-        // followed.
         let mut file =
             crate::store::owner_only(std::fs::OpenOptions::new().write(true).create_new(true))
-                .open(&tmp)?;
-        file.write_all(&bytes)?;
+                .open(tmp)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
-        std::fs::rename(&tmp, path)
+        std::fs::rename(tmp, path)
     })();
     if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
     }
     written
 }
@@ -611,9 +614,10 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
-    /// A link planted at a temporary name is never followed: the file
-    /// it points to keeps its content, and the record is written all
-    /// the same.
+    /// A link planted at the temporary name a write uses is never
+    /// followed: the write fails, the file the link points to keeps its
+    /// content, and the next write, under a name of its own, goes
+    /// through.
     #[cfg(unix)]
     #[test]
     fn the_record_never_writes_through_a_link() {
@@ -621,7 +625,14 @@ mod tests {
         let path = dir.path().join("gerfaut.attempts");
         let victim = dir.path().join("victim");
         std::fs::write(&victim, b"keep me").unwrap();
-        std::os::unix::fs::symlink(&victim, dir.path().join("gerfaut.attempts.tmp")).unwrap();
+        // The name the write is about to use, taken by a link first.
+        let tmp = temporary_path(&path);
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+        let refused = write_through(&path, &tmp, b"{\"failures\":1}").unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        assert!(!path.exists(), "nothing renamed into place");
+        // The next write picks a name of its own and goes through.
         let mut attempts = LockAttempts::load(path.clone());
         attempts.fail(Instant::now());
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
