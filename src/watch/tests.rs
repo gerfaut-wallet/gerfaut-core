@@ -419,6 +419,57 @@ async fn electrum_fills_what_a_padding_server_holds_back() {
     );
 }
 
+/// The watch keeps a window of subscriptions awaiting their answer, a
+/// wider one on the user's own node, where electrs, as its author
+/// publishes it, looks at every subscription again after each round;
+/// not on ElectrumX, where requests that wait too long are errors that
+/// cost the session.
+#[tokio::test]
+async fn electrum_keeps_a_wider_window_on_the_users_node() {
+    let all: Vec<u8> = (0..250).collect();
+    for (own_node, software, most) in [
+        (false, "electrs/0.12.0", electrum::WINDOW),
+        (true, "electrs/0.12.0", all.len()),
+        (true, "ElectrumX 1.18.0", electrum::WINDOW),
+    ] {
+        let server = FakeElectrum::start().await;
+        server.state.lock().unwrap().software = software;
+        // Every answer held a moment: what the watch sends meanwhile is
+        // what it keeps waiting on.
+        server.state.lock().unwrap().hold = Some((usize::MAX, Duration::from_millis(50)));
+        let BackendConfig::CustomElectrum { url, .. } = server.backend() else {
+            unreachable!()
+        };
+        let (watch, _events) = LiveWatch::start_with(
+            config(BackendConfig::CustomElectrum { url, own_node }),
+            vec![wallet("a", &all, &[], false)],
+            Some(Timings {
+                keepalive: Duration::from_secs(60),
+                pong: Duration::from_secs(10),
+                ..timings()
+            }),
+        );
+        let watched = if own_node {
+            all.len()
+        } else {
+            MAX_SCRIPTS_PER_WALLET
+        };
+        until(&watch, "subscribed", |s| {
+            s.pushed_scripts as usize == watched
+        })
+        .await;
+        let held = server.state.lock().unwrap().held_most;
+        assert!(
+            held <= most.min(electrum::OWN_NODE_WINDOW),
+            "own node {own_node}, {software}: {held} waiting"
+        );
+        assert!(
+            held * 10 >= most.min(watched) * 8,
+            "own node {own_node}, {software}: {held} waiting"
+        );
+    }
+}
+
 /// A server that takes so many subscriptions on one connection and no
 /// more, whether its refusal says so or it only refuses one after the
 /// other: what it took is watched, and every script past it is reported

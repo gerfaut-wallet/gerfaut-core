@@ -191,6 +191,9 @@ pub(crate) struct ElectrumState {
     /// has passed since the last write; the first kilobyte goes out at
     /// once, for the handshake.
     pub hold: Option<(usize, std::time::Duration)>,
+    /// The most answers held back at once on a connection: what the
+    /// client had sent and was waiting on.
+    pub held_most: usize,
 }
 
 /// Heights past which the fake Electrum server makes a header up on the
@@ -281,6 +284,7 @@ impl FakeElectrum {
         let mut spoke = false;
         let hold = state.lock().unwrap().hold;
         let mut held: Vec<u8> = Vec::new();
+        let mut held_answers = 0usize;
         let mut last_write = tokio::time::Instant::now();
         // What was written, the first kilobyte of which goes out at once
         // so that the handshake is not held back.
@@ -297,6 +301,7 @@ impl FakeElectrum {
                     }
                 } => {
                     let bytes = std::mem::take(&mut held);
+                    held_answers = 0;
                     if writer.write_all(&bytes).await.is_err() {
                         return;
                     }
@@ -351,8 +356,12 @@ impl FakeElectrum {
                         Some((size, _)) => {
                             held.extend_from_slice(&bytes);
                             if held.len() < size && written >= 1024 {
+                                held_answers += 1;
+                                let mut state = state.lock().unwrap();
+                                state.held_most = state.held_most.max(held_answers);
                                 continue;
                             }
+                            held_answers = 0;
                             std::mem::take(&mut held)
                         }
                         None => bytes,

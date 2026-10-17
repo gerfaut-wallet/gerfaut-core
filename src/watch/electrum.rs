@@ -44,7 +44,17 @@ const MAX_LINE: usize = 64 * 1024;
 /// ElectrumX works through ten at a time and queues the rest at no cost
 /// to the session, and a server at its limit refuses the few already
 /// sent.
-const WINDOW: usize = 32;
+pub(super) const WINDOW: usize = 32;
+/// The same on the user's own node. electrs, as its author publishes
+/// it, looks at every subscription of a connection again each time it
+/// has answered all it was sent: twenty thousand subscriptions cost it
+/// four minutes of processor ten at a time, close to one thirty-two at
+/// a time, and six seconds two hundred and fifty-six at a time. Not on
+/// ElectrumX, which works through ten at a time and turns a request that
+/// waited thirty seconds into an error that costs the session a hundred:
+/// on a session it slows down, two hundred and fifty-six in flight time
+/// out, and the session is cut.
+pub(super) const OWN_NODE_WINDOW: usize = 256;
 /// The codes aiorpcx, under ElectrumX, refuses a request with when the
 /// session costs the server too much, before it closes it: excessive
 /// resource usage, and server busy.
@@ -73,6 +83,9 @@ enum Request {
 struct Session {
     /// The server, whose refusals the hub keeps.
     endpoint: Endpoint,
+    /// Subscriptions awaiting their answer at most: [`WINDOW`], or
+    /// [`OWN_NODE_WINDOW`].
+    window: usize,
     writer: WriteHalf<BoxStream>,
     next_id: u64,
     in_flight: HashMap<u64, Request>,
@@ -175,6 +188,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
     hub.retry_limit(endpoint);
     let mut session = Session {
         endpoint: endpoint.clone(),
+        window: window_for(hub.config.backend.is_own_node(), software.as_deref()),
         writer,
         next_id: 2,
         in_flight: HashMap::new(),
@@ -315,7 +329,7 @@ impl Session {
 
     /// Sends queued subscriptions up to the window.
     async fn pump(&mut self) -> Result<(), String> {
-        while self.in_flight.len() < WINDOW {
+        while self.in_flight.len() < self.window {
             let Some(scripthash) = self.queue.pop_front() else {
                 break;
             };
@@ -620,6 +634,18 @@ fn costs_too_much(error: &Value) -> bool {
 fn names_a_limit(refusal: &str) -> bool {
     let refusal = refusal.to_lowercase();
     refusal.contains("subscription") && (refusal.contains("limit") || refusal.contains("too many"))
+}
+
+/// The window of a session: [`OWN_NODE_WINDOW`] on the user's own node,
+/// unless it runs ElectrumX, and [`WINDOW`] everywhere else.
+fn window_for(own_node: bool, software: Option<&str>) -> usize {
+    let electrumx =
+        software.is_some_and(|software| software.to_ascii_lowercase().starts_with("electrumx"));
+    if own_node && !electrumx {
+        OWN_NODE_WINDOW
+    } else {
+        WINDOW
+    }
 }
 
 fn at_least_1_4_2(version: &str) -> bool {
