@@ -785,9 +785,10 @@ fn check_pair(
 /// [`check_pair`] for a pair that reaches the engine without the
 /// parser's two-line reading: read back from a backup, handed back by
 /// the app, or split out of one multipath descriptor. It refuses what
-/// proves the two are not one wallet, and lets through a policy that
-/// cannot be lifted, which says nothing either way and which these
-/// pairs always went through with.
+/// proves the two are not one wallet, and does not refuse a policy that
+/// cannot be lifted for being unreadable: two such branches are held to
+/// the same script on the same keys instead, and one that lifts beside
+/// one that does not is refused.
 pub(crate) fn check_stored_pair(
     external: &Descriptor<DescriptorPublicKey>,
     internal: &Descriptor<DescriptorPublicKey>,
@@ -814,16 +815,37 @@ fn pair_holds(
     if external.desc_type() != internal.desc_type() {
         return refuse("the change descriptor is not of the receive descriptor's script type");
     }
+    let another_wallet = || {
+        refuse(
+            "the change descriptor does not spend under the receive descriptor's keys and \
+             conditions: change would go to another wallet",
+        )
+    };
     match (
         crate::wallet::policy::policy_by_material(external),
         crate::wallet::policy::policy_by_material(internal),
     ) {
-        (Ok(receive), Ok(change)) if receive != change => refuse(
-            "the change descriptor does not spend under the receive descriptor's keys and \
-             conditions: change would go to another wallet",
-        ),
+        (Ok(receive), Ok(change)) if receive != change => another_wallet(),
+        (Ok(_), Ok(_)) => Ok(()),
         (Err(unliftable), _) | (_, Err(unliftable)) if unliftable_refused => Err(unliftable),
-        _ => Ok(()),
+        // Two branches of one wallet lift alike: one that lifts beside
+        // one that does not, a raw hash swapped in for a key, is
+        // another wallet.
+        (Ok(_), Err(_)) | (Err(_), Ok(_)) => another_wallet(),
+        // Neither lifts: the two are held to the same script on the
+        // same keys, read whole instead of through their policies.
+        (Err(_), Err(_)) => {
+            let receive = crate::wallet::policy::descriptor_by_material(external);
+            match receive {
+                Some(receive)
+                    if Some(&receive)
+                        == crate::wallet::policy::descriptor_by_material(internal).as_ref() =>
+                {
+                    Ok(())
+                }
+                _ => another_wallet(),
+            }
+        }
     }
 }
 
@@ -2627,6 +2649,24 @@ mod tests {
         let receive = read_descriptor(&format!("wpkh({XPUB}/0/*)")).unwrap();
         let change = read_descriptor(&format!("wpkh({XPUB_B}/1/*)")).unwrap();
         assert!(check_stored_pair(&receive, &change).is_err());
+
+        // A raw hash does not lift. Swapped in on one branch only, beside
+        // another key, it is another wallet; on both branches, around the
+        // same keys, it is one.
+        const HASH: &str = "1234567890123456789012345678901234567890";
+        let raw = |key: &str, branch: u32| {
+            read_descriptor(&format!(
+                "wsh(or_d(pk({key}/{branch}/*),c:expr_raw_pkh({HASH})))"
+            ))
+            .unwrap()
+        };
+        let multi = read_descriptor(&format!("wsh(multi(2,{XPUB}/0/*,{XPUB_B}/0/*))")).unwrap();
+        let refused = check_stored_pair(&multi, &raw(XPUB_C, 1)).unwrap_err();
+        assert!(refused.to_string().contains("another wallet"), "{refused}");
+        assert!(check_stored_pair(&raw(XPUB, 0), &multi).is_err());
+        check_stored_pair(&raw(XPUB, 0), &raw(XPUB, 1)).unwrap();
+        assert!(check_stored_pair(&raw(XPUB, 0), &raw(XPUB_C, 1)).is_err());
+        assert!(check_pair(&raw(XPUB, 0), &raw(XPUB, 1)).is_err());
     }
 
     #[test]

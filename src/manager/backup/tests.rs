@@ -740,6 +740,60 @@ async fn a_backup_pairing_two_wallets_is_not_restored() {
     assert!(manager.list_wallets(None).await.is_empty());
 }
 
+/// The same with a change descriptor whose policy does not lift, a raw
+/// hash beside a key of someone else, next to a receive descriptor that
+/// does: still another wallet, refused, not let through as unreadable.
+#[tokio::test]
+async fn a_backup_hiding_another_wallet_in_a_raw_hash_is_not_restored() {
+    const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+    const XPUB_B: &str = "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw";
+    const XPUB_C: &str = "xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ";
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: vec![BackupWallet {
+            name: "Vault".to_owned(),
+            network: Network::Mainnet,
+            kind: WalletKind::Descriptors {
+                external: format!("wsh(multi(2,{XPUB}/0/*,{XPUB_B}/0/*))"),
+                internal: Some(format!(
+                    "wsh(or_d(pk({XPUB_C}/1/*),c:expr_raw_pkh(1234567890123456789012345678901234567890)))"
+                )),
+                script: crate::input::ScriptKind::WitnessScript,
+            },
+            gap_limit: 20,
+            labels: Default::default(),
+            created_at: 1_755_000_000,
+            live_pinned: false,
+        }],
+        backends: None,
+        electrum_certs: None,
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    assert!(
+        preview.wallets[0]
+            .refused
+            .as_deref()
+            .is_some_and(|reason| reason.contains("another wallet")),
+        "{:?}",
+        preview.wallets[0].refused
+    );
+    assert!(
+        manager
+            .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+            .await
+            .is_err()
+    );
+    assert!(manager.list_wallets(None).await.is_empty());
+}
+
 /// A certificate in a backup is restored only for an Electrum server a
 /// backend of the same backup names: a pin for a host the settings
 /// never reach would wait in the vault for the day that host is typed
