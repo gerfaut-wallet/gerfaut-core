@@ -423,49 +423,67 @@ async fn electrum_fills_what_a_padding_server_holds_back() {
 /// wider one on the user's own node, where electrs, as its author
 /// publishes it, looks at every subscription again after each round;
 /// not on ElectrumX, where requests that wait too long are errors that
-/// cost the session.
+/// cost the session. The lists are longer than either window, and every
+/// answer is held a moment: what the server holds at most is what the
+/// watch kept waiting on.
 #[tokio::test]
 async fn electrum_keeps_a_wider_window_on_the_users_node() {
-    let all: Vec<u8> = (0..250).collect();
-    for (own_node, software, most) in [
-        (false, "electrs/0.12.0", electrum::WINDOW),
-        (true, "electrs/0.12.0", all.len()),
-        (true, "ElectrumX 1.18.0", electrum::WINDOW),
+    // A script of each of `n` distinct values, past the 256 of `script`.
+    let wide = |n: usize| -> WatchedWallet {
+        WatchedWallet {
+            wallet_id: "a".to_owned(),
+            scripts: (0..n)
+                .map(|i| WatchedScript {
+                    script: format!("0014{i:04x}{}", "ab".repeat(18)),
+                    lookahead: false,
+                    status: None,
+                    counts: None,
+                })
+                .collect(),
+            has_pending: false,
+            pinned: false,
+            holds_coins: false,
+            unlisted: 0,
+        }
+    };
+    let own = 2 * electrum::OWN_NODE_WINDOW + 50;
+    for (own_node, software, window, scripts) in [
+        (
+            false,
+            "electrs/0.12.0",
+            electrum::WINDOW,
+            MAX_SCRIPTS_PER_WALLET,
+        ),
+        (true, "electrs/0.12.0", electrum::OWN_NODE_WINDOW, own),
+        (true, "ElectrumX 1.18.0", electrum::WINDOW, own),
+        (true, " ElectrumX 2.0.0", electrum::WINDOW, own),
     ] {
         let server = FakeElectrum::start().await;
-        server.state.lock().unwrap().software = software;
-        // Every answer held a moment: what the watch sends meanwhile is
-        // what it keeps waiting on.
-        server.state.lock().unwrap().hold = Some((usize::MAX, Duration::from_millis(50)));
+        {
+            let mut state = server.state.lock().unwrap();
+            state.software = software;
+            state.hold = Some((usize::MAX, Duration::from_millis(100)));
+        }
         let BackendConfig::CustomElectrum { url, .. } = server.backend() else {
             unreachable!()
         };
         let (watch, _events) = LiveWatch::start_with(
             config(BackendConfig::CustomElectrum { url, own_node }),
-            vec![wallet("a", &all, &[], false)],
+            vec![wide(scripts)],
             Some(Timings {
                 keepalive: Duration::from_secs(60),
                 pong: Duration::from_secs(10),
                 ..timings()
             }),
         );
-        let watched = if own_node {
-            all.len()
-        } else {
-            MAX_SCRIPTS_PER_WALLET
-        };
         until(&watch, "subscribed", |s| {
-            s.pushed_scripts as usize == watched
+            s.pushed_scripts as usize == scripts
         })
         .await;
-        let held = server.state.lock().unwrap().held_most;
-        assert!(
-            held <= most.min(electrum::OWN_NODE_WINDOW),
-            "own node {own_node}, {software}: {held} waiting"
-        );
-        assert!(
-            held * 10 >= most.min(watched) * 8,
-            "own node {own_node}, {software}: {held} waiting"
+        assert_eq!(
+            server.state.lock().unwrap().held_most,
+            window,
+            "own node {own_node}, {software:?}"
         );
     }
 }
