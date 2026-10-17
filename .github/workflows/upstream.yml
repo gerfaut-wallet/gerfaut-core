@@ -4,14 +4,17 @@ name: Upstream
 # search from spinning forever on Windows (arti #2678 and #2726), and the
 # fork goes once a release of the crate itself carries a fix. Every
 # Monday, and on demand, this looks for a release on crates.io newer than
-# both the fork and REVIEWED below, and fails when there is one; GitHub
-# then notifies whoever last edited the cron line. Never run on a pull
-# request: a release upstream says nothing about a change here.
+# the fork and not listed in REVIEWED below, and fails when there is one;
+# GitHub then notifies whoever last edited the cron line. Never run on a
+# pull request: a release upstream says nothing about a change here.
 #
 # Read the new release's find_limit. If it stops on a step that does not
 # move the value, and arti accepts that release, remove the
-# [patch.crates-io] section here, in gerfaut-desktop and in
-# gerfaut-mobile. If not, set REVIEWED to it.
+# [patch.crates-io] section and the saturating-time entry of allow-git in
+# deny.toml, here, in gerfaut-desktop and in gerfaut-mobile, then the
+# "Check that every patch applies" step of the three ci.yml, this
+# workflow and .github/saturating-time-upstream.py. If not, add the
+# release to REVIEWED.
 on:
   schedule:
     - cron: '41 5 * * 1'
@@ -25,7 +28,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      # The newest release read so far that does not carry the fix.
+      # The releases newer than the fork that were read and do not carry
+      # the fix, separated by spaces.
       REVIEWED: 0.5.0
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
