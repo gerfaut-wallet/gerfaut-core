@@ -1121,6 +1121,13 @@ pub fn build_preview(
         }
     }
     if in_mempool {
+        // A PSBT whose transaction already waits there, signed by whoever
+        // sent it: telling the reader to take it back to the signer would
+        // contradict the line below. Its inputs still read unsigned, and
+        // the pill says the copy pasted is not, which is true.
+        if !decoded.ready {
+            warnings.retain(|w| w.kind != TxWarningKind::Unsigned);
+        }
         warnings.push(TxWarning::new(
             TxWarningKind::InMempool,
             if decoded.ready {
@@ -3503,5 +3510,50 @@ mod tests {
         );
         assert!(preview.amounts_declared);
         assert!(!preview.amounts_listed);
+    }
+
+    /// A PSBT still missing its signatures, whose transaction already
+    /// waits in the mempool, signed by whoever sent it: no red line that
+    /// sends it back to the signer, one amber line that says it is out,
+    /// and nothing to broadcast from this copy.
+    #[test]
+    fn an_unsigned_copy_of_a_transaction_in_the_mempool_is_not_sent_back() {
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx()).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: p2wpkh(0x33),
+        });
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        let preview = build_preview(
+            &decoded,
+            Network::Signet,
+            &spent_coin(Some(SpentBy {
+                txid: unsigned_tx().compute_txid(),
+                confirmed: false,
+                verified: true,
+            })),
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(preview.readiness, TxReadiness::Unsigned);
+        assert!(!preview.ready);
+        assert!(preview.hex.is_none());
+        let kinds: Vec<TxWarningKind> = preview.warnings.iter().map(|w| w.kind).collect();
+        assert!(!kinds.contains(&TxWarningKind::Unsigned), "{kinds:?}");
+        let waiting = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InMempool)
+            .expect("it is said to be out");
+        assert!(waiting.message.contains("nothing left to send"));
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .all(|w| w.severity == TxSeverity::Info),
+            "{:?}",
+            preview.warnings
+        );
     }
 }
