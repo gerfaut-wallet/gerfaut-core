@@ -992,13 +992,34 @@ fn canonical_branch(path: &str, which: &str) -> CoreResult<String> {
     Ok(canonical.join("/"))
 }
 
+/// Where a key origin was read, which decides what an error about it
+/// quotes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OriginSource {
+    /// Typed by hand: it is on screen in its field already, and a
+    /// message never copies it back, since it could be a key pasted in
+    /// the wrong place.
+    Typed,
+    /// Read from a wallet export, every string of which went through the
+    /// private key filter: the message quotes what it read, the one way
+    /// to find the fault in a file nobody sees.
+    File,
+}
+
 /// Checks a key origin and returns it in canonical form,
 /// `[fingerprint/path]` with `'` on hardened steps, the way the
 /// descriptor prints it. Hardened steps are fine here: the origin
 /// records what the signer derived, not what this key will.
-fn canonical_origin(origin: &str) -> CoreResult<String> {
+fn canonical_origin(origin: &str, source: OriginSource) -> CoreResult<String> {
     let origin = origin.trim();
-    let refuse = |reason: String| derivation_error(format!("the key origin {reason}"));
+    let quoted = source == OriginSource::File;
+    let refuse = |reason: String| {
+        derivation_error(if quoted {
+            format!("the key origin `{origin}` {reason}")
+        } else {
+            format!("the key origin {reason}")
+        })
+    };
     let inner = match origin
         .strip_prefix('[')
         .and_then(|inner| inner.strip_suffix(']'))
@@ -1014,9 +1035,12 @@ fn canonical_origin(origin: &str) -> CoreResult<String> {
     let mut steps = inner.split('/');
     let fingerprint = steps.next().unwrap_or_default();
     if fingerprint.len() != 8 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(refuse(
-            "must start with the master key fingerprint, 8 hexadecimal characters".to_owned(),
-        ));
+        let reason = "must start with the master key fingerprint, 8 hexadecimal characters";
+        return Err(refuse(if quoted {
+            format!("{reason}, not `{fingerprint}`")
+        } else {
+            reason.to_owned()
+        }));
     }
     let mut canonical = fingerprint.to_ascii_lowercase();
     for step in steps {
@@ -1074,7 +1098,7 @@ fn effective_derivation(
         .map(str::trim)
         .filter(|origin| !origin.is_empty())
         .or(input_origin)
-        .map(canonical_origin)
+        .map(|origin| canonical_origin(origin, OriginSource::Typed))
         .transpose()?;
     Ok(DerivationChoice {
         receive,
@@ -1386,10 +1410,11 @@ fn coldcard_account(
         .and_then(|v| v.as_str())
         .map(|deriv| deriv.trim_start_matches('m').trim_start_matches('/'));
     let origin = match (fingerprint, path) {
-        (Some(fingerprint), Some("")) => Some(canonical_origin(fingerprint)?),
-        (Some(fingerprint), Some(path)) => {
-            Some(canonical_origin(&format!("[{fingerprint}/{path}]"))?)
-        }
+        (Some(fingerprint), Some("")) => Some(canonical_origin(fingerprint, OriginSource::File)?),
+        (Some(fingerprint), Some(path)) => Some(canonical_origin(
+            &format!("[{fingerprint}/{path}]"),
+            OriginSource::File,
+        )?),
         _ => None,
     };
     let derivation = DerivationChoice {
@@ -2299,6 +2324,19 @@ mod tests {
         let (external, _, script) = descriptors(&parsed);
         assert_eq!(script, ScriptKind::Segwit);
         assert!(external.contains("[0f056943/84'/1'/0']"));
+    }
+
+    /// A wallet export whose origin does not read is refused naming what
+    /// it read: the file is out of sight, unlike a field of the app.
+    #[test]
+    fn an_export_origin_that_does_not_read_is_quoted() {
+        let json = format!(
+            "{{\"xfp\": \"0F05694\", \"bip84\": {{\"xpub\": \"{TPUB}\", \
+             \"deriv\": \"m/84'/1'/0'\", \"name\": \"p2wpkh\"}}}}"
+        );
+        let error = parse_input(&json).unwrap_err().to_string();
+        assert!(error.contains("`[0F05694/84'/1'/0']`"), "{error}");
+        assert!(error.contains("not `0F05694`"), "{error}");
     }
 
     /// A Coldcard export gives each account the fingerprint of the
