@@ -70,7 +70,7 @@ def fetch():
                     page = json.load(response)
                 break
             except urllib.error.HTTPError as error:
-                if error.code != 429 and error.code < 500 or attempt == 2:
+                if attempt == 2 or (error.code != 429 and error.code < 500):
                     raise
                 print(f"crates.io: {error}, trying again", file=sys.stderr)
             except (OSError, ValueError, http.client.HTTPException) as error:
@@ -112,6 +112,8 @@ def main():
             f"::error::Cargo.lock no longer takes {CRATE} from the fork: if the fork is gone "
             f"on purpose, remove .github/workflows/upstream.yml and this script"
         )
+    if any(numbers(text) is None for text in forks):
+        sys.exit(f"::error::Cargo.lock gives the fork a version that is not major.minor.patch: {', '.join(forks)}")
     fork = max(numbers(text) for text in forks)
 
     releases = {
@@ -134,4 +136,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:  # every failure gets its annotation
+        # On one line: the runner reads a line that starts with :: as a command.
+        message = " ".join(str(error).split())
+        sys.exit(f"::error::the check itself failed: {type(error).__name__}: {message}")
