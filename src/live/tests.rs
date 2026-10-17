@@ -243,6 +243,7 @@ fn timings() -> crate::watch::Timings {
         refused: Duration::from_millis(600),
         limit_kept: Duration::from_secs(3600),
         zero_limit_kept: Duration::from_secs(3600),
+        stale: Duration::from_secs(3600),
     }
 }
 

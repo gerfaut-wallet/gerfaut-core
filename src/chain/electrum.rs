@@ -78,6 +78,20 @@ impl Target {
             pin,
         }
     }
+
+    /// How a connection to this server is secured, `tls` as [`parse`]
+    /// read the address: TLS checked by the verifier every Electrum
+    /// connection goes through, the fingerprint accepted for this server
+    /// included, or nothing over plain TCP.
+    pub(crate) fn security(&self, tls: bool) -> crate::chain::net::Security<'_> {
+        if tls {
+            crate::chain::net::Security::Electrum {
+                pin: self.pin.as_deref(),
+            }
+        } else {
+            crate::chain::net::Security::Plain
+        }
+    }
 }
 
 /// What a settings screen needs to know about a server's certificate.
@@ -435,6 +449,7 @@ async fn run<T: Send + 'static>(
     std::thread::Builder::new()
         .name("gerfaut-electrum".to_owned())
         .spawn(move || {
+            PAUSES_LEFT.set(PAUSES);
             let result = connect(&target, proxy.as_deref(), &cancel)
                 .map_err(|e| e.to_string())
                 .and_then(|raw| operation(&raw));
@@ -528,6 +543,22 @@ pub(crate) fn out_of_budget(error: &serde_json::Value) -> bool {
             .is_some_and(|message| message.to_ascii_lowercase().contains("budget exhausted"))
 }
 
+/// The waits one connection takes at most for a server out of memory,
+/// fifteen seconds or so. A wallet of a hundred batches under a server
+/// that stays out of memory would otherwise wait for each, past the
+/// deadline of its sync, which relegates nothing, and the next sync
+/// would start over. Past them, a refusal for want of memory is the
+/// answer at once: the sync moves to the next server, and this one is
+/// relegated for it ([`crate::chain::is_outage`]).
+pub(crate) const PAUSES: u32 = 3;
+
+std::thread_local! {
+    /// The waits left to the connection of this thread: each operation
+    /// of the client of BDK runs on a thread of its own ([`run`]), which
+    /// starts with [`PAUSES`].
+    static PAUSES_LEFT: std::cell::Cell<u32> = const { std::cell::Cell::new(PAUSES) };
+}
+
 /// The wait before such a request is asked again: [`BUSY_WAIT`], and up
 /// to a fifth more so that the clients turned down together do not come
 /// back together.
@@ -538,8 +569,18 @@ pub(crate) fn busy_pause() -> Duration {
 /// `call`, made once more after [`busy_pause`] when the server turned it
 /// down for want of memory ([`out_of_budget`]), the way an Esplora server
 /// that limits the rate of requests is asked again once: a second
-/// refusal is the answer. The thread of the sync sleeps meanwhile, its
+/// refusal is the answer, and so is the first once the connection has
+/// taken its [`PAUSES`]. The thread of the sync sleeps meanwhile, its
 /// connection open.
+///
+/// A batch of the client of BDK is asked again whole, ten requests at
+/// most: it ends at the first refusal and drops the answers it had, so
+/// nothing tells which ones went through, where the asynchronous client
+/// ([`rpc::Connection::batch`]) asks again the refused ones alone. And it
+/// reads a refusal only from a server that answers in order: one
+/// answered out of order reaches it as a result it cannot read. The
+/// electrs of Blockstream, the one server that refuses for want of
+/// memory, answers the requests of a connection one after the other.
 pub(crate) fn patiently<T>(
     call: impl FnMut() -> Result<T, electrum_client::Error>,
 ) -> Result<T, electrum_client::Error> {
@@ -551,12 +592,23 @@ fn patiently_with<T>(
     pause: impl FnOnce(Duration),
 ) -> Result<T, electrum_client::Error> {
     match call() {
-        Err(electrum_client::Error::Protocol(error)) if out_of_budget(&error) => {
+        Err(electrum_client::Error::Protocol(error)) if out_of_budget(&error) && take_pause() => {
             pause(busy_pause());
             call()
         }
         other => other,
     }
+}
+
+/// One of the waits left to the connection of this thread, if any.
+fn take_pause() -> bool {
+    PAUSES_LEFT.with(|left| match left.get() {
+        0 => false,
+        n => {
+            left.set(n - 1);
+            true
+        }
+    })
 }
 
 // --- errors ---------------------------------------------------------------
@@ -1072,6 +1124,76 @@ mod tests {
         );
         assert!(refused.is_err());
         assert_eq!((calls, waited), (1, false));
+    }
+
+    /// A connection waits for a server out of memory three times at most:
+    /// past them, the refusal is the answer at once, and the sync moves
+    /// on instead of waiting out its deadline batch after batch.
+    #[test]
+    fn a_connection_waits_three_times_at_most() {
+        PAUSES_LEFT.set(PAUSES);
+        let mut waits = 0;
+        for _ in 0..PAUSES {
+            let mut calls = 0;
+            let answer = patiently_with(
+                || {
+                    calls += 1;
+                    if calls == 1 {
+                        Err(out_of_memory())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| waits += 1,
+            );
+            assert!(answer.is_ok());
+        }
+        assert_eq!(waits, PAUSES);
+        let mut calls = 0;
+        let refused = patiently_with(
+            || {
+                calls += 1;
+                Err::<(), _>(out_of_memory())
+            },
+            |_| waits += 1,
+        );
+        assert!(refused.is_err());
+        assert_eq!((calls, waits), (1, PAUSES));
+    }
+
+    /// A connection that fails, in the words this client puts it in, is an
+    /// outage, and so is a server out of memory twice in a row; another
+    /// refusal is not.
+    #[test]
+    fn connections_that_fail_are_outages() {
+        use crate::chain::is_outage;
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::UnexpectedEof,
+        ] {
+            let detail = describe_io(&Error::from(kind), TIMEOUT);
+            assert!(is_outage(&detail), "{kind:?}: {detail}");
+        }
+        let unknown = describe_io(
+            &Error::other("failed to lookup address information"),
+            TIMEOUT,
+        );
+        assert_eq!(unknown, "host not found");
+        assert!(is_outage(&unknown));
+        // The words of this device's system, a firewall that says no:
+        // nothing tells that it is the server.
+        let local = describe_io(&Error::other("no route"), TIMEOUT);
+        assert_eq!(local, "connection failed: no route");
+        assert!(!is_outage(&local));
+        assert!(is_outage(&describe(&out_of_memory(), TIMEOUT)));
+        let refused = electrum_client::Error::Protocol(serde_json::json!({
+            "code": 1, "message": "Too many history entries",
+        }));
+        assert!(!is_outage(&describe(&refused, TIMEOUT)));
     }
 
     /// A sync whose server turns transactions down for want of memory,

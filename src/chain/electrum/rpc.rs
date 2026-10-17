@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
@@ -24,7 +24,7 @@ use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use super::{
     CLIENT_NAME, MAX_LINE, MAX_READ, PROTOCOL, TIMEOUT, TOR_TIMEOUT, Target, parse, too_long, words,
 };
-use crate::chain::net::{self, BoxStream, LineReader, LineTooLong, Security};
+use crate::chain::net::{self, BoxStream, LineReader, LineTooLong};
 
 /// Requests awaiting their answer at any time.
 const WINDOW: usize = 16;
@@ -65,6 +65,16 @@ impl From<CallError> for String {
     }
 }
 
+/// One request as it goes on the wire, its parameters borrowed: a batch
+/// keeps them for the requests it asks again, and copies none.
+#[derive(Serialize)]
+struct Outgoing<'a> {
+    jsonrpc: &'static str,
+    id: u64,
+    method: &'a str,
+    params: &'a Value,
+}
+
 /// One answer as it comes off the wire: the result is kept as its text
 /// until the caller says what it should be.
 #[derive(Deserialize)]
@@ -86,6 +96,9 @@ pub(crate) struct Connection {
     /// Bytes read since the connection opened, and how many it may.
     read: usize,
     read_max: usize,
+    /// The waits left to this connection for a server out of memory:
+    /// see [`super::PAUSES`].
+    pauses: u32,
 }
 
 impl Connection {
@@ -96,15 +109,8 @@ impl Connection {
         let (tls, host, port) = parse(&target.url)?;
         let onion = super::is_onion(target, &host);
         let timeout = if onion { TOR_TIMEOUT } else { TIMEOUT };
-        let security = if tls {
-            Security::Electrum {
-                pin: target.pin.as_deref(),
-            }
-        } else {
-            Security::Plain
-        };
         let proxy = proxy.filter(|_| onion);
-        let stream = net::open(&host, port, security, proxy, timeout).await?;
+        let stream = net::open(&host, port, target.security(tls), proxy, timeout).await?;
         let (reader, writer) = tokio::io::split(stream);
         let mut connection = Connection {
             reader: LineReader::new(reader, MAX_LINE),
@@ -113,6 +119,7 @@ impl Connection {
             timeout,
             read: 0,
             read_max: MAX_READ,
+            pauses: super::PAUSES,
         };
         connection
             .call::<Value>("server.version", json!([CLIENT_NAME, [PROTOCOL, PROTOCOL]]))
@@ -142,7 +149,8 @@ impl Connection {
     /// `each` ends the batch. The requests the server turned down for
     /// want of memory are asked again once, after
     /// [`super::busy_pause`], and their answers then handed over, a
-    /// second refusal as a refusal.
+    /// second refusal as a refusal; once the connection has taken its
+    /// waits ([`super::PAUSES`]), the first refusal is.
     pub(crate) async fn batch<T: DeserializeOwned>(
         &mut self,
         method: &str,
@@ -150,21 +158,27 @@ impl Connection {
         mut each: impl FnMut(usize, Result<T, CallError>) -> Result<(), CallError>,
     ) -> Result<(), CallError> {
         let mut busy = Vec::new();
-        let first = params.iter().cloned().enumerate();
-        self.round(method, first, |index, result| match result {
-            Err(CallError::Busy(_)) => {
-                busy.push(index);
-                Ok(())
-            }
-            result => each(index, result),
-        })
+        let patient = self.pauses > 0;
+        self.round(
+            method,
+            params.iter().enumerate(),
+            |index, result| match result {
+                Err(CallError::Busy(_)) if patient => {
+                    busy.push(index);
+                    Ok(())
+                }
+                Err(CallError::Busy(words)) => each(index, Err(CallError::Refused(words))),
+                result => each(index, result),
+            },
+        )
         .await?;
         if busy.is_empty() {
             return Ok(());
         }
+        self.pauses -= 1;
         tokio::time::sleep(super::busy_pause()).await;
         busy.sort_unstable();
-        let again = busy.into_iter().map(|index| (index, params[index].clone()));
+        let again = busy.into_iter().map(|index| (index, &params[index]));
         self.round(method, again, |index, result| match result {
             Err(CallError::Busy(words)) => each(index, Err(CallError::Refused(words))),
             result => each(index, result),
@@ -177,7 +191,7 @@ impl Connection {
     async fn round<T: DeserializeOwned>(
         &mut self,
         method: &str,
-        mut queue: impl Iterator<Item = (usize, Value)>,
+        mut queue: impl Iterator<Item = (usize, &Value)>,
         mut each: impl FnMut(usize, Result<T, CallError>) -> Result<(), CallError>,
     ) -> Result<(), CallError> {
         let mut waiting: HashMap<u64, usize> = HashMap::new();
@@ -199,11 +213,17 @@ impl Connection {
         }
     }
 
-    async fn send(&mut self, method: &str, params: Value) -> Result<u64, CallError> {
+    async fn send(&mut self, method: &str, params: &Value) -> Result<u64, CallError> {
         let id = self.next_id;
         self.next_id += 1;
-        let mut line =
-            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
+        let request = Outgoing {
+            jsonrpc: "2.0",
+            id,
+            method,
+            params,
+        };
+        let mut line = serde_json::to_string(&request)
+            .map_err(|_| CallError::Failed("the request could not be written".to_owned()))?;
         line.push('\n');
         let write = async {
             self.writer.write_all(line.as_bytes()).await?;
@@ -363,5 +383,31 @@ mod tests {
         let count = |method: &str| asked.iter().filter(|asked| *asked == method).count();
         assert_eq!(count("blockchain.transaction.get"), 5);
         assert_eq!(count("blockchain.scripthash.get_history"), 2);
+    }
+
+    /// A connection that has taken its waits hands a refusal for want of
+    /// memory over at once, as a refusal.
+    #[tokio::test]
+    async fn a_connection_out_of_waits_takes_the_refusal_at_once() {
+        let server = FakeElectrum::start().await;
+        server
+            .state
+            .lock()
+            .unwrap()
+            .busy
+            .insert("blockchain.transaction.get", 1);
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        let mut connection = Connection::open(&target, None).await.unwrap();
+        connection.pauses = 0;
+        let started = std::time::Instant::now();
+        let refused = connection
+            .call::<String>("blockchain.transaction.get", json!(["00".repeat(32)]))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            refused,
+            CallError::Refused("response budget exhausted, retry later".to_owned())
+        );
     }
 }
