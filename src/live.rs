@@ -1133,16 +1133,19 @@ impl WalletManager {
     }
 
     /// Waits out the first pass of a running watch over its servers
-    /// ([`LiveWatch::first_pass`]), for a sync that names no server.
-    /// Before its first session the watch names none, and the sync would
-    /// go to the first of its own order: under the automatic backend,
-    /// the head of the rotation, an operator other than the watch's,
-    /// which would see every address of the wallet each time the app
-    /// opens, the opening sync and the watch racing from the same start.
-    pub(crate) async fn live_first_pass(&self) {
+    /// ([`LiveWatch::first_pass`]), for a sync of a wallet of `network`
+    /// that names no server. Before its first session the watch names
+    /// none, and the sync would go to the first of its own order: under
+    /// the automatic backend, the head of the rotation, an operator other
+    /// than the watch's, which would see every address of the wallet each
+    /// time the app opens, the opening sync and the watch racing from the
+    /// same start. A watch of another network has no server for this
+    /// wallet: nothing to wait for.
+    pub(crate) async fn live_first_pass(&self, network: Network) {
         let first_pass = self
             .live_slot()
             .as_ref()
+            .filter(|running| running.config.network == network)
             .map(|running| running.watch.first_pass());
         if let Some(first_pass) = first_pass {
             first_pass.await;

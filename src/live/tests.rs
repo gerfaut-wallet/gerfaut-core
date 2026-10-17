@@ -1037,6 +1037,58 @@ async fn the_first_pass_has_one_deadline_per_configuration() {
     manager.live_stop().await;
 }
 
+/// What does not wait for the first pass: a rescan the person asked
+/// for, and the sync of a wallet of another network than the watch's,
+/// which has no server for it.
+#[tokio::test]
+async fn a_rescan_and_another_network_do_not_wait_for_the_first_pass() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let stalled = FakeElectrum::start().await;
+    stalled.state.lock().unwrap().silent = true;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) = automatic(dir.path(), &rotation, &[&stalled]).await;
+    // A testnet4 wallet, its own server one that refuses at once.
+    manager
+        .set_backend(
+            Network::Testnet4,
+            crate::chain::BackendConfig::CustomEsplora {
+                url: "http://127.0.0.1:9".to_owned(),
+                own_node: false,
+            },
+        )
+        .await
+        .unwrap();
+    let parsed = crate::input::parse_input(
+        "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)",
+    )
+    .unwrap();
+    let elsewhere = manager
+        .add_wallet("Elsewhere", &parsed, Network::Testnet4)
+        .await
+        .unwrap()
+        .id;
+    let budget = Duration::from_secs(2);
+    let pace = crate::watch::Timings {
+        connect: Duration::from_secs(60),
+        first_session: budget,
+        ..timings()
+    };
+    let _events = manager.live_start_with(Some(pace)).await.unwrap();
+
+    let started = std::time::Instant::now();
+    manager.rescan_wallet(&wallet).await.unwrap();
+    let rescan = started.elapsed();
+    let started = std::time::Instant::now();
+    let _ = manager.sync_wallet(&elsewhere).await;
+    let other = started.elapsed();
+    assert!(rescan < budget / 2, "the rescan waited: {rescan:?}");
+    assert!(
+        other < budget / 2,
+        "a testnet4 sync waited for a signet watch: {other:?}"
+    );
+    manager.live_stop().await;
+}
+
 /// A watch started on an empty vault has no session to open, and its
 /// first pass is over at once; the first wallet added opens one, which
 /// the sync of that wallet waits for, instead of going to the head of
