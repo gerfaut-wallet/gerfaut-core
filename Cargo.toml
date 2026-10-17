@@ -109,12 +109,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 # on a clock coarser than a nanosecond: Windows counts 100 ns intervals,
 # so adding 1 ns returns the same value and the loop takes that for
 # progress (arti #2678). 0.5.0, the version arti 0.47 asks for, still
-# has the bug; the fork is that release with the three-line fix, on its
-# gerfaut-0.5.0 branch. A patch that no longer matches the version arti
-# asks for is skipped without an error, so the next arti that moves to
-# another version of this crate needs the fix carried over again; drop
-# it once a release carries one. Every manifest that builds this crate
-# needs the same section: Cargo only honours [patch] in the root
-# manifest.
+# has the bug; the fork is that release with the fix, on its
+# gerfaut-0.5.0 branch, where CI runs the tests on Windows. A patch that
+# no longer matches the version arti asks for is skipped without an
+# error, so the next arti that moves to another version of this crate
+# needs the fix carried over again; drop it once a release carries one.
+# Every manifest that builds this crate needs the same section: Cargo
+# only honours [patch] in the root manifest.
 [patch.crates-io]
-saturating-time = { git = "https://github.com/gerfaut-wallet/saturating-time", rev = "185ef6a4a1647adac291bd43bb9fd2821e73b9bc" }
+saturating-time = { git = "https://github.com/gerfaut-wallet/saturating-time", rev = "784e1a396ac8890fcc2c7bab6d1c07e432ceedac" }
