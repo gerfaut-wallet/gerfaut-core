@@ -132,6 +132,10 @@ pub struct Shared {
     /// Counts the readings of what the watch should follow, so an older
     /// one never replaces a newer one on the running watch.
     pub(crate) watch_setups: std::sync::atomic::AtomicU64,
+    /// The starts of the live watch under way: a sync that names no
+    /// server waits for them, then for the first pass of the watch they
+    /// start ([`WalletManager::live_first_pass`]).
+    pub(crate) live_starting: tokio::sync::watch::Sender<usize>,
     /// What the notifications of Live may still spend this minute, for
     /// every caller of the process: see [`WalletManager::notices`].
     pub(crate) notice_budgets: std::sync::Mutex<crate::live::notice::Budgets>,
@@ -181,6 +185,7 @@ impl WalletManager {
                 attempts: Mutex::new(attempts),
                 live: std::sync::Mutex::new(None),
                 watch_setups: std::sync::atomic::AtomicU64::new(0),
+                live_starting: tokio::sync::watch::Sender::new(0),
                 notice_budgets: std::sync::Mutex::new(crate::live::notice::Budgets::new()),
                 syncing: std::sync::Mutex::new(HashMap::new()),
                 complete_here: std::sync::Mutex::new(HashSet::new()),
@@ -216,16 +221,11 @@ fn create_engine(
     internal: Option<&str>,
     network: Network,
 ) -> CoreResult<bdk_wallet::Wallet> {
-    // The engine takes a descriptor with private keys as readily as one
-    // without, and would sign with them. The text reaches here from the
-    // parser, but also from a backup file and from whatever the app
-    // hands back as a parsed input, so it is held to watch-only again.
-    for descriptor in std::iter::once(external).chain(internal) {
-        require_public_descriptor(descriptor)?;
-    }
+    // The engine is given what was read, never the text again.
+    let (external, internal) = read_pair(external, internal)?;
     let params = match internal {
-        Some(internal) => bdk_wallet::Wallet::create(external.to_owned(), internal.to_owned()),
-        None => bdk_wallet::Wallet::create_single(external.to_owned()),
+        Some(internal) => bdk_wallet::Wallet::create(external, internal),
+        None => bdk_wallet::Wallet::create_single(external),
     };
     params
         .network(network.to_bitcoin())
@@ -233,17 +233,45 @@ fn create_engine(
         .map_err(|e| CoreError::Descriptor(e.to_string()))
 }
 
-/// Refuses a descriptor that carries private key material, or that does
-/// not read as a descriptor of public keys alone, held to what an
-/// import is held to.
-fn require_public_descriptor(descriptor: &str) -> CoreResult<()> {
+/// Reads the descriptors of a wallet as they reach the engine: from the
+/// parser, but also from a backup file and from whatever the app hands
+/// back as a parsed input. The engine takes a descriptor with private
+/// keys as readily as one without, and would sign with them, so each is
+/// held to watch-only again; and the pair to being one wallet on two
+/// branches, which a backup written by hand could break, pairing a
+/// receive descriptor, which the policy page reads, with a change
+/// descriptor of another wallet.
+fn read_pair(
+    external: &str,
+    internal: Option<&str>,
+) -> CoreResult<(
+    bdk_wallet::descriptor::ExtendedDescriptor,
+    Option<bdk_wallet::descriptor::ExtendedDescriptor>,
+)> {
+    let external = require_public_descriptor(external)?;
+    let internal = internal.map(require_public_descriptor).transpose()?;
+    if let Some(internal) = &internal {
+        crate::input::check_stored_pair(&external, internal).map_err(as_descriptor_error)?;
+    }
+    Ok((external, internal))
+}
+
+/// Reads a descriptor of public keys alone, held to what an import is
+/// held to: one that carries private key material, or that does not
+/// read as public keys alone, is refused.
+fn require_public_descriptor(
+    descriptor: &str,
+) -> CoreResult<bdk_wallet::descriptor::ExtendedDescriptor> {
     crate::input::reject_private_material(descriptor)?;
-    crate::input::read_descriptor(descriptor)
-        .map(|_| ())
-        .map_err(|e| match e {
-            CoreError::InvalidInput { detail, .. } => CoreError::Descriptor(detail),
-            other => other,
-        })
+    crate::input::read_descriptor(descriptor).map_err(as_descriptor_error)
+}
+
+/// An input error about stored material, said as a descriptor error.
+fn as_descriptor_error(error: CoreError) -> CoreError {
+    match error {
+        CoreError::InvalidInput { detail, .. } => CoreError::Descriptor(detail),
+        other => other,
+    }
 }
 
 /// The wallet already watching the same material on the same network,
@@ -291,43 +319,76 @@ fn fresh_meta(
 /// single address is re-checked against its network as a defense in
 /// depth, whatever validated it upstream.
 fn build_record(meta: WalletMeta) -> CoreResult<(WalletRecord, Option<bdk_wallet::Wallet>)> {
-    let kind = meta.kind.clone();
-    match &kind {
+    let mut engine = engine_for(&meta.kind, meta.network)?;
+    let changeset = match &mut engine {
+        Some(engine) => Some(engine.take_staged().ok_or_else(|| {
+            CoreError::Internal("new wallet produced no initial change set".to_owned())
+        })?),
+        None => None,
+    };
+    Ok((
+        WalletRecord {
+            meta,
+            changeset,
+            address_state: None,
+        },
+        engine,
+    ))
+}
+
+/// What a wallet of this material is watched with on `network`: the
+/// engine of a descriptor wallet, nothing for a single address, which is
+/// checked against the network instead.
+fn engine_for(kind: &WalletKind, network: Network) -> CoreResult<Option<bdk_wallet::Wallet>> {
+    match kind {
+        WalletKind::Descriptors {
+            external, internal, ..
+        } => create_engine(external, internal.as_deref(), network).map(Some),
+        WalletKind::SingleAddress { address } => {
+            check_address(address, network)?;
+            Ok(None)
+        }
+    }
+}
+
+/// What [`engine_for`] would refuse about this material on `network`,
+/// without building the engine, which derives addresses ahead: the
+/// descriptors held to public keys and to one wallet on two branches,
+/// the keys and the address to the network. Cheap enough for a backup's
+/// preview to ask of every wallet.
+pub(crate) fn check_material(kind: &WalletKind, network: Network) -> CoreResult<()> {
+    match kind {
         WalletKind::Descriptors {
             external, internal, ..
         } => {
-            let mut engine = create_engine(external, internal.as_deref(), meta.network)?;
-            let changeset = engine.take_staged().ok_or_else(|| {
-                CoreError::Internal("new wallet produced no initial change set".to_owned())
-            })?;
-            Ok((
-                WalletRecord {
-                    meta,
-                    changeset: Some(changeset),
-                    address_state: None,
-                },
-                Some(engine),
-            ))
+            let (external, internal) = read_pair(external, internal.as_deref())?;
+            for descriptor in std::iter::once(&external).chain(internal.as_ref()) {
+                let networks =
+                    crate::input::descriptor_networks(descriptor).map_err(as_descriptor_error)?;
+                if !networks.contains(&network) {
+                    return Err(CoreError::NetworkMismatch {
+                        expected: network.to_string(),
+                        found: "descriptor".to_owned(),
+                    });
+                }
+            }
+            Ok(())
         }
-        WalletKind::SingleAddress { address } => {
-            address
-                .parse::<bdk_wallet::bitcoin::Address<_>>()
-                .ok()
-                .and_then(|a| a.require_network(meta.network.to_bitcoin()).ok())
-                .ok_or_else(|| CoreError::NetworkMismatch {
-                    expected: meta.network.to_string(),
-                    found: "address".to_owned(),
-                })?;
-            Ok((
-                WalletRecord {
-                    meta,
-                    changeset: None,
-                    address_state: None,
-                },
-                None,
-            ))
-        }
+        WalletKind::SingleAddress { address } => check_address(address, network),
     }
+}
+
+/// Refuses an address that is not one of `network`.
+fn check_address(address: &str, network: Network) -> CoreResult<()> {
+    address
+        .parse::<bdk_wallet::bitcoin::Address<_>>()
+        .ok()
+        .and_then(|a| a.require_network(network.to_bitcoin()).ok())
+        .map(|_| ())
+        .ok_or_else(|| CoreError::NetworkMismatch {
+            expected: network.to_string(),
+            found: "address".to_owned(),
+        })
 }
 
 /// Loads the BDK engine for a wallet from its stored change set, caching
