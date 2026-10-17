@@ -216,23 +216,19 @@ fn create_engine(
     // The engine takes a descriptor with private keys as readily as one
     // without, and would sign with them. The text reaches here from the
     // parser, but also from a backup file and from whatever the app
-    // hands back as a parsed input, so it is held to watch-only again.
-    for descriptor in std::iter::once(external).chain(internal) {
-        require_public_descriptor(descriptor)?;
-    }
-    // The same text is held to what a pair is held to on import: one
-    // wallet on two branches. A backup written by hand could otherwise
-    // pair a receive descriptor, which the policy page reads, with a
-    // change descriptor of another wallet.
-    if let Some(internal) = internal {
-        crate::input::check_descriptor_pair(external, internal).map_err(|e| match e {
-            CoreError::InvalidInput { detail, .. } => CoreError::Descriptor(detail),
-            other => other,
-        })?;
+    // hands back as a parsed input, so it is held to watch-only again,
+    // and the engine is given what was read, never the text again.
+    let external = require_public_descriptor(external)?;
+    let internal = internal.map(require_public_descriptor).transpose()?;
+    // The pair is held to being one wallet on two branches. A backup
+    // written by hand could otherwise pair a receive descriptor, which
+    // the policy page reads, with a change descriptor of another wallet.
+    if let Some(internal) = &internal {
+        crate::input::check_stored_pair(&external, internal).map_err(as_descriptor_error)?;
     }
     let params = match internal {
-        Some(internal) => bdk_wallet::Wallet::create(external.to_owned(), internal.to_owned()),
-        None => bdk_wallet::Wallet::create_single(external.to_owned()),
+        Some(internal) => bdk_wallet::Wallet::create(external, internal),
+        None => bdk_wallet::Wallet::create_single(external),
     };
     params
         .network(network.to_bitcoin())
@@ -240,17 +236,22 @@ fn create_engine(
         .map_err(|e| CoreError::Descriptor(e.to_string()))
 }
 
-/// Refuses a descriptor that carries private key material, or that does
-/// not read as a descriptor of public keys alone, held to what an
-/// import is held to.
-fn require_public_descriptor(descriptor: &str) -> CoreResult<()> {
+/// Reads a descriptor of public keys alone, held to what an import is
+/// held to: one that carries private key material, or that does not
+/// read as public keys alone, is refused.
+fn require_public_descriptor(
+    descriptor: &str,
+) -> CoreResult<bdk_wallet::descriptor::ExtendedDescriptor> {
     crate::input::reject_private_material(descriptor)?;
-    crate::input::read_descriptor(descriptor)
-        .map(|_| ())
-        .map_err(|e| match e {
-            CoreError::InvalidInput { detail, .. } => CoreError::Descriptor(detail),
-            other => other,
-        })
+    crate::input::read_descriptor(descriptor).map_err(as_descriptor_error)
+}
+
+/// An input error about stored material, said as a descriptor error.
+fn as_descriptor_error(error: CoreError) -> CoreError {
+    match error {
+        CoreError::InvalidInput { detail, .. } => CoreError::Descriptor(detail),
+        other => other,
+    }
 }
 
 /// The wallet already watching the same material on the same network,

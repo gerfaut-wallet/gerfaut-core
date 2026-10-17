@@ -769,13 +769,6 @@ fn parse_descriptor_file(lines: &[&str]) -> CoreResult<ParsedInput> {
     Ok(wallet)
 }
 
-/// [`check_pair`] for a pair stored as text: the one a backup carries,
-/// or a parsed input the app hands back to be added, which reach the
-/// engine without going through the parser.
-pub(crate) fn check_descriptor_pair(external: &str, internal: &str) -> CoreResult<()> {
-    check_pair(&read_descriptor(external)?, &read_descriptor(internal)?)
-}
-
 /// Holds the change descriptor of a pair to the receive one. The two
 /// are one wallet: the same script type, the same keys with the same
 /// say, on other paths. The policy page reads the receive descriptor
@@ -785,6 +778,29 @@ pub(crate) fn check_descriptor_pair(external: &str, internal: &str) -> CoreResul
 fn check_pair(
     external: &Descriptor<DescriptorPublicKey>,
     internal: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<()> {
+    pair_holds(external, internal, true)
+}
+
+/// [`check_pair`] for a pair that reaches the engine without the
+/// parser's two-line reading: read back from a backup, handed back by
+/// the app, or split out of one multipath descriptor. It refuses what
+/// proves the two are not one wallet, and lets through a policy that
+/// cannot be lifted, which says nothing either way and which these
+/// pairs always went through with.
+pub(crate) fn check_stored_pair(
+    external: &Descriptor<DescriptorPublicKey>,
+    internal: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<()> {
+    pair_holds(external, internal, false)
+}
+
+/// The two checks above: `unliftable_refused` says whether a policy that
+/// does not lift fails the pair.
+fn pair_holds(
+    external: &Descriptor<DescriptorPublicKey>,
+    internal: &Descriptor<DescriptorPublicKey>,
+    unliftable_refused: bool,
 ) -> CoreResult<()> {
     let refuse = |detail: &str| {
         Err(CoreError::InvalidInput {
@@ -798,15 +814,17 @@ fn check_pair(
     if external.desc_type() != internal.desc_type() {
         return refuse("the change descriptor is not of the receive descriptor's script type");
     }
-    if crate::wallet::policy::policy_by_material(external)?
-        != crate::wallet::policy::policy_by_material(internal)?
-    {
-        return refuse(
+    match (
+        crate::wallet::policy::policy_by_material(external),
+        crate::wallet::policy::policy_by_material(internal),
+    ) {
+        (Ok(receive), Ok(change)) if receive != change => refuse(
             "the change descriptor does not spend under the receive descriptor's keys and \
              conditions: change would go to another wallet",
-        );
+        ),
+        (Err(unliftable), _) | (_, Err(unliftable)) if unliftable_refused => Err(unliftable),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 // --- extended keys -----------------------------------------------------
@@ -2545,6 +2563,32 @@ mod tests {
         assert!(rejected("a/*", Some("1/*")).contains("not a number"));
         assert!(rejected("2147483648/*", Some("1/*")).contains("above"));
         assert!(rejected("*/0/*", Some("1/*")).contains("last"));
+    }
+
+    /// A pair whose policy does not lift, here a height and a time lock
+    /// on one path, which only a permissive reading lets through: the
+    /// two-line import refuses it as unreadable, a stored pair goes
+    /// through, since nothing in it proves two wallets; a stored pair
+    /// that does prove it is still refused.
+    #[test]
+    fn a_stored_pair_is_refused_only_on_proof() {
+        use bdk_wallet::miniscript::{ExtParams, Miniscript, Segwitv0};
+        let read = |branch: u32, key: &str| {
+            let ms = Miniscript::<DescriptorPublicKey, Segwitv0>::from_str_ext(
+                &format!("and_v(v:pk({key}/{branch}/*),and_v(v:after(100),after(500000001)))"),
+                &ExtParams::allow_all(),
+            )
+            .unwrap();
+            Descriptor::new_wsh(ms).unwrap()
+        };
+        let (receive, change) = (read(0, TPUB), read(1, TPUB));
+        assert!(crate::wallet::policy::policy_by_material(&receive).is_err());
+        assert!(check_pair(&receive, &change).is_err());
+        check_stored_pair(&receive, &change).unwrap();
+
+        let receive = read_descriptor(&format!("wpkh({XPUB}/0/*)")).unwrap();
+        let change = read_descriptor(&format!("wpkh({XPUB_B}/1/*)")).unwrap();
+        assert!(check_stored_pair(&receive, &change).is_err());
     }
 
     #[test]
