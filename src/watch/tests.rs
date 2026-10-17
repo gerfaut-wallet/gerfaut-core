@@ -845,6 +845,55 @@ async fn a_server_that_took_none_is_asked_again_sooner() {
     no_event(&mut events, Duration::from_millis(300)).await;
 }
 
+/// On a session ElectrumX slows down for what it costs, subscriptions
+/// past the few it serves at once wait their turn too long and are
+/// refused: the watch narrows its window and sends them again, instead
+/// of cutting a session that ten at a time would only have slowed down.
+#[tokio::test]
+async fn electrum_narrows_its_window_when_subscriptions_wait_too_long() {
+    let server = FakeElectrum::start().await;
+    {
+        let mut state = server.state.lock().unwrap();
+        state.hold = Some((usize::MAX, Duration::from_millis(50)));
+        state.busy_past = Some(10);
+    }
+    let all: Vec<u8> = (0..100).collect();
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            keepalive: Duration::from_secs(60),
+            pong: Duration::from_secs(10),
+            ..timings()
+        }),
+    );
+    let status = until(&watch, "subscribed", |s| s.pushed_scripts == 100).await;
+    assert_eq!(status.state, WatchState::Connected);
+    assert_eq!(asked(&server, "server.version"), 1);
+
+    // Refused again once narrowed: the session is cut.
+    let server = FakeElectrum::start().await;
+    {
+        let mut state = server.state.lock().unwrap();
+        state.hold = Some((usize::MAX, Duration::from_millis(50)));
+        state.busy_past = Some(0);
+    }
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            keepalive: Duration::from_secs(60),
+            pong: Duration::from_secs(10),
+            ..timings()
+        }),
+    );
+    let status = until(&watch, "cut", |s| s.state == WatchState::Reconnecting).await;
+    assert_eq!(
+        status.detail.as_deref(),
+        Some("server busy - request timed out")
+    );
+}
+
 /// ElectrumX that refuses the handshake for what the watch costs it
 /// still holds the cost of an earlier session against the address: when
 /// the watch comes back, it asks for half the list, and reports the rest

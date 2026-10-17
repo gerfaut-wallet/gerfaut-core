@@ -55,10 +55,17 @@ pub(super) const WINDOW: usize = 32;
 /// on a session it slows down, two hundred and fifty-six in flight time
 /// out, and the session is cut.
 pub(super) const OWN_NODE_WINDOW: usize = 256;
+/// The window once ElectrumX has let a subscription wait its turn too
+/// long: as many as it serves at once on a session it does not slow
+/// down, and few enough to be served within its thirty seconds on one it
+/// slows down to its last notch.
+const NARROW_WINDOW: usize = 10;
 /// The refusals of aiorpcx, under ElectrumX, for what a session costs,
 /// code and the start of its words: excessive resource usage, before it
 /// closes the connection, and a request that waited its turn too long.
-const COSTLY: [(i64, &str); 2] = [(-101, "excessive resource usage"), (-102, "server busy")];
+const COSTLY: [(i64, &str); 2] = [(-101, "excessive resource usage"), (BUSY, "server busy")];
+/// The code of a request that waited its turn too long.
+const BUSY: i64 = -102;
 /// Subscriptions refused in a row, in words that do not say why, before
 /// the server is taken to be at its limit and the rest of the queue is
 /// given up: a server at its limit refuses them all, and asking on only
@@ -97,6 +104,9 @@ struct Session {
     refused_run: Vec<String>,
     /// The server takes no more on this connection.
     at_limit: bool,
+    /// The id of the first request sent once the window narrowed after a
+    /// subscription waited too long ([`Session::narrow`]).
+    narrowed_at: Option<u64>,
     /// The server cut the session for what it costs, in these words.
     overloaded: Option<String>,
     can_unsubscribe: bool,
@@ -196,6 +206,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         acknowledged: 0,
         refused_run: Vec::new(),
         at_limit: false,
+        narrowed_at: None,
         overloaded: None,
         can_unsubscribe: at_least_1_4_2(&negotiated),
         pong_by: None,
@@ -388,7 +399,9 @@ impl Session {
             if let Some(error) = error
                 && costs_too_much(error)
             {
-                self.cut(hub, words(error));
+                if !self.narrow(id, &request, error) {
+                    self.cut(hub, words(error));
+                }
                 return;
             }
             let refused = error.is_some();
@@ -489,6 +502,29 @@ impl Session {
         for hex in &report {
             hub.mark_entry(hex, reason);
         }
+    }
+
+    /// ElectrumX let a subscription wait its turn too long and refused it,
+    /// on a session it slows down for what it costs: each such refusal
+    /// costs the session more, and enough of them cut it. The first time,
+    /// the window narrows to [`NARROW_WINDOW`], and every subscription
+    /// already sent and refused the same way is sent again later; one
+    /// sent after, refused the same way, is a session the server is about
+    /// to cut, and it is cut ([`Session::cut`]).
+    fn narrow(&mut self, id: u64, request: &Request, error: &Value) -> bool {
+        let Request::Subscribe(scripthash) = request else {
+            return false;
+        };
+        if error.get("code").and_then(Value::as_i64) != Some(BUSY) {
+            return false;
+        }
+        let narrowed_at = *self.narrowed_at.get_or_insert(self.next_id);
+        if id >= narrowed_at {
+            return false;
+        }
+        self.window = self.window.min(NARROW_WINDOW);
+        self.queue.push_front(scripthash.clone());
+        true
     }
 
     /// The server refused a request for what the session costs it,

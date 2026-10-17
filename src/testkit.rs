@@ -199,6 +199,10 @@ pub(crate) struct ElectrumState {
     /// How many times held answers went out because the wait was over,
     /// not because a kilobyte of them was ready.
     pub timed_flushes: usize,
+    /// While answers are held, a subscription that finds this many held
+    /// before it is refused as ElectrumX refuses a request that waited
+    /// its turn too long on a session it slows down.
+    pub busy_past: Option<usize>,
 }
 
 /// Heights past which the fake Electrum server makes a header up on the
@@ -339,7 +343,18 @@ impl FakeElectrum {
                             .as_ref()
                             .filter(|(gated, _)| *gated == method)
                             .map(|(_, gate)| gate.clone());
-                        (Self::answer(&mut state, index, &request, &method), gate)
+                        let busy = method == "blockchain.scripthash.subscribe"
+                            && written >= 1024
+                            && state.busy_past.is_some_and(|most| held_answers >= most);
+                        let answer = if busy {
+                            Answer::Line(json!({
+                                "jsonrpc": "2.0", "id": request["id"],
+                                "error": { "code": -102, "message": "server busy - request timed out" },
+                            }))
+                        } else {
+                            Self::answer(&mut state, index, &request, &method)
+                        };
+                        (answer, gate)
                     };
                     if let Some(gate) = gate
                         && let Ok(permit) = gate.acquire().await
