@@ -45,7 +45,7 @@ use futures_util::future::try_join_all;
 
 use super::page::PageTx;
 use super::{Client, Counts, PAGE, PARALLEL_REQUESTS};
-use crate::chain::proof::{FALSE_PROOF, Proof, check_confirmation, recheck};
+use crate::chain::proof::{FALSE_PROOF, Proof, above_the_tip, check_confirmation, recheck};
 use crate::chain::{
     Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX, height_limit,
 };
@@ -214,7 +214,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, String> {
     }
 
     let mut update = found.update;
-    prove(client, network, &held, start_time, &mut update).await?;
+    prove(client, network, server_tip, &held, start_time, &mut update).await?;
     let chain = meeting.chain(client, &latest, &update.anchors).await?;
     Ok(Synced {
         update: bdk_wallet::Update {
@@ -482,6 +482,7 @@ impl Found {
 async fn prove(
     client: &Client,
     network: Network,
+    tip: u32,
     held: &Held,
     start_time: u64,
     update: &mut TxUpdate<ConfirmationBlockTime>,
@@ -500,7 +501,7 @@ async fn prove(
         .iter()
         .map(|(anchor, txid)| (*txid, anchor.block_id))
         .collect();
-    let times = prove_confirmations(client, network, &claimed).await?;
+    let times = prove_confirmations(client, network, tip, &claimed).await?;
     for ((anchor, txid), time) in new.into_iter().zip(times) {
         update.anchors.remove(&(anchor, txid));
         match time {
@@ -531,8 +532,43 @@ async fn prove(
 /// it. A proof that does not hold refuses the server ([`FALSE_PROOF`]),
 /// and so does a header that is not the block named. A sound branch into
 /// another block has the block at its height read again ([`recheck`]):
-/// one that replaced the block named leaves the confirmation unsure.
+/// one that replaced the block named leaves the confirmation unsure. One
+/// above `tip`, the tip the server gave before, is weighed by
+/// [`above_the_tip`] without a request.
 pub(crate) async fn prove_confirmations(
+    client: &Client,
+    network: Network,
+    tip: u32,
+    claimed: &[(Txid, BlockId)],
+) -> Result<Vec<Option<u64>>, String> {
+    if claimed
+        .iter()
+        .any(|(_, block)| above_the_tip(block.height, tip) == Some(Proof::False))
+    {
+        return Err(FALSE_PROOF.to_owned());
+    }
+    let below: Vec<(Txid, BlockId)> = claimed
+        .iter()
+        .copied()
+        .filter(|(_, block)| block.height <= tip)
+        .collect();
+    let mut proven = prove_below_the_tip(client, network, &below)
+        .await?
+        .into_iter();
+    Ok(claimed
+        .iter()
+        .map(|(_, block)| {
+            if block.height <= tip {
+                proven.next().flatten()
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+/// [`prove_confirmations`], for confirmations at the tip or below it.
+async fn prove_below_the_tip(
     client: &Client,
     network: Network,
     claimed: &[(Txid, BlockId)],

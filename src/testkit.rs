@@ -87,7 +87,7 @@ pub(crate) fn esplora_payment(label: u8, spends: u8, sats: u64, confirmed: bool)
         "vout": [{ "scriptpubkey": ADDRESS_SCRIPT, "value": sats }],
         "status": if confirmed {
             json!({
-                "confirmed": true, "block_height": 501, "block_hash": "33".repeat(32),
+                "confirmed": true, "block_height": 500, "block_hash": "33".repeat(32),
                 "block_time": 1_700_000_000,
             })
         } else {

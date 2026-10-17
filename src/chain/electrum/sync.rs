@@ -27,7 +27,7 @@ use bdk_wallet::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use electrum_client::{self, ElectrumApi, GetHistoryRes};
 
-use crate::chain::proof::{FALSE_PROOF, Proof, check_confirmation, recheck};
+use crate::chain::proof::{FALSE_PROOF, Proof, above_the_tip, check_confirmation, recheck};
 use crate::chain::{
     ANOTHER_NETWORK, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX, has_proof_of_work,
     height_limit,
@@ -141,6 +141,9 @@ struct Chain {
     /// chain of the update was built without them: see
     /// [`Synced::drop_above`].
     dropped: Option<u32>,
+    /// The tip the server announced: no confirmation sits above it but
+    /// for blocks that came in since ([`above_the_tip`]).
+    server_tip: u32,
 }
 
 impl Chain {
@@ -199,6 +202,7 @@ impl Chain {
                         headers,
                         agreement: at,
                         dropped,
+                        server_tip: height,
                     });
                 }
                 same_network(client, &local, &mut network_checked)?;
@@ -254,6 +258,7 @@ impl Chain {
             headers,
             agreement: agreement.height(),
             dropped,
+            server_tip: height,
         })
     }
 
@@ -415,8 +420,9 @@ impl Pass<'_> {
     /// cannot back, and the next server is asked instead of this one
     /// being believed on anything else. One that is unsure leaves the
     /// transaction unconfirmed, as seen in the mempool now: among them, a
-    /// branch the server refused, and one into a block that replaced the
-    /// one read ([`recheck`]).
+    /// branch the server refused, one into a block that replaced the one
+    /// read ([`recheck`]), and one in a block that came in since the tip
+    /// was read ([`above_the_tip`]).
     fn prove(
         &mut self,
         client: &impl ElectrumApi,
@@ -424,7 +430,17 @@ impl Pass<'_> {
         chain: &mut Chain,
     ) -> Result<(), Error> {
         let false_proof = || Error::Message(FALSE_PROOF.to_owned());
-        let to_prove = std::mem::take(&mut self.to_prove);
+        let mut to_prove = std::mem::take(&mut self.to_prove);
+        for (txid, height) in &to_prove {
+            match above_the_tip(*height, chain.server_tip) {
+                Some(Proof::False) => return Err(false_proof()),
+                Some(_) => {
+                    self.update.seen_ats.insert((*txid, self.start_time));
+                }
+                None => {}
+            }
+        }
+        to_prove.retain(|(_, height)| *height <= chain.server_tip);
         let mut missing: Vec<u32> = to_prove
             .iter()
             .map(|(_, height)| *height)

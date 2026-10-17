@@ -501,6 +501,18 @@ fn a_branch_into_another_block_is_read_again() {
     );
 }
 
+/// A confirmation above the tip the server just gave: within three
+/// blocks, blocks that came in since, unsure; further, a lie.
+#[test]
+fn a_confirmation_above_the_tip_is_weighed() {
+    assert_eq!(above_the_tip(100, 100), None);
+    assert_eq!(above_the_tip(99, 100), None);
+    assert_eq!(above_the_tip(101, 100), Some(Proof::Unsure));
+    assert_eq!(above_the_tip(103, 100), Some(Proof::Unsure));
+    assert_eq!(above_the_tip(104, 100), Some(Proof::False));
+    assert_eq!(above_the_tip(u32::MAX, u32::MAX - 1), Some(Proof::Unsure));
+}
+
 /// The two halves of a transaction of 64 bytes, as they are hashed: the
 /// first one read as a txid, the second as its sibling.
 pub(super) fn halves_of_64_bytes(first: [u8; 32]) -> (Txid, [u8; 32], Transaction) {
@@ -877,6 +889,54 @@ mod servers {
         );
     }
 
+    /// A confirmation claimed above the tip the server gave: a few blocks
+    /// above, unsure, further, the server is refused, on every path.
+    #[tokio::test]
+    async fn a_confirmation_above_the_tip_is_refused() {
+        // A descriptor wallet over Electrum, tip at 100.
+        for (height, refused) in [(102, false), (110, true)] {
+            let server = signet().await;
+            let payment = pay(&server, height, |_| true);
+            let synced = electrum_sync(&server, Network::Signet).await;
+            match (synced, refused) {
+                (Err(error), true) => assert!(error.contains(FALSE_PROOF), "{error}"),
+                (Ok(synced), false) => {
+                    assert_eq!(anchored(&synced), []);
+                    let txid = payment.compute_txid();
+                    assert!(
+                        synced
+                            .update
+                            .tx_update
+                            .seen_ats
+                            .iter()
+                            .any(|(seen, _)| *seen == txid)
+                    );
+                }
+                (synced, _) => panic!("{height}: {:?}", synced.map(|synced| anchored(&synced))),
+            }
+        }
+        // A watched address over Electrum.
+        let server = signet().await;
+        pay_address(&server, 102);
+        let state = address_state(&server, SIGNET_ADDRESS, Network::Signet)
+            .await
+            .unwrap();
+        assert_eq!(state.txs[0].height, None);
+        let server = signet().await;
+        pay_address(&server, 110);
+        let refused = address_state(&server, SIGNET_ADDRESS, Network::Signet)
+            .await
+            .unwrap_err();
+        assert!(refused.contains(FALSE_PROOF), "{refused}");
+        // A tip no chain has reached.
+        let server = signet().await;
+        server.state.lock().unwrap().height = 4_000_000_000;
+        let refused = address_state(&server, SIGNET_ADDRESS, Network::Signet)
+            .await
+            .unwrap_err();
+        assert!(refused.contains(crate::chain::IMPOSSIBLE_TIP), "{refused}");
+    }
+
     /// On mainnet, a real transaction of the last checkpoint's block is
     /// proven by its real branch; a payment in a header that commits to
     /// it and that no one mined refuses the server, where it used to
@@ -1104,7 +1164,7 @@ mod servers {
     use crate::testkit::{FakeMempool, esplora_payment};
 
     /// An instance of `network` whose tip is past the payments of
-    /// [`esplora_payment`], at 501.
+    /// [`esplora_payment`], at 500.
     async fn mempool(network: Network) -> FakeMempool {
         let server = FakeMempool::start(false, 0).await;
         {
@@ -1168,7 +1228,7 @@ mod servers {
         let txid: Txid = crate::testkit::esplora_txid(0x31).parse().unwrap();
         let (anchor, anchored_txid) = synced.update.tx_update.anchors.first().unwrap();
         assert_eq!(*anchored_txid, txid);
-        assert_eq!(anchor.block_id.height, 501);
+        assert_eq!(anchor.block_id.height, 500);
         assert_eq!(
             (asked(&server, "/merkle-proof"), asked(&server, "/header")),
             (1, 1)
@@ -1216,9 +1276,9 @@ mod servers {
         list(&server, vec![esplora_payment(0x3e, 0x4e, 50_000, true)]);
         {
             let mut state = server.state.lock().unwrap();
-            let mut stale = crate::testkit::FakeMempool::header_at_height(&state, 501);
+            let mut stale = crate::testkit::FakeMempool::header_at_height(&state, 500);
             stale.merkle_root = TxMerkleNode::from_byte_array([7; 32]);
-            state.stale.insert(501, stale);
+            state.stale.insert(500, stale);
         }
         let synced = esplora_sync(&server, address_plan(Network::Signet, Held::default()))
             .await
@@ -1233,6 +1293,35 @@ mod servers {
                 .iter()
                 .any(|(seen, _)| *seen == txid)
         );
+    }
+
+    /// Over Esplora too, a confirmation a few blocks above the tip is
+    /// unsure, one further above it refuses the server, and a watched
+    /// address on a tip no chain has reached is refused.
+    #[tokio::test]
+    async fn an_esplora_confirmation_above_the_tip_is_refused() {
+        for (height, refused) in [(502, false), (520, true)] {
+            let server = mempool(Network::Signet).await;
+            server.state.lock().unwrap().tip = 500;
+            let mut payment = esplora_payment(0x3f, 0x4f, 50_000, true);
+            payment["status"]["block_height"] = serde_json::json!(height);
+            list(&server, vec![payment.clone()]);
+            let synced =
+                esplora_sync(&server, address_plan(Network::Signet, Held::default())).await;
+            server.state.lock().unwrap().address_txs = vec![payment];
+            let state = esplora_address(&server, Network::Signet).await;
+            if refused {
+                assert!(refusal(synced).contains(FALSE_PROOF));
+                assert!(state.unwrap_err().contains(FALSE_PROOF));
+            } else {
+                assert!(synced.unwrap().update.tx_update.anchors.is_empty());
+                assert_eq!(state.unwrap().txs[0].height, None);
+            }
+        }
+        let server = mempool(Network::Signet).await;
+        server.state.lock().unwrap().tip = 4_000_000_000;
+        let refused = esplora_address(&server, Network::Signet).await.unwrap_err();
+        assert!(refused.contains(crate::chain::IMPOSSIBLE_TIP), "{refused}");
     }
 
     /// On mainnet, a confirmation in a header no one mined refuses the
@@ -1351,7 +1440,7 @@ mod servers {
         let server = mempool(Network::Signet).await;
         server.state.lock().unwrap().address_txs = vec![esplora_payment(0x35, 0x45, 50_000, true)];
         let state = esplora_address(&server, Network::Signet).await.unwrap();
-        assert_eq!(state.txs[0].height, Some(501));
+        assert_eq!(state.txs[0].height, Some(500));
         assert_eq!(
             (asked(&server, "/merkle-proof"), asked(&server, "/header")),
             (1, 1)
@@ -1395,7 +1484,7 @@ mod servers {
         }
         let state = esplora_address(&server, Network::Signet).await.unwrap();
         assert_eq!(state.utxos.len(), 2);
-        assert_eq!(state.utxos[0].height, Some(501));
+        assert_eq!(state.utxos[0].height, Some(500));
         let balance = crate::wallet::views::address_balance(&state);
         assert_eq!(balance.confirmed, 50_000);
         assert_eq!(balance.untrusted_pending, 7_000_000);
@@ -1446,28 +1535,36 @@ mod servers {
         let read = |coins, held: Vec<crate::wallet::AddressTx>| {
             let (client, ours, round) = (&client, &ours, &round);
             async move {
-                crate::chain::esplora::coins(client, Network::Signet, ours, coins, round, &held)
-                    .await
+                crate::chain::esplora::coins(
+                    client,
+                    Network::Signet,
+                    600,
+                    ours,
+                    coins,
+                    round,
+                    &held,
+                )
+                .await
             }
         };
 
-        let coins = read(vec![coin(50_000, 501)], Vec::new()).await.unwrap();
-        assert_eq!(coins[0].height, Some(501));
+        let coins = read(vec![coin(50_000, 500)], Vec::new()).await.unwrap();
+        assert_eq!(coins[0].height, Some(500));
         assert_eq!(asked(&server, "/raw"), 1);
         // Proven this session: not read again.
-        let again = read(vec![coin(50_000, 501)], Vec::new()).await.unwrap();
+        let again = read(vec![coin(50_000, 500)], Vec::new()).await.unwrap();
         assert_eq!(again, coins);
         assert_eq!(asked(&server, "/raw"), 1);
         // Held there, paying it: at the time the wallet holds, whatever
         // time the server gives the coin.
         let mut held = whole.txs.clone();
         held[1].timestamp = Some(1_234);
-        let coins = read(vec![coin(50_000, 501)], held).await.unwrap();
-        assert_eq!(coins[0].height, Some(501));
+        let coins = read(vec![coin(50_000, 500)], held).await.unwrap();
+        assert_eq!(coins[0].height, Some(500));
         assert_eq!(coins[0].timestamp, Some(1_234));
         assert_eq!(asked(&server, "/raw"), 1);
         // More than its transaction pays.
-        let refused = read(vec![coin(5_000_000, 501)], Vec::new())
+        let refused = read(vec![coin(5_000_000, 500)], Vec::new())
             .await
             .unwrap_err();
         assert!(refused.contains("does not pay"), "{refused}");

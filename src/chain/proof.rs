@@ -155,6 +155,25 @@ pub(crate) fn check_confirmation(
     }
 }
 
+/// Blocks a confirmation may sit above the tip the same server gave a
+/// moment before: blocks that came in since.
+pub(crate) const ABOVE_THE_TIP: u32 = 3;
+
+/// What a confirmation claimed at `height` is worth against `tip`, the
+/// tip the same server gave just before: above it by more than
+/// [`ABOVE_THE_TIP`], a false proof whatever header comes with it; above
+/// it within that, unsure, a block that came in since and that the next
+/// sync reads. `None` at the tip or below it.
+pub(crate) fn above_the_tip(height: u32, tip: u32) -> Option<Proof> {
+    if height > tip.saturating_add(ABOVE_THE_TIP) {
+        Some(Proof::False)
+    } else if height > tip {
+        Some(Proof::Unsure)
+    } else {
+        None
+    }
+}
+
 /// What a branch that led elsewhere ([`Proof::Elsewhere`]) proves once
 /// the header at its height is read `again`: a block that is not the one
 /// first read, which the branch proves the transaction in, says a

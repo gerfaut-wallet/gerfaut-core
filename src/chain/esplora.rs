@@ -678,7 +678,7 @@ pub(crate) async fn fetch_address_state(
     let our_script = address.script_pubkey();
     check_network(client, network).await?;
 
-    let tip_height = client.height().await?;
+    let tip_height = read_tip(client, network).await?;
     let stats = client.address_stats(&address).await?;
 
     let round = history_round(
@@ -686,6 +686,7 @@ pub(crate) async fn fetch_address_state(
         &address,
         &our_script,
         network,
+        tip_height,
         None,
         Some(stats.chain_stats.tx_count as usize),
         held,
@@ -695,6 +696,7 @@ pub(crate) async fn fetch_address_state(
     let utxos = coins(
         client,
         network,
+        tip_height,
         &our_script,
         client.address_utxos(&address).await?,
         &round,
@@ -724,9 +726,11 @@ pub(crate) async fn fetch_address_state(
 /// read again, counted against what the sync may keep, found to pay it,
 /// and its confirmation proven. Any other coin is taken as unconfirmed.
 /// A coin listed twice counts once.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn coins(
     client: &Client,
     network: Network,
+    tip: u32,
     ours: &bdk_wallet::bitcoin::ScriptBuf,
     utxos: Vec<api::Utxo>,
     round: &HistoryRound,
@@ -828,7 +832,7 @@ pub(crate) async fn coins(
         .into_iter()
         .filter(|(txid, _)| read.contains(txid))
         .collect();
-    let times = sync::prove_confirmations(client, network, &unread).await?;
+    let times = sync::prove_confirmations(client, network, tip, &unread).await?;
     for ((txid, block), time) in unread.iter().zip(times) {
         let Some(time) = time else {
             continue;
@@ -885,16 +889,28 @@ pub(crate) async fn fetch_address_history(
         .parse()
         .map_err(|_| format!("invalid history cursor: {from}"))?;
     check_network(client, network).await?;
+    let tip = read_tip(client, network).await?;
     history_round(
         client,
         &address,
         &our_script,
         network,
+        tip,
         Some(from),
         None,
         &[],
     )
     .await
+}
+
+/// The server's tip, refused past any height a chain of `network` can
+/// have reached ([`crate::chain::height_limit`]).
+async fn read_tip(client: &Client, network: Network) -> Result<u32, String> {
+    let tip = client.height().await?;
+    if tip > crate::chain::height_limit(network, crate::now_secs()) {
+        return Err(crate::chain::IMPOSSIBLE_TIP.to_owned());
+    }
+    Ok(tip)
 }
 
 /// Refuses a server whose genesis block is not the network's. Testnet,
@@ -935,17 +951,22 @@ pub(crate) fn parse_address(address: &str, network: Network) -> Result<Address, 
 /// ([`sync::prove_confirmations`]); an unsure proof leaves it
 /// unconfirmed. One it holds there keeps the time it holds.
 ///
+/// A confirmation above `tip`, the tip the server gave before, is weighed
+/// by [`crate::chain::proof::above_the_tip`].
+///
 /// A page that lists only transactions of `held`, what the wallet holds,
 /// each at the height it holds it, ends the reading: the history below
 /// it is what the wallet holds, and the round is filled from there. An
 /// address paid a thousand times reads one page a sync, not forty. When
 /// what the wallet holds below would come to more than the server counts,
 /// the pages are read on.
+#[allow(clippy::too_many_arguments)]
 async fn history_round(
     client: &Client,
     address: &Address,
     our_script: &bdk_wallet::bitcoin::ScriptBuf,
     network: Network,
+    tip: u32,
     from: Option<Txid>,
     confirmed_total: Option<usize>,
     held: &[AddressTx],
@@ -1038,7 +1059,7 @@ async fn history_round(
         }
         (confirmed_so_far, last, all_held) = read(page, &mut txs)?;
     }
-    let times = sync::prove_confirmations(client, network, &claimed).await?;
+    let times = sync::prove_confirmations(client, network, tip, &claimed).await?;
     let proven: std::collections::HashMap<(String, u32), Option<u64>> = claimed
         .iter()
         .zip(times)

@@ -40,9 +40,10 @@ use super::rpc::{CallError, Connection};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
 use crate::chain::proof::{
-    FALSE_PROOF, Proof, ProvenCoin, check_confirmation, proven_coin, recheck, remember_coin,
+    FALSE_PROOF, Proof, ProvenCoin, above_the_tip, check_confirmation, proven_coin, recheck,
+    remember_coin,
 };
-use crate::chain::{KEEP_MAX, Kept};
+use crate::chain::{IMPOSSIBLE_TIP, KEEP_MAX, Kept, height_limit};
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
 use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
@@ -133,9 +134,7 @@ async fn state_in_rounds_of(
     let hash = scripthash(&ours);
     let mut connection = Connection::open(target, proxy).await?;
     check_network(&mut connection, network).await?;
-    let tip: Tip = connection
-        .call("blockchain.headers.subscribe", json!([]))
-        .await?;
+    let tip = read_tip(&mut connection, network).await?;
     let history = history(&mut connection, &hash).await?;
     let unspent: Vec<Unspent> = connection
         .call("blockchain.scripthash.listunspent", json!([hash]))
@@ -166,10 +165,11 @@ async fn state_in_rounds_of(
         )
         .collect();
     let headers = block_headers(&mut connection, heights).await?;
-    let unsure = prove(&mut connection, network, &unproven, &headers).await?;
+    let unsure = prove(&mut connection, network, tip, &unproven, &headers).await?;
     let read_again = ReadAgain {
         server: &target.url,
         network,
+        tip,
         ours: &ours,
         unspent: &unspent,
         kept: &kept,
@@ -191,7 +191,7 @@ async fn state_in_rounds_of(
     Ok(AddressWatchState {
         txs,
         utxos,
-        tip_height: tip.height,
+        tip_height: tip,
         truncated: cursor.is_some(),
         history_cursor: cursor,
     })
@@ -211,6 +211,7 @@ async fn history_in_rounds_of(
         .map_err(|_| format!("invalid history cursor: {from}"))?;
     let mut connection = Connection::open(target, proxy).await?;
     check_network(&mut connection, network).await?;
+    let tip = read_tip(&mut connection, network).await?;
     let history = history(&mut connection, &scripthash(&ours)).await?;
     let (round, cursor) = round_of(&history, Some(from), per_round)?;
     let kept = Kept::up_to(KEEP_MAX);
@@ -218,7 +219,7 @@ async fn history_in_rounds_of(
     let unproven = unproven(&round, &[]);
     let heights: Vec<u32> = unproven.iter().map(|(_, height)| *height).collect();
     let headers = block_headers(&mut connection, heights).await?;
-    let unsure = prove(&mut connection, network, &unproven, &headers).await?;
+    let unsure = prove(&mut connection, network, tip, &unproven, &headers).await?;
     for tx in &mut txs {
         if unsure.contains(&tx.txid) {
             tx.height = None;
@@ -570,14 +571,33 @@ fn unproven(round: &[Picked], held: &[AddressTx]) -> Vec<(Txid, u32)> {
 /// confirmations left unsure, which stay unconfirmed: those whose header
 /// was past what a round reads ([`MAX_HEADERS`]) or refused, those whose
 /// branch the server refused, as it does when a block came in since it
-/// listed the history, and those whose branch leads into a block that
-/// replaced the one read ([`recheck`]).
+/// listed the history, those whose branch leads into a block that
+/// replaced the one read ([`recheck`]), and those in a block that came in
+/// since the server gave `tip` ([`above_the_tip`]). One further above it
+/// refuses the server.
 async fn prove(
     connection: &mut Connection,
     network: Network,
+    tip: u32,
     unproven: &[(Txid, u32)],
     headers: &Headers,
 ) -> Result<HashSet<String>, String> {
+    let mut unsure = HashSet::new();
+    for (txid, height) in unproven {
+        match above_the_tip(*height, tip) {
+            Some(Proof::False) => return Err(FALSE_PROOF.to_owned()),
+            Some(_) => {
+                unsure.insert(txid.to_string());
+            }
+            None => {}
+        }
+    }
+    let unproven: Vec<(Txid, u32)> = unproven
+        .iter()
+        .copied()
+        .filter(|(_, height)| *height <= tip)
+        .collect();
+    let unproven = unproven.as_slice();
     let mut verdicts: Vec<(Proof, Option<GetMerkleRes>)> =
         vec![(Proof::False, None); unproven.len()];
     connection
@@ -606,7 +626,6 @@ async fn prove(
             },
         )
         .await?;
-    let mut unsure = HashSet::new();
     for ((txid, height), (verdict, branch)) in unproven.iter().zip(verdicts) {
         let verdict = match (verdict, branch, headers.found.get(height)) {
             (Proof::Elsewhere, Some(branch), Some(first)) => {
@@ -626,6 +645,18 @@ async fn prove(
         }
     }
     Ok(unsure)
+}
+
+/// The server's tip, refused past any height a chain of `network` can
+/// have reached ([`height_limit`]).
+async fn read_tip(connection: &mut Connection, network: Network) -> Result<u32, String> {
+    let tip: Tip = connection
+        .call("blockchain.headers.subscribe", json!([]))
+        .await?;
+    if tip.height > height_limit(network, crate::now_secs()) {
+        return Err(IMPOSSIBLE_TIP.to_owned());
+    }
+    Ok(tip.height)
 }
 
 /// The header at `height`, read again; `None` when the server refuses it.
@@ -732,6 +763,7 @@ fn past_the_round(
 struct ReadAgain<'a> {
     server: &'a str,
     network: Network,
+    tip: u32,
     ours: &'a ScriptBuf,
     unspent: &'a [Unspent],
     kept: &'a Kept,
@@ -771,7 +803,7 @@ impl ReadAgain<'_> {
                 }
             }
         }
-        let unsure = prove(connection, self.network, unread, headers).await?;
+        let unsure = prove(connection, self.network, self.tip, unread, headers).await?;
         let mut proven = HashMap::new();
         for (txid, height) in unread {
             if unsure.contains(&txid.to_string()) {
@@ -1326,6 +1358,7 @@ mod tests {
         let read_again = ReadAgain {
             server: "nowhere",
             network: Network::Signet,
+            tip: 100,
             ours: &ours,
             unspent: &unspent,
             kept: &tight,
