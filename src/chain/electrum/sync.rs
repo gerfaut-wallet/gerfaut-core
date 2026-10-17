@@ -48,13 +48,16 @@ const BATCH: usize = 10;
 /// a hundred; a hundred in a batch would wait that long well before the
 /// session is cut for what it costs.
 const LIST_BATCH: usize = 50;
-/// The same for transactions, which Fulcrum reads from bitcoind: once
-/// fifty requests of a client wait on bitcoind, it holds the client back
-/// for at least 200 ms.
+/// The same for transactions, which Fulcrum reads from bitcoind: kept
+/// under [`FULCRUM_BITCOIND_BURST`].
 const TX_BATCH: usize = 40;
+/// Requests of one client waiting on bitcoind past which Fulcrum holds
+/// the client back for at least 200 ms (`bitcoind_throttle`, fifty by
+/// default).
+const FULCRUM_BITCOIND_BURST: usize = 50;
 const _: () = assert!(
-    TX_BATCH < 50,
-    "Fulcrum holds back a client with fifty waiting"
+    TX_BATCH < FULCRUM_BITCOIND_BURST,
+    "a batch of transactions would hold the client back at Fulcrum"
 );
 /// The latest blocks read with the tip, as the engine of BDK reads them:
 /// a reorganisation that deep is met without a request per block.
