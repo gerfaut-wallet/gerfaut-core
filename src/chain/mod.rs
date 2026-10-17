@@ -933,8 +933,10 @@ pub(crate) fn send_order(
 
 /// Whether a host belongs to the operator whose web API is at
 /// `operator`: the same host, or one under it
-/// (`electrum.blockstream.info` and `blockstream.info`).
-fn same_operator(host: &str, operator: &str) -> bool {
+/// (`electrum.blockstream.info` and `blockstream.info`). The one rule
+/// for it: the live watch's servers are picked by it too
+/// (`watch::servers_for`).
+pub(crate) fn same_operator(host: &str, operator: &str) -> bool {
     host == operator || host.ends_with(&format!(".{operator}"))
 }
 

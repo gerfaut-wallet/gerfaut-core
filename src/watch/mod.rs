@@ -1729,7 +1729,7 @@ pub(crate) fn servers_for(
                 let host = chain::host_of(&server.url)?;
                 let operator = operators
                     .iter()
-                    .find(|operator| host == **operator || host.ends_with(&format!(".{operator}")))?
+                    .find(|operator| chain::same_operator(&host, operator))?
                     .clone();
                 let chosen = BackendConfig::Public {
                     server: Some(server.id),
