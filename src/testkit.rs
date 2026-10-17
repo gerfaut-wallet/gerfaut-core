@@ -194,6 +194,9 @@ pub(crate) struct ElectrumState {
     /// The most answers held back at once on a connection: what the
     /// client had sent and was waiting on.
     pub held_most: usize,
+    /// How many times held answers went out because the wait was over,
+    /// not because a kilobyte of them was ready.
+    pub timed_flushes: usize,
 }
 
 /// Heights past which the fake Electrum server makes a header up on the
@@ -302,6 +305,7 @@ impl FakeElectrum {
                 } => {
                     let bytes = std::mem::take(&mut held);
                     held_answers = 0;
+                    state.lock().unwrap().timed_flushes += 1;
                     if writer.write_all(&bytes).await.is_err() {
                         return;
                     }

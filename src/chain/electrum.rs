@@ -734,6 +734,42 @@ mod tests {
         assert_eq!(standing, (true, Some(90), 100));
     }
 
+    /// ElectrumX holds small answers back until a kilobyte of them
+    /// waits, or a second has passed: a sync asks for a list it knows in
+    /// full in few batches, so that it waits that second a few times,
+    /// not once every ten scripts.
+    #[tokio::test]
+    async fn a_sync_waits_little_on_a_server_that_holds_answers_back() {
+        use bdk_wallet::bitcoin::constants::genesis_block;
+        use bdk_wallet::chain::{BlockId, CheckPoint};
+
+        use crate::testkit::{FakeElectrum, script};
+        let server = FakeElectrum::start().await;
+        server.state.lock().unwrap().hold = Some((1024, Duration::from_millis(50)));
+        let genesis = genesis_block(bdk_wallet::bitcoin::Network::Signet).block_hash();
+        let plan = crate::chain::Plan {
+            network: crate::network::Network::Signet,
+            tip: CheckPoint::new(BlockId {
+                height: 0,
+                hash: genesis,
+            }),
+            start_time: 0,
+            scripts: (0..200)
+                .map(|n| ScriptBuf::from_hex(&script(n)).unwrap())
+                .collect(),
+            scans: Vec::new(),
+            stop_gap: 20,
+            reading: crate::chain::Reading::Complete,
+            held: crate::chain::Held::default(),
+        };
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        sync(&target, plan, None, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let waits = server.state.lock().unwrap().timed_flushes;
+        assert!(waits < 10, "{waits} waits");
+    }
+
     /// A server that answers `server.version`, then starts its answer
     /// to the next request and never finishes it. It says when that
     /// request arrived, and when the client closed the connection.
