@@ -699,19 +699,25 @@ pub fn owner_only(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptio
 
 /// Takes from a file every right of its group and of everyone else,
 /// and leaves its owner's as they are. Nothing when there were none.
-/// Only a regular file at that very name: a link there is not followed,
-/// whatever it points to is not the vault's to change, and the mode is
-/// set on the file opened, after making sure it is the one looked at.
+/// Only a regular file at that very name: it is opened without
+/// following a link, and without waiting on a pipe, then held to be the
+/// file the name points at, and the mode is set on the file opened.
 #[cfg(unix)]
 fn keep_to_owner(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let seen = std::fs::symlink_metadata(path)?;
-    if !seen.file_type().is_file() {
-        return Ok(());
-    }
-    let file = std::fs::File::open(path)?;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        // A link at that name, refused by `O_NOFOLLOW`.
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(()),
+        Err(error) => return Err(error),
+    };
     let opened = file.metadata()?;
-    if (opened.dev(), opened.ino()) != (seen.dev(), seen.ino()) {
+    let seen = std::fs::symlink_metadata(path)?;
+    if !opened.file_type().is_file() || (opened.dev(), opened.ino()) != (seen.dev(), seen.ino()) {
         return Ok(());
     }
     let mode = opened.permissions().mode() & 0o7777;
@@ -1482,6 +1488,28 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
         let (_vault, _) = Vault::open_or_create(&path, key()).unwrap();
         assert_eq!(mode(&elsewhere), 0o644);
+    }
+
+    /// Closing an old vault to others neither waits on a pipe planted
+    /// at its name nor changes one.
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_vault_never_waits_on_a_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0);
+        let mode = || {
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let before = mode();
+        keep_to_owner(&path).unwrap();
+        assert_eq!(mode(), before);
     }
 
     /// The rule the apps write their exports with: a file created is
