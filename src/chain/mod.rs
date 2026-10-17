@@ -189,12 +189,13 @@ pub(crate) fn server_words(text: &str) -> String {
 /// would not do, or the server answered HTTP 429 or a 5xx. Each is this
 /// crate's own wording, and each is pinned by a test on the function
 /// that writes it. The deadline of a whole sync is not one: how long a
-/// sync takes depends on the wallet as much as on the server.
-const OUTAGES: [&str; 9] = [
+/// sync takes depends on the wallet as much as on the server. Nor is
+/// what this device says: a Tor that is starting or missing, or the
+/// words of its system, a firewall for instance ("connection failed").
+const OUTAGES: [&str; 8] = [
     "could not connect",
     "timed out",
     "the connection was closed",
-    "connection failed",
     "host not found",
     "TLS handshake failed",
     "the server's certificate",
@@ -208,6 +209,9 @@ const OUTAGES: [&str; 9] = [
 /// request or one wallet, whatever those words say, unless they are the
 /// ones of a server out of memory for its answers.
 pub(crate) fn is_outage(detail: &str) -> bool {
+    if detail.contains("through Tor") {
+        return false;
+    }
     if ["the server refused", "the server will not send"]
         .iter()
         .any(|refused| detail.contains(refused))

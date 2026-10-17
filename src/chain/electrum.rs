@@ -977,17 +977,17 @@ mod tests {
             let detail = describe_io(&Error::from(kind), TIMEOUT);
             assert!(is_outage(&detail), "{kind:?}: {detail}");
         }
-        for (error, said) in [
-            (
-                Error::other("failed to lookup address information"),
-                "host not found",
-            ),
-            (Error::other("no route"), "connection failed: no route"),
-        ] {
-            let detail = describe_io(&error, TIMEOUT);
-            assert_eq!(detail, said);
-            assert!(is_outage(&detail), "{detail}");
-        }
+        let unknown = describe_io(
+            &Error::other("failed to lookup address information"),
+            TIMEOUT,
+        );
+        assert_eq!(unknown, "host not found");
+        assert!(is_outage(&unknown));
+        // The words of this device's system, a firewall that says no:
+        // nothing tells that it is the server.
+        let local = describe_io(&Error::other("no route"), TIMEOUT);
+        assert_eq!(local, "connection failed: no route");
+        assert!(!is_outage(&local));
         assert!(is_outage(&describe(&out_of_memory(), TIMEOUT)));
         let refused = electrum_client::Error::Protocol(serde_json::json!({
             "code": 1, "message": "Too many history entries",

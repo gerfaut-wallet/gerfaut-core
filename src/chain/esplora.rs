@@ -1321,6 +1321,8 @@ mod error_tests {
             error,
             "could not connect through Tor: server does not support user/pass authentication"
         );
+        // The route, not the server: it relegates nothing.
+        assert!(!crate::chain::is_outage(&error));
     }
 
     /// A server that answers with `status` and `body` gzipped, whatever
