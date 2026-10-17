@@ -337,20 +337,28 @@ impl Session {
         }
     }
 
-    /// Sends queued subscriptions up to the window.
+    /// Sends queued subscriptions up to the window, in one write and one
+    /// flush: a flush each would cost a TLS record, or a Tor cell, each.
     async fn pump(&mut self) -> Result<(), String> {
+        let mut lines = Vec::new();
         while self.in_flight.len() < self.window {
             let Some(scripthash) = self.queue.pop_front() else {
                 break;
             };
-            self.request(
-                Request::Subscribe(scripthash.clone()),
-                "blockchain.scripthash.subscribe",
-                json!([scripthash]),
-            )
-            .await?;
+            let id = self.next_id;
+            self.next_id += 1;
+            let message = json!({
+                "jsonrpc": "2.0", "id": id, "method": "blockchain.scripthash.subscribe",
+                "params": [scripthash],
+            });
+            self.in_flight.insert(id, Request::Subscribe(scripthash));
+            lines.extend(message.to_string().into_bytes());
+            lines.push(b'\n');
         }
-        Ok(())
+        if lines.is_empty() {
+            return Ok(());
+        }
+        write_lines(&mut self.writer, &lines).await
     }
 
     /// The list changed: new scripts are subscribed, and the ones that
@@ -698,8 +706,13 @@ fn cost_exit(hub: &Hub, detail: String, opened: bool) -> Exit {
 async fn send(writer: &mut WriteHalf<BoxStream>, message: &Value) -> Result<(), String> {
     let mut line = message.to_string().into_bytes();
     line.push(b'\n');
+    write_lines(writer, &line).await
+}
+
+/// Writes whole lines, then flushes once.
+async fn write_lines(writer: &mut WriteHalf<BoxStream>, lines: &[u8]) -> Result<(), String> {
     let write = async {
-        writer.write_all(&line).await?;
+        writer.write_all(lines).await?;
         writer.flush().await
     };
     match tokio::time::timeout(std::time::Duration::from_secs(20), write).await {
@@ -763,4 +776,94 @@ fn at_least_1_4_2(version: &str) -> bool {
         parts.next().unwrap_or(0),
     );
     version >= (1, 4, 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    use super::*;
+
+    /// A stream that keeps what is written and counts the flushes, and
+    /// never has anything to read.
+    #[derive(Clone, Default)]
+    struct Counting {
+        written: Arc<Mutex<Vec<u8>>>,
+        flushes: Arc<Mutex<usize>>,
+    }
+
+    impl AsyncRead for Counting {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for Counting {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.written.lock().unwrap().extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            *self.flushes.lock().unwrap() += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A window of subscriptions goes out in one write and one flush.
+    #[tokio::test]
+    async fn a_window_of_subscriptions_is_flushed_once() {
+        let stream = Counting::default();
+        let (_reader, writer) = tokio::io::split(Box::new(stream.clone()) as BoxStream);
+        let mut session = Session {
+            endpoint: Endpoint::Electrum(Target::new("tcp://127.0.0.1:1", None)),
+            window: WINDOW,
+            writer,
+            next_id: 2,
+            in_flight: HashMap::new(),
+            queue: (0..40).map(|n| format!("{n:064x}")).collect(),
+            subscribed: HashSet::new(),
+            acknowledged: 0,
+            refused_run: Vec::new(),
+            at_limit: false,
+            narrowed_at: None,
+            overloaded: None,
+            can_unsubscribe: false,
+            pong_by: None,
+            opening: HashSet::new(),
+            resumed: false,
+            ready_told: false,
+        };
+        session.pump().await.unwrap();
+        assert_eq!(*stream.flushes.lock().unwrap(), 1);
+        let written = stream.written.lock().unwrap().clone();
+        let lines: Vec<Value> = written
+            .split(|&byte| byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), WINDOW);
+        assert_eq!(lines[0]["method"], "blockchain.scripthash.subscribe");
+        assert_eq!(lines[0]["id"], 2);
+        assert_eq!(session.queue.len(), 40 - WINDOW);
+        // Nothing more goes out while the window is full.
+        session.pump().await.unwrap();
+        assert_eq!(*stream.flushes.lock().unwrap(), 1);
+    }
 }
