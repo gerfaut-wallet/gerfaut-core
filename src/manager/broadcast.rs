@@ -210,6 +210,7 @@ impl WalletManager {
             // tip is not asked of them, which would wait out their time
             // limit a second time.
             let mut down = vec![false; endpoints.len()];
+            let mut failures: Vec<(&chain::Endpoint, Failure)> = Vec::new();
             for (e, endpoint) in endpoints.iter().enumerate() {
                 let asked: Vec<usize> = (0..settled.len()).filter(|&i| !settled[i]).collect();
                 if asked.is_empty() {
@@ -218,6 +219,9 @@ impl WalletManager {
                 let coins: Vec<OutPoint> = asked.iter().map(|&i| outpoints[i]).collect();
                 let (answers, failed) =
                     chain::fetch_prevouts(endpoint, &coins, proxy.as_deref()).await;
+                if !answers.is_empty() {
+                    self.note_send(endpoint, &failures);
+                }
                 for (&i, chain_facts) in asked.iter().zip(answers) {
                     let facts = &mut input_facts[i];
                     settled[i] = true;
@@ -237,8 +241,9 @@ impl WalletManager {
                 // about the coins it has not answered about would only make
                 // that worse, so they go to the next endpoint instead of
                 // being dropped. Nothing a lookup gets is a refusal.
-                if failed.is_some() {
+                if let Some(failure) = failed {
                     down[e] = true;
+                    failures.push((endpoint, failure));
                 }
             }
             if needs_tip {
@@ -249,9 +254,13 @@ impl WalletManager {
                     match chain::tip_height(endpoint, proxy.as_deref()).await {
                         Ok(height) => {
                             tip_height = Some(height);
+                            self.note_send(endpoint, &failures);
                             break;
                         }
-                        Err(_) => down[e] = true,
+                        Err(failure) => {
+                            down[e] = true;
+                            failures.push((endpoint, failure));
+                        }
                     }
                 }
             }
@@ -306,9 +315,11 @@ impl WalletManager {
         let endpoints = self.send_endpoints(network, &config, &certs, Purpose::Broadcast)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
         let mut refusals: Vec<(String, String)> = Vec::new();
+        let mut failures: Vec<(&chain::Endpoint, Failure)> = Vec::new();
         for endpoint in &endpoints {
             match chain::broadcast(endpoint, &decoded.tx, proxy.as_deref()).await {
                 Ok(()) => {
+                    self.note_send(endpoint, &failures);
                     let report = BroadcastReport {
                         txid: decoded.tx.compute_txid().to_string(),
                         backend: endpoint.label(),
@@ -317,7 +328,10 @@ impl WalletManager {
                     self.remember_broadcast(network, &decoded.tx, &report).await;
                     return Ok(report);
                 }
-                Err(Failure::Transport(detail)) => refusals.push((endpoint.label(), detail)),
+                Err(Failure::Transport(detail)) => {
+                    refusals.push((endpoint.label(), detail.clone()));
+                    failures.push((endpoint, Failure::Transport(detail)));
+                }
                 Err(Failure::Refused(detail)) => {
                     refusals.push((endpoint.label(), detail));
                     break;
@@ -330,9 +344,9 @@ impl WalletManager {
     /// The endpoints the preview, the broadcast and the standing of a
     /// transaction are asked of, in the order they are tried: the one
     /// place that order is decided. The backend's endpoints, the operator
-    /// of the live watch first ([`chain::send_order`]). What else orders
-    /// the syncs, the server that answered last or the ones that failed
-    /// lately, goes here too, for all three at once.
+    /// of the live watch first ([`chain::send_order`]), and the servers
+    /// relegated for an outage after the others, as the syncs take them
+    /// ([`Self::relegated_last`]), never before the server of the watch.
     fn send_endpoints(
         &self,
         network: Network,
@@ -340,11 +354,29 @@ impl WalletManager {
         certs: &crate::chain::TrustedCerts,
         purpose: Purpose,
     ) -> CoreResult<Vec<chain::Endpoint>> {
-        Ok(chain::send_order(
+        let live = self.live_endpoint(network, config, certs);
+        let ordered = chain::send_order(
             chain::endpoints(config, network, certs)?,
-            self.live_endpoint(network, config, certs),
+            live.clone(),
             purpose,
-        ))
+        );
+        Ok(self.relegated_last(ordered, live.as_ref()))
+    }
+
+    /// `answered` answered after each of `failed` went down: those are
+    /// relegated, for the syncs as for what is sent. Only an outage of the
+    /// server itself counts ([`chain::is_outage`]): a node's verdict, a
+    /// page a server would not serve, a route through Tor that failed,
+    /// relegate nothing.
+    fn note_send(&self, answered: &chain::Endpoint, failed: &[(&chain::Endpoint, Failure)]) {
+        let down: Vec<&chain::Endpoint> = failed
+            .iter()
+            .filter(|(_, failure)| {
+                matches!(failure, Failure::Transport(detail) if chain::is_outage(detail))
+            })
+            .map(|(endpoint, _)| *endpoint)
+            .collect();
+        self.answered_after(answered, &down);
     }
 
     /// The server the live watch has on `network`, when the backend
@@ -447,9 +479,11 @@ impl WalletManager {
         let endpoints = self.send_endpoints(network, &config, &certs, Purpose::Broadcast)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
         let mut attempts: Vec<String> = Vec::new();
+        let mut failures: Vec<(&chain::Endpoint, Failure)> = Vec::new();
         for endpoint in &endpoints {
             match chain::tx_standing(endpoint, txid, scripts.clone(), proxy.as_deref()).await {
                 Ok(standing) => {
+                    self.note_send(endpoint, &failures);
                     let confirmations = standing
                         .block_height
                         .map(|height| standing.tip_height.saturating_sub(height) + 1)
@@ -464,7 +498,10 @@ impl WalletManager {
                         at: now_secs(),
                     });
                 }
-                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
+                Err(detail) => {
+                    attempts.push(format!("{}: {detail}", endpoint.label()));
+                    failures.push((endpoint, Failure::Transport(detail)));
+                }
             }
         }
         Err(sync_failure(&endpoints, attempts))

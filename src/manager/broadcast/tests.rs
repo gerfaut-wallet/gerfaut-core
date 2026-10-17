@@ -1733,3 +1733,27 @@ async fn an_electrum_preview_keeps_one_connection_and_reads_from_the_coin_on() {
         .count();
     assert_eq!(gets, 4, "{:?}", state.asked);
 }
+
+/// A server down when a transaction is sent goes behind the others for
+/// what comes next, sends and syncs alike, as one that fails a sync does;
+/// one that only turned the request away, a proxy's page, does not.
+#[tokio::test]
+async fn a_server_down_for_a_send_is_relegated_and_a_wall_is_not() {
+    let (taking, _) = esplora_taking(Takes::Yes).await;
+    let down = nobody_there().await;
+    let (walled, _) = esplora_taking(Takes::Walled).await;
+    for (first, relegated) in [(down, true), (walled, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_stand_in, manager) = rotating(dir.path(), &[first.clone(), taking.clone()]).await;
+        manager
+            .broadcast_transaction(Network::Regtest, &signed(1))
+            .await
+            .unwrap();
+        let (config, certs) = manager.state.lock().await.chain_setup(Network::Regtest);
+        let order = manager
+            .send_endpoints(Network::Regtest, &config, &certs, Purpose::Broadcast)
+            .unwrap();
+        let first = crate::chain::Endpoint::Esplora(first);
+        assert_eq!(order.last() == Some(&first), relegated, "{order:?}");
+    }
+}
