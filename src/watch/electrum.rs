@@ -41,9 +41,13 @@
 //! wallet's history comes to once the latest of them took what waits
 //! ([`super::confirmed_at`]). When they match, the proof of each of
 //! those transactions in that block is asked for on this connection,
-//! and the script is reported with the proofs once they all lead to the
-//! header's root ([`super::Proven`]); as any change, for a sync, when
-//! one does not, or does not come within the time a ping may take.
+//! and held to what a sync holds a confirmation to
+//! ([`crate::chain::proof::check_confirmation`]): the script is reported
+//! with the proofs once they all hold ([`super::Proven`]); as any change,
+//! for a sync, when one is unsure, leads to another block, or does not
+//! come within the time a ping may take; and a false one refuses the
+//! server. A block early in the chain, which a header alone does not
+//! prove, is never foretold: the sync chains it to its checkpoint.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -65,6 +69,7 @@ use super::{
 use crate::chain::electrum::status::history_status;
 use crate::chain::electrum::{CLIENT_NAME, Target, parse, words};
 use crate::chain::net::{self, BoxStream, LineReader};
+use crate::chain::proof::{FALSE_PROOF, Proof, check_confirmation, checkpoint_for};
 use crate::chain::{ANOTHER_NETWORK, Endpoint, has_proof_of_work, is_genesis_of};
 use crate::network::Network;
 
@@ -166,6 +171,9 @@ struct Session {
     at_limit: bool,
     /// The server cut the session for what it costs, in these words.
     overloaded: Option<String>,
+    /// The server sent a false proof of a confirmation foretold: it is
+    /// refused, as a sync refuses it ([`FALSE_PROOF`]).
+    false_proof: bool,
     can_unsubscribe: bool,
     /// When the ping in flight, if any, is given up on.
     pong_by: Option<Instant>,
@@ -243,6 +251,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         refused_run: Vec::new(),
         at_limit: false,
         overloaded: None,
+        false_proof: false,
         can_unsubscribe: at_least_1_4_2(&negotiated),
         pong_by: None,
         opening: HashSet::new(),
@@ -298,6 +307,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                     session.handle(hub, &line);
                     if let Some(detail) = session.overloaded.take() {
                         return Exit::Refused(detail);
+                    }
+                    if session.false_proof {
+                        return Exit::Refused(FALSE_PROOF.to_owned());
                     }
                     session.check_ready(hub);
                     session.pump().await
@@ -826,6 +838,12 @@ impl Session {
         let Some(block) = headers.at(height).map(Header::block_hash) else {
             return false;
         };
+        // A block in a period whose forged header costs little proves
+        // nothing alone: its chain to the checkpoint is read by the sync
+        // of the script, not foretold here.
+        if checkpoint_for(hub.config.network, height).is_some() {
+            return false;
+        }
         let mut txids = BTreeSet::new();
         for held in &entry.histories {
             match confirmed_at(held, height) {
@@ -881,9 +899,9 @@ impl Session {
         if self.proofs.len() > PROOFS_KEPT {
             self.proofs.clear();
         }
-        let branch = branch
-            .and_then(|branch| serde_json::from_value::<GetMerkleRes>(branch.clone()).ok())
-            .filter(|branch| u32::try_from(branch.block_height) == Ok(height));
+        let branch =
+            branch.and_then(|branch| serde_json::from_value::<GetMerkleRes>(branch.clone()).ok());
+        let network = hub.config.network;
         let waiting: Vec<String> = self
             .provings
             .iter()
@@ -900,13 +918,27 @@ impl Session {
                 hub.mark_entry(&proving.hex, ChangeReason::Activity);
                 continue;
             };
-            let holds = branch.as_ref().is_some_and(|branch| {
-                electrum_client::utils::validate_merkle_proof(&txid, &header.merkle_root, branch)
+            // Held to what a sync holds a confirmation to. One that
+            // leads elsewhere, a block replaced since the header came, or
+            // one unsure, is left to the sync of the script; a false one
+            // refuses the server, as a sync refuses it.
+            let proof = branch.as_ref().map_or(Proof::Unsure, |branch| {
+                check_confirmation(network, height, header, txid, branch)
             });
-            self.proofs.insert((txid, header.block_hash()), holds);
-            if !holds {
-                hub.mark_entry(&proving.hex, ChangeReason::Activity);
-                continue;
+            match proof {
+                Proof::Holds => {
+                    self.proofs.insert((txid, header.block_hash()), true);
+                }
+                Proof::False => {
+                    self.proofs.insert((txid, header.block_hash()), false);
+                    self.false_proof = true;
+                    hub.mark_entry(&proving.hex, ChangeReason::Activity);
+                    continue;
+                }
+                Proof::Unsure | Proof::Elsewhere => {
+                    hub.mark_entry(&proving.hex, ChangeReason::Activity);
+                    continue;
+                }
             }
             proving.waiting.remove(&txid);
             if proving.waiting.is_empty() {

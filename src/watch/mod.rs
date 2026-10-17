@@ -347,9 +347,10 @@ pub enum WatchEvent {
 /// height of the block, in the same order: the watch hashes that and
 /// compares, as Electrum does, instead of having the history read
 /// again. A status that matches is only the server's word, so each of
-/// those transactions is proven in the block before anything is said:
-/// the merkle branch the server hands for it must lead to the root of
-/// the header it pushed. The wallet then checks that header against its
+/// those transactions is proven in the block before anything is said,
+/// as a sync proves it: the merkle branch the server hands for it must
+/// lead to the root of the header it pushed, a header with the work of
+/// its height. The wallet then checks that header against its
 /// own chain ([`crate::manager`]) and that it still holds what the guess
 /// was made from, and syncs the script when anything differs.
 #[derive(Debug, Clone, PartialEq, Eq)]

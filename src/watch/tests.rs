@@ -3473,3 +3473,72 @@ async fn proofs_given_up_on_leave_room_for_the_rest() {
     .await;
     assert!(server.subscriptions()[0].contains(&scripthash(&script(2))));
 }
+
+/// A server that answers the proof of a confirmation foretold with a
+/// branch no block has, a position past it, sent a false proof: the
+/// guess is given up, the script reported for a sync, and the server is
+/// refused and left alone, as a sync refuses it.
+#[tokio::test]
+async fn a_false_proof_of_a_foretold_confirmation_refuses_the_server() {
+    let server = FakeElectrum::start().await;
+    let txid = Txid::from_byte_array([5; 32]);
+    server
+        .state
+        .lock()
+        .unwrap()
+        .branches
+        .insert(txid, (Vec::new(), 1));
+    let waiting = waiting_on(&server, "a", 1, txid);
+    let (watch, mut events) =
+        LiveWatch::start_with(config(server.backend()), vec![waiting], Some(timings()));
+    until(&watch, "subscribed", |s| s.pushed_scripts == 1).await;
+    no_event(&mut events, Duration::from_millis(300)).await;
+
+    mined(&server, 1, txid, 101);
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock { height: 101 }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        moved("a", ChangeReason::Activity, false, &[1])
+    );
+    let refused = until(&watch, "the server refused", |s| {
+        s.detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains(crate::chain::proof::FALSE_PROOF))
+    })
+    .await;
+    assert_eq!(refused.state, WatchState::Reconnecting);
+}
+
+/// On a network whose blocks prove their work, a header the server
+/// pushes without the work of its height is taken for nothing: no
+/// confirmation is foretold on it and no proof asked for, and the
+/// status that says the block took the payment is a change to sync,
+/// whose sync holds the server to the same rule.
+#[tokio::test]
+async fn a_header_without_its_work_foretells_nothing() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    let txid = Txid::from_byte_array([5; 32]);
+    let waiting = waiting_on(&server, "a", 1, txid);
+    let testnet4 = WatchConfig {
+        network: Network::Testnet4,
+        ..config(server.backend())
+    };
+    let (watch, mut events) = LiveWatch::start_with(testnet4, vec![waiting], Some(timings()));
+    until(&watch, "subscribed", |s| s.pushed_scripts == 1).await;
+    no_event(&mut events, Duration::from_millis(300)).await;
+
+    mined(&server, 1, txid, 101);
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock { height: 101 }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        moved("a", ChangeReason::Activity, false, &[1])
+    );
+    assert!(!server.was_asked("blockchain.transaction.get_merkle"));
+}

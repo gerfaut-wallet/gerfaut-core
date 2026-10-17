@@ -20,6 +20,7 @@ use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 
 use super::{Reach, SyncSlot, WalletManager, apply_address_state, apply_synced, nothing_new};
 use crate::chain::electrum::status::history_status;
+use crate::chain::proof::checkpoint_for;
 use crate::chain::{self, Endpoint, has_proof_of_work};
 use crate::error::CoreResult;
 use crate::manager::{ManagerState, ensure_engine, find_record};
@@ -70,6 +71,14 @@ fn take(
     let Some(top) = top_chain(meta.network, proven) else {
         return Ok(None);
     };
+    // A block a header alone does not prove, early in the chain: the
+    // sync of its scripts chains it to its checkpoint.
+    let early = proven.iter().any(|proven| {
+        block_of(proven).is_some_and(|(height, _)| checkpoint_for(meta.network, height).is_some())
+    });
+    if early {
+        return Ok(None);
+    }
     match &meta.kind {
         WalletKind::Descriptors { .. } => {
             take_descriptor(state, &meta, proven, top, &server, started)
