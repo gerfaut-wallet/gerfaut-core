@@ -1132,6 +1132,26 @@ async fn the_first_wallet_of_an_empty_watch_waits_for_its_session() {
     manager.live_stop().await;
 }
 
+/// A sync that arrives while the watch is being started waits for that
+/// start, then for the first pass of the watch it starts, instead of
+/// going out before the watch exists.
+#[tokio::test]
+async fn a_sync_waits_for_a_start_under_way() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) = automatic(dir.path(), &rotation, &[]).await;
+    let starting = Starting::begin(&manager.live_starting);
+    let sync = {
+        let manager = manager.clone();
+        let wallet = wallet.clone();
+        tokio::spawn(async move { manager.sync_wallet(&wallet).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!sync.is_finished(), "the sync went out during the start");
+    drop(starting);
+    sync.await.unwrap().unwrap();
+}
+
 /// Once the first pass is over, the lists of wallets the syncs hand the
 /// watch make no later sync wait.
 #[tokio::test]

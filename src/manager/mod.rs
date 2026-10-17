@@ -132,6 +132,10 @@ pub struct Shared {
     /// Counts the readings of what the watch should follow, so an older
     /// one never replaces a newer one on the running watch.
     pub(crate) watch_setups: std::sync::atomic::AtomicU64,
+    /// The starts of the live watch under way: a sync that names no
+    /// server waits for them, then for the first pass of the watch they
+    /// start ([`WalletManager::live_first_pass`]).
+    pub(crate) live_starting: tokio::sync::watch::Sender<usize>,
     /// What the notifications of Live may still spend this minute, for
     /// every caller of the process: see [`WalletManager::notices`].
     pub(crate) notice_budgets: std::sync::Mutex<crate::live::notice::Budgets>,
@@ -181,6 +185,7 @@ impl WalletManager {
                 attempts: Mutex::new(attempts),
                 live: std::sync::Mutex::new(None),
                 watch_setups: std::sync::atomic::AtomicU64::new(0),
+                live_starting: tokio::sync::watch::Sender::new(0),
                 notice_budgets: std::sync::Mutex::new(crate::live::notice::Budgets::new()),
                 syncing: std::sync::Mutex::new(HashMap::new()),
                 complete_here: std::sync::Mutex::new(HashSet::new()),

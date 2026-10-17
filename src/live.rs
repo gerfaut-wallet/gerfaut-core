@@ -96,6 +96,29 @@ pub mod notice;
 #[cfg(test)]
 mod tests;
 
+/// The longest a sync waits for a start of the live watch under way,
+/// before the first pass of that watch: a start reads the vault, and
+/// takes a moment.
+const LIVE_START: Duration = Duration::from_secs(5);
+
+/// A start of the live watch under way, counted while it lasts, however
+/// it ends.
+struct Starting<'a>(&'a watch::Sender<usize>);
+
+impl<'a> Starting<'a> {
+    fn begin(starts: &'a watch::Sender<usize>) -> Self {
+        starts.send_modify(|starts| *starts += 1);
+        Starting(starts)
+    }
+}
+
+impl Drop for Starting<'_> {
+    fn drop(&mut self) {
+        self.0
+            .send_modify(|starts| *starts = starts.saturating_sub(1));
+    }
+}
+
 /// Announcements remembered. Past this the oldest are forgotten, which
 /// costs nothing: a sync reports a transaction once, and the record
 /// only has to outlive the callers racing for that one report.
@@ -497,6 +520,10 @@ impl WalletManager {
     }
 
     pub(crate) async fn live_start_with(&self, timings: Option<Timings>) -> CoreResult<LiveEvents> {
+        // From here a sync that names no server waits: the watch's first
+        // pass opens before the watch exists, and the reading below takes
+        // the lock a sync may be holding.
+        let _starting = Starting::begin(&self.live_starting);
         let (config, wallets, applied) = self.watch_setup().await;
         let pace = timings.unwrap_or_else(|| Timings::of(&config));
         let (watch, changes) = LiveWatch::start_with(config.clone(), wallets.clone(), timings);
@@ -1142,6 +1169,8 @@ impl WalletManager {
     /// same start. A watch of another network has no server for this
     /// wallet: nothing to wait for.
     pub(crate) async fn live_first_pass(&self, network: Network) {
+        let mut starting = self.live_starting.subscribe();
+        let _ = tokio::time::timeout(LIVE_START, starting.wait_for(|starts| *starts == 0)).await;
         let first_pass = self
             .live_slot()
             .as_ref()
