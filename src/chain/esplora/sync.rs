@@ -50,7 +50,7 @@ use futures_util::future::try_join_all;
 use super::page::PageTx;
 use super::{Client, Counts, PAGE, PARALLEL_REQUESTS};
 use crate::chain::proof::{
-    FALSE_PROOF, Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
+    COIN_NOT_PAID, FALSE_PROOF, Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
     check_confirmation, esplora_chains, recheck,
 };
 use crate::chain::{
@@ -258,6 +258,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, String> {
     }
 
     let mut update = found.update;
+    check_spent(&held, &update)?;
     prove(client, network, server_tip, &held, start_time, &mut update).await?;
     let chain = meeting.chain(client, &latest, &update.anchors).await?;
     Ok(Synced {
@@ -462,6 +463,49 @@ fn enough(txs: &[Listed], facts: &ScriptFacts, held: &Held, stats: &ScriptHashSt
         .collect();
     let covered = facts.confirmed.union(&read_confirmed).count();
     covered as u64 >= u64::from(stats.chain_stats.tx_count)
+}
+
+/// Refuses a server that says a coin a new transaction spends is other
+/// than what the transaction that pays it pays, when the wallet holds
+/// that transaction or this sync read it ([`COIN_NOT_PAID`]): those
+/// hash to their txids, the coins Esplora attaches to each input do
+/// not. A coin of the wallet's is one of them once the history of its
+/// script is read, as long as the server lists there the transaction
+/// that paid it: what a transaction spends of the wallet, and so what it
+/// sends, is then the transaction's word and not the server's. A server
+/// that leaves that transaction out of the history, its counters
+/// lowered to match, still has its word taken for the coin, which moves
+/// what the transaction shows sent, never the balance, made of the
+/// wallet's own outputs. The coins of others whose transaction neither
+/// holds are the server's word still, as they are for a watched
+/// address: they make the fee shown, and the facts read of an input.
+/// Reading each of their transactions would prove them: a request for
+/// each payer's transaction, a third more requests for the first sync of
+/// a wallet of twenty addresses paid twice each (122 requests, measured
+/// against a server of the tests), 42 per cent more for one of a hundred
+/// addresses paid five times each (1,202), as much again for each other
+/// coin a payer spends, and every byte of those transactions, for
+/// figures that do not move the balance.
+fn check_spent(held: &Held, update: &TxUpdate<ConfirmationBlockTime>) -> Result<(), String> {
+    let read: HashMap<Txid, &Transaction> = update
+        .txs
+        .iter()
+        .map(|tx| (tx.compute_txid(), tx.as_ref()))
+        .collect();
+    for (outpoint, said) in &update.txouts {
+        let paying = held
+            .txs
+            .get(&outpoint.txid)
+            .map(|tx| tx.as_ref())
+            .or_else(|| read.get(&outpoint.txid).copied());
+        let Some(paying) = paying else {
+            continue;
+        };
+        if paying.output.get(outpoint.vout as usize) != Some(said) {
+            return Err(COIN_NOT_PAID.to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// The update being put together.

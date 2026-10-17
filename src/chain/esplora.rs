@@ -1071,6 +1071,9 @@ async fn history_round(
     };
     let (mut confirmed_so_far, mut last, mut all_held) =
         read(client.address_txs(address, from).await?, &mut txs)?;
+    // The transactions the server sent this round, ahead of those filled
+    // from what the wallet holds.
+    let mut sent = txs.len();
     let mut cursor: Option<String> = None;
     let mut pages = 1usize;
     loop {
@@ -1108,7 +1111,9 @@ async fn history_round(
             break;
         }
         (confirmed_so_far, last, all_held) = read(page, &mut txs)?;
+        sent = txs.len();
     }
+    check_spent(&txs[..sent], held)?;
     let times = sync::prove_confirmations(client, network, tip, &claimed).await?;
     let proven: std::collections::HashMap<(String, u32), Option<u64>> = claimed
         .iter()
@@ -1133,6 +1138,60 @@ async fn history_round(
         }
     }
     Ok(HistoryRound { txs, cursor })
+}
+
+/// Refuses a server that says a coin a transaction it sent this round
+/// (`sent`) spends is other than what the transaction that pays it
+/// pays, when that one is in the round or the wallet holds it
+/// ([`crate::chain::proof::COIN_NOT_PAID`]): what it pays hashes to its
+/// txid, the coin Esplora attaches to an input does not. A coin of the
+/// address is one of them as long as the address has fewer transactions
+/// than a round holds and the server lists the transaction that paid it
+/// in the address's history: what a transaction spends of the address,
+/// and so what it sends, is then the word of the transaction that paid
+/// it, and the server cannot make it more, nor pass off a spend of the
+/// address as one of someone else's. One that leaves that transaction
+/// out, its counters lowered to match, still has its word taken for the
+/// coin, which moves what the transaction shows sent and its fee, never
+/// the balance, read from the coins ([`coins`]). A transaction the
+/// wallet holds is held to what it pays and whether it pays the
+/// address, the address spelled as a release before this one may have
+/// spelled it being left aside. A coin whose transaction is past the
+/// round, or someone else's paid by a transaction the address had no
+/// part in, is the server's word still, and with it the fee and the
+/// facts read of the input: proving it would cost reading that
+/// transaction, a request for each payer's, and for a busy address
+/// whose coins are old, a request for each coin it spends in the first
+/// page, read at every sync.
+fn check_spent(sent: &[AddressTx], held: &[AddressTx]) -> Result<(), String> {
+    use std::collections::HashMap;
+    let read: HashMap<&str, &AddressTx> = sent.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
+    let kept: HashMap<&str, &AddressTx> = held
+        .iter()
+        .filter(|tx| !tx.outputs.is_empty())
+        .map(|tx| (tx.txid.as_str(), tx))
+        .collect();
+    for input in sent.iter().flat_map(|tx| &tx.inputs) {
+        let (Some(txid), Some(vout), Some(_)) =
+            (&input.prev_txid, input.prev_vout, input.value_sats)
+        else {
+            continue;
+        };
+        let (paying, fresh) = match (read.get(txid.as_str()), kept.get(txid.as_str())) {
+            (Some(paying), _) => (paying, true),
+            (None, Some(paying)) => (paying, false),
+            (None, None) => continue,
+        };
+        let agrees = paying.outputs.get(vout as usize).is_some_and(|output| {
+            output.value_sats == input.value_sats
+                && output.is_mine == input.is_mine
+                && (!fresh || output.address == input.address)
+        });
+        if !agrees {
+            return Err(crate::chain::proof::COIN_NOT_PAID.to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// Fills a round read down to a page the wallet holds whole from the
@@ -1225,8 +1284,22 @@ fn to_address_tx(
             ..TxIo::default()
         })
         .collect();
-    // A coinbase transaction has no fee; Esplora reports 0.
+    // The fee, from the coins spent as the inputs list them, as over
+    // Electrum: none for a coinbase, nor for an input without its coin.
+    // The server's own figure for it would be one more claim, which
+    // nothing checks against the coins.
     let is_coinbase = tx.vin.first().is_some_and(|vin| vin.is_coinbase);
+    let paid_in = tx.vin.iter().try_fold(0u64, |sum, vin| {
+        sum.checked_add(vin.prevout.as_ref()?.value)
+    });
+    let paid_out = tx
+        .vout
+        .iter()
+        .try_fold(0u64, |sum, vout| sum.checked_add(vout.value));
+    let fee = match (is_coinbase, paid_in, paid_out) {
+        (false, Some(paid_in), Some(paid_out)) => paid_in.checked_sub(paid_out),
+        _ => None,
+    };
     // The prevouts Esplora attaches to each input make the deep
     // analysis (taproot spend, sigops) as accurate as the API is.
     let prevouts: std::collections::HashMap<OutPoint, TxOut> = tx
@@ -1248,7 +1321,7 @@ fn to_address_tx(
     AddressTx {
         txid: tx.txid.to_string(),
         net_sats: crate::chain::net_sats(received, spent),
-        fee_sats: (!is_coinbase).then_some(tx.fee),
+        fee_sats: fee,
         // Confirmed in a block it names, or not confirmed at all: a
         // height alone names no block to prove it in.
         height: tx

@@ -1810,6 +1810,101 @@ mod servers {
         assert_eq!((branches, headers), (500, 250));
     }
 
+    /// A payment of 40,000 to [`ADDRESS_SCRIPT`] that spends output 0 of
+    /// the payment labelled `parent`, the coin said to be `value` sats
+    /// paid to `script`: its txid is the hash of what it lists.
+    fn spending(parent: u8, value: u64, script: &str) -> serde_json::Value {
+        let mut child = esplora_payment(0x5f, 0x6f, 40_000, false);
+        child["vin"][0]["txid"] = serde_json::json!(crate::testkit::esplora_txid(parent));
+        child["vin"][0]["prevout"] = serde_json::json!({ "scriptpubkey": script, "value": value });
+        child["txid"] = serde_json::json!(page_tx(&child).to_string());
+        child
+    }
+
+    /// The coins a new transaction spends, as Esplora describes them, are
+    /// what the transaction that pays them pays, when the wallet holds it
+    /// or the sync read it: a coin of the wallet's said to be worth more,
+    /// or said to be someone else's, refuses the server, where it used to
+    /// move what the wallet shows sent, silently.
+    #[tokio::test]
+    async fn an_esplora_coin_spent_is_what_its_transaction_pays() {
+        let ours = ADDRESS_SCRIPT;
+        let server = mempool(Network::Signet).await;
+        let parent = esplora_payment(0x51, 0x61, 50_000, true);
+        list(&server, vec![spending(0x51, 50_000, ours), parent.clone()]);
+        let synced = esplora_sync(&server, address_plan(Network::Signet, Held::default()))
+            .await
+            .unwrap();
+        assert_eq!(synced.update.tx_update.txs.len(), 2);
+        // The wallet holds the payment alone: a transaction it holds is
+        // not read again, nor the coins it spends.
+        let paid = page_tx(&parent);
+        let mut held = Held::default();
+        for tx in &synced.update.tx_update.txs {
+            if tx.compute_txid() == paid {
+                held.txs.insert(paid, tx.clone());
+            }
+        }
+        assert_eq!(held.txs.len(), 1);
+        for lie in [
+            spending(0x51, 70_000, ours),
+            spending(0x51, 50_000, &script(9)),
+        ] {
+            list(&server, vec![lie.clone(), parent.clone()]);
+            let refused =
+                esplora_sync(&server, address_plan(Network::Signet, Held::default())).await;
+            assert!(refusal(refused).contains(COIN_NOT_PAID));
+            // The transaction that pays it held, not read again.
+            list(&server, vec![lie]);
+            let plan = address_plan(
+                Network::Signet,
+                Held {
+                    txs: held.txs.clone(),
+                    ..Held::default()
+                },
+            );
+            assert!(refusal(esplora_sync(&server, plan).await).contains(COIN_NOT_PAID));
+        }
+    }
+
+    /// The same for a watched address: what a transaction spends of it is
+    /// what the transaction that paid it pays, in the round or held, and
+    /// the fee is read from the coins spent, not from the server's own
+    /// figure for it.
+    #[tokio::test]
+    async fn an_esplora_address_spends_what_its_transaction_paid() {
+        let ours = ADDRESS_SCRIPT;
+        let server = mempool(Network::Signet).await;
+        let parent = esplora_payment(0x53, 0x63, 50_000, true);
+        let mut honest = spending(0x53, 50_000, ours);
+        honest["fee"] = serde_json::json!(1);
+        server.state.lock().unwrap().address_txs = vec![honest, parent.clone()];
+        let state = esplora_address(&server, Network::Signet).await.unwrap();
+        assert_eq!(
+            (state.txs[0].net_sats, state.txs[0].fee_sats),
+            (-10_000, Some(10_000))
+        );
+        let held = state.txs.clone();
+        for lie in [
+            spending(0x53, 70_000, ours),
+            spending(0x53, 50_000, &script(9)),
+        ] {
+            server.state.lock().unwrap().address_txs = vec![lie.clone(), parent.clone()];
+            let refused = esplora_address(&server, Network::Signet).await.unwrap_err();
+            assert!(refused.contains(COIN_NOT_PAID), "{refused}");
+            server.state.lock().unwrap().address_txs = vec![lie];
+            let refused = crate::chain::esplora::fetch_address_state(
+                &esplora(&server),
+                SIGNET_ADDRESS,
+                Network::Signet,
+                &held,
+            )
+            .await
+            .unwrap_err();
+            assert!(refused.contains(COIN_NOT_PAID), "{refused}");
+        }
+    }
+
     /// The txid of a transaction as Esplora lists it.
     fn page_tx(listed: &serde_json::Value) -> Txid {
         let tx: crate::chain::esplora::page::PageTx =
