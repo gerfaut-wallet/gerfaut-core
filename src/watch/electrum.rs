@@ -139,7 +139,7 @@ struct Session {
     /// The height of the last block the server announced.
     tip: Option<u32>,
     /// When it last announced one, or when the session opened, or when
-    /// the last look began, or the device woke up.
+    /// the last look began.
     block_at: Instant,
     look: Look,
     /// The Tor proxy the session goes through, when its server is an
