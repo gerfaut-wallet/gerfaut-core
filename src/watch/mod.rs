@@ -2087,7 +2087,7 @@ pub(crate) fn servers_for(
                 let host = chain::host_of(&server.url)?;
                 let operator = operators
                     .iter()
-                    .find(|operator| runs(operator, &host))?
+                    .find(|operator| chain::same_operator(&host, operator))?
                     .clone();
                 let chosen = BackendConfig::Public {
                     server: Some(server.id),
@@ -2112,13 +2112,6 @@ pub(crate) fn servers_for(
         endpoints.splice(0..0, pushing);
     }
     Ok(endpoints)
-}
-
-/// Whether `host` is one the operator of the host `operator` runs: the
-/// same host, or one under it, `electrum.blockstream.info` under
-/// `blockstream.info`.
-pub(super) fn runs(operator: &str, host: &str) -> bool {
-    host == operator || host.ends_with(&format!(".{operator}"))
 }
 
 /// The task of a watcher: the supervisor, cut short the moment the

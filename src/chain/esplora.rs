@@ -12,6 +12,7 @@ pub(crate) mod sync;
 
 use page::PageTx;
 
+use crate::chain::Failure;
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
 use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
@@ -363,22 +364,41 @@ impl Client {
             .await
     }
 
-    /// Hands a transaction to the server. The node's refusal comes back
-    /// as the error, from a body held to a few kilobytes.
-    async fn post_tx(&self, tx: &Transaction) -> Result<(), String> {
+    /// Hands a transaction to the server, and returns the txid it
+    /// answers with. Only the node's verdict comes back as a refusal: a
+    /// 400 whose body, held to a few kilobytes, is bitcoind's refusal in
+    /// the words of electrs ([`crate::chain::node_verdict`]). Any other
+    /// status, a proxy's page, a 2xx that is no txid, is the way there
+    /// failing.
+    async fn post_tx(&self, tx: &Transaction) -> Result<Txid, Failure> {
         let response = self
             .http
             .post(format!("{}/tx", self.base))
             .body(bdk_wallet::bitcoin::consensus::encode::serialize_hex(tx))
             .send()
             .await
-            .map_err(|e| describe_request(&e, self.budget))?;
-        // Accepted: whatever else the server says is not read.
-        if response.status().is_success() {
-            return Ok(());
+            .map_err(|e| Failure::Transport(describe_request(&e, self.budget)))?;
+        let status = response.status().as_u16();
+        let body = self
+            .body(response, REFUSAL_MAX)
+            .await
+            .map_err(Failure::Transport)?;
+        let text = String::from_utf8_lossy(&body);
+        if (200..300).contains(&status) {
+            // Esplora answers with the txid, and nothing else.
+            return text.trim().parse().map_err(|_| {
+                Failure::Transport(format!(
+                    "the server answered {} instead of a txid",
+                    crate::chain::server_words(text.trim())
+                ))
+            });
         }
-        let body = self.body(response, REFUSAL_MAX).await?;
-        Err(node_message(&String::from_utf8_lossy(&body)))
+        if status == 400
+            && let Some(words) = crate::chain::node_verdict(&text)
+        {
+            return Err(Failure::Refused(words));
+        }
+        Err(Failure::Transport(describe_status(status)))
     }
 }
 
@@ -1256,45 +1276,17 @@ pub(crate) fn script_address(
 // --- broadcast ------------------------------------------------------------
 
 /// Hands a signed transaction to the network through this instance.
-/// The instance's own node validates it; its refusal comes back as the
-/// message, verbatim, which is the most useful thing to show.
+/// The instance's own node validates it; its refusal comes back as a
+/// refusal in the node's words, which is the most useful thing to show.
 ///
-/// Esplora wraps the node's refusal in an HTTP error whose body is the
-/// reason, in one of two spellings:
+/// Esplora wraps the node's refusal in a 400 whose body is the reason,
+/// in one of two spellings:
 /// `sendrawtransaction RPC error: {"code":-26,"message":"..."}` (the
 /// mempool instances) or `sendrawtransaction RPC error -26: ...`
-/// (blockstream.info). The message is kept, the wrapping dropped.
-/// Anything else is a failure to reach the node, described as such.
-pub(crate) async fn broadcast(client: &Client, tx: &Transaction) -> Result<(), String> {
+/// (blockstream.info): see [`crate::chain::node_verdict`]. Anything
+/// else is a failure of the way there, and the next endpoint may take it.
+pub(crate) async fn broadcast(client: &Client, tx: &Transaction) -> Result<Txid, Failure> {
     client.post_tx(tx).await
-}
-
-/// The reason inside a `sendrawtransaction` refusal, whichever way the
-/// server spelled it; the whole text when it is not one. Shown as the
-/// node's words, so kept to one short line: a server that answers a
-/// page of text, or instructions of its own, gets its first 200
-/// characters on screen ([`crate::chain::server_words`]).
-pub(crate) fn node_message(text: &str) -> String {
-    crate::chain::server_words(&node_words(text))
-}
-
-fn node_words(text: &str) -> String {
-    // A body quoted inside another error arrives with its quotes
-    // escaped: read it as if it were not.
-    let text = text.replace("\\\"", "\"");
-    if let Some(start) = text.find("\"message\":\"") {
-        let rest = &text[start + 11..];
-        if let Some(end) = rest.find('"') {
-            return rest[..end].to_owned();
-        }
-    }
-    if let Some(start) = text.find("RPC error -") {
-        let rest = &text[start..];
-        if let Some(colon) = rest.find(": ") {
-            return rest[colon + 2..].trim().to_owned();
-        }
-    }
-    text.trim().to_owned()
 }
 
 /// The output an input spends, whether it is already spent, and by
@@ -1310,8 +1302,13 @@ pub(crate) struct PrevoutFacts {
 pub(crate) async fn fetch_prevout(
     client: &Client,
     outpoint: OutPoint,
-) -> Result<PrevoutFacts, String> {
-    let tx = client.tx(&outpoint.txid).await?;
+) -> Result<PrevoutFacts, Failure> {
+    // Nothing a lookup gets back is the node's verdict on a transaction:
+    // whatever fails is the way there failing.
+    let tx = client
+        .tx(&outpoint.txid)
+        .await
+        .map_err(Failure::Transport)?;
     let Some(tx) = tx else {
         return Ok(PrevoutFacts {
             txout: None,
@@ -1319,7 +1316,7 @@ pub(crate) async fn fetch_prevout(
             spent_by: None,
         });
     };
-    let txout = crate::chain::output_at(&tx, outpoint)?;
+    let txout = crate::chain::output_at(&tx, outpoint).map_err(Failure::Transport)?;
     let status = client
         .output_status(&outpoint.txid, outpoint.vout)
         .await
@@ -1329,18 +1326,36 @@ pub(crate) async fn fetch_prevout(
     // Named only when the server says both who spends it and where that
     // stands: a spend whose standing is unknown is not taken for one
     // in a block.
-    let spent_by = status.and_then(|status| match (status.spent, status.txid, status.status) {
-        (true, Some(txid), Some(standing)) => Some(crate::broadcast::SpentBy {
-            txid,
-            confirmed: standing.confirmed,
-        }),
-        _ => None,
-    });
+    let spent_by =
+        match status.and_then(|status| match (status.spent, status.txid, status.status) {
+            (true, Some(txid), Some(standing)) => Some((txid, standing.confirmed)),
+            _ => None,
+        }) {
+            // A spend in a block holds the broadcast back: the server shows
+            // the transaction that makes it, and it has to spend this coin.
+            // One in the mempool holds nothing back, and costs no request.
+            Some((txid, confirmed)) => Some(crate::broadcast::SpentBy {
+                txid,
+                confirmed,
+                verified: confirmed && shows_spend(client, txid, outpoint).await,
+            }),
+            None => None,
+        };
     Ok(PrevoutFacts {
         txout,
         spent,
         spent_by,
     })
+}
+
+/// Whether the server hands over the transaction `txid`, as that txid
+/// commits to it, with `outpoint` among its inputs. Anything else, a
+/// server that cannot show it included, is no proof of the spend.
+async fn shows_spend(client: &Client, txid: Txid, outpoint: OutPoint) -> bool {
+    match client.tx(&txid).await {
+        Ok(Some(tx)) => crate::chain::spends(&tx, txid, outpoint),
+        _ => false,
+    }
 }
 
 /// Where a transaction stands: unknown, in the mempool, or at a height.
@@ -1351,7 +1366,14 @@ pub(crate) struct TxStanding {
     pub tip_height: u32,
 }
 
-pub(crate) async fn tx_standing(client: &Client, txid: &Txid) -> Result<TxStanding, String> {
+/// A confirmation counts once proven, as a sync's
+/// ([`sync::prove_confirmations`]): one that cannot be leaves the
+/// transaction waiting, and a false proof refuses the server.
+pub(crate) async fn tx_standing(
+    client: &Client,
+    network: Network,
+    txid: &Txid,
+) -> Result<TxStanding, String> {
     let tip_height = client.height().await?;
     let found = client.knows_tx(txid).await?;
     if !found {
@@ -1363,10 +1385,21 @@ pub(crate) async fn tx_standing(client: &Client, txid: &Txid) -> Result<TxStandi
         });
     }
     let status = client.tx_status(txid).await?;
+    let block = match (status.confirmed, status.block_height, status.block_hash) {
+        (true, Some(height), Some(hash)) => Some(bdk_wallet::chain::BlockId { height, hash }),
+        _ => None,
+    };
+    let proven = match block {
+        Some(block) => sync::prove_confirmations(client, network, tip_height, &[(*txid, block)])
+            .await?
+            .first()
+            .is_some_and(Option::is_some),
+        None => false,
+    };
     Ok(TxStanding {
         found: true,
-        confirmed: status.confirmed,
-        block_height: status.block_height,
+        confirmed: proven,
+        block_height: block.filter(|_| proven).map(|block| block.height),
         tip_height,
     })
 }
@@ -1379,6 +1412,102 @@ mod error_tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    /// What a server answers a posted transaction with, in every form: a
+    /// refusal only when a 400 carries the node's verdict in the words of
+    /// electrs, Blockstream's or mempool.space's; anything else, another
+    /// status, a proxy's page, a node warming up, a body that is no txid,
+    /// is the way there failing, and the next endpoint may be asked.
+    #[tokio::test]
+    async fn only_the_nodes_verdict_refuses_a_posted_transaction() {
+        let tx = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let answer = |status: &str, body: &str| {
+            format!(
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let refused = |words: &str| Err(Failure::Refused(words.to_owned()));
+        let transport = |text: &str| Err::<Txid, _>(Failure::Transport(text.to_owned()));
+        let txid = tx.compute_txid().to_string();
+        for (status, body, expected) in [
+            ("200 OK", txid.as_str(), Ok(tx.compute_txid())),
+            (
+                "400 Bad Request",
+                "sendrawtransaction RPC error -26: min relay fee not met, 0 < 11",
+                refused("min relay fee not met, 0 < 11"),
+            ),
+            (
+                "400 Bad Request",
+                r#"sendrawtransaction RPC error: {"code":-26,"message":"min relay fee not met"}"#,
+                refused("min relay fee not met"),
+            ),
+            (
+                "400 Bad Request",
+                r#"sendrawtransaction RPC error: {"code":-27,"message":"Transaction outputs already in utxo set"}"#,
+                refused("Transaction outputs already in utxo set"),
+            ),
+            (
+                "400 Bad Request",
+                "sendrawtransaction RPC error -25: bad-txns-inputs-missingorspent",
+                refused("bad-txns-inputs-missingorspent"),
+            ),
+            (
+                "400 Bad Request",
+                "sendrawtransaction RPC error -28: Loading block index...",
+                transport("HTTP 400: bad request"),
+            ),
+            (
+                "400 Bad Request",
+                "Invalid hex string",
+                transport("HTTP 400: bad request"),
+            ),
+            (
+                "403 Forbidden",
+                "<html><title>Attention Required! | Cloudflare</title></html>",
+                transport("HTTP 403: access refused"),
+            ),
+            (
+                "401 Unauthorized",
+                "",
+                transport("HTTP 401: access refused"),
+            ),
+            (
+                "404 Not Found",
+                "Not Found",
+                transport("HTTP 404: not found"),
+            ),
+            (
+                "413 Payload Too Large",
+                "",
+                transport("HTTP 413: unexpected status"),
+            ),
+            (
+                "503 Service Unavailable",
+                "busy",
+                transport("HTTP 503: server error"),
+            ),
+            (
+                "429 Too Many Requests",
+                "",
+                transport("HTTP 429: rate limited"),
+            ),
+            (
+                "200 OK",
+                "<html>maintenance</html>",
+                transport("the server answered <html>maintenance</html> instead of a txid"),
+            ),
+        ] {
+            let (address, _) = answering(vec![answer(status, body)]).await;
+            let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
+            assert_eq!(broadcast(&client, &tx).await, expected, "{status} {body}");
+        }
+    }
 
     /// Budgets short enough to test: the connection has five seconds,
     /// the whole request one.
@@ -1625,7 +1754,7 @@ mod error_tests {
         };
         assert_eq!(
             broadcast(&client, &tx).await.unwrap_err(),
-            "the server sent an answer longer than 64 KiB"
+            Failure::Transport("the server sent an answer longer than 64 KiB".to_owned())
         );
     }
 
@@ -1963,32 +2092,5 @@ mod error_tests {
                 total: TOR_TIMEOUT,
             }
         );
-    }
-}
-
-#[cfg(test)]
-mod broadcast_tests {
-    use super::node_message;
-
-    #[test]
-    fn the_node_reason_is_kept_whichever_spelling() {
-        let mempool = r#"sendrawtransaction RPC error: {"code":-27,"message":"Transaction outputs already in utxo set"}"#;
-        assert_eq!(
-            node_message(mempool),
-            "Transaction outputs already in utxo set"
-        );
-        let blockstream = "sendrawtransaction RPC error -26: mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)";
-        assert_eq!(
-            node_message(blockstream),
-            "mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)"
-        );
-        let escaped = r#"{\"code\":-26,\"message\":\"bad-txns-inputs-missingorspent\"}"#;
-        assert_eq!(node_message(escaped), "bad-txns-inputs-missingorspent");
-        assert_eq!(node_message("connection refused"), "connection refused");
-        // A page of text, or a sentence of the server's own, is cut to
-        // one short line.
-        let long = node_message(&format!("send it again to\n{}", "x".repeat(1 << 20)));
-        assert_eq!(long.chars().count(), 201);
-        assert!(long.starts_with("send it again tox") && long.ends_with('\u{2026}'));
     }
 }

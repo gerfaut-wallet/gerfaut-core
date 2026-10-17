@@ -1112,7 +1112,7 @@ async fn open(
 /// The Electrum servers of `candidates` other than `endpoint` that its
 /// operator runs, in their order: through Tor when it is, in the clear
 /// when it is not. One runs the other when its host is the other's, or
-/// one under it ([`super::runs`]), as the watch picks the Electrum
+/// one under it ([`crate::chain::same_operator`]), as the watch picks the Electrum
 /// servers of an operator of the rotation.
 pub(super) fn siblings(candidates: Vec<Endpoint>, endpoint: &Endpoint) -> Vec<(Endpoint, Target)> {
     let ours = endpoint.label();
@@ -1121,7 +1121,8 @@ pub(super) fn siblings(candidates: Vec<Endpoint>, endpoint: &Endpoint) -> Vec<(E
         .filter(|other| other != endpoint && other.is_onion() == endpoint.is_onion())
         .filter(|other| {
             let theirs = other.label();
-            super::runs(&ours, &theirs) || super::runs(&theirs, &ours)
+            crate::chain::same_operator(&theirs, &ours)
+                || crate::chain::same_operator(&ours, &theirs)
         })
         .filter_map(|other| match &other {
             Endpoint::Electrum(target) => {

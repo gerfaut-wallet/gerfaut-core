@@ -686,7 +686,7 @@ fn branches(
 
 /// The `count` headers from `from`, asked as many times as the server's
 /// own limit takes; `None` when it refuses them.
-fn headers_from(
+pub(crate) fn headers_from(
     client: &impl ElectrumApi,
     from: u32,
     count: u32,

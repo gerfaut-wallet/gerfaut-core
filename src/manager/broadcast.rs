@@ -10,10 +10,10 @@ use bdk_wallet::bitcoin::{Address, Amount, OutPoint, Transaction, TxOut, Txid};
 use bdk_wallet::chain::CanonicalizationParams;
 
 use crate::broadcast::{
-    self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, RecentBroadcast, SpentBy,
-    TxPreview, WalletRef,
+    self, BroadcastReport, BroadcastStatus, InputFacts, OutputFacts, RecentBroadcast, Satisfaction,
+    SpentBy, TxPreview, WalletRef,
 };
-use crate::chain;
+use crate::chain::{self, Failure, Purpose};
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
 use crate::now_secs;
@@ -38,7 +38,7 @@ impl WalletManager {
         let outpoints = broadcast::outpoints(&decoded);
 
         // Everything the vault knows, under the lock.
-        let (config, certs, mut input_facts, output_facts, tip_height) = {
+        let (config, certs, mut input_facts, output_facts, mut tip_height) = {
             let mut state = self.state.lock().await;
             let (config, certs) = state.chain_setup(network);
             let ids: Vec<(String, String, WalletKind)> = state
@@ -79,6 +79,13 @@ impl WalletManager {
                             let Some((txout, spender)) = coin else {
                                 continue;
                             };
+                            // The most its policy can take to sign, whatever
+                            // the PSBT says.
+                            input_facts[i].satisfaction = engine
+                                .derivation_of_spk(txout.script_pubkey.clone())
+                                .and_then(|(keychain, _)| {
+                                    Satisfaction::of_descriptor(engine.public_descriptor(keychain))
+                                });
                             input_facts[i].prevout = Some(txout);
                             input_facts[i].wallet = Some(wallet_ref.clone());
                             input_facts[i].spent = Some(spender.is_some());
@@ -116,8 +123,10 @@ impl WalletManager {
                                     script_pubkey: script.clone(),
                                 });
                                 input_facts[i].wallet = Some(wallet_ref.clone());
-                                input_facts[i].spent = Some(false);
-                                // The server's figure, not a transaction.
+                                // The server's figure, not a transaction, and
+                                // as old as the last sync: the backend is
+                                // asked for the transaction and where the
+                                // coin stands now.
                                 input_facts[i].listed = true;
                             }
                         }
@@ -153,19 +162,31 @@ impl WalletManager {
         }
 
         // What only the chain knows, outside the lock: the coins the
-        // vault does not hold, and whether known coins are still
-        // unspent. One endpoint, the first that answers. A coin the
-        // PSBT describes is asked about all the same: its word is its
-        // author's, and the preview confronts it with the chain's.
+        // vault does not hold, whether known coins are still unspent,
+        // and the transactions behind a watched address's listing. One
+        // endpoint, the first that answers. A coin the PSBT describes is
+        // asked about all the same: its word is its author's, and the
+        // preview confronts it with the chain's.
         let needs_chain = input_facts
             .iter()
-            .any(|f| f.prevout.is_none() || f.spent.is_none());
+            .any(|f| f.prevout.is_none() || f.spent.is_none() || f.listed);
+        // A height lock is judged against the node the transaction goes
+        // to. A wallet's last sync can be blocks behind the lock a
+        // signer set at its own tip against fee sniping, so the backend
+        // is asked for its height whenever the wallets' would hold the
+        // transaction back, or no wallet has one.
+        let locktime = decoded.tx.lock_time;
+        // A lock at block 0 holds nothing back, whatever the tip.
+        let needs_tip = decoded.tx.is_lock_time_enabled()
+            && locktime.is_block_height()
+            && locktime.to_consensus_u32() > 0
+            && tip_height.is_none_or(|tip| locktime.to_consensus_u32() > tip);
         // No backend for this network, or a Tor route that cannot be
         // opened, is no answer at all: the coins stay unchecked below,
         // the same as when every endpoint stopped answering. Without
         // this the PSBT's word went through unconfronted and unmarked.
-        let route = if needs_chain {
-            match chain::endpoints(&config, network, &certs) {
+        let route = if needs_chain || needs_tip {
+            match self.send_endpoints(network, &config, &certs, Purpose::Preview) {
                 Ok(endpoints) => match self.tor_proxy_for(&endpoints).await {
                     Ok(proxy) => Some((endpoints, proxy)),
                     Err(_) => None,
@@ -176,40 +197,71 @@ impl WalletManager {
             None
         };
         if let Some((endpoints, proxy)) = route {
-            // A coin is settled once an endpoint has spoken for it:
-            // either it handed the output over, or it said it has no
-            // such outpoint. Anything else is still an open question,
-            // and an open question goes to the next endpoint.
-            let settled =
-                |f: &broadcast::InputFacts| (f.prevout.is_some() && f.spent.is_some()) || f.unknown;
-            for endpoint in &endpoints {
-                for (i, facts) in input_facts.iter_mut().enumerate() {
-                    if settled(facts) {
-                        continue;
-                    }
-                    match chain::fetch_prevout(endpoint, outpoints[i], proxy.as_deref()).await {
-                        Ok(chain_facts) => {
-                            if facts.prevout.is_none() {
-                                match chain_facts.txout {
-                                    Some(txout) => facts.prevout = Some(txout),
-                                    None => facts.unknown = true,
-                                }
-                            }
-                            if facts.spent.is_none() {
-                                facts.spent = chain_facts.spent;
-                                facts.spent_by = chain_facts.spent_by;
-                            }
+            // A coin is settled once an endpoint has spoken for it: it
+            // handed the output over, said it has no such outpoint, or
+            // refused to say. What it left open, whether the coin is
+            // spent, stays open: the next endpoint is another operator,
+            // asked only when this one stops answering.
+            let mut settled: Vec<bool> = input_facts
+                .iter()
+                .map(|f| (f.prevout.is_some() && f.spent.is_some() && !f.listed) || f.unknown)
+                .collect();
+            // The endpoints that stopped answering during this preview: the
+            // tip is not asked of them, which would wait out their time
+            // limit a second time.
+            let mut down = vec![false; endpoints.len()];
+            let mut failures: Vec<(&chain::Endpoint, Failure)> = Vec::new();
+            for (e, endpoint) in endpoints.iter().enumerate() {
+                let asked: Vec<usize> = (0..settled.len()).filter(|&i| !settled[i]).collect();
+                if asked.is_empty() {
+                    break;
+                }
+                let coins: Vec<OutPoint> = asked.iter().map(|&i| outpoints[i]).collect();
+                let (answers, failed) =
+                    chain::fetch_prevouts(endpoint, &coins, proxy.as_deref()).await;
+                if !answers.is_empty() {
+                    self.note_send(endpoint, &failures);
+                }
+                for (&i, chain_facts) in asked.iter().zip(answers) {
+                    let facts = &mut input_facts[i];
+                    settled[i] = true;
+                    if facts.prevout.is_none() || facts.listed {
+                        match chain_facts.txout {
+                            Some(txout) => backed(facts, txout),
+                            None => facts.unknown = true,
                         }
-                        // This one has stopped answering — throttled,
-                        // timed out, cut off. Asking it about the coins
-                        // it has not been asked about yet would only
-                        // make that worse, so they go to the next
-                        // endpoint instead of being dropped.
-                        Err(_) => break,
+                    }
+                    if facts.spent.is_none() {
+                        facts.spent = chain_facts.spent;
+                        facts.spent_by = chain_facts.spent_by;
                     }
                 }
-                if input_facts.iter().all(settled) {
-                    break;
+                // This one has stopped answering — throttled, timed out,
+                // cut off, a proxy's page in place of an answer. Asking it
+                // about the coins it has not answered about would only make
+                // that worse, so they go to the next endpoint instead of
+                // being dropped. Nothing a lookup gets is a refusal.
+                if let Some(failure) = failed {
+                    down[e] = true;
+                    failures.push((endpoint, failure));
+                }
+            }
+            if needs_tip {
+                for (e, endpoint) in endpoints.iter().enumerate() {
+                    if down[e] {
+                        continue;
+                    }
+                    match chain::tip_height(endpoint, proxy.as_deref()).await {
+                        Ok(height) => {
+                            tip_height = Some(height);
+                            self.note_send(endpoint, &failures);
+                            break;
+                        }
+                        Err(failure) => {
+                            down[e] = true;
+                            failures.push((endpoint, failure));
+                        }
+                    }
                 }
             }
         }
@@ -218,9 +270,11 @@ impl WalletManager {
         // fee, but it says which coin nobody stood behind: without
         // this, a backend that stopped answering, or no backend at all,
         // was indistinguishable from one that agreed.
+        // A listing nothing backed is in the same place: the server's
+        // figure from the last sync, its coin's standing unknown.
         if needs_chain {
             for facts in input_facts.iter_mut() {
-                if facts.prevout.is_none() && !facts.unknown {
+                if (facts.prevout.is_none() || facts.listed) && !facts.unknown {
                     facts.unchecked = true;
                 }
             }
@@ -237,10 +291,14 @@ impl WalletManager {
     }
 
     /// Hands a signed transaction to the network through the backend
-    /// configured for it. Every endpoint is tried in turn; the node's
-    /// own refusal (a missing signature, a spent input, a fee below the
-    /// floor) is returned verbatim. A transaction the network took is
-    /// kept among the [`Self::recent_broadcasts`].
+    /// configured for it, its endpoints in the order of
+    /// [`chain::send_order`]: the operator of the live watch first. The
+    /// next endpoint is tried only when one cannot be reached; the
+    /// node's own refusal (a missing signature, a spent input, a fee
+    /// below the floor) ends it, and is returned verbatim. Sent means
+    /// the server answered with the txid the transaction hashes to, or
+    /// said it already held it and handed it over. A transaction the
+    /// network took is kept among the [`Self::recent_broadcasts`].
     pub async fn broadcast_transaction(
         &self,
         network: Network,
@@ -254,12 +312,14 @@ impl WalletManager {
             });
         }
         let (config, certs) = self.state.lock().await.chain_setup(network);
-        let endpoints = chain::endpoints(&config, network, &certs)?;
+        let endpoints = self.send_endpoints(network, &config, &certs, Purpose::Broadcast)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
         let mut refusals: Vec<(String, String)> = Vec::new();
+        let mut failures: Vec<(&chain::Endpoint, Failure)> = Vec::new();
         for endpoint in &endpoints {
             match chain::broadcast(endpoint, &decoded.tx, proxy.as_deref()).await {
                 Ok(()) => {
+                    self.note_send(endpoint, &failures);
                     let report = BroadcastReport {
                         txid: decoded.tx.compute_txid().to_string(),
                         backend: endpoint.label(),
@@ -268,10 +328,73 @@ impl WalletManager {
                     self.remember_broadcast(network, &decoded.tx, &report).await;
                     return Ok(report);
                 }
-                Err(detail) => refusals.push((endpoint.label(), detail)),
+                Err(Failure::Transport(detail)) => {
+                    refusals.push((endpoint.label(), detail.clone()));
+                    failures.push((endpoint, Failure::Transport(detail)));
+                }
+                Err(Failure::Refused(detail)) => {
+                    refusals.push((endpoint.label(), detail));
+                    break;
+                }
             }
         }
         Err(broadcast_failure(refusals))
+    }
+
+    /// The endpoints the preview, the broadcast and the standing of a
+    /// transaction are asked of, in the order they are tried: the one
+    /// place that order is decided. The backend's endpoints, the operator
+    /// of the live watch first ([`chain::send_order`]), and the servers
+    /// relegated for an outage after the others, as the syncs take them
+    /// ([`Self::relegated_last`]), never before the server of the watch.
+    fn send_endpoints(
+        &self,
+        network: Network,
+        config: &crate::chain::BackendConfig,
+        certs: &crate::chain::TrustedCerts,
+        purpose: Purpose,
+    ) -> CoreResult<Vec<chain::Endpoint>> {
+        let live = self.live_endpoint(network, config, certs);
+        let ordered = chain::send_order(
+            chain::endpoints(config, network, certs)?,
+            live.clone(),
+            purpose,
+        );
+        Ok(self.relegated_last(ordered, live.as_ref()))
+    }
+
+    /// `answered` answered after each of `failed` went down: those are
+    /// relegated, for the syncs as for what is sent. Only an outage of the
+    /// server itself counts ([`chain::is_outage`]): a node's verdict, a
+    /// page a server would not serve, a route through Tor that failed,
+    /// relegate nothing.
+    fn note_send(&self, answered: &chain::Endpoint, failed: &[(&chain::Endpoint, Failure)]) {
+        let down: Vec<&chain::Endpoint> = failed
+            .iter()
+            .filter(|(_, failure)| {
+                matches!(failure, Failure::Transport(detail) if chain::is_outage(detail))
+            })
+            .map(|(endpoint, _)| *endpoint)
+            .collect();
+        self.answered_after(answered, &down);
+    }
+
+    /// The server the live watch has on `network`, when the backend
+    /// names it: the one the preview and the broadcast go to first
+    /// ([`chain::send_order`]), the same rule as the syncs'.
+    fn live_endpoint(
+        &self,
+        network: Network,
+        config: &crate::chain::BackendConfig,
+        certs: &crate::chain::TrustedCerts,
+    ) -> Option<chain::Endpoint> {
+        self.live_server()
+            .filter(|(on, server)| {
+                *on == network
+                    && crate::watch::servers_for(config, network, certs)
+                        .is_ok_and(|allowed| allowed.contains(server))
+            })
+            .map(|(_, server)| server)
     }
 
     /// Keeps a transaction the network just took at the head of the
@@ -335,7 +458,9 @@ impl WalletManager {
 
     /// Where a broadcast transaction stands now. `hex` is the transaction
     /// itself: Electrum can only look a transaction up through one of
-    /// its scripts, and the apps already hold the bytes.
+    /// its scripts, and the apps already hold the bytes. Asked in the
+    /// order of a broadcast ([`chain::send_order`]): the operator the
+    /// transaction went to, not the head of the rotation.
     pub async fn transaction_status(
         &self,
         network: Network,
@@ -351,12 +476,16 @@ impl WalletManager {
             });
         }
         let (config, certs) = self.state.lock().await.chain_setup(network);
-        let endpoints = chain::endpoints(&config, network, &certs)?;
+        let endpoints = self.send_endpoints(network, &config, &certs, Purpose::Broadcast)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
         let mut attempts: Vec<String> = Vec::new();
+        let mut failures: Vec<(&chain::Endpoint, Failure)> = Vec::new();
         for endpoint in &endpoints {
-            match chain::tx_standing(endpoint, txid, scripts.clone(), proxy.as_deref()).await {
+            match chain::tx_standing(endpoint, network, txid, scripts.clone(), proxy.as_deref())
+                .await
+            {
                 Ok(standing) => {
+                    self.note_send(endpoint, &failures);
                     let confirmations = standing
                         .block_height
                         .map(|height| standing.tip_height.saturating_sub(height) + 1)
@@ -371,7 +500,10 @@ impl WalletManager {
                         at: now_secs(),
                     });
                 }
-                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
+                Err(detail) => {
+                    attempts.push(format!("{}: {detail}", endpoint.label()));
+                    failures.push((endpoint, Failure::Transport(detail)));
+                }
             }
         }
         Err(sync_failure(&endpoints, attempts))
@@ -430,16 +562,38 @@ fn wallet_coins(
             if !engine.is_mine(txout.script_pubkey.clone()) {
                 return None;
             }
-            // At most one spend is canonical.
+            // At most one spend is canonical. The wallet holds it, so it
+            // is seen spending the coin.
             let spender = spenders.iter().find_map(|txid| {
                 canonical.get(txid).map(|&(_, confirmed)| SpentBy {
                     txid: *txid,
                     confirmed,
+                    verified: true,
                 })
             });
             Some((txout.clone(), spender))
         })
         .collect()
+}
+
+/// A coin the backend handed over in its transaction, txid checked: the
+/// value and script it holds now stand for the coin. A watched address's
+/// listing it replaces is kept when the two differ, for the caution
+/// that says so, and the wallet keeps the coin only while it sits on
+/// the address listed.
+fn backed(facts: &mut InputFacts, txout: TxOut) {
+    if facts.listed {
+        facts.listed = false;
+        if let Some(listed) = facts.prevout.take().filter(|listed| *listed != txout) {
+            let wallet = if listed.script_pubkey == txout.script_pubkey {
+                facts.wallet.clone()
+            } else {
+                facts.wallet.take()
+            };
+            facts.contradicted_listing = wallet.map(|wallet| (wallet, listed));
+        }
+    }
+    facts.prevout = Some(txout);
 }
 
 /// Every node said the same thing: say it once, with the first host.

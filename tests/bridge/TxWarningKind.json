@@ -5,6 +5,7 @@
   "locked": "locked",
   "input_unknown": "input_unknown",
   "input_spent": "input_spent",
+  "in_mempool": "in_mempool",
   "input_mismatch": "input_mismatch",
   "fee_unknown": "fee_unknown",
   "dust_output": "dust_output",
