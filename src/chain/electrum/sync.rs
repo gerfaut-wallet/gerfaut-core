@@ -27,6 +27,7 @@ use bdk_wallet::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use electrum_client::{self, ElectrumApi, GetHistoryRes};
 
+use crate::chain::proof::{FALSE_PROOF, Proof, check_confirmation};
 use crate::chain::{
     ANOTHER_NETWORK, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX, has_proof_of_work,
     height_limit,
@@ -110,7 +111,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
     }
 
     pass.fetch_missing(client)?;
-    pass.prove(client, &mut chain)?;
+    pass.prove(client, network, &mut chain)?;
     pass.fetch_prevouts(client)?;
     let tip = chain.update(&pass.update);
     Ok(Synced {
@@ -309,9 +310,9 @@ fn checked_suffix(
         let at_tip = headers
             .last()
             .is_some_and(|last| last.block_hash() == tip.block_hash());
-        let worked = headers
-            .iter()
-            .all(|header| has_proof_of_work(network, header));
+        let worked = (start..)
+            .zip(&headers)
+            .all(|(at, header)| has_proof_of_work(network, at, header));
         if chained && at_tip && worked {
             return Ok(headers);
         }
@@ -408,11 +409,19 @@ impl Pass<'_> {
     }
 
     /// Proves the confirmations the wallet does not hold: the header of
-    /// each block, then the merkle branch of each transaction in it. A
-    /// branch that does not lead to the header's root proves nothing,
-    /// and the transaction is left unconfirmed, as the engine of BDK
-    /// leaves it.
-    fn prove(&mut self, client: &impl ElectrumApi, chain: &mut Chain) -> Result<(), Error> {
+    /// each block, then the merkle branch of each transaction in it,
+    /// each held to [`check_confirmation`]. A proof that does not hold
+    /// refuses the server ([`FALSE_PROOF`]): it named a confirmation it
+    /// cannot back, and the next server is asked instead of this one
+    /// being believed on anything else. One that is unsure leaves the
+    /// transaction unconfirmed, as seen in the mempool now.
+    fn prove(
+        &mut self,
+        client: &impl ElectrumApi,
+        network: Network,
+        chain: &mut Chain,
+    ) -> Result<(), Error> {
+        let false_proof = || Error::Message(FALSE_PROOF.to_owned());
         let to_prove = std::mem::take(&mut self.to_prove);
         let mut missing: Vec<u32> = to_prove
             .iter()
@@ -423,6 +432,9 @@ impl Pass<'_> {
         missing.dedup();
         for heights in missing.chunks(BATCH) {
             let headers = client.batch_block_header(heights.iter().copied())?;
+            if headers.len() != heights.len() {
+                return Err(false_proof());
+            }
             for (height, header) in heights.iter().zip(headers) {
                 chain.headers.insert(*height, header);
             }
@@ -430,23 +442,29 @@ impl Pass<'_> {
         for batch in to_prove.chunks(BATCH) {
             let proofs = client
                 .batch_transaction_get_merkle(batch.iter().map(|(txid, h)| (*txid, *h as usize)))?;
+            if proofs.len() != batch.len() {
+                return Err(false_proof());
+            }
             for ((txid, height), proof) in batch.iter().zip(proofs) {
-                let Some(header) = chain.headers.get(height) else {
-                    continue;
-                };
-                if electrum_client::utils::validate_merkle_proof(txid, &header.merkle_root, &proof)
-                {
-                    self.update.anchors.insert((
-                        ConfirmationBlockTime {
-                            block_id: BlockId {
-                                height: *height,
-                                hash: header.block_hash(),
-                            },
-                            confirmation_time: u64::from(header.time),
-                        },
-                        *txid,
-                    ));
+                let header = chain.headers.get(height).ok_or_else(false_proof)?;
+                match check_confirmation(network, *height, header, *txid, &proof) {
+                    Proof::Holds => {}
+                    Proof::Unsure => {
+                        self.update.seen_ats.insert((*txid, self.start_time));
+                        continue;
+                    }
+                    Proof::False => return Err(false_proof()),
                 }
+                self.update.anchors.insert((
+                    ConfirmationBlockTime {
+                        block_id: BlockId {
+                            height: *height,
+                            hash: header.block_hash(),
+                        },
+                        confirmation_time: u64::from(header.time),
+                    },
+                    *txid,
+                ));
             }
         }
         Ok(())

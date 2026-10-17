@@ -105,6 +105,36 @@ pub(crate) fn header_at(height: u32) -> String {
     })
 }
 
+/// The merkle root of a block of `txids`, and the branch of the one at
+/// `pos` as a server spells it: each hash reversed, in hex. The last
+/// node of an odd row is paired with a copy of itself, as consensus
+/// builds the tree. No transaction, no root: all zeroes.
+pub(crate) fn merkle_of(txids: &[Txid], pos: usize) -> ([u8; 32], Vec<String>) {
+    use bdk_wallet::bitcoin::hashes::{Hash, sha256d};
+    let mut row: Vec<[u8; 32]> = txids.iter().map(|txid| txid.to_byte_array()).collect();
+    let mut index = pos;
+    let mut branch = Vec::new();
+    while row.len() > 1 {
+        if row.len() % 2 == 1 {
+            row.push(*row.last().unwrap());
+        }
+        let mut sibling = row[index ^ 1];
+        sibling.reverse();
+        branch.push(data_encoding::HEXLOWER.encode(&sibling));
+        row = row
+            .chunks(2)
+            .map(|pair| {
+                let mut inner = [0u8; 64];
+                inner[..32].copy_from_slice(&pair[0]);
+                inner[32..].copy_from_slice(&pair[1]);
+                sha256d::Hash::hash(&inner).to_byte_array()
+            })
+            .collect();
+        index /= 2;
+    }
+    (row.first().copied().unwrap_or_default(), branch)
+}
+
 /// A transaction spending `inputs` to `outputs`, each a script in hex
 /// and an amount. Nothing in it comes from a key: no signature, no
 /// witness, only what anyone can write.
@@ -186,6 +216,12 @@ pub(crate) struct ElectrumState {
     /// What the server says it runs, first in its answer to
     /// `server.version`.
     pub software: &'static str,
+    /// Headers served as they are at their height, whatever the chain
+    /// below them: real ones, or forged.
+    pub served: HashMap<u32, bdk_wallet::bitcoin::block::Header>,
+    /// The merkle branch sent for a transaction, as hashes in hex and a
+    /// position, in place of the empty one.
+    pub branches: HashMap<Txid, (Vec<String>, usize)>,
 }
 
 /// Heights past which the fake Electrum server makes a header up on the
@@ -200,16 +236,35 @@ impl ElectrumState {
         serialize_hex(&self.header_of(height))
     }
 
-    /// The header at `height`: the signet genesis block at 0, so a
-    /// descriptor wallet's chain meets the server's there, and above it
-    /// the header of [`header_at`] with the one below as its parent,
-    /// whose merkle root is the txid of the transaction a history puts at
-    /// that height, if any: the one transaction of its block.
-    fn header_of(&self, height: u32) -> bdk_wallet::bitcoin::block::Header {
+    /// The transactions the histories put at `height`, in the order
+    /// their block holds them: by txid.
+    fn mined_at(&self, height: i64) -> Vec<Txid> {
+        let mut mined: Vec<Txid> = self
+            .histories
+            .values()
+            .flatten()
+            .filter(|(_, at)| *at == height)
+            .map(|(txid, _)| *txid)
+            .collect();
+        mined.sort();
+        mined.dedup();
+        mined
+    }
+
+    /// The header at `height`: one [`ElectrumState::served`] as it is,
+    /// or else the signet genesis block at 0, so a descriptor wallet's
+    /// chain meets the server's there, and above it the header of
+    /// [`header_at`] with the one below as its parent, whose merkle root
+    /// is the root of the transactions the histories put at that height
+    /// ([`merkle_of`]), if any.
+    pub(crate) fn header_of(&self, height: u32) -> bdk_wallet::bitcoin::block::Header {
         use bdk_wallet::bitcoin::TxMerkleNode;
         use bdk_wallet::bitcoin::block::Header;
         use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
         use bdk_wallet::bitcoin::hashes::Hash;
+        if let Some(served) = self.served.get(&height) {
+            return *served;
+        }
         let mut header = bdk_wallet::bitcoin::constants::genesis_block(
             self.genesis.unwrap_or(bdk_wallet::bitcoin::Network::Signet),
         )
@@ -217,15 +272,16 @@ impl ElectrumState {
         if height > CHAINED_UP_TO {
             return deserialize_hex(&header_at(height)).unwrap();
         }
-        let mut mined: HashMap<i64, Txid> = HashMap::new();
-        for (txid, at) in self.histories.values().flatten() {
-            mined.entry(*at).or_insert(*txid);
+        let mut mined: HashMap<i64, Vec<Txid>> = HashMap::new();
+        for (_, at) in self.histories.values().flatten() {
+            mined.entry(*at).or_insert_with(|| self.mined_at(*at));
         }
         for at in 1..=height {
             let mut next: Header = deserialize_hex(&header_at(at)).unwrap();
             next.prev_blockhash = header.block_hash();
-            if let Some(txid) = mined.get(&i64::from(at)) {
-                next.merkle_root = TxMerkleNode::from_byte_array(txid.to_byte_array());
+            if let Some(txids) = mined.get(&i64::from(at)) {
+                let (root, _) = merkle_of(txids, 0);
+                next.merkle_root = TxMerkleNode::from_byte_array(root);
             }
             header = next;
         }
@@ -391,13 +447,23 @@ impl FakeElectrum {
                 let hex: String = (start..end).map(|height| state.header(height)).collect();
                 json!({ "count": end.saturating_sub(start), "hex": hex, "max": 2016 })
             }
-            // The only transaction of its block, whose merkle root is
-            // its txid: an empty branch proves it.
-            "blockchain.transaction.get_merkle" => json!({
-                "block_height": request["params"][1].as_u64().unwrap_or(0),
-                "merkle": [],
-                "pos": 0,
-            }),
+            // Its branch in the block the histories make of its height,
+            // unless one was set for it.
+            "blockchain.transaction.get_merkle" => {
+                let height = request["params"][1].as_i64().unwrap_or(0);
+                let txid = param.as_str().and_then(|txid| txid.parse::<Txid>().ok());
+                let (merkle, pos) = match txid.and_then(|txid| state.branches.get(&txid)) {
+                    Some(set) => set.clone(),
+                    None => {
+                        let mined = state.mined_at(height);
+                        let pos = txid
+                            .and_then(|txid| mined.iter().position(|at| *at == txid))
+                            .unwrap_or(0);
+                        (merkle_of(&mined, pos).1, pos)
+                    }
+                };
+                json!({ "block_height": height, "merkle": merkle, "pos": pos })
+            }
             "blockchain.scripthash.subscribe" => {
                 state.connections[index].0.push(scripthash.clone());
                 // A status set by the test, or the one of the history,

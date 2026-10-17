@@ -18,6 +18,12 @@
 //! now, is kept as it is, with the time of its block: a sync reads what
 //! is new or moved, and the transactions its inputs spend, not a round
 //! of a thousand transactions and their parents for each payment.
+//!
+//! What is new or moved and confirmed is proven, as a descriptor
+//! wallet's confirmations are: the header of its block and its merkle
+//! branch ([`crate::chain::proof`]). A proof that does not hold refuses
+//! the server. The coins are read against what was read and proven
+//! ([`coins`]): what the server says of a coin alone confirms nothing.
 
 use std::collections::{HashMap, HashSet};
 
@@ -28,9 +34,12 @@ use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use serde::Deserialize;
 use serde_json::json;
 
+use electrum_client::GetMerkleRes;
+
 use super::rpc::{CallError, Connection};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
+use crate::chain::proof::{FALSE_PROOF, Proof, check_confirmation};
 use crate::chain::{KEEP_MAX, Kept};
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
@@ -46,6 +55,9 @@ pub(crate) const CONFIRMED_PER_ROUND: usize = HISTORY_PAGES_PER_ROUND * 25;
 const TXS_AT_ONCE: usize = 10;
 /// Blocks whose time is read for one round, at most.
 const MAX_HEADERS: usize = 2_000;
+/// What a server that lists a coin its own transaction does not pay is
+/// refused with.
+pub(crate) const COIN_NOT_PAID: &str = "the server listed a coin its transaction does not pay";
 
 #[derive(Deserialize)]
 struct Tip {
@@ -59,11 +71,12 @@ struct Entry {
     height: i64,
 }
 
+/// A coin as `listunspent` lists it. The height it gives is not read:
+/// a coin is as confirmed as its transaction ([`coins`]).
 #[derive(Deserialize)]
 struct Unspent {
     tx_hash: Txid,
     tx_pos: u32,
-    height: i64,
     value: u64,
 }
 
@@ -128,35 +141,48 @@ async fn state_in_rounds_of(
     let (round, cursor) = round_of(&history, None, per_round)?;
     let kept = Kept::up_to(KEEP_MAX);
     let mut txs = read(&mut connection, &round, &ours, network, &kept, held).await?;
+    let unproven = unproven(&round, held);
 
     // The time of a block a transaction kept from `held` has already.
     let mut times: HashMap<u32, u64> = txs
         .iter()
         .filter_map(|tx| Some((tx.height?, tx.timestamp?)))
         .collect();
-    let heights: Vec<u32> = txs
+    let (mut past, unread) = past_the_round(&unspent, &history, &round, held);
+    // The blocks to prove in first, those of the coins past the round
+    // among them, then those whose time is still to read.
+    let heights: Vec<u32> = unproven
         .iter()
-        .filter_map(|tx| tx.height)
-        .chain(unspent.iter().filter_map(|coin| height_of(coin.height)))
-        .filter(|height| !times.contains_key(height))
+        .chain(&unread)
+        .map(|(_, height)| *height)
+        .chain(
+            txs.iter()
+                .filter_map(|tx| tx.height)
+                .filter(|height| !times.contains_key(height)),
+        )
         .collect();
-    times.extend(block_times(&mut connection, heights).await?);
+    let headers = block_headers(&mut connection, heights).await?;
+    let unsure = prove(&mut connection, network, &unproven, &headers).await?;
+    past.extend(prove_past(&mut connection, network, &ours, &unspent, &unread, &headers).await?);
+    times.extend(
+        headers
+            .found
+            .iter()
+            .map(|(height, header)| (*height, u64::from(header.time))),
+    );
     for tx in &mut txs {
+        if unsure.contains(&tx.txid) {
+            tx.height = None;
+        }
         tx.timestamp = tx.height.and_then(|height| times.get(&height).copied());
     }
-    let utxos = unspent
-        .into_iter()
-        .map(|coin| {
-            let height = height_of(coin.height);
-            AddressUtxo {
-                txid: coin.tx_hash.to_string(),
-                vout: coin.tx_pos,
-                value_sats: coin.value,
-                height,
-                timestamp: height.and_then(|height| times.get(&height).copied()),
-            }
-        })
-        .collect();
+    // The time of the blocks of what the wallet holds past the round.
+    times.extend(
+        held.iter()
+            .filter(|tx| tx.txid.parse().is_ok_and(|txid: Txid| past.contains(&txid)))
+            .filter_map(|tx| Some((tx.height?, tx.timestamp?))),
+    );
+    let utxos = coins(unspent, &history, &txs, &past, &times)?;
     Ok(AddressWatchState {
         txs,
         utxos,
@@ -184,10 +210,18 @@ async fn history_in_rounds_of(
     let (round, cursor) = round_of(&history, Some(from), per_round)?;
     let kept = Kept::up_to(KEEP_MAX);
     let mut txs = read(&mut connection, &round, &ours, network, &kept, &[]).await?;
-    let heights: Vec<u32> = txs.iter().filter_map(|tx| tx.height).collect();
-    let times = block_times(&mut connection, heights).await?;
+    let unproven = unproven(&round, &[]);
+    let heights: Vec<u32> = unproven.iter().map(|(_, height)| *height).collect();
+    let headers = block_headers(&mut connection, heights).await?;
+    let unsure = prove(&mut connection, network, &unproven, &headers).await?;
     for tx in &mut txs {
-        tx.timestamp = tx.height.and_then(|height| times.get(&height).copied());
+        if unsure.contains(&tx.txid) {
+            tx.height = None;
+        }
+        tx.timestamp = tx
+            .height
+            .and_then(|height| headers.found.get(&height))
+            .map(|header| u64::from(header.time));
     }
     Ok(HistoryRound { txs, cursor })
 }
@@ -459,36 +493,262 @@ async fn check_network(connection: &mut Connection, network: Network) -> Result<
     Ok(())
 }
 
-/// The time of the blocks at these heights, from their headers. Past
-/// [`MAX_HEADERS`] distinct heights the rest stay without a time.
-async fn block_times(
+/// The headers of a round, by height: those asked for, those the server
+/// sent, and the words of its refusal for those it would not.
+struct Headers {
+    asked: HashSet<u32>,
+    found: HashMap<u32, Header>,
+    refused: HashMap<u32, String>,
+}
+
+/// The headers of the blocks at these heights, the first ones first.
+/// Past [`MAX_HEADERS`] distinct heights the rest are not read. A header
+/// the server cannot send leaves its transactions without a time, or, to
+/// be proven, unproven.
+async fn block_headers(
     connection: &mut Connection,
     heights: impl IntoIterator<Item = u32>,
-) -> Result<HashMap<u32, u64>, String> {
+) -> Result<Headers, String> {
     let mut seen = HashSet::new();
     let heights: Vec<u32> = heights
         .into_iter()
         .filter(|height| seen.insert(*height))
         .take(MAX_HEADERS)
         .collect();
-    let mut times = HashMap::new();
+    let mut headers = Headers {
+        asked: heights.iter().copied().collect(),
+        found: HashMap::new(),
+        refused: HashMap::new(),
+    };
     connection
         .batch::<String>(
             "blockchain.block.header",
             heights.iter().map(|height| json!([height])).collect(),
             |index, answer| {
-                // A block the server cannot describe leaves its
-                // transactions without a time, nothing more.
-                if let Ok(hex) = answer
-                    && let Ok(header) = deserialize_hex::<Header>(&hex)
-                {
-                    times.insert(heights[index], u64::from(header.time));
+                match answer.map(|hex| deserialize_hex::<Header>(&hex)) {
+                    Ok(Ok(header)) => {
+                        headers.found.insert(heights[index], header);
+                    }
+                    Ok(Err(_)) => {}
+                    Err(error) => {
+                        headers.refused.insert(heights[index], error.to_string());
+                    }
                 }
                 Ok(())
             },
         )
         .await?;
-    Ok(times)
+    Ok(headers)
+}
+
+/// The confirmations of a round the wallet does not hold at the height
+/// the server gives them: a transaction it holds there is kept as it is,
+/// as [`read`] keeps it.
+fn unproven(round: &[Picked], held: &[AddressTx]) -> Vec<(Txid, u32)> {
+    let held: HashMap<&str, Option<u32>> = held
+        .iter()
+        .map(|tx| (tx.txid.as_str(), tx.height))
+        .collect();
+    round
+        .iter()
+        .filter_map(|(txid, height)| {
+            let height = (*height)?;
+            (held.get(txid.to_string().as_str()) != Some(&Some(height))).then_some((*txid, height))
+        })
+        .collect()
+}
+
+/// Proves each of `unproven` in the block at its height: its merkle
+/// branch, against the header `headers` holds for it
+/// ([`check_confirmation`]). One the server cannot prove, or proves with
+/// a branch or a header that does not hold, refuses the server; the
+/// server's refusal of a header it was asked for is said in its words.
+/// Returns the txids of the confirmations left unsure, which stay
+/// unconfirmed: among them, those whose header was past what a round
+/// reads ([`MAX_HEADERS`]).
+async fn prove(
+    connection: &mut Connection,
+    network: Network,
+    unproven: &[(Txid, u32)],
+    headers: &Headers,
+) -> Result<HashSet<String>, String> {
+    if let Some(words) = unproven
+        .iter()
+        .find_map(|(_, height)| headers.refused.get(height))
+    {
+        return Err(words.clone());
+    }
+    let mut proofs = vec![Proof::False; unproven.len()];
+    connection
+        .batch::<GetMerkleRes>(
+            "blockchain.transaction.get_merkle",
+            unproven
+                .iter()
+                .map(|(txid, height)| json!([txid.to_string(), height]))
+                .collect(),
+            |index, answer| {
+                let (txid, height) = unproven[index];
+                proofs[index] = match (answer, headers.found.get(&height)) {
+                    _ if !headers.asked.contains(&height) => Proof::Unsure,
+                    (Ok(branch), Some(header)) => {
+                        check_confirmation(network, height, header, txid, &branch)
+                    }
+                    // What a server answers when a block came in since
+                    // it listed the history.
+                    (Err(CallError::Refused(_)), _) => Proof::Unsure,
+                    _ => Proof::False,
+                };
+                Ok(())
+            },
+        )
+        .await?;
+    if proofs.contains(&Proof::False) {
+        return Err(FALSE_PROOF.to_owned());
+    }
+    Ok(unproven
+        .iter()
+        .zip(proofs)
+        .filter(|(_, proof)| *proof == Proof::Unsure)
+        .map(|((txid, _), _)| txid.to_string())
+        .collect())
+}
+
+/// The transactions past the round whose coins may be confirmed where
+/// the history puts them: those the wallet holds there, paying the coin
+/// as listed, vouched for already; and the others, to read again and
+/// prove there ([`prove_past`]), with their height.
+fn past_the_round(
+    unspent: &[Unspent],
+    history: &[Entry],
+    round: &[Picked],
+    held: &[AddressTx],
+) -> (HashSet<Txid>, Vec<(Txid, u32)>) {
+    let in_round: HashSet<Txid> = round.iter().map(|(txid, _)| *txid).collect();
+    let mut listed: HashMap<Txid, Option<u32>> = HashMap::new();
+    for entry in history {
+        listed
+            .entry(entry.tx_hash)
+            .or_insert_with(|| height_of(entry.height));
+    }
+    let mut vouched = HashSet::new();
+    let mut unread: Vec<(Txid, u32)> = Vec::new();
+    for coin in unspent {
+        if in_round.contains(&coin.tx_hash) {
+            continue;
+        }
+        let Some(Some(height)) = listed.get(&coin.tx_hash).copied() else {
+            continue;
+        };
+        let txid = coin.tx_hash.to_string();
+        let holds = held.iter().any(|tx| {
+            tx.txid == txid
+                && tx.height == Some(height)
+                && tx
+                    .outputs
+                    .get(coin.tx_pos as usize)
+                    .is_some_and(|output| output.is_mine && output.value_sats == Some(coin.value))
+        });
+        if holds {
+            vouched.insert(coin.tx_hash);
+        } else if !unread.contains(&(coin.tx_hash, height)) {
+            unread.push((coin.tx_hash, height));
+        }
+    }
+    (vouched, unread)
+}
+
+/// Reads again each transaction of `unread`, past the round, and proves
+/// it where the history puts it ([`prove`]). One read that does not pay
+/// the coins listed of it refuses the server, as a proof that does not
+/// hold does; one whose proof is unsure is left out of those returned.
+async fn prove_past(
+    connection: &mut Connection,
+    network: Network,
+    ours: &ScriptBuf,
+    unspent: &[Unspent],
+    unread: &[(Txid, u32)],
+    headers: &Headers,
+) -> Result<HashSet<Txid>, String> {
+    if unread.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let txids: Vec<Txid> = unread.iter().map(|(txid, _)| *txid).collect();
+    let read: HashMap<Txid, Transaction> = txids
+        .iter()
+        .copied()
+        .zip(fetch_txs(connection, &txids).await?)
+        .collect();
+    for coin in unspent {
+        if let Some(tx) = read.get(&coin.tx_hash) {
+            let pays = tx.output.get(coin.tx_pos as usize).is_some_and(|output| {
+                output.script_pubkey == *ours && output.value.to_sat() == coin.value
+            });
+            if !pays {
+                return Err(COIN_NOT_PAID.to_owned());
+            }
+        }
+    }
+    let unsure = prove(connection, network, unread, headers).await?;
+    Ok(txids
+        .into_iter()
+        .filter(|txid| !unsure.contains(&txid.to_string()))
+        .collect())
+}
+
+/// The coins of the address, as far as what was read vouches for each.
+/// A coin of a transaction of the round must be an output of it that
+/// pays the address that much, or the server is refused, and it is as
+/// confirmed as that transaction. One of a transaction past the round is
+/// confirmed where the history puts it once [`past_the_round`] vouches
+/// for it. Any other one is taken as unconfirmed: what the server says of
+/// a coin alone confirms nothing. A coin listed twice counts once.
+fn coins(
+    unspent: Vec<Unspent>,
+    history: &[Entry],
+    txs: &[AddressTx],
+    past: &HashSet<Txid>,
+    times: &HashMap<u32, u64>,
+) -> Result<Vec<AddressUtxo>, String> {
+    let in_round: HashMap<&str, &AddressTx> = txs.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
+    let mut listed: HashMap<Txid, Option<u32>> = HashMap::new();
+    for entry in history {
+        listed
+            .entry(entry.tx_hash)
+            .or_insert_with(|| height_of(entry.height));
+    }
+    let mut seen = HashSet::new();
+    let mut coins = Vec::new();
+    for coin in unspent {
+        if !seen.insert((coin.tx_hash, coin.tx_pos)) {
+            continue;
+        }
+        let txid = coin.tx_hash.to_string();
+        let height = match in_round.get(txid.as_str()) {
+            Some(tx) => {
+                let pays = tx
+                    .outputs
+                    .get(coin.tx_pos as usize)
+                    .is_some_and(|output| output.is_mine && output.value_sats == Some(coin.value));
+                if !pays {
+                    return Err(COIN_NOT_PAID.to_owned());
+                }
+                tx.height
+            }
+            None => listed
+                .get(&coin.tx_hash)
+                .copied()
+                .flatten()
+                .filter(|_| past.contains(&coin.tx_hash)),
+        };
+        coins.push(AddressUtxo {
+            txid,
+            vout: coin.tx_pos,
+            value_sats: coin.value,
+            height,
+            timestamp: height.and_then(|height| times.get(&height).copied()),
+        });
+    }
+    Ok(coins)
 }
 
 /// One transaction as seen from the watched address: the shape the
@@ -864,6 +1124,70 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, "unexpected response");
+    }
+
+    /// A coin of a transaction past the round counts as confirmed once
+    /// that transaction, read again, pays it and is proven where the
+    /// history puts it, or once the wallet holds it there: a server that
+    /// fills the round with what it can prove and lists a coin past it,
+    /// of any value, confirms nothing it cannot back.
+    #[tokio::test]
+    async fn a_coin_past_the_round_counts_once_proven() {
+        let server = FakeElectrum::start().await;
+        let (parent, payment, _) = story();
+        let newer = transaction(&[nowhere(3, 0)], &[(OURS, 1_000)]);
+        for tx in [&parent, &payment, &newer] {
+            server.add_tx(tx);
+        }
+        let paid = payment.compute_txid();
+        server.set_history(OURS, &[(paid, 90), (newer.compute_txid(), 95)]);
+        let state_with = |held: Vec<AddressTx>| {
+            let target = target(&server);
+            async move { state_in_rounds_of(&target, ADDRESS, Network::Signet, None, 1, &held).await }
+        };
+        let asked = |method: &str| {
+            let state = server.state.lock().unwrap();
+            state.asked.iter().filter(|asked| *asked == method).count()
+        };
+
+        server.set_unspent(OURS, &[(paid, 0, 90, 50_000)]);
+        let state = state_with(Vec::new()).await.unwrap();
+        assert_eq!(state.txs.len(), 1, "the round holds the newer one alone");
+        assert_eq!(state.utxos[0].height, Some(90));
+        assert_eq!(state.utxos[0].timestamp, Some(1_700_000_090));
+
+        // Held there, paying it: nothing read again for it.
+        let held = {
+            let whole =
+                state_in_rounds_of(&target(&server), ADDRESS, Network::Signet, None, 10, &[])
+                    .await
+                    .unwrap();
+            whole.txs
+        };
+        let (got, proofs) = (
+            asked("blockchain.transaction.get"),
+            asked("blockchain.transaction.get_merkle"),
+        );
+        let state = state_with(held).await.unwrap();
+        assert_eq!(state.utxos[0].height, Some(90));
+        assert_eq!(asked("blockchain.transaction.get"), got);
+        assert_eq!(asked("blockchain.transaction.get_merkle"), proofs);
+
+        // More than its transaction pays.
+        server.set_unspent(OURS, &[(paid, 0, 90, 5_000_000)]);
+        let refused = state_with(Vec::new()).await.unwrap_err();
+        assert!(refused.contains("does not pay"), "{refused}");
+
+        // A branch that does not hold, for the coin past the round.
+        server.set_unspent(OURS, &[(paid, 0, 90, 50_000)]);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .branches
+            .insert(paid, (vec!["ab".repeat(32)], 0));
+        let refused = state_with(Vec::new()).await.unwrap_err();
+        assert_eq!(refused, crate::chain::proof::FALSE_PROOF);
     }
 
     /// An onion server without a route to it: nothing is opened.
