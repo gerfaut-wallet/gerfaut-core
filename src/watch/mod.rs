@@ -612,10 +612,12 @@ pub(crate) struct Timings {
     /// The same for a server that took none, which leaves the watch
     /// nothing to push: kept a shorter while.
     pub zero_limit_kept: Duration,
-    /// For the live alerts too: how long after the watch starts, or
-    /// takes a new configuration, a sync waits for its first session at
-    /// the most: see [`LiveWatch::first_pass`]. Through Tor, the longer
-    /// of this and `tor_connect`.
+    /// For the live alerts too: how long after the watch starts, takes
+    /// a new configuration or gets its first wallets, a sync waits for
+    /// its first session at the most: see [`LiveWatch::first_pass`].
+    /// When a server of the configuration is a `.onion`, the longer of
+    /// this and `tor_connect`: Tor carries the connections to onion
+    /// servers, and to no other.
     pub first_session: Duration,
 }
 
@@ -655,9 +657,10 @@ impl Timings {
 }
 
 enum Command {
-    Wallets(Vec<WatchedWallet>),
-    /// The new configuration, the wallets, and the count of
-    /// configurations handed over so far, this one included.
+    /// The wallets, and the count of setups handed over so far, this
+    /// one included: see [`LiveWatch::first_pass`].
+    Wallets(Vec<WatchedWallet>, u64),
+    /// The new configuration, the wallets, and the count of setups.
     Reconfigure(Box<WatchConfig>, Vec<WatchedWallet>, u64),
     Tick,
     Stop,
@@ -673,38 +676,39 @@ pub struct LiveWatch {
     /// The server of the last session, while the watch still counts on
     /// it: see [`LiveWatch::held`].
     held: watch::Receiver<Option<(Network, Endpoint)>>,
-    /// Where the first pass of the latest configuration the watcher took
-    /// stands: see [`LiveWatch::first_pass`].
+    /// Where the first pass of the latest setup the watcher took stands:
+    /// see [`LiveWatch::first_pass`].
     first_pass: watch::Receiver<FirstPass>,
-    /// The configurations handed to the watcher so far, the first one
-    /// counted: the watcher may not have taken the latest yet.
-    configurations: std::sync::atomic::AtomicU64,
+    /// The setups handed to the watcher so far, configurations and lists
+    /// of wallets, the first one counted: the watcher may not have taken
+    /// the latest yet.
+    setups: std::sync::atomic::AtomicU64,
     /// Set once to stop the watcher, whatever it is waiting on.
     halt: watch::Sender<bool>,
 }
 
-/// The first pass of a configuration over its servers, which a sync
-/// that names no server waits out: see [`LiveWatch::first_pass`].
+/// The first pass of the watch over its servers, which a sync that names
+/// no server waits out: see [`LiveWatch::first_pass`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FirstPass {
-    /// The configuration it belongs to, counted from 1.
-    configuration: u64,
-    /// Until when a sync waits for it; `None` once it is over: a session
-    /// opened, every server was tried, there is nothing to watch, or
-    /// the configuration names a single server, which leaves a sync no
-    /// other.
+    /// The latest setup the watcher took, counted from 1.
+    setup: u64,
+    /// Until when a sync waits for the pass; `None` once it is over: a
+    /// session opened, every server was tried, there is nothing to
+    /// watch, or the configuration names a single server, which leaves
+    /// a sync no other.
     until: Option<Instant>,
 }
 
-/// How long a sync waits for the watcher to take a configuration just
-/// handed to it, which it does between two awaits: a bound, never
-/// reached in practice.
-const TAKE_CONFIGURATION: Duration = Duration::from_secs(1);
+/// How long a sync waits for the watcher to take a setup just handed to
+/// it, which it does between two awaits: a bound, never reached in
+/// practice.
+const TAKE_SETUP: Duration = Duration::from_secs(1);
 
 impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Command::Wallets(_) => "Wallets",
+            Command::Wallets(..) => "Wallets",
             Command::Reconfigure(..) => "Reconfigure",
             Command::Tick => "Tick",
             Command::Stop => "Stop",
@@ -745,7 +749,7 @@ impl LiveWatch {
         let (serving_tx, serving) = watch::channel(None);
         let (held_tx, held) = watch::channel(None);
         let (first_pass_tx, first_pass) = watch::channel(FirstPass {
-            configuration: 1,
+            setup: 1,
             until: None,
         });
         let mut hub = Hub {
@@ -784,7 +788,7 @@ impl LiveWatch {
                 serving,
                 held,
                 first_pass,
-                configurations: std::sync::atomic::AtomicU64::new(1),
+                setups: std::sync::atomic::AtomicU64::new(1),
                 halt,
             },
             WatchEvents { events },
@@ -794,16 +798,22 @@ impl LiveWatch {
     /// Replaces the list of what is watched: after a sync, a wallet
     /// added or removed. Scripts already subscribed stay as they are.
     pub fn set_wallets(&self, wallets: Vec<WatchedWallet>) {
-        let _ = self.commands.send(Command::Wallets(wallets));
+        let _ = self
+            .commands
+            .send(Command::Wallets(wallets, self.next_setup()));
+    }
+
+    /// Counts one more setup handed to the watcher.
+    fn next_setup(&self) -> u64 {
+        self.setups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
     }
 
     /// Another network, another backend, other Tor settings, a newly
     /// accepted certificate: the connection is reopened under them.
     pub fn reconfigure(&self, config: WatchConfig, wallets: Vec<WatchedWallet>) {
-        let count = self
-            .configurations
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
+        let count = self.next_setup();
         let _ = self
             .commands
             .send(Command::Reconfigure(Box::new(config), wallets, count));
@@ -849,34 +859,31 @@ impl LiveWatch {
         self.held.borrow().clone()
     }
 
-    /// Waits for the end of the first pass of the watch's latest
-    /// configuration over its servers: a session open, none to be had
-    /// from any of them, nothing to watch, or the watch stopped. One
-    /// deadline per configuration, [`Timings::first_session`] after the
-    /// watcher took it, so that a server that does not answer holds the
-    /// syncs back that long once, not each of them in turn; past it, and
-    /// once the pass is over, this returns at once. A configuration that
-    /// names a single server has nothing to wait for. Owns what it waits
-    /// on: the handle may go while it waits.
+    /// Waits for the end of the watch's first pass over its servers: a
+    /// session open, none to be had from any of them, nothing to watch,
+    /// or the watch stopped. A pass opens when the watch starts, when it
+    /// takes a new configuration, and when wallets come to a watch that
+    /// had none to follow, an empty vault that gets its first wallet:
+    /// one deadline each, [`Timings::first_session`] after the watcher
+    /// took it, so that a server that does not answer holds the syncs
+    /// back that long once, not each of them in turn; past it, and once
+    /// the pass is over, this returns at once. A configuration that names
+    /// a single server has nothing to wait for. Owns what it waits on:
+    /// the handle may go while it waits.
     pub(crate) fn first_pass(&self) -> impl Future<Output = ()> + Send + 'static {
         let mut pass = self.first_pass.clone();
-        let wanted = self
-            .configurations
-            .load(std::sync::atomic::Ordering::SeqCst);
+        let wanted = self.setups.load(std::sync::atomic::Ordering::SeqCst);
         let halted = *self.halt.borrow();
         async move {
             if halted {
                 return;
             }
-            let taking = Instant::now() + TAKE_CONFIGURATION;
+            let taking = Instant::now() + TAKE_SETUP;
             loop {
-                let FirstPass {
-                    configuration,
-                    until,
-                } = *pass.borrow_and_update();
+                let FirstPass { setup, until } = *pass.borrow_and_update();
                 let until = match until {
-                    // The watcher is still on an older configuration.
-                    _ if configuration < wanted => taking,
+                    // The watcher is still on an older setup.
+                    _ if setup < wanted => taking,
                     Some(until) => until,
                     None => return,
                 };
@@ -1629,8 +1636,17 @@ impl Hub {
                     self.serve(None);
                     Wake::Reconfigured
                 }
-                Some(Command::Wallets(wallets)) => {
+                Some(Command::Wallets(wallets, count)) => {
+                    let had_none = self.watched.entries.is_empty();
                     self.watched = Watched::new(wallets, WatchLimits::of(&self.config.backend));
+                    // A watch that had nothing to follow opened no session:
+                    // its first one starts now, and the sync of the wallet
+                    // just added waits for it.
+                    if had_none && !self.watched.entries.is_empty() {
+                        self.open_first_pass(count);
+                    } else {
+                        self.first_pass.send_modify(|pass| pass.setup = count);
+                    }
                     let kept: HashSet<&String> =
                         self.watched.wallets.iter().map(|(id, _)| id).collect();
                     self.debounce.pending.retain(|id, _| kept.contains(id));
@@ -1665,11 +1681,11 @@ impl Hub {
         self.debounce = Debouncer::default();
     }
 
-    /// Starts the first pass of configuration `count`: a sync that names
-    /// no server waits for it, [`Timings::first_session`] at most, or
-    /// `tor_connect` when a server is reached through Tor. Over at once
-    /// when the configuration names a single server: a sync has no other
-    /// to go to.
+    /// Starts the first pass of setup `count`: a sync that names no
+    /// server waits for it, [`Timings::first_session`] at most, or
+    /// `tor_connect` when a server is an onion, reached through Tor. Over
+    /// at once when the configuration names a single server: a sync has
+    /// no other to go to.
     fn open_first_pass(&self, count: u64) {
         let until = match candidates(&self.config) {
             Ok(servers) if servers.len() > 1 => {
@@ -1683,7 +1699,7 @@ impl Hub {
             _ => None,
         };
         self.first_pass.send_replace(FirstPass {
-            configuration: count,
+            setup: count,
             until,
         });
     }

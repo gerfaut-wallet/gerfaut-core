@@ -1037,6 +1037,48 @@ async fn the_first_pass_has_one_deadline_per_configuration() {
     manager.live_stop().await;
 }
 
+/// A watch started on an empty vault has no session to open, and its
+/// first pass is over at once; the first wallet added opens one, which
+/// the sync of that wallet waits for, instead of going to the head of
+/// the rotation while the watch reaches its operator.
+#[tokio::test]
+async fn the_first_wallet_of_an_empty_watch_waits_for_its_session() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let stalled = FakeElectrum::start().await;
+    stalled.state.lock().unwrap().silent = true;
+    let _stand_in = crate::chain::public::stand_in(
+        &[format!("http://{}/api", rotation.address)],
+        &[format!("tcp://{}", stalled.address)],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let manager = WalletManager::open(dir.path(), key()).unwrap();
+    manager.set_active_network(Network::Signet).await.unwrap();
+    let budget = Duration::from_millis(800);
+    let pace = crate::watch::Timings {
+        connect: Duration::from_secs(60),
+        first_session: budget,
+        ..timings()
+    };
+    let _events = manager.live_start_with(Some(pace)).await.unwrap();
+    // Past the deadline of the empty start, whatever it was.
+    tokio::time::sleep(budget * 2).await;
+
+    let parsed = crate::input::parse_input(ADDRESS).unwrap();
+    let wallet = manager
+        .add_wallet("Watched", &parsed, Network::Signet)
+        .await
+        .unwrap()
+        .id;
+    let started = std::time::Instant::now();
+    manager.sync_wallet(&wallet).await.unwrap();
+    let first = started.elapsed();
+    assert!(
+        first >= budget * 3 / 4,
+        "the first sync of the first wallet went out at once: {first:?}"
+    );
+    manager.live_stop().await;
+}
+
 /// A server behind the wallet whose chain never meets the wallet's, one
 /// of another network: the sync fails, saying so once the first block
 /// differs, and the payment the wallet holds is not taken for gone from
