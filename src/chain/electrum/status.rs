@@ -39,7 +39,7 @@ use crate::chain::Endpoint;
 
 /// One transaction of a history: its txid and height, 0 or -1 for the
 /// mempool.
-type Entry = (Txid, i32);
+pub(crate) type Entry = (Txid, i32);
 
 /// Transactions of a mempool tried in every order, at most: 720 orders.
 const REORDERED_MAX: usize = 6;
@@ -98,13 +98,55 @@ pub(crate) enum Verdict {
     SetAside,
 }
 
+/// The histories of one script a sync reads, checked against what a
+/// live watch heard of it from the same server: the first one, then the
+/// one read again when the first asks for it. Both sync paths, a
+/// descriptor wallet's and a watched address's, go through it.
+pub(crate) struct Check<'a> {
+    told: Option<&'a Told>,
+    script: &'a Script,
+    /// What the wallet holds on the script.
+    expected: &'a HashSet<Txid>,
+    asked_again: bool,
+}
+
+impl<'a> Check<'a> {
+    pub(crate) fn new(
+        told: Option<&'a Told>,
+        script: &'a Script,
+        expected: &'a HashSet<Txid>,
+    ) -> Self {
+        Check {
+            told,
+            script,
+            expected,
+            asked_again: false,
+        }
+    }
+
+    /// What to do with the history the server listed: read when no
+    /// status was heard for the script, or when it cannot be spelled as
+    /// one (`None`, a height past what a status holds); otherwise see
+    /// [`verdict`]. [`Verdict::AskAgain`] comes once at most: the answer
+    /// to it is read or set aside.
+    pub(crate) fn verdict(&mut self, listed: Option<&[Entry]>) -> Verdict {
+        let status = self.told.and_then(|told| told.status_of(self.script));
+        let (Some(status), Some(listed)) = (status, listed) else {
+            return Verdict::Read;
+        };
+        let verdict = verdict(listed, status.as_deref(), self.expected, self.asked_again);
+        self.asked_again = true;
+        verdict
+    }
+}
+
 /// What a sync does with `history`, listed by a server that announced
 /// `status` for the script, the wallet holding `expected` there. Read
 /// when it hashes to the status ([`agreement`]), or leaves out nothing
 /// the wallet holds; otherwise asked for once more when the order may be
 /// at fault ([`Agreement::asks_again`]), then, `asked_again`, read when
 /// no order can be told for it, and set aside when it still disagrees.
-pub(crate) fn verdict(
+fn verdict(
     history: &[Entry],
     status: Option<&str>,
     expected: &HashSet<Txid>,

@@ -28,7 +28,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::rpc::{CallError, Connection};
-use super::status::{Told, Verdict, scripthash, verdict};
+use super::status::{Check, Told, Verdict, scripthash};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
 use crate::chain::{KEEP_MAX, Kept};
@@ -188,28 +188,20 @@ async fn stood_by(
     hash: &str,
     history: Vec<Entry>,
 ) -> Result<Option<Vec<Entry>>, String> {
-    let entries = |history: &[Entry]| -> Option<Vec<(Txid, i32)>> {
-        history
+    let expected: HashSet<Txid> = held.iter().filter_map(|tx| tx.txid.parse().ok()).collect();
+    let mut check = Check::new(told, ours, &expected);
+    let mut history = history;
+    loop {
+        let listed: Option<Vec<(Txid, i32)>> = history
             .iter()
             .map(|entry| Some((entry.tx_hash, i32::try_from(entry.height).ok()?)))
-            .collect()
-    };
-    let expected: HashSet<Txid> = held.iter().filter_map(|tx| tx.txid.parse().ok()).collect();
-    let mut history = history;
-    for asked_again in [false, true] {
-        let (Some(status), Some(listed)) = (
-            told.and_then(|told| told.status_of(ours)),
-            entries(&history),
-        ) else {
-            return Ok(Some(history));
-        };
-        match verdict(&listed, status.as_deref(), &expected, asked_again) {
+            .collect();
+        match check.verdict(listed.as_deref()) {
             Verdict::Read => return Ok(Some(history)),
             Verdict::SetAside => return Ok(None),
             Verdict::AskAgain => history = self::history(connection, hash).await?,
         }
     }
-    Ok(None)
 }
 
 async fn history_in_rounds_of(

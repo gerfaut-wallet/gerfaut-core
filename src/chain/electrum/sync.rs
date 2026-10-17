@@ -31,7 +31,7 @@ use bdk_wallet::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use electrum_client::{self, ElectrumApi, GetHistoryRes};
 
-use super::status::{Told, Verdict, verdict};
+use super::status::{Check, Entry, Told, Verdict};
 use crate::chain::{
     ANOTHER_NETWORK, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX, has_proof_of_work,
     height_limit,
@@ -160,29 +160,24 @@ fn stood_by(
     script: &ScriptBuf,
     history: Vec<GetHistoryRes>,
 ) -> Result<Option<Vec<GetHistoryRes>>, Error> {
-    let entries = |history: &[GetHistoryRes]| -> Vec<(Txid, i32)> {
-        history
-            .iter()
-            .map(|entry| (entry.tx_hash, entry.height))
-            .collect()
-    };
     let none = HashSet::new();
     let expected = held
         .scripts
         .get(script)
         .map_or(&none, |facts| &facts.expected);
+    let mut check = Check::new(told, script, expected);
     let mut history = history;
-    for asked_again in [false, true] {
-        let Some(status) = told.and_then(|told| told.status_of(script)) else {
-            return Ok(Some(history));
-        };
-        match verdict(&entries(&history), status.as_deref(), expected, asked_again) {
+    loop {
+        let listed: Vec<Entry> = history
+            .iter()
+            .map(|entry| (entry.tx_hash, entry.height))
+            .collect();
+        match check.verdict(Some(&listed)) {
             Verdict::Read => return Ok(Some(history)),
             Verdict::SetAside => return Ok(None),
             Verdict::AskAgain => history = client.script_get_history(script)?,
         }
     }
-    Ok(None)
 }
 
 /// The server's chain against the wallet's.
