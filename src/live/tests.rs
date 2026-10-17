@@ -988,6 +988,55 @@ async fn a_sync_never_goes_first_where_the_watch_failed() {
     manager.live_stop().await;
 }
 
+/// The first pass has one deadline, counted from the start of the
+/// watch: a server that never answers holds the first sync back once,
+/// not every sync in turn. A new configuration opens a pass of its own,
+/// which the syncs wait out again.
+#[tokio::test]
+async fn the_first_pass_has_one_deadline_per_configuration() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let stalled = FakeElectrum::start().await;
+    stalled.state.lock().unwrap().silent = true;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager, wallet) = automatic(dir.path(), &rotation, &[&stalled]).await;
+    let budget = Duration::from_millis(800);
+    let pace = crate::watch::Timings {
+        connect: Duration::from_secs(60),
+        first_session: budget,
+        ..timings()
+    };
+    let _events = manager.live_start_with(Some(pace)).await.unwrap();
+    let timed = async || {
+        let started = std::time::Instant::now();
+        manager.sync_wallet(&wallet).await.unwrap();
+        started.elapsed()
+    };
+    let first = timed().await;
+    let second = timed().await;
+    assert!(
+        first >= budget * 3 / 4,
+        "the first sync went out at once: {first:?}"
+    );
+    assert!(
+        second < budget / 2,
+        "the second sync waited again: {second:?}"
+    );
+
+    manager
+        .set_tor_settings(crate::chain::tor::TorSettings {
+            mode: crate::chain::tor::TorMode::System,
+            socks_proxy: None,
+        })
+        .await
+        .unwrap();
+    let third = timed().await;
+    assert!(
+        third >= budget * 3 / 4,
+        "a new configuration was not waited for: {third:?}"
+    );
+    manager.live_stop().await;
+}
+
 /// A server behind the wallet whose chain never meets the wallet's, one
 /// of another network: the sync fails, saying so once the first block
 /// differs, and the payment the wallet holds is not taken for gone from
