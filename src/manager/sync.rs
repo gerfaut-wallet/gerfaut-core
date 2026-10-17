@@ -298,34 +298,7 @@ impl WalletManager {
             let (config, certs) = state.chain_setup(record.meta.network);
             (meta, config, certs)
         };
-        // The server of the watch that asked for this sync: it told of
-        // the change, so it holds what changed. For any other sync, the
-        // server a running watch talks to, or last talked to
-        // (`live_server`): it already sees every script the watch
-        // follows, and a sync there shows the wallet to no second
-        // operator. Only a server a watch of the wallet's own network
-        // may talk to under its backend: the watch may have moved to
-        // another network, or another backend, since the sync was asked
-        // for, and a wallet's addresses never go to a server its backend
-        // does not name.
-        let first = prefer
-            .or_else(|| self.live_server())
-            .filter(|(network, prefer)| {
-                *network == meta.network
-                    && crate::watch::servers_for(&config, meta.network, &certs)
-                        .is_ok_and(|allowed| allowed.contains(prefer))
-            })
-            .map(|(_, prefer)| prefer);
-        let answered = meta
-            .last_sync
-            .as_ref()
-            .and_then(|stamp| stamp.server.as_deref());
-        let endpoints = sync_order(
-            chain::endpoints(&config, meta.network, &certs)?,
-            answered,
-            first.clone(),
-        );
-        let endpoints = self.relegated_last(endpoints, first.as_ref());
+        let endpoints = self.sync_endpoints(&meta, &config, &certs, prefer)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
 
         match &meta.kind {
@@ -570,7 +543,7 @@ impl WalletManager {
         let Some(cursor) = cursor else {
             return Ok(0);
         };
-        let endpoints = self.relegated_last(chain::endpoints(&config, meta.network, &certs)?, None);
+        let endpoints = self.sync_endpoints(&meta, &config, &certs, None)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
 
         let mut attempts: Vec<String> = Vec::new();
@@ -617,6 +590,46 @@ impl WalletManager {
             }
         }
         Err(sync_failure(&endpoints, attempts))
+    }
+
+    /// The servers a sync of the wallet of `meta` tries, in order.
+    ///
+    /// `prefer` is the server of the watch that asked for the sync: it
+    /// told of the change, so it holds what changed. For any other sync,
+    /// and for the older history of a watched address, the server a
+    /// running watch talks to, or last talked to (`live_server`): it
+    /// already sees every script the watch follows, and reading there
+    /// shows the wallet to no second operator. Only a server a watch of
+    /// the wallet's own network may talk to under its backend: the watch
+    /// may have moved to another network, or another backend, since, and
+    /// a wallet's addresses never go to a server its backend does not
+    /// name. Then [`sync_order`], the relegated servers last
+    /// ([`Relegations`]), and never before the server of the watch.
+    fn sync_endpoints(
+        &self,
+        meta: &WalletMeta,
+        config: &chain::BackendConfig,
+        certs: &chain::TrustedCerts,
+        prefer: Option<(Network, Endpoint)>,
+    ) -> CoreResult<Vec<Endpoint>> {
+        let first = prefer
+            .or_else(|| self.live_server())
+            .filter(|(network, prefer)| {
+                *network == meta.network
+                    && crate::watch::servers_for(config, meta.network, certs)
+                        .is_ok_and(|allowed| allowed.contains(prefer))
+            })
+            .map(|(_, prefer)| prefer);
+        let answered = meta
+            .last_sync
+            .as_ref()
+            .and_then(|stamp| stamp.server.as_deref());
+        let endpoints = sync_order(
+            chain::endpoints(config, meta.network, certs)?,
+            answered,
+            first.clone(),
+        );
+        Ok(self.relegated_last(endpoints, first.as_ref()))
     }
 
     /// `endpoints` with the ones relegated now tried after the others:

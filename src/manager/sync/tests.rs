@@ -348,3 +348,49 @@ async fn an_old_relegation_is_forgotten() {
         rotation
     );
 }
+
+/// The older history of a watched address goes first to the server the
+/// watch talks to, as a sync does, and is never put behind another: it
+/// already sees the address.
+#[tokio::test]
+async fn older_history_goes_first_to_the_server_of_the_watch() {
+    use crate::testkit::{FakeElectrum, FakeMempool};
+    let rotation = FakeMempool::start(false, 0).await;
+    let live = FakeElectrum::start().await;
+    let _stand_in = crate::chain::public::stand_in(
+        &[format!("http://{}/api", rotation.address)],
+        &[format!("tcp://{}", live.address)],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let watcher = manager(dir.path()).await;
+    watcher.set_active_network(Network::Signet).await.unwrap();
+    let parsed = parse_input(crate::testkit::ADDRESS).unwrap();
+    let wallet = watcher
+        .add_wallet("Watch", &parsed, Network::Signet)
+        .await
+        .unwrap();
+    let _events = watcher.live_start_with(None).await.unwrap();
+    let started = std::time::Instant::now();
+    while watcher.live_server().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the watch never connected"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (_, served) = watcher.live_server().unwrap();
+    let (config, certs) = watcher.state.lock().await.chain_setup(Network::Signet);
+    let meta = watcher.list_wallets(None).await.remove(0);
+    assert_eq!(meta.id, wallet.id);
+    let order = watcher
+        .sync_endpoints(&meta, &config, &certs, None)
+        .unwrap();
+    assert_eq!(order[0], served);
+    // Down for a sync, it stays first all the same.
+    watcher.answered_after(&order[1], &[&served]);
+    let order = watcher
+        .sync_endpoints(&meta, &config, &certs, None)
+        .unwrap();
+    assert_eq!(order[0], served);
+    watcher.live_stop().await;
+}
