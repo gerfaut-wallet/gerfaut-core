@@ -1173,6 +1173,47 @@ async fn a_server_found_behind_is_left_alone() {
     assert_eq!(behind.subscriptions().len(), 1, "the watch went to it");
 }
 
+/// A session that opens on a tip below a block the watch already heard
+/// of compares at once, without waiting for the hours without a block:
+/// the server the watch comes back to may be the one that stopped.
+#[tokio::test]
+async fn a_session_that_opens_behind_compares_at_once() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (stuck, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    stuck.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    other.state.lock().unwrap().height = 101;
+    let _stand_in = automatic(&rotation, &[&stuck, &other]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            refused: Duration::from_millis(300),
+            ..timings()
+        }),
+    );
+    // The first one turned away a moment, the watch hears of block 101
+    // from the other.
+    until(&watch, "on the other", |_| {
+        watch.serving().map(|(_, at)| at) == Some(electrum_endpoint(&other))
+    })
+    .await;
+    stuck.state.lock().unwrap().genesis = None;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Back on the first one, at 100.
+    other.hang_up();
+    within("back on the first", WAIT, || {
+        stuck.subscriptions().len() == 2
+    })
+    .await;
+    until(&watch, "on the other again", |_| {
+        watch.serving().map(|(_, at)| at) == Some(electrum_endpoint(&other))
+    })
+    .await;
+    let looked = other.subscriptions();
+    assert_eq!(looked.len(), 3, "the session, a look, the session");
+    assert!(looked[1].is_empty());
+}
+
 /// When the wait without a block runs out, the server is asked for its
 /// tip again before any other is: one that moved without a word, or
 /// whose word is still on its way, is not compared on an old tip.

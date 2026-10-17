@@ -28,9 +28,11 @@
 //! another Electrum server of the same operator is read on a connection
 //! of its own that asks for nothing else. The one of the two that is
 //! behind is left alone for a quarter of an hour: when it is the
-//! session's, the watch moves to the other one. No other operator is
-//! ever asked, since it would learn from which address the app is used,
-//! and an onion server is compared with onion servers only.
+//! session's, the watch moves to the other one. A session that opens
+//! on a tip below one the watch already heard of looks at once. No
+//! other operator is ever asked, since it would learn from which address
+//! the app is used, and an onion server is compared with onion servers
+//! only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -408,6 +410,14 @@ impl Session {
                 Request::Headers if !refused => {
                     if let Some(height) = height_of(&message["result"]) {
                         self.tip = Some(height);
+                        // Below a block the watch already heard of, from
+                        // the server it left or one before: this one may
+                        // be the one that stopped, and is not given two
+                        // hours to show it.
+                        if hub.tip.is_some_and(|heard| height < heard) {
+                            self.look = tip_elsewhere(hub, &self.endpoint)
+                                .map_or(Look::Idle, Look::Probing);
+                        }
                         hub.new_tip(height, false);
                     }
                 }
