@@ -8,8 +8,7 @@
     "currency": "eur",
     "source": "coingecko",
     "range": "day",
-    "at": 1750000000,
-    "credit": "Powered by CoinGecko"
+    "at": 1750000000
   },
   "year": {
     "points": [
@@ -20,7 +19,6 @@
     "currency": "eur",
     "source": "mempool_space",
     "range": "year",
-    "at": 1750000000,
-    "credit": null
+    "at": 1750000000
   }
 }

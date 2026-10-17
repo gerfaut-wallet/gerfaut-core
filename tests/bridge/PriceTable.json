@@ -216,12 +216,17 @@
       {
         "source": "mempool_space",
         "label": "mempool.space",
-        "ranges": ["day", "week", "month", "year", "max"]
+        "ranges": ["day", "week", "month", "year", "max"],
+        "credit": null
       },
       {
         "source": "coingecko",
         "label": "CoinGecko",
-        "ranges": ["day", "week", "month", "year"]
+        "ranges": ["day", "week", "month", "year"],
+        "credit": {
+          "text": "Powered by CoinGecko",
+          "url": "https://www.coingecko.com"
+        }
       }
     ],
     "refresh_secs": 60

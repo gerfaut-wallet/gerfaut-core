@@ -43,15 +43,18 @@ impl PriceSource {
     }
 
     /// The credit the source's terms ask for wherever its data is on
-    /// screen, word for word; `None` when they ask for none.
+    /// screen; `None` when they ask for none.
     ///
     /// CoinGecko's API terms ask for "Powered by CoinGecko", shown
-    /// prominently in a legible font, and its attribution guide puts it
-    /// close to the data, above or below it. mempool.space asks for
-    /// nothing.
-    pub fn credit(self) -> Option<&'static str> {
+    /// prominently in a legible font; its attribution guide puts it
+    /// close to the data, above or below it, as a link to its site.
+    /// mempool.space asks for nothing.
+    pub fn credit(self) -> Option<Credit> {
         match self {
-            PriceSource::Coingecko => Some("Powered by CoinGecko"),
+            PriceSource::Coingecko => Some(Credit {
+                text: "Powered by CoinGecko".to_owned(),
+                url: "https://www.coingecko.com".to_owned(),
+            }),
             PriceSource::MempoolSpace => None,
         }
     }
@@ -243,6 +246,20 @@ pub struct SourceEntry {
     pub label: String,
     /// The chart ranges it serves without a key, shortest first.
     pub ranges: Vec<PriceRange>,
+    /// What its terms ask to be shown with its data
+    /// ([`PriceSource::credit`]): each screen that shows a price or an
+    /// amount it priced shows the credit once, under the data. `None`,
+    /// nothing is shown.
+    pub credit: Option<Credit>,
+}
+
+/// The credit a price source asks for beside its data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Credit {
+    /// Word for word, as its terms write it.
+    pub text: String,
+    /// The page the words link to, opened in the browser.
+    pub url: String,
 }
 
 /// The currencies and sources on offer, and how often a price is asked.
@@ -270,6 +287,7 @@ pub fn price_table() -> PriceTable {
                     .into_iter()
                     .filter(|&range| source.supports(range))
                     .collect(),
+                credit: source.credit(),
             })
             .collect(),
         refresh_secs: REFRESH_SECS,
@@ -285,12 +303,6 @@ pub struct PriceQuote {
     pub source: PriceSource,
     /// Unix timestamp, seconds, when the quote was fetched.
     pub at: u64,
-    /// What the source asks to be shown with its data, word for word
-    /// ([`PriceSource::credit`]). A screen that shows this price, or an
-    /// amount priced by it, shows the credit once, under the data; with
-    /// none, it shows nothing.
-    #[serde(default)]
-    pub credit: Option<String>,
 }
 
 /// An HTTP client, optionally through a SOCKS proxy.
@@ -422,7 +434,6 @@ pub(crate) async fn fetch_price(
         currency,
         source,
         at: now_secs(),
-        credit: source.credit().map(str::to_owned),
     })
 }
 
@@ -446,10 +457,6 @@ pub struct PriceHistory {
     pub range: PriceRange,
     /// Unix timestamp, seconds, when the series was fetched.
     pub at: u64,
-    /// What the source asks to be shown with its data, word for word,
-    /// as for [`PriceQuote::credit`].
-    #[serde(default)]
-    pub credit: Option<String>,
 }
 
 /// Enough for a chart at any width; series are thinned above this.
@@ -506,7 +513,6 @@ pub(crate) async fn fetch_price_history(
         source,
         range,
         at: now,
-        credit: source.credit().map(str::to_owned),
     })
 }
 
@@ -596,24 +602,20 @@ mod tests {
     }
 
     /// CoinGecko's terms ask for its credit beside its data, word for
-    /// word; mempool.space asks for none.
+    /// word, linked to its site; mempool.space asks for none. The table
+    /// carries it with each source.
     #[test]
     fn a_source_gives_the_credit_its_terms_ask_for() {
-        assert_eq!(
-            PriceSource::Coingecko.credit(),
-            Some("Powered by CoinGecko")
-        );
+        let credit = PriceSource::Coingecko.credit().unwrap();
+        assert_eq!(credit.text, "Powered by CoinGecko");
+        assert_eq!(credit.url, "https://www.coingecko.com");
         assert_eq!(PriceSource::MempoolSpace.credit(), None);
-        let quote = PriceQuote {
-            rate: 1.0,
-            currency: FiatCurrency::Eur,
-            source: PriceSource::Coingecko,
-            at: 0,
-            credit: Some("Powered by CoinGecko".to_owned()),
-        };
+        for entry in price_table().sources {
+            assert_eq!(entry.credit, entry.source.credit());
+        }
         assert_eq!(
-            serde_json::to_value(&quote).unwrap()["credit"],
-            "Powered by CoinGecko"
+            serde_json::to_value(price_table().sources[1].credit.clone()).unwrap(),
+            serde_json::json!({"text": "Powered by CoinGecko", "url": "https://www.coingecko.com"})
         );
     }
 

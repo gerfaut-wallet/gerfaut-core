@@ -3,14 +3,12 @@
     "rate": 92034.25,
     "currency": "eur",
     "source": "mempool_space",
-    "at": 1750000000,
-    "credit": null
+    "at": 1750000000
   },
   "coingecko": {
     "rate": 1532870.0,
     "currency": "try",
     "source": "coingecko",
-    "at": 1750000000,
-    "credit": "Powered by CoinGecko"
+    "at": 1750000000
   }
 }
