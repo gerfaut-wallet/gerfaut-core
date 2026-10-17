@@ -9,8 +9,9 @@
 //! the largest satisfaction, so the estimate errs on the side of a lower
 //! rate.
 
+use bdk_wallet::bitcoin::key::TapTweak;
 use bdk_wallet::bitcoin::secp256k1::Secp256k1;
-use bdk_wallet::bitcoin::taproot::ControlBlock;
+use bdk_wallet::bitcoin::taproot::{ControlBlock, TapNodeHash};
 use bdk_wallet::bitcoin::{
     PublicKey, Script, ScriptBuf, Transaction, VarInt, Weight, XOnlyPublicKey,
 };
@@ -59,19 +60,32 @@ impl Satisfaction {
 }
 
 /// What a PSBT input carries that tells how it will be signed: the
-/// scripts behind a script hash, and the leaves of a taproot output.
-/// Its author's word: each is read only once the coin's script is seen
-/// to commit to it.
+/// scripts behind a script hash, the keys, the internal key and the
+/// leaves of a taproot output. Its author's word: each is read only
+/// once the coin's script is seen to commit to it.
 #[derive(Debug, Clone, Default)]
 pub struct SigningHints {
     pub redeem_script: Option<ScriptBuf>,
     pub witness_script: Option<ScriptBuf>,
     /// Each leaf script with the control block that reveals it.
     pub tap_leaves: Vec<(ScriptBuf, ControlBlock)>,
+    /// The internal key of a taproot output, and the root of its script
+    /// tree when it has one.
+    pub tap_internal_key: Option<XOnlyPublicKey>,
+    pub tap_merkle_root: Option<TapNodeHash>,
+    /// The keys the PSBT names for the input: its BIP-32 derivations,
+    /// in both encodings, and the keys of its partial signatures.
+    pub keys: Vec<PublicKey>,
 }
 
 impl SigningHints {
     pub(crate) fn of_psbt_input(input: &bdk_wallet::bitcoin::psbt::Input) -> Self {
+        // A derivation names the key without its encoding: both are
+        // offered, and the coin's hash picks the one it commits to.
+        let derived = input
+            .bip32_derivation
+            .keys()
+            .flat_map(|key| [PublicKey::new(*key), PublicKey::new_uncompressed(*key)]);
         SigningHints {
             redeem_script: input.redeem_script.clone(),
             witness_script: input.witness_script.clone(),
@@ -80,14 +94,21 @@ impl SigningHints {
                 .iter()
                 .map(|(control, (script, _))| (script.clone(), control.clone()))
                 .collect(),
+            tap_internal_key: input.tap_internal_key,
+            tap_merkle_root: input.tap_merkle_root,
+            keys: derived.chain(input.partial_sigs.keys().copied()).collect(),
         }
     }
 }
 
 /// What signing will add to an input spending `spent`, judged by the
 /// coin's script and what the PSBT says about it. `None` when neither
-/// tells: a script hash whose script the PSBT does not carry, or carries
-/// wrong, a script that is no miniscript, a bare script.
+/// tells, rather than a guess that could weigh less than the signature:
+/// a script hash whose script the PSBT does not carry, or carries wrong,
+/// a script that is no miniscript, a bare script, a key hash whose key
+/// the PSBT does not name (it may be the uncompressed one, 32 bytes
+/// more), a taproot output whose key path is not shown to be its only
+/// path.
 pub fn estimated(spent: &Script, hints: &SigningHints) -> Option<Satisfaction> {
     let key: PublicKey = ANY_KEY.parse().ok()?;
     let of = |descriptor: Result<Descriptor<PublicKey>, _>| {
@@ -99,10 +120,14 @@ pub fn estimated(spent: &Script, hints: &SigningHints) -> Option<Satisfaction> {
         return of(Descriptor::new_wpkh(key));
     }
     if spent.is_p2pkh() {
-        return of(Descriptor::new_pkh(key));
+        let named = hints
+            .keys
+            .iter()
+            .find(|key| ScriptBuf::new_p2pkh(&key.pubkey_hash()) == *spent)?;
+        return of(Descriptor::new_pkh(*named));
     }
     if spent.is_p2tr() {
-        return taproot(spent, &hints.tap_leaves);
+        return taproot(spent, hints);
     }
     // A script the coin's hash does not commit to says nothing of how it
     // will be spent.
@@ -143,10 +168,23 @@ fn segwit_ms(script: &Script) -> Option<Miniscript<PublicKey, Segwitv0>> {
 /// A taproot input: the key path, or the heaviest leaf the PSBT
 /// reveals, counted as miniscript counts a tree's leaves. A leaf that is
 /// no miniscript, or whose control block the output key does not commit
-/// to, leaves the weight unknown.
-fn taproot(spent: &Script, leaves: &[(ScriptBuf, ControlBlock)]) -> Option<Satisfaction> {
+/// to, leaves the weight unknown. With no leaf, the key path is counted
+/// only when the PSBT shows it is the only one: its internal key, tweaked
+/// with no script tree, is the output key. Otherwise a leaf the PSBT
+/// does not show may be the one spent, and its weight is unknown.
+fn taproot(spent: &Script, hints: &SigningHints) -> Option<Satisfaction> {
     let output_key = XOnlyPublicKey::from_slice(spent.as_bytes().get(2..34)?).ok()?;
     let secp = Secp256k1::verification_only();
+    let leaves = &hints.tap_leaves;
+    if leaves.is_empty() {
+        let internal = hints
+            .tap_internal_key
+            .filter(|_| hints.tap_merkle_root.is_none())?;
+        let (tweaked, _) = internal.tap_tweak(&secp, None);
+        if tweaked.to_x_only_public_key() != output_key {
+            return None;
+        }
+    }
     // One item: a 64-byte signature and its sighash byte, with its length.
     let key_path = VarInt(1).size() - VarInt(0).size() + 1 + 65;
     let mut heaviest = key_path;
@@ -156,6 +194,9 @@ fn taproot(spent: &Script, leaves: &[(ScriptBuf, ControlBlock)]) -> Option<Satis
         }
         let control = control.size();
         let ms = Miniscript::<XOnlyPublicKey, Tap>::parse_insane(script).ok()?;
+        // The satisfaction's elements and the script, as miniscript
+        // counts them (`max_satisfaction_witness_elements` includes the
+        // script); one more for the control block.
         let elements = ms.max_satisfaction_witness_elements().ok()?;
         let size = ms.max_satisfaction_size().ok()?;
         let script_size = script.len();
@@ -253,15 +294,38 @@ mod tests {
     }
 
     /// The key path of a taproot coin: a 64-byte signature, its sighash
-    /// byte at most.
+    /// byte at most. Counted only when the PSBT shows it is the only path:
+    /// its internal key, tweaked with no script tree, is the output key.
+    /// Without that, a leaf it does not show may be the one spent, far
+    /// heavier, and the weight is unknown rather than guessed low.
     #[test]
-    fn a_taproot_key_path_is_one_signature() {
-        let spk = ScriptBuf::from_hex(
-            "51200000000000000000000000000000000000000000000000000000000000000001",
-        )
-        .unwrap();
+    fn a_taproot_key_path_is_one_signature_when_shown_to_be_the_only_one() {
+        let secp = Secp256k1::verification_only();
+        let key: PublicKey = ANY_KEY.parse().unwrap();
+        let internal = XOnlyPublicKey::from(key.inner);
+        let spk = ScriptBuf::new_p2tr(&secp, internal, None);
+        assert_eq!(estimated(&spk, &SigningHints::default()), None);
+        let shown = SigningHints {
+            tap_internal_key: Some(internal),
+            ..Default::default()
+        };
+        // A script tree under it: the key path is one path among others.
+        let with_a_tree = SigningHints {
+            tap_merkle_root: Some(TapNodeHash::from_byte_array([7; 32])),
+            ..shown.clone()
+        };
+        assert_eq!(estimated(&spk, &with_a_tree), None);
+        // An internal key the output does not commit to.
+        let other: PublicKey = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+            .parse()
+            .unwrap();
+        let wrong = SigningHints {
+            tap_internal_key: Some(XOnlyPublicKey::from(other.inner)),
+            ..Default::default()
+        };
+        assert_eq!(estimated(&spk, &wrong), None);
         let tx = skeleton(1, p2wpkh());
-        let missing = estimated(&spk, &SigningHints::default()).unwrap();
+        let missing = estimated(&spk, &shown).unwrap();
         let estimate = weight_once_signed(&tx, &[Some(missing)]).to_wu();
         let mut signed = tx.clone();
         signed.input[0].witness = Witness::from_slice(&[[0x01; 64]]);
@@ -317,21 +381,38 @@ mod tests {
     /// signature goes in the script.
     #[test]
     fn a_legacy_spend_adds_no_witness() {
-        let spk = ScriptBuf::new_p2pkh(&bdk_wallet::bitcoin::PubkeyHash::from_byte_array([3; 20]));
+        let key: PublicKey = ANY_KEY.parse().unwrap();
         let tx = skeleton(1, p2wpkh());
-        let missing = estimated(&spk, &SigningHints::default()).unwrap();
-        assert!(!missing.witness);
-        let estimate = weight_once_signed(&tx, &[Some(missing)]).to_wu();
-        let mut signed = tx.clone();
-        signed.input[0].script_sig = bdk_wallet::bitcoin::script::Builder::new()
-            .push_slice([0x30; 72])
-            .push_slice([0x02; 33])
-            .into_script();
-        let real = signed.weight().to_wu();
-        assert!(
-            estimate >= real && estimate <= real + 4,
-            "{estimate} vs {real}"
-        );
+        for (key, length) in [(key, 33), (PublicKey::new_uncompressed(key.inner), 65)] {
+            let spk = ScriptBuf::new_p2pkh(&key.pubkey_hash());
+            // The key the coin's hash commits to, named by the PSBT: its
+            // own length, the uncompressed one 32 bytes longer.
+            let named = SigningHints {
+                keys: vec![
+                    PublicKey::new(key.inner),
+                    PublicKey::new_uncompressed(key.inner),
+                ],
+                ..Default::default()
+            };
+            let missing = estimated(&spk, &named).unwrap();
+            assert!(!missing.witness);
+            let estimate = weight_once_signed(&tx, &[Some(missing)]).to_wu();
+            let mut signed = tx.clone();
+            signed.input[0].script_sig = bdk_wallet::bitcoin::script::Builder::new()
+                .push_slice([0x30; 72])
+                .push_slice(
+                    <&bdk_wallet::bitcoin::script::PushBytes>::try_from(&vec![0x04; length][..])
+                        .unwrap(),
+                )
+                .into_script();
+            let real = signed.weight().to_wu();
+            assert!(
+                estimate >= real && estimate <= real + 4,
+                "{length}-byte key: {estimate} vs {real}"
+            );
+            // A key hash whose key the PSBT does not name may hide either.
+            assert_eq!(estimated(&spk, &SigningHints::default()), None);
+        }
     }
 
     /// What a finalized input carries is counted as it is.
@@ -456,8 +537,8 @@ mod tests {
             ..Default::default()
         };
         let missing = estimated(&spk, &hints).unwrap();
-        let key_path = estimated(&spk, &SigningHints::default()).unwrap();
-        assert!(missing.weight > key_path.weight);
+        // Heavier than the key path's one signature.
+        assert!(missing.weight > 66);
         // Signed through that leaf: a signature, the script, the control
         // block. The estimate is that, at most a byte over.
         let tx = skeleton(1, p2wpkh());
