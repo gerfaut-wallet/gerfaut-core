@@ -347,8 +347,8 @@ async fn get_json(url: &str, proxy: Option<&str>) -> CoreResult<serde_json::Valu
     serde_json::from_slice(&body).map_err(|e| price_error(e.to_string()))
 }
 
-/// Largest price answer read: the whole daily history of every currency
-/// mempool.space serves fits several times over.
+/// Largest price answer read: the whole history mempool.space serves in
+/// one currency fits many times over.
 const MAX_ANSWER: usize = 32 << 20;
 
 fn price_error(detail: String) -> CoreError {
@@ -488,8 +488,7 @@ pub(crate) async fn fetch_price_history(
             parse_coingecko_history(&value)?
         }
         PriceSource::MempoolSpace => {
-            // One endpoint, the full daily history for every currency.
-            let value = get_json("https://mempool.space/api/v1/historical-price", proxy).await?;
+            let value = get_json(&mempool_history_url(currency), proxy).await?;
             parse_mempool_history(&value, currency)?
         }
     };
@@ -531,6 +530,16 @@ fn parse_coingecko_history(value: &serde_json::Value) -> CoreResult<Vec<PricePoi
             })
         })
         .collect())
+}
+
+/// mempool.space's whole history in the one currency on screen. With no
+/// `currency`, a documented parameter, it answers every currency it
+/// serves; with one, that currency and the dollar.
+fn mempool_history_url(currency: FiatCurrency) -> String {
+    format!(
+        "https://mempool.space/api/v1/historical-price?currency={}",
+        currency.code()
+    )
 }
 
 /// mempool.space historical prices: `{"prices": [{"time": s, "USD": n, ...}]}`.
@@ -781,6 +790,20 @@ mod tests {
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].t, 1_700_000_000);
         assert_eq!(points[0].rate, 35000.5);
+    }
+
+    /// The history is asked in the currency on screen alone.
+    #[test]
+    fn mempool_history_asks_for_one_currency() {
+        assert_eq!(
+            mempool_history_url(FiatCurrency::Eur),
+            "https://mempool.space/api/v1/historical-price?currency=EUR"
+        );
+        for currency in FiatCurrency::ALL {
+            if PriceSource::MempoolSpace.supports_currency(*currency) {
+                assert!(mempool_history_url(*currency).ends_with(currency.code()));
+            }
+        }
     }
 
     #[test]
