@@ -355,7 +355,6 @@ impl WalletManager {
                     attempts.push(format!("{}: {detail}", endpoint.label()));
                 }
                 Ok(synced) => {
-                    self.answered_after(endpoint, &failed);
                     let mut state = self.state.lock().await;
                     state.orders.extend(synced.orders);
                     let vanishing = crate::live::news::vanishing(&state.payload, &meta.id);
@@ -416,6 +415,7 @@ impl WalletManager {
                         complete,
                     )?;
                     drop(state);
+                    self.answered_after(endpoint, &failed);
                     if complete && let Ok(mut done) = self.complete_here.lock() {
                         done.insert(meta.id.clone());
                     }
@@ -456,7 +456,6 @@ impl WalletManager {
                     attempts.push(format!("{}: {detail}", endpoint.label()));
                 }
                 Ok(mut watch) => {
-                    self.answered_after(endpoint, &failed);
                     let mut state = self.state.lock().await;
                     // Against the state as stored, before the older
                     // rounds are carried over into the fresh one.
@@ -510,6 +509,8 @@ impl WalletManager {
                         None,
                         true,
                     )?;
+                    drop(state);
+                    self.answered_after(endpoint, &failed);
                     return Ok((report, endpoint.clone()));
                 }
             }
@@ -565,7 +566,6 @@ impl WalletManager {
                     attempts.push(format!("{}: {detail}", endpoint.label()));
                 }
                 Ok(round) => {
-                    self.answered_after(endpoint, &failed);
                     let mut state = self.state.lock().await;
                     let record = find_record_mut(&mut state.payload, id)?;
                     let Some(watch) = record.address_state.as_mut() else {
@@ -585,6 +585,8 @@ impl WalletManager {
                     let tx_count = watch.txs.len() as u32;
                     record.meta.cached.tx_count = tx_count;
                     state.vault.save(&state.payload)?;
+                    drop(state);
+                    self.answered_after(endpoint, &failed);
                     return Ok(added);
                 }
             }

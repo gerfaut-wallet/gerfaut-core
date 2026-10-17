@@ -394,3 +394,37 @@ async fn older_history_goes_first_to_the_server_of_the_watch() {
     assert_eq!(order[0], served);
     watcher.live_stop().await;
 }
+
+/// A sync that fails once the server has answered, the vault not saved,
+/// relegates nothing: what failed may well be this device. The next
+/// wallet asks the first server first.
+#[tokio::test]
+async fn a_sync_that_fails_after_the_answer_relegates_nothing() {
+    use crate::testkit::FakeMempool;
+    let flaky = FakeMempool::start(false, 0).await;
+    let steady = FakeMempool::start(false, 0).await;
+    let _stand_in = crate::chain::public::stand_in(
+        &[
+            format!("http://{}/api", flaky.address),
+            format!("http://{}/api", steady.address),
+        ],
+        &[],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let watcher = manager(dir.path()).await;
+    let mut wallets = Vec::new();
+    for address in [crate::testkit::ADDRESS, SECOND_ADDRESS] {
+        let parsed = parse_input(address).unwrap();
+        let wallet = watcher.add_wallet(address, &parsed, Network::Signet).await;
+        wallets.push(wallet.unwrap().id);
+    }
+    flaky.state.lock().unwrap().down = true;
+    watcher.state.lock().await.vault.fail_saves(true);
+    assert!(watcher.sync_wallet(&wallets[0]).await.is_err());
+    assert!(!asked(&steady).is_empty(), "the other one answered");
+    watcher.state.lock().await.vault.fail_saves(false);
+    flaky.state.lock().unwrap().down = false;
+    asked(&flaky);
+    watcher.sync_wallet(&wallets[1]).await.unwrap();
+    assert!(!asked(&flaky).is_empty(), "relegated by a sync that failed");
+}
