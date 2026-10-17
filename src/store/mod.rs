@@ -1627,6 +1627,32 @@ mod tests {
         assert_eq!(vault.load().unwrap().settings.preferences.unit, Unit::Btc);
     }
 
+    /// A vault whose preferences hold a currency and no source, as a
+    /// record written by hand or by a build that kept no source would,
+    /// opens on a source that quotes it.
+    #[test]
+    fn a_vault_on_a_currency_alone_opens_on_a_source_that_quotes_it() {
+        use crate::price::{FiatCurrency, PriceSource};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let (vault, payload) = Vault::open_or_create(&path, key()).unwrap();
+        vault.save(&payload).unwrap();
+        drop(vault);
+        let plaintext = cipher::unseal(&std::fs::read(&path).unwrap(), &key()).unwrap();
+        let mut written: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
+        written["settings"]["preferences"] =
+            serde_json::json!({"fiat": true, "fiat_currency": "inr"});
+        let sealed = cipher::seal(&serde_json::to_vec(&written).unwrap(), &key()).unwrap();
+        std::fs::write(&path, sealed).unwrap();
+
+        let (_, reopened) = Vault::open_or_create(&path, key()).unwrap();
+        let preferences = reopened.settings.preferences;
+        assert!(preferences.fiat);
+        assert_eq!(preferences.fiat_currency, FiatCurrency::Inr);
+        assert_eq!(preferences.price_source, PriceSource::Coingecko);
+    }
+
     /// A vault whose preferences record names Kraken, which left the
     /// price sources, opens: the source reads as mempool.space, and
     /// every other setting it holds stands.

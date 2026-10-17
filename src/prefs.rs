@@ -28,9 +28,12 @@ pub enum Unit {
 }
 
 /// The preferences both apps keep, as the vault holds them. A field a
-/// vault never stored reads as its default.
+/// vault never stored reads as its default, and the pair of currency
+/// and source read is made one that exists, as [`Preferences::change`]
+/// makes it: a record that holds a currency and no source, or a source
+/// that does not quote the currency, never loads a price that fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "Stored")]
 pub struct Preferences {
     /// The unit of every amount. BTC by default.
     pub unit: Unit,
@@ -70,6 +73,67 @@ impl Default for Preferences {
             notify_new_tx: false,
             explorer_ack: false,
         }
+    }
+}
+
+/// The preferences as a record holds them, before the pair of currency
+/// and source is made one that exists.
+#[derive(Deserialize)]
+#[serde(default)]
+struct Stored {
+    unit: Unit,
+    masked: bool,
+    fiat: bool,
+    fiat_currency: FiatCurrency,
+    price_source: PriceSource,
+    notify_new_tx: bool,
+    explorer_ack: bool,
+}
+
+impl Default for Stored {
+    fn default() -> Self {
+        let Preferences {
+            unit,
+            masked,
+            fiat,
+            fiat_currency,
+            price_source,
+            notify_new_tx,
+            explorer_ack,
+        } = Preferences::default();
+        Stored {
+            unit,
+            masked,
+            fiat,
+            fiat_currency,
+            price_source,
+            notify_new_tx,
+            explorer_ack,
+        }
+    }
+}
+
+impl From<Stored> for Preferences {
+    fn from(stored: Stored) -> Self {
+        let Stored {
+            unit,
+            masked,
+            fiat,
+            fiat_currency,
+            price_source,
+            notify_new_tx,
+            explorer_ack,
+        } = stored;
+        Preferences {
+            unit,
+            masked,
+            fiat,
+            fiat_currency,
+            price_source,
+            notify_new_tx,
+            explorer_ack,
+        }
+        .quotable()
     }
 }
 
@@ -281,6 +345,39 @@ mod tests {
                 "explorer_ack": true,
             })
         );
+    }
+
+    /// A record whose source does not quote its currency, or that holds
+    /// a currency and no source, loads with a source that quotes it:
+    /// the default, mempool.space, gives way to CoinGecko, and the rest
+    /// stands.
+    #[test]
+    fn a_record_loads_with_a_source_that_quotes_its_currency() {
+        let alone: Preferences = serde_json::from_str(r#"{"fiat_currency":"inr"}"#).unwrap();
+        assert_eq!(alone.fiat_currency, FiatCurrency::Inr);
+        assert_eq!(alone.price_source, PriceSource::Coingecko);
+
+        let unquoted: Preferences = serde_json::from_str(
+            r#"{"unit":"sats","fiat":true,"fiat_currency":"ngn","price_source":"mempool_space"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            unquoted,
+            Preferences {
+                unit: Unit::Sats,
+                fiat: true,
+                fiat_currency: FiatCurrency::Ngn,
+                price_source: PriceSource::Coingecko,
+                ..Preferences::default()
+            }
+        );
+
+        // A pair that exists loads as it was.
+        let quoted: Preferences =
+            serde_json::from_str(r#"{"fiat_currency":"usd","price_source":"coingecko"}"#).unwrap();
+        assert_eq!(quoted.price_source, PriceSource::Coingecko);
+        let usd: Preferences = serde_json::from_str(r#"{"fiat_currency":"usd"}"#).unwrap();
+        assert_eq!(usd.price_source, PriceSource::MempoolSpace);
     }
 
     /// A record that names Kraken, which left the sources, reads as
