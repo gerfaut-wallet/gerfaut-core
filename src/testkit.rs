@@ -186,6 +186,8 @@ pub(crate) struct ElectrumState {
     pub genesis: Option<bdk_wallet::bitcoin::Network>,
     /// Every method asked for, in order, over every connection.
     pub asked: Vec<String>,
+    /// The same, each with its first parameter as text.
+    pub calls: Vec<(String, String)>,
     /// Connections the client closed.
     pub closed: usize,
     /// What the server says it runs, first in its answer to
@@ -298,6 +300,11 @@ impl FakeElectrum {
                     let (answer, gate) = {
                         let mut state = state.lock().unwrap();
                         state.asked.push(method.clone());
+                        let about = match &request["params"][0] {
+                            Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        };
+                        state.calls.push((method.clone(), about));
                         if state.silent || stalled {
                             continue;
                         }
@@ -488,6 +495,20 @@ impl FakeElectrum {
     /// Connections the client has closed so far.
     pub(crate) fn closed(&self) -> usize {
         self.state.lock().unwrap().closed
+    }
+
+    /// How many times the history of `script_hex` was asked for.
+    pub(crate) fn histories_of(&self, script_hex: &str) -> usize {
+        let hash = scripthash(script_hex);
+        self.state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(method, about)| {
+                method == "blockchain.scripthash.get_history" && *about == hash
+            })
+            .count()
     }
 
     /// Whether a request of this method has arrived.

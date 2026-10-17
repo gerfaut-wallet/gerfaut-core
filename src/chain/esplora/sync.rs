@@ -123,6 +123,8 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, String> {
         stop_gap,
         reading,
         held,
+        // Esplora gives no status to check a history against.
+        told: _,
     } = plan;
     // Before any history, and so never past it: the tip of the answer
     // is what the wallet counts itself synced up to.

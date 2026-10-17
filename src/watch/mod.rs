@@ -120,6 +120,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
+use crate::chain::electrum::status::Announced;
 use crate::chain::tor::TorSettings;
 use crate::chain::{self, BackendConfig, Endpoint, TrustedCerts};
 use crate::network::Network;
@@ -763,6 +764,8 @@ pub struct LiveWatch {
     held: watch::Receiver<Option<(Network, Endpoint)>>,
     /// Set once to stop the watcher, whatever it is waiting on.
     halt: watch::Sender<bool>,
+    /// What the server of the open session announced of each script.
+    announced: Announced,
 }
 
 impl std::fmt::Debug for Command {
@@ -808,7 +811,9 @@ impl LiveWatch {
         let (status_tx, status) = watch::channel(WatchStatus::default());
         let (serving_tx, serving) = watch::channel(None);
         let (held_tx, held) = watch::channel(None);
+        let announced = Announced::default();
         let mut hub = Hub {
+            announced: announced.clone(),
             serving: serving_tx,
             held: held_tx,
             config,
@@ -842,6 +847,7 @@ impl LiveWatch {
                 serving,
                 held,
                 halt,
+                announced,
             },
             WatchEvents { events },
         )
@@ -899,6 +905,12 @@ impl LiveWatch {
             return None;
         }
         self.held.borrow().clone()
+    }
+
+    /// The statuses the server of the open session announced, as a sync
+    /// on that server checks the histories it reads against them.
+    pub(crate) fn announced(&self) -> Announced {
+        self.announced.clone()
     }
 
     /// Stops the watcher and closes its connection, at once: the task
@@ -1414,6 +1426,8 @@ pub(crate) struct Hub {
     /// Electrum statuses by script hash: the baseline a reconnection is
     /// compared against.
     pub statuses: HashMap<String, Option<String>>,
+    /// The same, of the session open now only, for the syncs to read.
+    pub announced: Announced,
     /// Esplora counters by script hex: the same for polling.
     pub fingerprints: HashMap<String, poll::Fingerprint>,
     /// Scripts a mempool instance said it tracks per connection.
@@ -1931,6 +1945,7 @@ async fn watcher(mut hub: Hub, mut halted: watch::Receiver<bool>) {
     }
     hub.watched = Watched::default();
     hub.serve(None);
+    hub.announced.close();
     hub.held.send_replace(None);
     hub.set_status(|status| *status = WatchStatus::default());
 }
@@ -2024,7 +2039,10 @@ async fn run_once(hub: &mut Hub, endpoints: &[Endpoint], no_push: &mut Option<In
         match endpoint {
             Endpoint::Electrum(target) => {
                 let target = target.clone();
-                match electrum::run(hub, endpoint, &target).await {
+                let exit = electrum::run(hub, endpoint, &target).await;
+                // Whatever the session heard holds no longer.
+                hub.announced.close();
+                match exit {
                     // The next candidate may do.
                     Exit::Unreachable(detail) => {
                         hub.give_up_on(endpoint);

@@ -245,6 +245,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
     };
     hub.alive();
     hub.serve(Some(endpoint));
+    hub.announced.open(endpoint);
     hub.set_status(|status| {
         status.state = WatchState::Connected;
         status.transport = Some(WatchTransport::Electrum);
@@ -411,6 +412,7 @@ impl Session {
             self.provings.remove(&scripthash);
             self.queue.retain(|queued| *queued != scripthash);
             hub.statuses.remove(&scripthash);
+            hub.announced.forget(&scripthash);
             if self.can_unsubscribe {
                 self.request(
                     Request::Other,
@@ -602,6 +604,7 @@ impl Session {
             .map(|s| s.chars().take(64).collect::<String>());
         let lacking = entry.statuses.iter().any(|held| *held != status);
         let previous = hub.statuses.insert(scripthash.to_owned(), status.clone());
+        hub.announced.set(scripthash, status.clone());
         if !answer && previous.as_ref() != Some(&status) {
             // What was being proven of the status before is moot.
             self.provings.remove(scripthash);

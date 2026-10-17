@@ -29,6 +29,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::rpc::{CallError, Connection};
+use super::status::{Told, Verdict, verdict};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
 use crate::chain::{KEEP_MAX, Kept};
@@ -85,14 +86,27 @@ fn scripthash(script: &ScriptBuf) -> String {
 /// Fetches the complete state of a single watched address. `held` is
 /// what the wallet holds of it: a transaction it holds at the height the
 /// server lists it is kept as it is, and only the others are read.
+/// `None` when the history the server listed does not hash to the
+/// status it announced to a running watch (`told`) and leaves out a
+/// transaction of `held`: nothing was read, see [`super::status`].
 pub(crate) async fn fetch_state(
     target: &Target,
     address: &str,
     network: Network,
     proxy: Option<&str>,
     held: &[AddressTx],
-) -> Result<AddressWatchState, String> {
-    state_in_rounds_of(target, address, network, proxy, CONFIRMED_PER_ROUND, held).await
+    told: Option<&Told>,
+) -> Result<Option<AddressWatchState>, String> {
+    state_in_rounds_of(
+        target,
+        address,
+        network,
+        proxy,
+        CONFIRMED_PER_ROUND,
+        held,
+        told,
+    )
+    .await
 }
 
 /// Fetches the next round of older transactions, after `from`.
@@ -113,7 +127,8 @@ async fn state_in_rounds_of(
     proxy: Option<&str>,
     per_round: usize,
     held: &[AddressTx],
-) -> Result<AddressWatchState, String> {
+    told: Option<&Told>,
+) -> Result<Option<AddressWatchState>, String> {
     let ours = parse_address(address, network)?.script_pubkey();
     let hash = scripthash(&ours);
     let mut connection = Connection::open(target, proxy).await?;
@@ -122,6 +137,9 @@ async fn state_in_rounds_of(
         .call("blockchain.headers.subscribe", json!([]))
         .await?;
     let history = history(&mut connection, &hash).await?;
+    let Some(history) = stood_by(&mut connection, told, held, &ours, &hash, history).await? else {
+        return Ok(None);
+    };
     let unspent: Vec<Unspent> = connection
         .call("blockchain.scripthash.listunspent", json!([hash]))
         .await?;
@@ -157,13 +175,49 @@ async fn state_in_rounds_of(
             }
         })
         .collect();
-    Ok(AddressWatchState {
+    Ok(Some(AddressWatchState {
         txs,
         utxos,
         tip_height: tip.height,
         truncated: cursor.is_some(),
         history_cursor: cursor,
-    })
+    }))
+}
+
+/// The history of the address the server listed, when the sync reads
+/// it: see [`super::sync`], which checks a descriptor wallet's the same
+/// way, `held` being what the wallet expects there. `None` when it is
+/// set aside. A height past what a status can spell is not checked.
+async fn stood_by(
+    connection: &mut Connection,
+    told: Option<&Told>,
+    held: &[AddressTx],
+    ours: &ScriptBuf,
+    hash: &str,
+    history: Vec<Entry>,
+) -> Result<Option<Vec<Entry>>, String> {
+    let entries = |history: &[Entry]| -> Option<Vec<(Txid, i32)>> {
+        history
+            .iter()
+            .map(|entry| Some((entry.tx_hash, i32::try_from(entry.height).ok()?)))
+            .collect()
+    };
+    let expected: HashSet<Txid> = held.iter().filter_map(|tx| tx.txid.parse().ok()).collect();
+    let mut history = history;
+    for asked_again in [false, true] {
+        let (Some(status), Some(listed)) = (
+            told.and_then(|told| told.status_of(ours)),
+            entries(&history),
+        ) else {
+            return Ok(Some(history));
+        };
+        match verdict(&listed, status.as_deref(), &expected, asked_again) {
+            Verdict::Read => return Ok(Some(history)),
+            Verdict::SetAside => return Ok(None),
+            Verdict::AskAgain => history = self::history(connection, hash).await?,
+        }
+    }
+    Ok(None)
 }
 
 async fn history_in_rounds_of(
@@ -586,6 +640,20 @@ mod tests {
     use super::*;
     use crate::testkit::{FakeElectrum, nowhere, script, transaction};
 
+    /// The state of the address, read with no status heard: never set
+    /// aside.
+    async fn fetch_state(
+        target: &Target,
+        address: &str,
+        network: Network,
+        proxy: Option<&str>,
+        held: &[AddressTx],
+    ) -> Result<AddressWatchState, String> {
+        super::fetch_state(target, address, network, proxy, held, None)
+            .await
+            .map(|state| state.expect("nothing is set aside with no status heard"))
+    }
+
     /// The BIP-173 test vector address, and its script.
     const ADDRESS: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
     const OURS: &str = "0014751e76e8199196d454941c45d1b3a323f1433bd6";
@@ -779,8 +847,9 @@ mod tests {
         let txid = |n: usize| payments[n].compute_txid().to_string();
         let target = target(&server);
 
-        let first = state_in_rounds_of(&target, ADDRESS, Network::Signet, None, 2, &[])
+        let first = state_in_rounds_of(&target, ADDRESS, Network::Signet, None, 2, &[], None)
             .await
+            .unwrap()
             .unwrap();
         let listed: Vec<String> = first.txs.iter().map(|tx| tx.txid.clone()).collect();
         assert_eq!(listed, [txid(4), txid(3)]);

@@ -79,6 +79,7 @@ use tokio::task::JoinSet;
 use bdk_wallet::bitcoin::{Address, ScriptBuf};
 
 use crate::chain::Endpoint;
+use crate::chain::electrum::status::Told;
 use crate::error::CoreResult;
 use crate::manager::{ManagerState, Reach, WalletManager, ensure_engine, find_record};
 use crate::network::Network;
@@ -1150,6 +1151,18 @@ impl WalletManager {
         self.live_slot()
             .as_ref()
             .and_then(|running| running.watch.serving())
+    }
+
+    /// What a sync on `endpoint` checks the histories it reads against:
+    /// the statuses a running watch heard from that server, while its
+    /// session there is open ([`crate::chain::electrum::status`]).
+    pub(crate) fn told_on(&self, endpoint: &Endpoint) -> Option<Told> {
+        let slot = self.live_slot();
+        let watch = &slot.as_ref()?.watch;
+        matches!(endpoint, Endpoint::Electrum(_)).then(|| Told {
+            announced: watch.announced(),
+            server: endpoint.clone(),
+        })
     }
 
     /// The server a sync tries first while the live watch runs, and the

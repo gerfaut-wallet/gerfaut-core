@@ -18,7 +18,7 @@ use bdk_wallet::bitcoin::block::Header;
 use bdk_wallet::bitcoin::{Address, ScriptBuf, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 
-use super::{Reach, SyncSlot, WalletManager, apply_address_state, apply_synced};
+use super::{Reach, SyncSlot, WalletManager, apply_address_state, apply_synced, nothing_new};
 use crate::chain::electrum::status::history_status;
 use crate::chain::{self, Endpoint, has_proof_of_work};
 use crate::error::CoreResult;
@@ -168,26 +168,6 @@ fn carried(tip: &CheckPoint, headers: &Headers) -> Option<CheckPoint> {
         })
     });
     tip.clone().extend(above).ok()
-}
-
-/// A report of a wallet that took nothing: it held them already.
-fn nothing_new(
-    id: &str,
-    balance: crate::wallet::snapshot::BalanceSnapshot,
-    tip_height: u32,
-    server: &Endpoint,
-    started: Instant,
-) -> SyncReport {
-    SyncReport {
-        wallet_id: id.to_owned(),
-        new_tx_count: 0,
-        new_txs: Vec::new(),
-        confirmed_txs: Vec::new(),
-        balance,
-        tip_height,
-        took_ms: started.elapsed().as_millis() as u64,
-        backend: server.label(),
-    }
 }
 
 fn take_descriptor(

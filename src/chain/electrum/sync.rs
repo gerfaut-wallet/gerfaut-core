@@ -18,6 +18,10 @@
 //! - The coins a transaction spends are asked for only for a
 //!   transaction the wallet lacked, and only those it cannot find in
 //!   what it holds: they are what its fee is counted from.
+//! - A history read on the server of a running live watch that does not
+//!   hash to the status that server announced for the script, and
+//!   leaves out a transaction the wallet holds there, is set aside
+//!   unread ([`super::status`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -27,6 +31,7 @@ use bdk_wallet::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use electrum_client::{self, ElectrumApi, GetHistoryRes};
 
+use super::status::{Told, Verdict, verdict};
 use crate::chain::{
     ANOTHER_NETWORK, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX, has_proof_of_work,
     height_limit,
@@ -51,8 +56,10 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
         scans,
         stop_gap,
         held,
+        told,
         ..
     } = plan;
+    let told = told.as_ref();
     let mut chain = Chain::read(client, &tip, network, start_time)?;
     let mut pass = Pass {
         held: &held,
@@ -69,7 +76,9 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
     for batch in scripts.chunks(BATCH) {
         let histories = client.batch_script_get_history(batch.iter().map(|s| s.as_script()))?;
         for (script, history) in batch.iter().zip(histories) {
-            pass.take(script, &history, &chain);
+            if let Some(history) = stood_by(client, told, &held, script, history)? {
+                pass.take(script, &history, &chain);
+            }
         }
     }
 
@@ -84,6 +93,12 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
             let histories =
                 client.batch_script_get_history(batch.iter().map(|(_, s)| s.as_script()))?;
             for ((index, script), history) in batch.iter().zip(histories) {
+                // Set aside, it may hold something: the scan goes on.
+                let Some(history) = stood_by(client, told, &held, script, history)? else {
+                    covered.insert(script.clone());
+                    unused = 0;
+                    continue;
+                };
                 if history.is_empty() {
                     unused = unused.saturating_add(1);
                     if unused >= (stop_gap as usize).max(1) {
@@ -105,7 +120,9 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
     for batch in moved.chunks(BATCH) {
         let histories = client.batch_script_get_history(batch.iter().map(|s| s.as_script()))?;
         for (script, history) in batch.iter().zip(histories) {
-            pass.take(script, &history, &chain);
+            if let Some(history) = stood_by(client, told, &held, script, history)? {
+                pass.take(script, &history, &chain);
+            }
         }
     }
 
@@ -122,6 +139,42 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
         orders: pass.orders,
         drop_above: chain.dropped,
     })
+}
+
+/// The history of `script` the server listed, when the sync reads it:
+/// no status was heard from the server for the script, or the history
+/// stands up to it ([`verdict`]). `None` when it is set aside. The
+/// server is asked for it once more at most.
+fn stood_by(
+    client: &impl ElectrumApi,
+    told: Option<&Told>,
+    held: &Held,
+    script: &ScriptBuf,
+    history: Vec<GetHistoryRes>,
+) -> Result<Option<Vec<GetHistoryRes>>, Error> {
+    let entries = |history: &[GetHistoryRes]| -> Vec<(Txid, i32)> {
+        history
+            .iter()
+            .map(|entry| (entry.tx_hash, entry.height))
+            .collect()
+    };
+    let none = HashSet::new();
+    let expected = held
+        .scripts
+        .get(script)
+        .map_or(&none, |facts| &facts.expected);
+    let mut history = history;
+    for asked_again in [false, true] {
+        let Some(status) = told.and_then(|told| told.status_of(script)) else {
+            return Ok(Some(history));
+        };
+        match verdict(&entries(&history), status.as_deref(), expected, asked_again) {
+            Verdict::Read => return Ok(Some(history)),
+            Verdict::SetAside => return Ok(None),
+            Verdict::AskAgain => history = client.script_get_history(script)?,
+        }
+    }
+    Ok(None)
 }
 
 /// The server's chain against the wallet's.

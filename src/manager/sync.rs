@@ -176,6 +176,7 @@ fn plan_for(engine: &bdk_wallet::Wallet, reach: &Reach, gap_limit: u32) -> (chai
         stop_gap: gap_limit,
         reading,
         held,
+        told: None,
     };
     (plan, reach)
 }
@@ -364,12 +365,13 @@ impl WalletManager {
         for endpoint in endpoints {
             // Build a fresh plan under the lock (a plan is consumed by
             // each attempt).
-            let (plan, known, reach) = {
+            let (mut plan, known, reach) = {
                 let mut state = self.state.lock().await;
                 let engine = ensure_engine(&mut state, &meta.id)?;
                 let (plan, reach) = plan_for(engine, &reach, meta.gap_limit);
                 (plan, views::known(engine), reach)
             };
+            plan.told = self.told_on(endpoint);
 
             let response = chain::sync_engine(endpoint, plan, proxy).await;
             match response {
@@ -412,12 +414,40 @@ impl WalletManager {
                 .unwrap_or_default()
         };
         for endpoint in endpoints {
-            match chain::fetch_address_state(endpoint, address, meta.network, proxy, &held).await {
+            let told = self.told_on(endpoint);
+            let fetched = chain::fetch_address_state(
+                endpoint,
+                address,
+                meta.network,
+                proxy,
+                &held,
+                told.as_ref(),
+            )
+            .await;
+            match fetched {
                 Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
-                Ok(watch) => {
+                Ok(Some(watch)) => {
                     let mut state = self.state.lock().await;
                     let report =
                         apply_address_state(&mut state, meta, watch, endpoint, started, true)?;
+                    return Ok((report, endpoint.clone()));
+                }
+                // A history its server's own status disowns: nothing was
+                // read, and the address stays as it was until the watch
+                // hears it move again.
+                Ok(None) => {
+                    let state = self.state.lock().await;
+                    let stored = find_record(&state.payload, &meta.id)?
+                        .address_state
+                        .clone()
+                        .unwrap_or_default();
+                    let report = nothing_new(
+                        &meta.id,
+                        views::address_balance(&stored),
+                        stored.tip_height,
+                        endpoint,
+                        started,
+                    );
                     return Ok((report, endpoint.clone()));
                 }
             }
@@ -512,6 +542,26 @@ impl WalletManager {
             }
         }
         report
+    }
+}
+
+/// A report of a wallet that took nothing: what it holds, as it was.
+pub(super) fn nothing_new(
+    id: &str,
+    balance: crate::wallet::snapshot::BalanceSnapshot,
+    tip_height: u32,
+    server: &Endpoint,
+    started: Instant,
+) -> SyncReport {
+    SyncReport {
+        wallet_id: id.to_owned(),
+        new_tx_count: 0,
+        new_txs: Vec::new(),
+        confirmed_txs: Vec::new(),
+        balance,
+        tip_height,
+        took_ms: started.elapsed().as_millis() as u64,
+        backend: server.label(),
     }
 }
 
