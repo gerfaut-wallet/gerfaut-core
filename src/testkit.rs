@@ -563,6 +563,8 @@ pub(crate) struct MempoolState {
     pub address_txs: Vec<Value>,
     /// Pages of that history read so far.
     pub history_pages: usize,
+    /// Every path the REST side was asked for, in order.
+    pub paths: Vec<String>,
     /// The network whose genesis block the REST side names at height 0,
     /// signet when `None`.
     pub genesis: Option<bdk_wallet::bitcoin::Network>,
@@ -700,6 +702,7 @@ impl FakeMempool {
         let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut request).await;
         let (status, body) = {
             let mut state = state.lock().unwrap();
+            state.paths.push(path.to_owned());
             if path.ends_with("/blocks/tip/hash") {
                 state.tips_asked.push(std::time::Instant::now());
                 ("200 OK", format!("{:064x}", state.tip))

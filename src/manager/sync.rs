@@ -2,8 +2,8 @@
 //! of a wallet at a time, as far as the caller needs; every wallet of a
 //! network in turn; and the older history of a watched address.
 
-use std::collections::HashSet;
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -323,8 +323,9 @@ impl WalletManager {
         let endpoints = sync_order(
             chain::endpoints(&config, meta.network, &certs)?,
             answered,
-            first,
+            first.clone(),
         );
+        let endpoints = self.relegated_last(endpoints, first.as_ref());
         let proxy = self.tor_proxy_for(&endpoints).await?;
 
         match &meta.kind {
@@ -360,6 +361,7 @@ impl WalletManager {
             reach
         };
         let mut attempts: Vec<String> = Vec::new();
+        let mut failed: Vec<&Endpoint> = Vec::new();
 
         for endpoint in endpoints {
             // Build a fresh plan under the lock (a plan is consumed by
@@ -373,8 +375,12 @@ impl WalletManager {
 
             let response = chain::sync_engine(endpoint, plan, proxy).await;
             match response {
-                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
+                Err(detail) => {
+                    attempts.push(format!("{}: {detail}", endpoint.label()));
+                    failed.push(endpoint);
+                }
                 Ok(synced) => {
+                    self.answered_after(endpoint, &failed);
                     let mut state = self.state.lock().await;
                     state.orders.extend(synced.orders);
                     let vanishing = crate::live::news::vanishing(&state.payload, &meta.id);
@@ -465,10 +471,15 @@ impl WalletManager {
                 .map(|watch| watch.txs.clone())
                 .unwrap_or_default()
         };
+        let mut failed: Vec<&Endpoint> = Vec::new();
         for endpoint in endpoints {
             match chain::fetch_address_state(endpoint, address, meta.network, proxy, &held).await {
-                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
+                Err(detail) => {
+                    attempts.push(format!("{}: {detail}", endpoint.label()));
+                    failed.push(endpoint);
+                }
                 Ok(mut watch) => {
+                    self.answered_after(endpoint, &failed);
                     let mut state = self.state.lock().await;
                     // Against the state as stored, before the older
                     // rounds are carried over into the fresh one.
@@ -555,10 +566,11 @@ impl WalletManager {
         let Some(cursor) = cursor else {
             return Ok(0);
         };
-        let endpoints = chain::endpoints(&config, meta.network, &certs)?;
+        let endpoints = self.relegated_last(chain::endpoints(&config, meta.network, &certs)?, None);
         let proxy = self.tor_proxy_for(&endpoints).await?;
 
         let mut attempts: Vec<String> = Vec::new();
+        let mut failed: Vec<&Endpoint> = Vec::new();
         for endpoint in &endpoints {
             match chain::fetch_address_history(
                 endpoint,
@@ -569,8 +581,12 @@ impl WalletManager {
             )
             .await
             {
-                Err(detail) => attempts.push(format!("{}: {detail}", endpoint.label())),
+                Err(detail) => {
+                    attempts.push(format!("{}: {detail}", endpoint.label()));
+                    failed.push(endpoint);
+                }
                 Ok(round) => {
+                    self.answered_after(endpoint, &failed);
                     let mut state = self.state.lock().await;
                     let record = find_record_mut(&mut state.payload, id)?;
                     let Some(watch) = record.address_state.as_mut() else {
@@ -595,6 +611,27 @@ impl WalletManager {
             }
         }
         Err(sync_failure(&endpoints, attempts))
+    }
+
+    /// `endpoints` with the ones relegated now tried after the others:
+    /// see [`Relegations`].
+    pub(crate) fn relegated_last(
+        &self,
+        endpoints: Vec<Endpoint>,
+        first: Option<&Endpoint>,
+    ) -> Vec<Endpoint> {
+        match self.relegated.lock() {
+            Ok(relegated) => relegated.order(endpoints, first, tokio::time::Instant::now()),
+            Err(_) => endpoints,
+        }
+    }
+
+    /// `answered` answered after each of `failed` did not: see
+    /// [`Relegations::answered`].
+    pub(crate) fn answered_after(&self, answered: &Endpoint, failed: &[&Endpoint]) {
+        if let Ok(mut relegated) = self.relegated.lock() {
+            relegated.answered(answered, failed, tokio::time::Instant::now());
+        }
     }
 
     /// Syncs every wallet of a network (or all of them), sequentially:
@@ -645,6 +682,82 @@ fn sync_order(
         endpoints.insert(0, first);
     }
     endpoints
+}
+
+/// How long a server that failed while a later one answered is first
+/// tried after the others: five minutes, doubled each time it fails so
+/// again before it answers, up to an hour.
+const RELEGATION_FIRST: Duration = Duration::from_secs(5 * 60);
+const RELEGATION_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// The servers a sync tries after the others for a while. One that
+/// fails where a later one of the same list answers costs its timeout
+/// to every sync that starts with it, wallet after wallet: it is tried
+/// last for [`RELEGATION_FIRST`], then twice as long each time it fails
+/// so again, up to [`RELEGATION_MAX`], and no longer once it answers.
+/// When every server fails, the request is at fault, and none is.
+///
+/// Only the order changes, among the servers the backend names: none
+/// is added, since the more often a sync turns to the others, the more
+/// of them see its addresses over time. Nor is the server of the live
+/// watch ever put behind another: it already sees every script the
+/// watch follows, and a sync there shows the wallet to no second
+/// operator.
+#[derive(Debug, Default)]
+pub(crate) struct Relegations(HashMap<Endpoint, Relegation>);
+
+#[derive(Debug, Clone, Copy)]
+struct Relegation {
+    until: tokio::time::Instant,
+    /// Times it was relegated with no answer in between.
+    count: u32,
+}
+
+impl Relegations {
+    /// `endpoints` in the order a sync tries them: the ones relegated
+    /// at `now` after the others, each part in the order it had. `first`
+    /// stays where it is.
+    fn order(
+        &self,
+        endpoints: Vec<Endpoint>,
+        first: Option<&Endpoint>,
+        now: tokio::time::Instant,
+    ) -> Vec<Endpoint> {
+        let (kept, relegated): (Vec<Endpoint>, Vec<Endpoint>) =
+            endpoints.into_iter().partition(|endpoint| {
+                Some(endpoint) == first
+                    || self
+                        .0
+                        .get(endpoint)
+                        .is_none_or(|relegation| relegation.until <= now)
+            });
+        kept.into_iter().chain(relegated).collect()
+    }
+
+    /// `answered` answered at `now`, after each of `failed` did not:
+    /// those are relegated, unless one already is, by another sync that
+    /// met the same failure, and `answered` is no longer.
+    fn answered(&mut self, answered: &Endpoint, failed: &[&Endpoint], now: tokio::time::Instant) {
+        self.0.remove(answered);
+        for endpoint in failed {
+            let relegation = self.0.entry((*endpoint).clone()).or_insert(Relegation {
+                until: now,
+                count: 0,
+            });
+            if relegation.until > now {
+                continue;
+            }
+            relegation.until = now + relegation_for(relegation.count);
+            relegation.count = relegation.count.saturating_add(1);
+        }
+    }
+}
+
+/// [`RELEGATION_FIRST`] doubled once for each relegation before it.
+fn relegation_for(before: u32) -> Duration {
+    RELEGATION_FIRST
+        .checked_mul(2u32.saturating_pow(before))
+        .map_or(RELEGATION_MAX, |period| period.min(RELEGATION_MAX))
 }
 
 /// One error covering every endpoint tried, so the user sees each
