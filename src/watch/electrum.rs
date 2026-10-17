@@ -181,7 +181,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
     let (mut reader, writer, negotiated, software) = match hub.during(opening).await {
         Ok(Ok(opened)) => opened,
         Ok(Err(Unopened::Exit(exit))) | Err(exit) => return exit,
-        Ok(Err(Unopened::Costly(detail))) => return cost_exit(hub, detail, false),
+        Ok(Err(Unopened::Costly(detail))) => return refused_at_hello(hub, endpoint, detail),
     };
 
     hub.retry_limit(endpoint);
@@ -495,34 +495,11 @@ impl Session {
     /// ElectrumX past its budget, and is closing the connection. It
     /// keeps that cost against the address for a while, and coming back
     /// at once with the same burst would only be cut again: the session
-    /// ends, the server is left alone ([`Exit::Refused`]), and the next
-    /// session there asks for half as many scripts as this one took.
-    /// The scripts that leaves out are not asked for again, so each is
-    /// reported once, as a script given up on a refusal is: what it did
-    /// from the cut on, nothing will tell.
+    /// ends ([`cost_exit`]), and the next session there asks for half as
+    /// many scripts as this one took ([`ask_less`]).
     fn cut(&mut self, hub: &mut Hub, detail: String) {
         let half = self.acknowledged as usize / 2;
-        if half > 0 {
-            let refusals = hub.refusals.get(&self.endpoint);
-            let kept = refusals
-                .and_then(|refusals| refusals.limit)
-                .map_or(half, |limit| limit.min(half));
-            let past: Vec<String> = hub
-                .watched
-                .heard(refusals)
-                .skip(kept)
-                .filter(|entry| refusals.is_none_or(|r| !r.left_out.contains(&entry.scripthash)))
-                .map(|entry| entry.hex.clone())
-                .collect();
-            hub.refusals
-                .entry(self.endpoint.clone())
-                .or_default()
-                .learn_cut(kept);
-            let reason = self.opening_reason();
-            for hex in &past {
-                hub.mark_entry(hex, reason);
-            }
-        }
+        ask_less(hub, &self.endpoint, half, self.opening_reason());
         self.overloaded = Some(detail);
     }
 
@@ -613,6 +590,56 @@ async fn answer(
     tokio::time::timeout(budget, read)
         .await
         .map_err(|_| Unopened::unreachable(format!("timed out after {} s", budget.as_secs())))?
+}
+
+/// The next session on `endpoint` asks for `kept` scripts at most, the
+/// limit a cut for cost leaves, which holds for the configuration. The
+/// scripts that leaves out are not asked for again, so each is reported
+/// once, for a sync of its own, as a script given up on a refusal is:
+/// what it does from now on, nothing will tell. None kept is no cut: a
+/// watch that asks for nothing would never learn more.
+fn ask_less(hub: &mut Hub, endpoint: &Endpoint, kept: usize, reason: ChangeReason) {
+    if kept == 0 {
+        return;
+    }
+    let refusals = hub.refusals.get(endpoint);
+    let kept = refusals
+        .and_then(|refusals| refusals.limit)
+        .map_or(kept, |limit| limit.min(kept));
+    let past: Vec<String> = hub
+        .watched
+        .heard(refusals)
+        .skip(kept)
+        .filter(|entry| refusals.is_none_or(|r| !r.left_out.contains(&entry.scripthash)))
+        .map(|entry| entry.hex.clone())
+        .collect();
+    hub.refusals
+        .entry(endpoint.clone())
+        .or_default()
+        .learn_cut(kept);
+    for hex in &past {
+        hub.mark_entry(hex, reason);
+    }
+}
+
+/// The server refused the handshake for what the watch costs it, before
+/// it heard of a script: ElectrumX still holds the cost of an earlier
+/// session against the address. Asked for the same list once that wears
+/// off, it would cut the watch again: the next session asks for half of
+/// what this one was to ask, unless a cut already halved it, since the
+/// list is not what a refusal at the handshake measures.
+fn refused_at_hello(hub: &mut Hub, endpoint: &Endpoint, detail: String) -> Exit {
+    let refusals = hub.refusals.get(endpoint);
+    if !refusals.is_some_and(|refusals| refusals.cut) {
+        let asked = hub.watched.heard(refusals).count();
+        let reason = if hub.caught_up {
+            ChangeReason::Reconnected
+        } else {
+            ChangeReason::Started
+        };
+        ask_less(hub, endpoint, asked / 2, reason);
+    }
+    cost_exit(hub, detail, false)
 }
 
 /// How the watch leaves a server that refused it for what it costs,

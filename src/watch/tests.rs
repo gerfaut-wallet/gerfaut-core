@@ -845,6 +845,55 @@ async fn a_server_that_took_none_is_asked_again_sooner() {
     no_event(&mut events, Duration::from_millis(300)).await;
 }
 
+/// ElectrumX that refuses the handshake for what the watch costs it
+/// still holds the cost of an earlier session against the address: when
+/// the watch comes back, it asks for half the list, and reports the rest
+/// once for the syncs.
+#[tokio::test]
+async fn a_server_refusing_the_hello_for_cost_is_asked_less() {
+    let server = FakeElectrum::start().await;
+    server
+        .state
+        .lock()
+        .unwrap()
+        .refuse_coded
+        .insert("server.version", (-101, "excessive resource usage"));
+    let all: Vec<u8> = (1..=10).collect();
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &all, &[], false)],
+        Some(Timings {
+            refused: Duration::from_millis(300),
+            ..timings()
+        }),
+    );
+    // Statuses keep coming while the server refuses: the wait is on the
+    // whole of it.
+    let reported = tokio::time::timeout(WAIT, async {
+        let mut reported = BTreeSet::new();
+        while reported.len() < 5 {
+            match next_event(&mut events).await {
+                WatchEvent::WalletChanged {
+                    reason, scripts, ..
+                } => {
+                    assert_eq!(reason, ChangeReason::Started);
+                    reported.extend(scripts);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        reported
+    })
+    .await
+    .expect("the scripts past the half reported");
+    assert_eq!(reported, (6..=10).map(script).collect::<BTreeSet<_>>());
+    server.state.lock().unwrap().refuse_coded.clear();
+    let status = until(&watch, "half heard", |s| s.pushed_scripts == 5).await;
+    assert_eq!(status.left_out_scripts, 5);
+    assert_eq!(server.subscriptions().last().map(Vec::len), Some(5));
+    no_event(&mut events, Duration::from_millis(300)).await;
+}
+
 /// The user's own node that refuses the watch for what it costs, at the
 /// handshake or during a session, is tried again at the ordinary pace:
 /// its limits are the user's to raise, and a node that restarts must
