@@ -2939,3 +2939,36 @@ fn a_block_takes_what_waits_at_its_height() {
         status_of(&[(a, 90), (b, 101)])
     );
 }
+
+/// A server that refuses the proof of a confirmation foretold for what
+/// the session costs it, in ElectrumX's words, refuses a proof and
+/// nothing more: the guess is given up and the script reported for a
+/// sync, on the same session, with no limit learned of what the server
+/// takes.
+#[tokio::test]
+async fn a_proof_refused_for_its_cost_leaves_the_session_alone() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().refuse.insert(
+        "blockchain.transaction.get_merkle",
+        "excessive resource usage".to_owned(),
+    );
+    let txid = Txid::from_byte_array([5; 32]);
+    let waiting = waiting_on(&server, "a", 1, txid);
+    let (watch, mut events) =
+        LiveWatch::start_with(config(server.backend()), vec![waiting], Some(timings()));
+    until(&watch, "subscribed", |s| s.pushed_scripts == 1).await;
+    no_event(&mut events, Duration::from_millis(300)).await;
+
+    mined(&server, 1, txid, 101);
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock { height: 101 }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        moved("a", ChangeReason::Activity, false, &[1])
+    );
+    no_event(&mut events, Duration::from_millis(800)).await;
+    assert_eq!(server.subscriptions().len(), 1);
+    assert_eq!(watch.status().state, WatchState::Connected);
+}

@@ -442,8 +442,11 @@ impl Session {
                 return;
             };
             let error = message.get("error").filter(|error| !error.is_null());
+            // A proof refused is a guess given up, whatever the words: it
+            // is asked for nothing the watch needs.
             if let Some(error) = error
                 && costs_too_much(error)
+                && !matches!(request, Request::Merkle(..))
             {
                 self.cut(hub, words(error));
                 return;
