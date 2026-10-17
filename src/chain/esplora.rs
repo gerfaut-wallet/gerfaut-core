@@ -12,6 +12,7 @@ pub(crate) mod sync;
 
 use page::PageTx;
 
+use crate::chain::Failure;
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
 use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
@@ -363,22 +364,41 @@ impl Client {
             .await
     }
 
-    /// Hands a transaction to the server. The node's refusal comes back
-    /// as the error, from a body held to a few kilobytes.
-    async fn post_tx(&self, tx: &Transaction) -> Result<(), String> {
+    /// Hands a transaction to the server, and returns the txid it
+    /// answers with. Only the node's verdict comes back as a refusal: a
+    /// 400 whose body, held to a few kilobytes, is bitcoind's refusal in
+    /// the words of electrs ([`crate::chain::node_verdict`]). Any other
+    /// status, a proxy's page, a 2xx that is no txid, is the way there
+    /// failing.
+    async fn post_tx(&self, tx: &Transaction) -> Result<Txid, Failure> {
         let response = self
             .http
             .post(format!("{}/tx", self.base))
             .body(bdk_wallet::bitcoin::consensus::encode::serialize_hex(tx))
             .send()
             .await
-            .map_err(|e| describe_request(&e, self.budget))?;
-        // Accepted: whatever else the server says is not read.
-        if response.status().is_success() {
-            return Ok(());
+            .map_err(|e| Failure::Transport(describe_request(&e, self.budget)))?;
+        let status = response.status().as_u16();
+        let body = self
+            .body(response, REFUSAL_MAX)
+            .await
+            .map_err(Failure::Transport)?;
+        let text = String::from_utf8_lossy(&body);
+        if (200..300).contains(&status) {
+            // Esplora answers with the txid, and nothing else.
+            return text.trim().parse().map_err(|_| {
+                Failure::Transport(format!(
+                    "the server answered {} instead of a txid",
+                    crate::chain::server_words(text.trim())
+                ))
+            });
         }
-        let body = self.body(response, REFUSAL_MAX).await?;
-        Err(node_message(&String::from_utf8_lossy(&body)))
+        if status == 400
+            && let Some(words) = crate::chain::node_verdict(&text)
+        {
+            return Err(Failure::Refused(words));
+        }
+        Err(Failure::Transport(describe_status(status)))
     }
 }
 
@@ -709,7 +729,7 @@ pub(crate) async fn fetch_address_state(
     let our_script = address.script_pubkey();
     check_network(client, network).await?;
 
-    let tip_height = client.height().await?;
+    let tip_height = read_tip(client, network).await?;
     let stats = client.address_stats(&address).await?;
 
     let round = history_round(
@@ -717,24 +737,23 @@ pub(crate) async fn fetch_address_state(
         &address,
         &our_script,
         network,
+        tip_height,
         None,
         Some(stats.chain_stats.tx_count as usize),
         held,
     )
     .await?;
 
-    let utxos = client
-        .address_utxos(&address)
-        .await?
-        .into_iter()
-        .map(|utxo| AddressUtxo {
-            txid: utxo.txid.to_string(),
-            vout: utxo.vout,
-            value_sats: utxo.value,
-            height: utxo.status.block_height,
-            timestamp: utxo.status.block_time,
-        })
-        .collect();
+    let utxos = coins(
+        client,
+        network,
+        tip_height,
+        &our_script,
+        client.address_utxos(&address).await?,
+        &round,
+        held,
+    )
+    .await?;
 
     Ok(AddressWatchState {
         txs: round.txs,
@@ -743,6 +762,167 @@ pub(crate) async fn fetch_address_state(
         truncated: round.cursor.is_some(),
         history_cursor: round.cursor,
     })
+}
+
+/// The coins of the address, as far as what was read vouches for each,
+/// as over Electrum ([`crate::chain::electrum::address`]). A coin of a
+/// transaction of the round must be an output of it that pays the
+/// address that much, or the server is refused, and it is as confirmed as
+/// that transaction. When older transactions remain past the round, a
+/// coin of one of them, no higher than the round's oldest confirmation,
+/// is confirmed where the server puts it, at the time the wallet has for
+/// it, if the wallet holds its transaction there paying it, or if this
+/// session proved it there on the same server
+/// ([`crate::chain::proof::proven_coin`]). Otherwise its transaction is
+/// read again, counted against what the sync may keep, found to pay it,
+/// and its confirmation proven. Any other coin is taken as unconfirmed.
+/// A coin listed twice counts once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn coins(
+    client: &Client,
+    network: Network,
+    tip: u32,
+    ours: &bdk_wallet::bitcoin::ScriptBuf,
+    utxos: Vec<api::Utxo>,
+    round: &HistoryRound,
+    held: &[AddressTx],
+) -> Result<Vec<AddressUtxo>, String> {
+    use crate::chain::proof::{ProvenCoin, pays, proven_coin, remember_coin};
+    use bdk_wallet::chain::BlockId;
+    use std::collections::{HashMap, HashSet};
+    let in_round: HashMap<&str, &AddressTx> =
+        round.txs.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
+    let held: HashMap<&str, &AddressTx> = held.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
+    let oldest = round.txs.iter().filter_map(|tx| tx.height).min();
+    let mut seen = HashSet::new();
+    let utxos: Vec<(String, api::Utxo)> = utxos
+        .into_iter()
+        .filter(|utxo| seen.insert((utxo.txid, utxo.vout)))
+        .map(|utxo| (utxo.txid.to_string(), utxo))
+        .collect();
+    let proven_as = |utxo: &api::Utxo, height: u32| ProvenCoin {
+        script: ours.clone(),
+        value: utxo.value,
+        height,
+        time: None,
+    };
+    let outpoint = |utxo: &api::Utxo| OutPoint::new(utxo.txid, utxo.vout);
+
+    // Where each coin past the round stands: vouched for, at the time
+    // given, or its transaction to read again and prove.
+    let mut vouched: HashMap<(Txid, u32), Option<u64>> = HashMap::new();
+    let mut unread: Vec<(Txid, BlockId)> = Vec::new();
+    let mut to_read: HashSet<(Txid, BlockId)> = HashSet::new();
+    for (txid, utxo) in &utxos {
+        let block = match (utxo.status.block_height, utxo.status.block_hash, oldest) {
+            (Some(height), Some(hash), Some(oldest))
+                if round.cursor.is_some()
+                    && height <= oldest
+                    && !in_round.contains_key(txid.as_str()) =>
+            {
+                BlockId { height, hash }
+            }
+            _ => continue,
+        };
+        let from_held = held
+            .get(txid.as_str())
+            .filter(|tx| tx.height == Some(block.height) && tx.pays(utxo.vout, utxo.value))
+            .map(|tx| tx.timestamp);
+        match from_held.or_else(|| {
+            proven_coin(
+                network,
+                &client.base,
+                outpoint(utxo),
+                &proven_as(utxo, block.height),
+            )
+        }) {
+            Some(time) => {
+                vouched.insert((utxo.txid, utxo.vout), time);
+            }
+            None => {
+                if to_read.insert((utxo.txid, block)) {
+                    unread.push((utxo.txid, block));
+                }
+            }
+        }
+    }
+
+    // Each transaction read again is counted, checked against every coin
+    // listed of it, and dropped.
+    let mut listed_of: HashMap<Txid, Vec<&api::Utxo>> = HashMap::new();
+    for (_, utxo) in &utxos {
+        listed_of.entry(utxo.txid).or_default().push(utxo);
+    }
+    let mut read: HashSet<Txid> = HashSet::new();
+    for chunk in unread.chunks(PARALLEL_REQUESTS) {
+        let txs = futures_util::future::try_join_all(chunk.iter().map(|(txid, _)| client.tx(txid)))
+            .await?;
+        for ((txid, _), tx) in chunk.iter().zip(txs) {
+            let Some(tx) = tx else {
+                continue;
+            };
+            if tx.compute_txid() != *txid {
+                return Err(
+                    "the server answered with another transaction than the one asked for"
+                        .to_owned(),
+                );
+            }
+            client.keep(tx.total_size())?;
+            let paid = listed_of
+                .get(txid)
+                .into_iter()
+                .flatten()
+                .all(|utxo| pays(&tx, utxo.vout, ours, utxo.value));
+            if !paid {
+                return Err(crate::chain::proof::COIN_NOT_PAID.to_owned());
+            }
+            read.insert(*txid);
+        }
+    }
+    let unread: Vec<(Txid, BlockId)> = unread
+        .into_iter()
+        .filter(|(txid, _)| read.contains(txid))
+        .collect();
+    let times = sync::prove_confirmations(client, network, tip, &unread).await?;
+    for ((txid, block), time) in unread.iter().zip(times) {
+        let Some(time) = time else {
+            continue;
+        };
+        for utxo in listed_of.get(txid).into_iter().flatten() {
+            if utxo.status.block_height == Some(block.height) {
+                vouched.insert((utxo.txid, utxo.vout), Some(time));
+                let coin = ProvenCoin {
+                    time: Some(time),
+                    ..proven_as(utxo, block.height)
+                };
+                remember_coin(network, &client.base, outpoint(utxo), coin);
+            }
+        }
+    }
+
+    let mut coins = Vec::with_capacity(utxos.len());
+    for (txid, utxo) in utxos {
+        let (height, timestamp) = match in_round.get(txid.as_str()) {
+            Some(tx) => {
+                if !tx.pays(utxo.vout, utxo.value) {
+                    return Err(crate::chain::proof::COIN_NOT_PAID.to_owned());
+                }
+                (tx.height, tx.timestamp)
+            }
+            None => match vouched.get(&(utxo.txid, utxo.vout)) {
+                Some(time) => (utxo.status.block_height, *time),
+                None => (None, None),
+            },
+        };
+        coins.push(AddressUtxo {
+            txid,
+            vout: utxo.vout,
+            value_sats: utxo.value,
+            height,
+            timestamp,
+        });
+    }
+    Ok(coins)
 }
 
 /// Fetches the next round of older transactions, continuing after
@@ -760,16 +940,28 @@ pub(crate) async fn fetch_address_history(
         .parse()
         .map_err(|_| format!("invalid history cursor: {from}"))?;
     check_network(client, network).await?;
+    let tip = read_tip(client, network).await?;
     history_round(
         client,
         &address,
         &our_script,
         network,
+        tip,
         Some(from),
         None,
         &[],
     )
     .await
+}
+
+/// The server's tip, refused past any height a chain of `network` can
+/// have reached ([`crate::chain::height_limit`]).
+async fn read_tip(client: &Client, network: Network) -> Result<u32, String> {
+    let tip = client.height().await?;
+    if tip > crate::chain::height_limit(network, crate::now_secs()) {
+        return Err(crate::chain::IMPOSSIBLE_TIP.to_owned());
+    }
+    Ok(tip)
 }
 
 /// Refuses a server whose genesis block is not the network's. Testnet,
@@ -801,17 +993,31 @@ pub(crate) fn parse_address(address: &str, network: Network) -> Result<Address, 
 /// Pages through the address history from `from` (newest first when
 /// `None`), at most [`HISTORY_PAGES_PER_ROUND`] pages.
 ///
+/// Every transaction read must hash to the txid listed, the ones the
+/// wallet holds too: a proof is of a txid, and a server would otherwise
+/// pass off any transaction of a block as one paying the address, or
+/// rewrite what one the wallet holds pays. What the coins its inputs
+/// spend were is the server's word still, as the fee is. A confirmation
+/// read that the wallet does not hold at the same height is then proven
+/// ([`sync::prove_confirmations`]); an unsure proof leaves it
+/// unconfirmed. One it holds there keeps the time it holds.
+///
+/// A confirmation above `tip`, the tip the server gave before, is weighed
+/// by [`crate::chain::proof::above_the_tip`].
+///
 /// A page that lists only transactions of `held`, what the wallet holds,
 /// each at the height it holds it, ends the reading: the history below
 /// it is what the wallet holds, and the round is filled from there. An
 /// address paid a thousand times reads one page a sync, not forty. When
 /// what the wallet holds below would come to more than the server counts,
 /// the pages are read on.
+#[allow(clippy::too_many_arguments)]
 async fn history_round(
     client: &Client,
     address: &Address,
     our_script: &bdk_wallet::bitcoin::ScriptBuf,
     network: Network,
+    tip: u32,
     from: Option<Txid>,
     confirmed_total: Option<usize>,
     held: &[AddressTx],
@@ -820,6 +1026,10 @@ async fn history_round(
         .iter()
         .map(|tx| (tx.txid.as_str(), tx.height))
         .collect();
+    let held_times: std::collections::HashMap<(&str, Option<u32>), Option<u64>> = held
+        .iter()
+        .map(|tx| ((tx.txid.as_str(), tx.height), tx.timestamp))
+        .collect();
     // Each page is read into what the app shows as soon as it arrives,
     // and dropped: forty pages are never held as the server spelled them.
     // What is kept of them, every input and output of each transaction,
@@ -827,6 +1037,7 @@ async fn history_round(
     let mut txs: Vec<AddressTx> = Vec::new();
     let mut confirmed = 0usize;
     let mut last_seen: Option<Txid> = None;
+    let mut claimed: Vec<(Txid, bdk_wallet::chain::BlockId)> = Vec::new();
     let mut read = |page: Vec<PageTx>, txs: &mut Vec<AddressTx>| {
         let mut all_held = true;
         for tx in page {
@@ -834,7 +1045,25 @@ async fn history_round(
                 confirmed += 1;
                 last_seen = Some(tx.txid);
             }
-            let tx = to_address_tx(tx, our_script, network);
+            let whole = tx.to_tx();
+            if whole.compute_txid() != tx.txid {
+                return Err(
+                    "the server answered with another transaction than the one it listed"
+                        .to_owned(),
+                );
+            }
+            if let (true, Some(height), Some(hash)) = (
+                tx.status.confirmed,
+                tx.status.block_height,
+                tx.status.block_hash,
+            ) && known.get(tx.txid.to_string().as_str()) != Some(&Some(height))
+            {
+                let block = bdk_wallet::chain::BlockId { height, hash };
+                if !claimed.contains(&(tx.txid, block)) {
+                    claimed.push((tx.txid, block));
+                }
+            }
+            let tx = to_address_tx(tx, &whole, our_script, network);
             all_held &= known.get(tx.txid.as_str()) == Some(&tx.height);
             client.keep(crate::chain::held_by(&tx))?;
             txs.push(tx);
@@ -881,6 +1110,29 @@ async fn history_round(
         }
         (confirmed_so_far, last, all_held) = read(page, &mut txs)?;
     }
+    let times = sync::prove_confirmations(client, network, tip, &claimed).await?;
+    let proven: std::collections::HashMap<(String, u32), Option<u64>> = claimed
+        .iter()
+        .zip(times)
+        .map(|((txid, block), time)| ((txid.to_string(), block.height), time))
+        .collect();
+    for tx in &mut txs {
+        let Some(height) = tx.height else {
+            continue;
+        };
+        match proven.get(&(tx.txid.clone(), height)) {
+            Some(Some(time)) => tx.timestamp = Some(*time),
+            Some(None) => {
+                tx.height = None;
+                tx.timestamp = None;
+            }
+            None => {
+                if let Some(time) = held_times.get(&(tx.txid.as_str(), Some(height))) {
+                    tx.timestamp = *time;
+                }
+            }
+        }
+    }
     Ok(HistoryRound { txs, cursor })
 }
 
@@ -922,9 +1174,11 @@ fn fill_from_held(
 /// history, a script's or an address's.
 const PAGE: usize = 25;
 
-/// One esplora transaction as seen from the watched address.
+/// One esplora transaction as seen from the watched address. `whole` is
+/// the transaction itself, as [`PageTx::to_tx`] builds it.
 fn to_address_tx(
     tx: PageTx,
+    whole: &Transaction,
     our_script: &bdk_wallet::bitcoin::ScriptBuf,
     network: Network,
 ) -> AddressTx {
@@ -991,12 +1245,17 @@ fn to_address_tx(
             })
         })
         .collect();
-    let extras = tx_extras::analyze(&tx.to_tx(), |op| prevouts.get(op).cloned());
+    let extras = tx_extras::analyze(whole, |op| prevouts.get(op).cloned());
     AddressTx {
         txid: tx.txid.to_string(),
         net_sats: crate::chain::net_sats(received, spent),
         fee_sats: (!is_coinbase).then_some(tx.fee),
-        height: tx.status.block_height,
+        // Confirmed in a block it names, or not confirmed at all: a
+        // height alone names no block to prove it in.
+        height: tx
+            .status
+            .block_height
+            .filter(|_| tx.status.confirmed && tx.status.block_hash.is_some()),
         timestamp: tx.status.block_time,
         vsize: tx.weight.div_ceil(4),
         inputs,
@@ -1017,45 +1276,17 @@ pub(crate) fn script_address(
 // --- broadcast ------------------------------------------------------------
 
 /// Hands a signed transaction to the network through this instance.
-/// The instance's own node validates it; its refusal comes back as the
-/// message, verbatim, which is the most useful thing to show.
+/// The instance's own node validates it; its refusal comes back as a
+/// refusal in the node's words, which is the most useful thing to show.
 ///
-/// Esplora wraps the node's refusal in an HTTP error whose body is the
-/// reason, in one of two spellings:
+/// Esplora wraps the node's refusal in a 400 whose body is the reason,
+/// in one of two spellings:
 /// `sendrawtransaction RPC error: {"code":-26,"message":"..."}` (the
 /// mempool instances) or `sendrawtransaction RPC error -26: ...`
-/// (blockstream.info). The message is kept, the wrapping dropped.
-/// Anything else is a failure to reach the node, described as such.
-pub(crate) async fn broadcast(client: &Client, tx: &Transaction) -> Result<(), String> {
+/// (blockstream.info): see [`crate::chain::node_verdict`]. Anything
+/// else is a failure of the way there, and the next endpoint may take it.
+pub(crate) async fn broadcast(client: &Client, tx: &Transaction) -> Result<Txid, Failure> {
     client.post_tx(tx).await
-}
-
-/// The reason inside a `sendrawtransaction` refusal, whichever way the
-/// server spelled it; the whole text when it is not one. Shown as the
-/// node's words, so kept to one short line: a server that answers a
-/// page of text, or instructions of its own, gets its first 200
-/// characters on screen ([`crate::chain::server_words`]).
-pub(crate) fn node_message(text: &str) -> String {
-    crate::chain::server_words(&node_words(text))
-}
-
-fn node_words(text: &str) -> String {
-    // A body quoted inside another error arrives with its quotes
-    // escaped: read it as if it were not.
-    let text = text.replace("\\\"", "\"");
-    if let Some(start) = text.find("\"message\":\"") {
-        let rest = &text[start + 11..];
-        if let Some(end) = rest.find('"') {
-            return rest[..end].to_owned();
-        }
-    }
-    if let Some(start) = text.find("RPC error -") {
-        let rest = &text[start..];
-        if let Some(colon) = rest.find(": ") {
-            return rest[colon + 2..].trim().to_owned();
-        }
-    }
-    text.trim().to_owned()
 }
 
 /// The output an input spends, whether it is already spent, and by
@@ -1071,8 +1302,13 @@ pub(crate) struct PrevoutFacts {
 pub(crate) async fn fetch_prevout(
     client: &Client,
     outpoint: OutPoint,
-) -> Result<PrevoutFacts, String> {
-    let tx = client.tx(&outpoint.txid).await?;
+) -> Result<PrevoutFacts, Failure> {
+    // Nothing a lookup gets back is the node's verdict on a transaction:
+    // whatever fails is the way there failing.
+    let tx = client
+        .tx(&outpoint.txid)
+        .await
+        .map_err(Failure::Transport)?;
     let Some(tx) = tx else {
         return Ok(PrevoutFacts {
             txout: None,
@@ -1080,7 +1316,7 @@ pub(crate) async fn fetch_prevout(
             spent_by: None,
         });
     };
-    let txout = crate::chain::output_at(&tx, outpoint)?;
+    let txout = crate::chain::output_at(&tx, outpoint).map_err(Failure::Transport)?;
     let status = client
         .output_status(&outpoint.txid, outpoint.vout)
         .await
@@ -1090,18 +1326,36 @@ pub(crate) async fn fetch_prevout(
     // Named only when the server says both who spends it and where that
     // stands: a spend whose standing is unknown is not taken for one
     // in a block.
-    let spent_by = status.and_then(|status| match (status.spent, status.txid, status.status) {
-        (true, Some(txid), Some(standing)) => Some(crate::broadcast::SpentBy {
-            txid,
-            confirmed: standing.confirmed,
-        }),
-        _ => None,
-    });
+    let spent_by =
+        match status.and_then(|status| match (status.spent, status.txid, status.status) {
+            (true, Some(txid), Some(standing)) => Some((txid, standing.confirmed)),
+            _ => None,
+        }) {
+            // A spend in a block holds the broadcast back: the server shows
+            // the transaction that makes it, and it has to spend this coin.
+            // One in the mempool holds nothing back, and costs no request.
+            Some((txid, confirmed)) => Some(crate::broadcast::SpentBy {
+                txid,
+                confirmed,
+                verified: confirmed && shows_spend(client, txid, outpoint).await,
+            }),
+            None => None,
+        };
     Ok(PrevoutFacts {
         txout,
         spent,
         spent_by,
     })
+}
+
+/// Whether the server hands over the transaction `txid`, as that txid
+/// commits to it, with `outpoint` among its inputs. Anything else, a
+/// server that cannot show it included, is no proof of the spend.
+async fn shows_spend(client: &Client, txid: Txid, outpoint: OutPoint) -> bool {
+    match client.tx(&txid).await {
+        Ok(Some(tx)) => crate::chain::spends(&tx, txid, outpoint),
+        _ => false,
+    }
 }
 
 /// Where a transaction stands: unknown, in the mempool, or at a height.
@@ -1112,7 +1366,14 @@ pub(crate) struct TxStanding {
     pub tip_height: u32,
 }
 
-pub(crate) async fn tx_standing(client: &Client, txid: &Txid) -> Result<TxStanding, String> {
+/// A confirmation counts once proven, as a sync's
+/// ([`sync::prove_confirmations`]): one that cannot be leaves the
+/// transaction waiting, and a false proof refuses the server.
+pub(crate) async fn tx_standing(
+    client: &Client,
+    network: Network,
+    txid: &Txid,
+) -> Result<TxStanding, String> {
     let tip_height = client.height().await?;
     let found = client.knows_tx(txid).await?;
     if !found {
@@ -1124,10 +1385,21 @@ pub(crate) async fn tx_standing(client: &Client, txid: &Txid) -> Result<TxStandi
         });
     }
     let status = client.tx_status(txid).await?;
+    let block = match (status.confirmed, status.block_height, status.block_hash) {
+        (true, Some(height), Some(hash)) => Some(bdk_wallet::chain::BlockId { height, hash }),
+        _ => None,
+    };
+    let proven = match block {
+        Some(block) => sync::prove_confirmations(client, network, tip_height, &[(*txid, block)])
+            .await?
+            .first()
+            .is_some_and(Option::is_some),
+        None => false,
+    };
     Ok(TxStanding {
         found: true,
-        confirmed: status.confirmed,
-        block_height: status.block_height,
+        confirmed: proven,
+        block_height: block.filter(|_| proven).map(|block| block.height),
         tip_height,
     })
 }
@@ -1140,6 +1412,102 @@ mod error_tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    /// What a server answers a posted transaction with, in every form: a
+    /// refusal only when a 400 carries the node's verdict in the words of
+    /// electrs, Blockstream's or mempool.space's; anything else, another
+    /// status, a proxy's page, a node warming up, a body that is no txid,
+    /// is the way there failing, and the next endpoint may be asked.
+    #[tokio::test]
+    async fn only_the_nodes_verdict_refuses_a_posted_transaction() {
+        let tx = Transaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        };
+        let answer = |status: &str, body: &str| {
+            format!(
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let refused = |words: &str| Err(Failure::Refused(words.to_owned()));
+        let transport = |text: &str| Err::<Txid, _>(Failure::Transport(text.to_owned()));
+        let txid = tx.compute_txid().to_string();
+        for (status, body, expected) in [
+            ("200 OK", txid.as_str(), Ok(tx.compute_txid())),
+            (
+                "400 Bad Request",
+                "sendrawtransaction RPC error -26: min relay fee not met, 0 < 11",
+                refused("min relay fee not met, 0 < 11"),
+            ),
+            (
+                "400 Bad Request",
+                r#"sendrawtransaction RPC error: {"code":-26,"message":"min relay fee not met"}"#,
+                refused("min relay fee not met"),
+            ),
+            (
+                "400 Bad Request",
+                r#"sendrawtransaction RPC error: {"code":-27,"message":"Transaction outputs already in utxo set"}"#,
+                refused("Transaction outputs already in utxo set"),
+            ),
+            (
+                "400 Bad Request",
+                "sendrawtransaction RPC error -25: bad-txns-inputs-missingorspent",
+                refused("bad-txns-inputs-missingorspent"),
+            ),
+            (
+                "400 Bad Request",
+                "sendrawtransaction RPC error -28: Loading block index...",
+                transport("HTTP 400: bad request"),
+            ),
+            (
+                "400 Bad Request",
+                "Invalid hex string",
+                transport("HTTP 400: bad request"),
+            ),
+            (
+                "403 Forbidden",
+                "<html><title>Attention Required! | Cloudflare</title></html>",
+                transport("HTTP 403: access refused"),
+            ),
+            (
+                "401 Unauthorized",
+                "",
+                transport("HTTP 401: access refused"),
+            ),
+            (
+                "404 Not Found",
+                "Not Found",
+                transport("HTTP 404: not found"),
+            ),
+            (
+                "413 Payload Too Large",
+                "",
+                transport("HTTP 413: unexpected status"),
+            ),
+            (
+                "503 Service Unavailable",
+                "busy",
+                transport("HTTP 503: server error"),
+            ),
+            (
+                "429 Too Many Requests",
+                "",
+                transport("HTTP 429: rate limited"),
+            ),
+            (
+                "200 OK",
+                "<html>maintenance</html>",
+                transport("the server answered <html>maintenance</html> instead of a txid"),
+            ),
+        ] {
+            let (address, _) = answering(vec![answer(status, body)]).await;
+            let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
+            assert_eq!(broadcast(&client, &tx).await, expected, "{status} {body}");
+        }
+    }
 
     /// Budgets short enough to test: the connection has five seconds,
     /// the whole request one.
@@ -1386,7 +1754,7 @@ mod error_tests {
         };
         assert_eq!(
             broadcast(&client, &tx).await.unwrap_err(),
-            "the server sent an answer longer than 64 KiB"
+            Failure::Transport("the server sent an answer longer than 64 KiB".to_owned())
         );
     }
 
@@ -1636,7 +2004,8 @@ mod error_tests {
         );
         let page: PageTx = serde_json::from_str(&listed).unwrap();
         let ours = ScriptBuf::from_hex(ADDRESS_SCRIPT).unwrap();
-        let read = to_address_tx(page, &ours, Network::Signet);
+        let whole = page.to_tx();
+        let read = to_address_tx(page, &whole, &ours, Network::Signet);
         assert_eq!(read.net_sats, i64::MAX);
         assert_eq!(crate::chain::net_sats(0, u64::MAX), -i64::MAX);
     }
@@ -1723,32 +2092,5 @@ mod error_tests {
                 total: TOR_TIMEOUT,
             }
         );
-    }
-}
-
-#[cfg(test)]
-mod broadcast_tests {
-    use super::node_message;
-
-    #[test]
-    fn the_node_reason_is_kept_whichever_spelling() {
-        let mempool = r#"sendrawtransaction RPC error: {"code":-27,"message":"Transaction outputs already in utxo set"}"#;
-        assert_eq!(
-            node_message(mempool),
-            "Transaction outputs already in utxo set"
-        );
-        let blockstream = "sendrawtransaction RPC error -26: mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)";
-        assert_eq!(
-            node_message(blockstream),
-            "mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)"
-        );
-        let escaped = r#"{\"code\":-26,\"message\":\"bad-txns-inputs-missingorspent\"}"#;
-        assert_eq!(node_message(escaped), "bad-txns-inputs-missingorspent");
-        assert_eq!(node_message("connection refused"), "connection refused");
-        // A page of text, or a sentence of the server's own, is cut to
-        // one short line.
-        let long = node_message(&format!("send it again to\n{}", "x".repeat(1 << 20)));
-        assert_eq!(long.chars().count(), 201);
-        assert!(long.starts_with("send it again tox") && long.ends_with('\u{2026}'));
     }
 }

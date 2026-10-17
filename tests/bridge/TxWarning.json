@@ -16,5 +16,11 @@
     "message": "Input 0 is already spent by another transaction, which is in a block. The network will refuse this one.",
     "severity": "alert",
     "blocking": true
+  },
+  "in_mempool": {
+    "kind": "in_mempool",
+    "message": "This transaction is already waiting in the mempool: it was broadcast before. Broadcasting it again does no harm.",
+    "severity": "info",
+    "blocking": false
   }
 }

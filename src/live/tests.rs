@@ -37,8 +37,8 @@ fn staged(claimed: &[LiveTx]) -> Vec<(String, TxStage)> {
         .collect()
 }
 
-fn txid(byte: u8) -> String {
-    format!("{byte:02x}").repeat(32)
+fn txid(label: u8) -> String {
+    crate::testkit::esplora_txid(label)
 }
 
 /// A sync whose caller announces nothing loses nothing: what it found
@@ -1900,4 +1900,661 @@ fn a_batch_of_several_wallets_is_said_under_each_name() {
         ]
     );
     assert_ne!(said[0].id, said[1].id);
+}
+
+/// An Esplora on loopback, reached as `localhost`, that knows one
+/// transaction and says its first output unspent; its address, and every
+/// request it had as `METHOD path`.
+async fn web_api_knowing(
+    tx: bdk_wallet::bitcoin::Transaction,
+) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = asked.clone();
+    let txid = tx.compute_txid();
+    let raw = bdk_wallet::bitcoin::consensus::serialize(&tx);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let line: Vec<&str> = head.split_whitespace().take(2).collect();
+            let path = line.get(1).copied().unwrap_or_default().to_owned();
+            log.lock().unwrap().push(line.join(" "));
+            let (status, body) = if path == format!("/api/tx/{txid}/raw") {
+                ("200 OK", raw.clone())
+            } else if path == format!("/api/tx/{txid}/outspend/0") {
+                ("200 OK", br#"{"spent":false}"#.to_vec())
+            } else {
+                ("404 Not Found", b"not found".to_vec())
+            };
+            let mut response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend(body);
+            let _ = stream.write_all(&response).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    (format!("http://localhost:{port}/api"), asked)
+}
+
+/// With the watch on the Electrum server of one operator, what is sent
+/// goes to that operator: the preview to its web API, which says
+/// in one request whether a coin is spent, and the broadcast to the
+/// watch's own server. The head of the rotation, another operator, hears
+/// of neither.
+#[tokio::test]
+async fn what_is_sent_goes_to_the_operator_of_the_watch() {
+    use crate::testkit::{nowhere, script, transaction};
+    use bdk_wallet::bitcoin::OutPoint;
+
+    let rotation = FakeMempool::start(false, 0).await;
+    let live = FakeElectrum::start().await;
+    let funding = transaction(&[nowhere(1, 0)], &[(script(3).as_str(), 50_000)]);
+    let (web, web_asked) = web_api_knowing(funding.clone()).await;
+    let _stand_in = crate::chain::public::stand_in(
+        &[format!("http://{}/api", rotation.address), web],
+        &[format!("tcp://localhost:{}", live.address.port())],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), crate::chain::BackendConfig::default()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+
+    let mut pasted = transaction(
+        &[OutPoint::new(funding.compute_txid(), 0)],
+        &[(script(9).as_str(), 49_000)],
+    );
+    pasted.input[0].witness.push([0x30; 71]);
+    pasted.input[0].witness.push([0x02; 33]);
+    let hex = bdk_wallet::bitcoin::consensus::encode::serialize_hex(&pasted);
+
+    let preview = manager
+        .preview_transaction(&hex, Network::Signet)
+        .await
+        .unwrap();
+    assert_eq!(
+        preview.inputs[0].value_sats,
+        Some(50_000),
+        "{:?}",
+        preview.warnings
+    );
+    assert!(
+        web_asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line == &format!("GET /api/tx/{}/raw", funding.compute_txid())),
+    );
+    assert!(!live.was_asked("blockchain.transaction.get"));
+
+    let report = manager
+        .broadcast_transaction(Network::Signet, &hex)
+        .await
+        .unwrap();
+    assert_eq!(report.backend, "localhost");
+    assert!(live.was_asked("blockchain.transaction.broadcast"));
+    assert!(
+        !web_asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.starts_with("POST")),
+        "the watch's own server took it"
+    );
+    // Where it stands is asked of the same operator.
+    let standing = manager
+        .transaction_status(Network::Signet, &hex)
+        .await
+        .unwrap();
+    assert_eq!(standing.backend, "localhost");
+    manager.live_stop().await;
+}
+
+// --- a confirmation the status foretold ---------------------------------------------
+
+/// Where the server's log of requests and connections stands.
+fn server_mark(server: &FakeElectrum) -> (usize, usize) {
+    let state = server.state.lock().unwrap();
+    (state.asked.len(), state.connections.len())
+}
+
+/// What the server was asked since `mark`, and how many connections
+/// were opened to it.
+fn asked_since(server: &FakeElectrum, mark: (usize, usize)) -> (Vec<String>, usize) {
+    let state = server.state.lock().unwrap();
+    (
+        state.asked[mark.0..].to_vec(),
+        state.connections.len() - mark.1,
+    )
+}
+
+/// A block at `height` on the server: its header pushed, chained to the
+/// blocks under it, then the status of `script` hashing `status`.
+fn block(
+    server: &FakeElectrum,
+    height: u32,
+    script: &str,
+    status: &[(bdk_wallet::bitcoin::Txid, i64)],
+) {
+    let header = {
+        let mut state = server.state.lock().unwrap();
+        state.height = height;
+        state.header(height)
+    };
+    server.push(
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": "blockchain.headers.subscribe",
+            "params": [{ "height": height, "hex": header }],
+        })
+        .to_string(),
+    );
+    server.set_status(script, &crate::testkit::status_of(status));
+}
+
+/// A watch over the descriptor wallet of [`cold_wallet`], once a payment
+/// to its second receive address has come into the mempool, been
+/// announced, and the sync that found it handed out: the wallet waits
+/// for a block, and the watch holds what the wallet holds.
+async fn waiting_for_a_block(
+    server: &FakeElectrum,
+    dir: &std::path::Path,
+) -> (
+    WalletManager,
+    String,
+    LiveEvents,
+    String,
+    bdk_wallet::bitcoin::Txid,
+) {
+    waiting_for_a_block_at(server, dir, timings()).await
+}
+
+/// [`waiting_for_a_block`], the watch running at `pace`.
+async fn waiting_for_a_block_at(
+    server: &FakeElectrum,
+    dir: &std::path::Path,
+    pace: crate::watch::Timings,
+) -> (
+    WalletManager,
+    String,
+    LiveEvents,
+    String,
+    bdk_wallet::bitcoin::Txid,
+) {
+    let (manager, wallet) = cold_wallet(dir, server).await;
+    let mut events = manager.live_start_with(Some(pace)).await.unwrap();
+    quiet_start(&mut events).await;
+    let script = receive_script(1);
+    let paid: bdk_wallet::bitcoin::Txid = pay(server, 7, &script, 12_000, 0).parse().unwrap();
+    server.set_status(&script, &crate::testkit::status_of(&[(paid, 0)]));
+    let arrival = next_announcement(&mut events).await;
+    assert_eq!(staged(&[arrival]), [(paid.to_string(), TxStage::Mempool)]);
+    next_sync(&mut events, &wallet).await;
+    // The watch takes the wallet as that sync left it.
+    tokio::time::sleep(QUIET).await;
+    (manager, wallet, events, script, paid)
+}
+
+/// The confirmations the wallet shows for `txid`.
+async fn confirmations(manager: &WalletManager, wallet: &str, txid: &str) -> u32 {
+    manager
+        .wallet_snapshot(wallet)
+        .await
+        .unwrap()
+        .txs
+        .iter()
+        .find(|tx| tx.txid == txid)
+        .expect("the wallet shows the payment")
+        .confirmations
+}
+
+/// A block confirms the payment a wallet waits for, and the server
+/// pushes the status the wallet's history comes to once that block took
+/// it. The watch asks for the proof of that one transaction in the
+/// header it was pushed, on its own connection, and the confirmation is
+/// announced with no sync: no new connection, no history read. A sync
+/// cost a connection and five requests: the version, the tip, the
+/// latest headers, the history, the proof.
+#[tokio::test]
+async fn a_confirmation_the_status_foretold_costs_one_proof() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, mut events, script, paid) =
+        waiting_for_a_block(&server, dir.path()).await;
+
+    let mark = server_mark(&server);
+    server.set_history(&script, &[(paid, 101)]);
+    block(&server, 101, &script, &[(paid, 101)]);
+    let confirmation = next_announcement(&mut events).await;
+    assert_eq!(
+        staged(&[confirmation]),
+        [(paid.to_string(), TxStage::Confirmed)]
+    );
+    let (report, _) = next_sync(&mut events, &wallet).await;
+    assert_eq!(report.tip_height, 101);
+    tokio::time::sleep(QUIET).await;
+    let (asked, connections) = asked_since(&server, mark);
+    println!("a confirmation foretold asked {asked:?} over {connections} new connection(s)");
+    assert_eq!(asked, ["blockchain.transaction.get_merkle"]);
+    assert_eq!(connections, 0);
+    assert_eq!(confirmations(&manager, &wallet, &paid.to_string()).await, 1);
+
+    // The wallet holds what the server lists: a watch that starts over
+    // finds every status as the wallet holds it, and syncs nothing.
+    manager.live_stop().await;
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    manager.live_stop().await;
+}
+
+/// A server pushes the status of a payment confirmed in its new block
+/// while that block does not hold it: its header commits to no such
+/// transaction, so no branch the server hands proves it there. Nothing
+/// is shown confirmed on that guess: the script is synced, and the
+/// sync, which reads the payment still in the mempool, leaves it
+/// waiting.
+#[tokio::test]
+async fn a_status_the_block_does_not_bear_out_confirms_nothing() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, mut events, script, paid) =
+        waiting_for_a_block(&server, dir.path()).await;
+
+    let mark = server_mark(&server);
+    block(&server, 101, &script, &[(paid, 101)]);
+    loop {
+        match tokio::time::timeout(WAIT, events.next()).await {
+            Ok(Some(LiveEvent::WalletSynced { report })) if report.wallet_id == wallet => break,
+            Ok(Some(LiveEvent::Transaction(tx))) => panic!("announced {tx:?}"),
+            Ok(Some(LiveEvent::SyncFailed { message, .. })) => panic!("the sync failed: {message}"),
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the watch stopped"),
+            Err(_) => panic!("no sync within {WAIT:?}"),
+        }
+    }
+    let (asked, _) = asked_since(&server, mark);
+    let proof = asked
+        .iter()
+        .position(|method| method == "blockchain.transaction.get_merkle");
+    let history = asked
+        .iter()
+        .position(|method| method == "blockchain.scripthash.get_history");
+    assert!(proof.is_some() && history > proof, "{asked:?}");
+    assert_eq!(confirmations(&manager, &wallet, &paid.to_string()).await, 0);
+    manager.live_stop().await;
+}
+
+/// The server's tip moves two blocks at once, and the block that takes
+/// the payment is the second: the watch was given no header between the
+/// wallet's tip and it, so nothing ties that block to the wallet's
+/// chain. The confirmation is foretold and proven all the same, and the
+/// wallet syncs the script instead of taking it as it is.
+#[tokio::test]
+async fn a_block_the_wallet_cannot_chain_to_is_synced() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, mut events, script, paid) =
+        waiting_for_a_block(&server, dir.path()).await;
+
+    let mark = server_mark(&server);
+    server.set_history(&script, &[(paid, 102)]);
+    block(&server, 102, &script, &[(paid, 102)]);
+    let confirmation = next_announcement(&mut events).await;
+    assert_eq!(
+        staged(&[confirmation]),
+        [(paid.to_string(), TxStage::Confirmed)]
+    );
+    let (report, _) = next_sync(&mut events, &wallet).await;
+    assert_eq!(report.tip_height, 102);
+    let (asked, connections) = asked_since(&server, mark);
+    let proof = asked
+        .iter()
+        .position(|method| method == "blockchain.transaction.get_merkle");
+    let history = asked
+        .iter()
+        .position(|method| method == "blockchain.scripthash.get_history");
+    assert!(proof.is_some() && history > proof, "{asked:?}");
+    assert_eq!(connections, 1);
+    assert_eq!(confirmations(&manager, &wallet, &paid.to_string()).await, 1);
+    manager.live_stop().await;
+}
+
+/// A watched address waits for a block the same way: the block that
+/// takes its payment costs the proof of that payment, the coin it holds
+/// confirmed with it. A sync cost a connection and eight requests: the
+/// version, the genesis block, the tip, the history, the coins, the
+/// payment and the coin it spends, and the time of the block.
+#[tokio::test]
+async fn a_watched_address_takes_a_confirmation_the_status_foretold() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), server.backend()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    let payment = transaction(&[nowhere(4, 0)], &[(ADDRESS_SCRIPT, 12_000)]);
+    let paid = payment.compute_txid();
+    server.add_tx(&payment);
+    server.set_history(ADDRESS_SCRIPT, &[(paid, 0)]);
+    server.set_unspent(ADDRESS_SCRIPT, &[(paid, 0, 0, 12_000)]);
+    server.set_status(ADDRESS_SCRIPT, &crate::testkit::status_of(&[(paid, 0)]));
+    let arrival = next_announcement(&mut events).await;
+    assert_eq!(staged(&[arrival]), [(paid.to_string(), TxStage::Mempool)]);
+    next_sync(&mut events, &wallet).await;
+    tokio::time::sleep(QUIET).await;
+
+    let mark = server_mark(&server);
+    server.set_history(ADDRESS_SCRIPT, &[(paid, 101)]);
+    server.set_unspent(ADDRESS_SCRIPT, &[(paid, 0, 101, 12_000)]);
+    block(&server, 101, ADDRESS_SCRIPT, &[(paid, 101)]);
+    let confirmation = next_announcement(&mut events).await;
+    assert_eq!(
+        staged(&[confirmation]),
+        [(paid.to_string(), TxStage::Confirmed)]
+    );
+    let (report, _) = next_sync(&mut events, &wallet).await;
+    assert_eq!(report.tip_height, 101);
+    assert_eq!(report.balance.confirmed, 12_000);
+    tokio::time::sleep(QUIET).await;
+    let (asked, connections) = asked_since(&server, mark);
+    println!("a confirmation foretold asked {asked:?} over {connections} new connection(s)");
+    assert_eq!(asked, ["blockchain.transaction.get_merkle"]);
+    assert_eq!(connections, 0);
+    assert_eq!(confirmations(&manager, &wallet, &paid.to_string()).await, 1);
+
+    manager.live_stop().await;
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    manager.live_stop().await;
+}
+
+// --- a history its own status disowns -----------------------------------------------
+
+/// A payment of `sats` to `script` and the transaction it spends, both
+/// on the server, in no history yet.
+fn payment(server: &FakeElectrum, n: u8, script: &str, sats: u64) -> bdk_wallet::bitcoin::Txid {
+    let parent = transaction(
+        &[nowhere(n, 0)],
+        &[(crate::testkit::script(9).as_str(), sats + 1_000)],
+    );
+    let payment = transaction(
+        &[bdk_wallet::bitcoin::OutPoint::new(parent.compute_txid(), 0)],
+        &[(script, sats)],
+    );
+    server.add_tx(&parent);
+    server.add_tx(&payment);
+    payment.compute_txid()
+}
+
+/// A watch over the descriptor wallet of [`cold_wallet`], once `count`
+/// payments to its second receive address have come into the mempool
+/// together, been announced, and the sync that found them handed out:
+/// the server announced the status of that history, in that order.
+async fn several_waiting(
+    server: &FakeElectrum,
+    dir: &std::path::Path,
+    count: u8,
+) -> (
+    WalletManager,
+    String,
+    LiveEvents,
+    String,
+    Vec<bdk_wallet::bitcoin::Txid>,
+) {
+    let (manager, wallet) = cold_wallet(dir, server).await;
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    let script = receive_script(1);
+    let paid: Vec<bdk_wallet::bitcoin::Txid> = (0..count)
+        .map(|n| payment(server, 20 + n, &script, 1_000 * (u64::from(n) + 1)))
+        .collect();
+    let history: Vec<(bdk_wallet::bitcoin::Txid, i64)> =
+        paid.iter().map(|txid| (*txid, 0)).collect();
+    server.set_history(&script, &history);
+    server.set_status(&script, &crate::testkit::status_of(&history));
+    let mut announced = 0;
+    while announced < count {
+        assert_eq!(next_announcement(&mut events).await.stage, TxStage::Mempool);
+        announced += 1;
+    }
+    next_sync(&mut events, &wallet).await;
+    tokio::time::sleep(QUIET).await;
+    (manager, wallet, events, script, paid)
+}
+
+/// The txids the wallet shows.
+async fn shown(manager: &WalletManager, wallet: &str) -> Vec<String> {
+    manager
+        .wallet_snapshot(wallet)
+        .await
+        .unwrap()
+        .txs
+        .into_iter()
+        .map(|tx| tx.txid)
+        .collect()
+}
+
+/// The server of the watch announced the status of a history holding a
+/// payment the wallet waits for, then lists the script without it, as a
+/// server behind its own word does. That history does not hash to the
+/// status: a sync on that server sets it aside unread, asks nothing more
+/// for it, and the payment stays as the wallet held it, instead of being
+/// taken for gone. Nothing comes back for it after.
+#[tokio::test]
+async fn a_history_that_misses_its_own_status_is_set_aside() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, _events, script, paid) = several_waiting(&server, dir.path(), 1).await;
+
+    server.set_history(&script, &[]);
+    let before = server.histories_of(&script);
+    let report = manager.sync_wallet(&wallet).await.unwrap();
+    assert!(report.new_txs.is_empty() && report.confirmed_txs.is_empty());
+    assert_eq!(server.histories_of(&script), before + 1);
+    assert!(
+        shown(&manager, &wallet)
+            .await
+            .contains(&paid[0].to_string())
+    );
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(server.histories_of(&script), before + 1);
+    manager.live_stop().await;
+}
+
+/// Three payments wait on one script; one leaves the mempool, and the
+/// server announces the status of the two left, then lists them in
+/// another order: before protocol 1.6 that order is the server's to
+/// choose. The same transactions in another order are no disagreement:
+/// the sync the watch runs reads the history once, and the payment that
+/// left is taken for gone.
+#[tokio::test]
+async fn the_mempool_in_another_order_is_no_disagreement() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, mut events, script, paid) = several_waiting(&server, dir.path(), 3).await;
+
+    let before = server.histories_of(&script);
+    server.set_history(&script, &[(paid[1], 0), (paid[0], 0)]);
+    server.set_status(
+        &script,
+        &crate::testkit::status_of(&[(paid[0], 0), (paid[1], 0)]),
+    );
+    next_sync(&mut events, &wallet).await;
+    assert_eq!(server.histories_of(&script), before + 1);
+    let shown = shown(&manager, &wallet).await;
+    assert!(shown.contains(&paid[0].to_string()) && shown.contains(&paid[1].to_string()));
+    assert!(!shown.contains(&paid[2].to_string()), "{shown:?}");
+    manager.live_stop().await;
+}
+
+/// Two payments wait on one script, and the server lists one of them
+/// and another transaction: no order of its mempool hashes to its
+/// status. The history is asked for once more, in case the server moved
+/// between the two; still not its status, it is set aside, and the
+/// payment it lacks stays as the wallet held it.
+#[tokio::test]
+async fn a_disagreement_over_several_waiting_is_asked_again_once() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, _events, script, paid) = several_waiting(&server, dir.path(), 2).await;
+
+    let stranger = payment(&server, 40, &script, 9_000);
+    server.set_history(&script, &[(paid[0], 0), (stranger, 0)]);
+    let before = server.histories_of(&script);
+    manager.sync_wallet(&wallet).await.unwrap();
+    assert_eq!(server.histories_of(&script), before + 2);
+    let shown = shown(&manager, &wallet).await;
+    assert!(shown.contains(&paid[1].to_string()), "{shown:?}");
+    assert!(!shown.contains(&stranger.to_string()), "{shown:?}");
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(server.histories_of(&script), before + 2);
+    manager.live_stop().await;
+}
+
+/// Eight payments wait on one script, and the server lists seven of
+/// them, in another order than its status hashed: too many orders to
+/// try them all, so nothing tells a payment gone from a server that
+/// orders its mempool its own way. The history is asked for once more,
+/// and read as it then comes: an honest server is never refused for an
+/// order the protocol left to it.
+#[tokio::test]
+async fn too_many_waiting_to_reorder_are_asked_again_then_read() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, _events, script, paid) = several_waiting(&server, dir.path(), 8).await;
+
+    let listed: Vec<(bdk_wallet::bitcoin::Txid, i64)> =
+        paid[..7].iter().rev().map(|txid| (*txid, 0)).collect();
+    server.set_history(&script, &listed);
+    let before = server.histories_of(&script);
+    manager.sync_wallet(&wallet).await.unwrap();
+    assert_eq!(server.histories_of(&script), before + 2);
+    let shown = shown(&manager, &wallet).await;
+    assert!(
+        paid[..7]
+            .iter()
+            .all(|txid| shown.contains(&txid.to_string()))
+    );
+    assert!(!shown.contains(&paid[7].to_string()), "{shown:?}");
+    manager.live_stop().await;
+}
+
+/// A watched address, the same way: the server of the watch lists the
+/// address without the payment its status holds. The sync sets that
+/// history aside and says it read nothing, a failure rather than a sync
+/// with nothing new; it asks no other server, and the payment stays.
+#[tokio::test]
+async fn a_watched_address_sets_aside_a_history_its_status_disowns() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), server.backend()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    let payment = transaction(&[nowhere(4, 0)], &[(ADDRESS_SCRIPT, 12_000)]);
+    let paid = payment.compute_txid();
+    server.add_tx(&payment);
+    server.set_history(ADDRESS_SCRIPT, &[(paid, 0)]);
+    server.set_unspent(ADDRESS_SCRIPT, &[(paid, 0, 0, 12_000)]);
+    server.set_status(ADDRESS_SCRIPT, &crate::testkit::status_of(&[(paid, 0)]));
+    assert_eq!(next_announcement(&mut events).await.stage, TxStage::Mempool);
+    next_sync(&mut events, &wallet).await;
+    tokio::time::sleep(QUIET).await;
+
+    server.set_history(ADDRESS_SCRIPT, &[]);
+    server.set_unspent(ADDRESS_SCRIPT, &[]);
+    let before = server.histories_of(ADDRESS_SCRIPT);
+    let error = manager.sync_wallet(&wallet).await.unwrap_err().to_string();
+    assert!(error.contains("not read"), "{error}");
+    assert_eq!(server.histories_of(ADDRESS_SCRIPT), before + 1);
+    assert!(shown(&manager, &wallet).await.contains(&paid.to_string()));
+    manager.live_stop().await;
+}
+
+/// A complete sync that set a history aside did not read every script:
+/// it is not taken for the complete read of the day, and the next look
+/// reads the wallet whole again.
+#[tokio::test]
+async fn a_sync_that_set_a_history_aside_is_not_complete() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, _events, script, _) = several_waiting(&server, dir.path(), 1).await;
+
+    server.set_history(&script, &[]);
+    let old = age(&manager, &wallet).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    assert_eq!(complete_at(&manager, &wallet).await, Some(old));
+    manager.live_stop().await;
+}
+
+/// A confirmation the watch reports keeps its scripts through serde, the
+/// proofs left behind: what reads it back syncs those scripts, where a
+/// confirmation with nothing in it would be dropped.
+#[test]
+fn a_confirmation_read_back_without_its_proofs_is_a_sync() {
+    let script = ScriptBuf::from_bytes(vec![0x51]);
+    let proven = crate::watch::Proven {
+        script: script.to_hex_string(),
+        status: "ff".to_owned(),
+        txids: Vec::new(),
+        headers: Arc::new(crate::watch::Headers {
+            first: 100,
+            chain: Vec::new(),
+        }),
+        server: Endpoint::Esplora("http://127.0.0.1".to_owned()),
+    };
+    let reported = WatchEvent::Confirmed {
+        wallet_id: "w".to_owned(),
+        scripts: vec![script.to_hex_string()],
+        proven: vec![proven],
+    };
+    let read_back: WatchEvent =
+        serde_json::from_str(&serde_json::to_string(&reported).unwrap()).unwrap();
+    let WatchEvent::Confirmed {
+        scripts, proven, ..
+    } = read_back
+    else {
+        panic!("not a confirmation: {read_back:?}");
+    };
+    let asked = Asked::confirmed(scripts, proven);
+    assert!(asked.proven.is_empty());
+    assert_eq!(asked.reach(), Reach::Scripts(vec![script]));
+}
+
+/// A server that forged changes no sync found anything behind has its
+/// next claims held back. A confirmation the watch proved is no claim:
+/// it is taken at once, held back by nothing.
+#[tokio::test]
+async fn a_proven_confirmation_is_never_held_back() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let hold = Duration::from_secs(1);
+    let pace = crate::watch::Timings {
+        hold,
+        hold_cap: hold * 2,
+        ..timings()
+    };
+    let (manager, wallet, mut events, script, paid) =
+        waiting_for_a_block_at(&server, dir.path(), pace).await;
+    for forged in 0..=FREE_FUTILE {
+        server.set_status(&script, &format!("forged {forged}"));
+        let (report, _) = next_sync(&mut events, &wallet).await;
+        assert!(report.new_txs.is_empty());
+    }
+
+    server.set_history(&script, &[(paid, 101)]);
+    let pushed = std::time::Instant::now();
+    block(&server, 101, &script, &[(paid, 101)]);
+    let confirmation = next_announcement(&mut events).await;
+    assert_eq!(confirmation.stage, TxStage::Confirmed);
+    assert!(pushed.elapsed() < hold, "{:?}", pushed.elapsed());
+    manager.live_stop().await;
 }

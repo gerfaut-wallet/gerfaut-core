@@ -133,9 +133,16 @@ async fn with_an_onion_backend_the_price_goes_through_tor() {
         let error = manager.fetch_price().await.unwrap_err();
         assert!(is_price_failure(&error), "{source:?}: {error}");
     }
-    price_by(&manager, PriceSource::Kraken, FiatCurrency::Usd).await;
+    // Each source's history too.
+    price_by(&manager, PriceSource::MempoolSpace, FiatCurrency::Usd).await;
     let error = manager
         .fetch_price_history(PriceRange::Year)
+        .await
+        .unwrap_err();
+    assert!(is_price_failure(&error), "{error}");
+    price_by(&manager, PriceSource::Coingecko, FiatCurrency::Usd).await;
+    let error = manager
+        .fetch_price_history(PriceRange::Week)
         .await
         .unwrap_err();
     assert!(is_price_failure(&error), "{error}");
@@ -143,10 +150,10 @@ async fn with_an_onion_backend_the_price_goes_through_tor() {
     assert_eq!(
         *asked.lock().unwrap(),
         vec![
-            ("api.coingecko.com".to_owned(), 443),
-            ("api.kraken.com".to_owned(), 443),
             ("mempool.space".to_owned(), 443),
-            ("api.kraken.com".to_owned(), 443),
+            ("api.coingecko.com".to_owned(), 443),
+            ("mempool.space".to_owned(), 443),
+            ("api.coingecko.com".to_owned(), 443),
         ],
         "every host went to the proxy, by name, and nowhere else"
     );
@@ -180,7 +187,7 @@ async fn the_price_follows_the_preferences() {
     let (proxy, asked) = refusing_tor().await;
     let dir = tempfile::tempdir().unwrap();
     let manager = onion_manager(dir.path(), proxy).await;
-    price_by(&manager, PriceSource::Kraken, FiatCurrency::Usd).await;
+    price_by(&manager, PriceSource::MempoolSpace, FiatCurrency::Usd).await;
     manager
         .set_preferences(PreferencesChange {
             fiat_currency: Some(FiatCurrency::Ngn),
@@ -203,10 +210,10 @@ async fn an_unserved_range_is_refused_before_any_route() {
     let (proxy, asked) = refusing_tor().await;
     let dir = tempfile::tempdir().unwrap();
     let manager = onion_manager(dir.path(), proxy).await;
-    price_by(&manager, PriceSource::MempoolSpace, FiatCurrency::Usd).await;
+    price_by(&manager, PriceSource::Coingecko, FiatCurrency::Usd).await;
 
     let error = manager
-        .fetch_price_history(PriceRange::Day)
+        .fetch_price_history(PriceRange::Max)
         .await
         .unwrap_err();
     assert!(is_price_failure(&error), "{error}");

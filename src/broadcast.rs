@@ -30,6 +30,9 @@ use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
 use crate::wallet::tx_extras::{OpReturnData, op_return_of};
 
+mod signing;
+pub use signing::{Satisfaction, SigningHints};
+
 /// Largest input accepted, in characters: a fully signed transaction
 /// with hundreds of inputs fits many times over.
 const MAX_INPUT_LEN: usize = 4_000_000;
@@ -122,9 +125,13 @@ pub enum TxWarningKind {
     /// An input was not found on this network.
     InputUnknown,
     /// An input was already spent, by this transaction or another.
-    /// Blocks once the spend is in a block; one still waiting in the
+    /// Blocks once the spend is in a block and the transaction that
+    /// makes it was seen spending the coin; one still waiting in the
     /// mempool may be what this transaction replaces.
     InputSpent,
+    /// This very transaction is already waiting in the mempool: it was
+    /// broadcast before, and sending it again does no harm.
+    InMempool,
     /// The PSBT declares a coin other than the one the wallet or the
     /// backend holds at that outpoint, or other than the one its own
     /// previous transaction pays: another value, another script.
@@ -182,8 +189,10 @@ impl TxWarningKind {
             // Nothing here costs anything: an input the backend has not
             // indexed, a time lock, a fee that could not be computed, an
             // output under the dust threshold, a coin of a watched
-            // wallet being spent. All of them are worth reading.
+            // wallet being spent, a transaction the network already
+            // holds. All of them are worth reading.
             TxWarningKind::InputUnknown
+            | TxWarningKind::InMempool
             | TxWarningKind::Locked
             | TxWarningKind::FeeUnknown
             | TxWarningKind::DustOutput
@@ -202,8 +211,9 @@ pub struct TxWarning {
     /// fall through a hand-written table into an untoned panel.
     pub severity: TxSeverity,
     /// Whether the network is sure to refuse the transaction while this
-    /// holds: a signature missing, a coin already spent in a block,
-    /// outputs past all the bitcoin there will ever be, or outputs over
+    /// holds: a signature missing, a coin already spent in a block by a
+    /// transaction seen spending it, outputs past all the bitcoin there
+    /// will ever be, or outputs over
     /// inputs whose every amount is proven (by a watched wallet, the
     /// backend, or the previous transaction a PSBT carries). A preview
     /// with one is not ready, so neither application can send it, and
@@ -251,6 +261,25 @@ pub enum TxReadiness {
     Refused,
     /// Some inputs carry no signature, and that is all that holds it.
     Unsigned,
+    /// Signed, and already waiting in the mempool: it was broadcast
+    /// before. It can be sent again, which does no harm.
+    InMempool,
+}
+
+/// What the fee rate is measured on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeRateBasis {
+    /// The transaction as it will be sent: every input signed.
+    Exact,
+    /// The transaction once signed, each missing signature counted at
+    /// the most it can weigh: the rate it will pay, give or take a few
+    /// bytes, and never more.
+    Estimated,
+    /// The transaction as it is, some signatures missing and their
+    /// weight unknown: signatures only add weight, so the rate once
+    /// signed is this one at most.
+    UpperBound,
 }
 
 /// Everything shown before broadcasting.
@@ -265,18 +294,29 @@ pub struct TxPreview {
     /// past all the bitcoin there will ever be, and the outputs pay no
     /// more than the inputs bring.
     pub fee_sats: Option<u64>,
+    /// The fee over the virtual size the transaction has once signed:
+    /// see `fee_rate_basis` for how that size is known.
     pub fee_rate_sat_vb: Option<f64>,
+    /// Whether the rate is the one paid, an estimate of it before the
+    /// signatures are in, or the most it can be.
+    pub fee_rate_basis: FeeRateBasis,
     /// Why there is no fee, in the words of the caution that says it:
     /// what each application repeats where the send is decided. `None`
     /// when there is a fee.
     pub fee_unknown_reason: Option<String>,
     /// Whether a value shown for an input is one nothing proves: a
-    /// witness entry the PSBT declares, or a watched address's listing,
-    /// with no wallet engine, no backend and no previous transaction
-    /// behind it. The inputs total and the fee rest on that word then,
-    /// and say so.
+    /// witness entry the PSBT declares, or a watched address's listing
+    /// the backend did not back with the transaction, with no wallet
+    /// engine and no previous transaction behind it. The inputs total
+    /// and the fee rest on that word then, and say so.
     pub amounts_declared: bool,
-    /// Virtual size in vbytes.
+    /// Whether one of those values is a watched address's listing, the
+    /// server's figure, rather than the PSBT's own word: what nothing
+    /// proves is then not only what the PSBT claims, and the mark on the
+    /// amounts says it neutrally.
+    pub amounts_listed: bool,
+    /// Virtual size in vbytes, of the transaction as it is: before its
+    /// signatures when some are missing.
     pub vsize: u64,
     /// Weight units.
     pub weight: u64,
@@ -290,7 +330,8 @@ pub struct TxPreview {
     pub rbf: bool,
     /// Whether the transaction can be sent: every input is signed, and
     /// no caution says the network is sure to refuse it
-    /// ([`TxWarning::blocking`]). The same as `readiness` being ready.
+    /// ([`TxWarning::blocking`]). The same as `readiness` being ready or
+    /// in the mempool.
     pub ready: bool,
     /// Where it stands, in the words of the readiness pill.
     pub readiness: TxReadiness,
@@ -396,6 +437,13 @@ pub struct DecodedInput {
     /// or without `ANYONECANPAY`, spelled that way. `None` when every
     /// signature found covers every output.
     pub loose_sighash: Option<String>,
+    /// What a PSBT input finalized on its own carries, when the rest of
+    /// the PSBT is not: the transaction read is then the unsigned
+    /// skeleton, which leaves it out, and the fee rate counts it back.
+    pub finalized: Option<Satisfaction>,
+    /// What the PSBT says about how the input will be signed, for the
+    /// weight its signatures will add.
+    pub hints: SigningHints,
 }
 
 /// Decodes a transaction from text: base64 PSBT, hex PSBT, hex raw
@@ -461,6 +509,8 @@ pub fn decode_bytes_as_transaction(bytes: &[u8]) -> CoreResult<DecodedTx> {
             prevout_proven: false,
             disputed_witness_utxo: None,
             loose_sighash: loose_sighash_in(&input.script_sig, &input.witness),
+            finalized: None,
+            hints: SigningHints::default(),
         })
         .collect::<Vec<_>>();
     let ready = inputs.iter().all(|input| input.signed);
@@ -586,12 +636,20 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
             input.final_script_witness.as_ref().unwrap_or(&no_witness),
         )
         .or_else(|| partial_loose[index].clone());
+        let signed = final_present && !unfinished.contains(&index);
         inputs.push(DecodedInput {
-            signed: final_present && !unfinished.contains(&index),
+            signed,
             prevout,
             prevout_proven,
             disputed_witness_utxo,
             loose_sighash,
+            finalized: signed.then(|| {
+                Satisfaction::of_final(
+                    input.final_script_sig.as_ref(),
+                    input.final_script_witness.as_ref(),
+                )
+            }),
+            hints: SigningHints::of_psbt_input(input),
         });
     }
     let ready = inputs.iter().all(|input| input.signed);
@@ -725,6 +783,10 @@ pub struct InputFacts {
     /// which is a backend's answer; this is the absence of one, and it
     /// leaves the PSBT's own declaration unconfronted.
     pub unchecked: bool,
+    /// What signing will add to this input, when the watched wallet that
+    /// holds the coin says it from its descriptor: the most its policy
+    /// can take.
+    pub satisfaction: Option<Satisfaction>,
 }
 
 /// The transaction that already spends a coin, as a watched wallet or
@@ -737,6 +799,12 @@ pub struct SpentBy {
     /// mempool can be replaced, and the transaction previewed may be
     /// the replacement.
     pub confirmed: bool,
+    /// Whether that transaction was seen spending the coin: held by the
+    /// watched wallet, or handed over by the backend, its txid checked,
+    /// with this coin among its inputs. A backend's word alone, one that
+    /// names a transaction it then cannot show, or one that spends
+    /// something else, is not enough to hold a broadcast back on.
+    pub verified: bool,
 }
 
 /// What the manager learned about an output beyond the script.
@@ -748,6 +816,9 @@ pub struct OutputFacts {
 
 /// Builds the preview from the decoded transaction and the facts the
 /// manager gathered. Pure: everything network-bound happened before.
+/// `tip_height` is the height a height lock is judged against: the
+/// backend's at the time of the preview when it answered, since that is
+/// the node the transaction goes to.
 pub fn build_preview(
     decoded: &DecodedTx,
     network: Network,
@@ -763,32 +834,37 @@ pub fn build_preview(
             .map(|a| a.to_string())
     };
 
+    // A coin the PSBT proves, read in the previous transaction its
+    // outpoint commits to, is the coin itself: nothing outweighs it,
+    // least of all a server's listing. Otherwise what the wallet or the
+    // backend holds at that outpoint comes first: the PSBT's own word
+    // about the coin it spends is its author's, and a finalized input is
+    // never checked against anything. The PSBT fills in only where
+    // neither knows it.
+    let spent: Vec<Option<TxOut>> = (0..tx.input.len())
+        .map(|i| {
+            if decoded.inputs[i].prevout_proven {
+                decoded.inputs[i].prevout.clone()
+            } else {
+                input_facts
+                    .get(i)
+                    .and_then(|f| f.prevout.clone())
+                    .or_else(|| decoded.inputs[i].prevout.clone())
+            }
+        })
+        .collect();
     let inputs: Vec<TxInputPreview> = tx
         .input
         .iter()
+        .zip(&spent)
         .enumerate()
-        .map(|(i, input)| {
-            let facts = input_facts.get(i).cloned().unwrap_or_default();
-            // A coin the PSBT proves, read in the previous transaction its
-            // outpoint commits to, is the coin itself: nothing outweighs
-            // it, least of all a server's listing. Otherwise what the
-            // wallet or the backend holds at that outpoint comes first:
-            // the PSBT's own word about the coin it spends is its
-            // author's, and a finalized input is never checked against
-            // anything. The PSBT fills in only where neither knows it.
-            let prevout = if decoded.inputs[i].prevout_proven {
-                decoded.inputs[i].prevout.clone()
-            } else {
-                facts.prevout.or_else(|| decoded.inputs[i].prevout.clone())
-            };
-            TxInputPreview {
-                txid: input.previous_output.txid.to_string(),
-                vout: input.previous_output.vout,
-                value_sats: prevout.as_ref().map(|p| p.value.to_sat()),
-                address: prevout.as_ref().and_then(|p| address_of(&p.script_pubkey)),
-                signed: decoded.inputs[i].signed,
-                wallet: facts.wallet,
-            }
+        .map(|(i, (input, prevout))| TxInputPreview {
+            txid: input.previous_output.txid.to_string(),
+            vout: input.previous_output.vout,
+            value_sats: prevout.as_ref().map(|p| p.value.to_sat()),
+            address: prevout.as_ref().and_then(|p| address_of(&p.script_pubkey)),
+            signed: decoded.inputs[i].signed,
+            wallet: input_facts.get(i).and_then(|f| f.wallet.clone()),
         })
         .collect();
 
@@ -830,7 +906,30 @@ pub fn build_preview(
         .filter(|_| !outputs_impossible && !inputs_impossible)
         .and_then(|(total, out)| total.checked_sub(out));
     let vsize = tx.vsize() as u64;
-    let fee_rate_sat_vb = fee_sats.map(|fee| fee as f64 / vsize as f64);
+    // The rate is paid on the transaction as it will be sent. Missing
+    // signatures are weight still to come: counted in when every input
+    // says what it will take, and otherwise the rate on the skeleton is
+    // the most it can be.
+    // Past that ceiling, the least the rate can plausibly be: each input
+    // whose signatures weigh what nobody can tell counted at the heaviest
+    // standard signature script there is. A fee far above what the chain
+    // asks for even then is one to say.
+    let missing = missing_signatures(decoded, input_facts, &spent);
+    let (signed_vsize, fee_rate_basis, plausible_vsize) = if decoded.ready {
+        (vsize, FeeRateBasis::Exact, vsize)
+    } else if missing.iter().all(Option::is_some) {
+        let known: Vec<Option<Satisfaction>> = missing.into_iter().flatten().collect();
+        let once_signed = signing::weight_once_signed(tx, &known).to_vbytes_ceil();
+        (once_signed, FeeRateBasis::Estimated, once_signed)
+    } else {
+        let heaviest: Vec<Option<Satisfaction>> = missing
+            .into_iter()
+            .map(|need| need.unwrap_or(Some(signing::PLAUSIBLE_HEAVIEST)))
+            .collect();
+        let plausible = signing::weight_once_signed(tx, &heaviest).to_vbytes_ceil();
+        (vsize, FeeRateBasis::UpperBound, plausible)
+    };
+    let fee_rate_sat_vb = fee_sats.map(|fee| fee as f64 / signed_vsize as f64);
 
     // Whether each value shown is proven, input by input: by a wallet
     // engine or a backend, which read it in a transaction whose txid
@@ -849,9 +948,18 @@ pub fn build_preview(
         .iter()
         .zip(&proven)
         .any(|(input, &proven)| input.value_sats.is_some() && !proven);
+    // The value shown for a coin the PSBT does not prove is the wallet's
+    // or the backend's first: a listing still standing is the server's.
+    let amounts_listed = (0..inputs.len()).any(|i| {
+        !proven[i]
+            && input_facts
+                .get(i)
+                .is_some_and(|f| f.listed && f.prevout.is_some())
+    });
 
     let txid = tx.compute_txid();
     let mut warnings = Vec::new();
+    let mut in_mempool = false;
     let unsigned = inputs.iter().filter(|i| !i.signed).count();
     if unsigned > 0 {
         warnings.push(TxWarning::refused(
@@ -936,19 +1044,24 @@ pub fn build_preview(
             };
             warnings.push(TxWarning::new(TxWarningKind::InputMismatch, message));
         }
-        // A listing the previous transaction contradicts, set aside before
-        // the backend was asked.
+        // A listing a transaction contradicts: the previous one the PSBT
+        // carries, set aside before the backend was asked, or the one the
+        // backend handed over when asked about the coin.
         if let (Some((wallet, listed)), Some(proof)) = (
             &facts.contradicted_listing,
-            decoded.inputs.get(i).and_then(|d| d.prevout.as_ref()),
+            spent.get(i).and_then(Option::as_ref),
         ) {
+            let source = if decoded.inputs[i].prevout_proven {
+                "the previous transaction the PSBT carries"
+            } else {
+                "the transaction the backend holds"
+            };
             warnings.push(TxWarning::new(
                 TxWarningKind::InputMismatch,
                 format!(
                     "Input {i} is not what {} lists: its server lists this coin as {} sats on \
-                     {}, but the previous transaction the PSBT carries, the one this input \
-                     spends, pays {} sats to {}. The value shown and the fee go by that \
-                     transaction.",
+                     {}, but {source}, the one this input spends, pays {} sats to {}. The value \
+                     shown and the fee go by that transaction.",
                     wallet.name,
                     listed.value.to_sat(),
                     place(listed),
@@ -977,6 +1090,21 @@ pub fn build_preview(
                      one this input spends; whether the coin is still there to spend is not."
                 ),
             ));
+        } else if facts.unchecked
+            && facts.listed
+            && let Some(wallet) = &facts.wallet
+        {
+            // Nothing answered about a coin a watched address listed: the
+            // value shown is that listing, as old as the last sync.
+            warnings.push(TxWarning::new(
+                TxWarningKind::InputUnknown,
+                format!(
+                    "Input {i} could not be checked: no backend answered about this coin. Its \
+                     value here, and the fee, are what the server listed for {} at the last \
+                     sync, not something confirmed.",
+                    wallet.name
+                ),
+            ));
         } else if facts.unchecked {
             // Saying it "was not found" would be a claim nobody made.
             // Nothing answered, so the value shown for this coin is the
@@ -989,9 +1117,35 @@ pub fn build_preview(
                      something confirmed."
                 ),
             ));
+        } else if facts
+            .spent_by
+            .is_some_and(|by| by.txid == txid && !by.confirmed)
+        {
+            // This very transaction, waiting: said once for the whole of
+            // it below, not coin by coin.
+            in_mempool = true;
         } else if facts.spent == Some(true) {
             warnings.push(spent_caution(i, txid, facts.spent_by));
         }
+    }
+    if in_mempool {
+        // A PSBT whose transaction already waits there, signed by whoever
+        // sent it: telling the reader to take it back to the signer would
+        // contradict the line below. Its inputs still read unsigned, and
+        // the pill says the copy pasted is not, which is true.
+        if !decoded.ready {
+            warnings.retain(|w| w.kind != TxWarningKind::Unsigned);
+        }
+        warnings.push(TxWarning::new(
+            TxWarningKind::InMempool,
+            if decoded.ready {
+                "This transaction is already waiting in the mempool: it was broadcast before. \
+                 Broadcasting it again does no harm."
+            } else {
+                "This transaction is already waiting in the mempool, signed: it was broadcast \
+                 before, and there is nothing left to send."
+            },
+        ));
     }
     // Every value known, every amount possible, and still no fee: the
     // outputs pay more than the inputs bring.
@@ -1035,12 +1189,23 @@ pub fn build_preview(
                 .to_owned(),
         )),
         (Some(fee), Some(rate), Some(total)) => {
-            if rate > HIGH_FEE_RATE_SAT_VB {
+            // A rate read on a skeleton whose signatures weigh what nobody
+            // can tell is only a ceiling: the caution goes by the least it
+            // can plausibly be once signed, and says so.
+            let (judged, measured) = match fee_rate_basis {
+                FeeRateBasis::Exact => (rate, format!("{rate:.0} sat/vB")),
+                FeeRateBasis::Estimated => (rate, format!("about {rate:.0} sat/vB once signed")),
+                FeeRateBasis::UpperBound => {
+                    let least = fee as f64 / plausible_vsize as f64;
+                    (least, format!("at least {least:.0} sat/vB once signed"))
+                }
+            };
+            if judged > HIGH_FEE_RATE_SAT_VB {
                 warnings.push(TxWarning::new(
                     TxWarningKind::HighFeeRate,
                     format!(
-                        "The fee rate is {rate:.0} sat/vB, far above what the chain asks for. \
-                         A wrong unit in the signing software is the usual cause."
+                        "The fee rate is {measured}, far above what the chain asks for. A wrong \
+                         unit in the signing software is the usual cause."
                     ),
                 ));
             }
@@ -1120,10 +1285,12 @@ pub fn build_preview(
         TxReadiness::Refused
     } else if !decoded.ready {
         TxReadiness::Unsigned
+    } else if in_mempool {
+        TxReadiness::InMempool
     } else {
         TxReadiness::Ready
     };
-    let ready = readiness == TxReadiness::Ready;
+    let ready = matches!(readiness, TxReadiness::Ready | TxReadiness::InMempool);
     TxPreview {
         txid: txid.to_string(),
         source: decoded.source,
@@ -1132,8 +1299,10 @@ pub fn build_preview(
         outputs,
         fee_sats,
         fee_rate_sat_vb,
+        fee_rate_basis,
         fee_unknown_reason,
         amounts_declared,
+        amounts_listed,
         vsize,
         weight: tx.weight().to_wu(),
         size: tx.total_size() as u64,
@@ -1145,6 +1314,38 @@ pub fn build_preview(
         warnings,
         hex: ready.then(|| encode::serialize_hex(tx)),
     }
+}
+
+/// What each input still lacks before the transaction is the one the
+/// network takes: `Some(None)` for an input that carries it already,
+/// `None` for one whose lack cannot be told. A finalized input counts as
+/// it is; a watched wallet's coin, as its descriptor allows; any other,
+/// by its script and what the PSBT carries about it.
+fn missing_signatures(
+    decoded: &DecodedTx,
+    input_facts: &[InputFacts],
+    spent: &[Option<TxOut>],
+) -> Vec<Option<Option<Satisfaction>>> {
+    decoded
+        .tx
+        .input
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            if !input.script_sig.is_empty() || !input.witness.is_empty() {
+                return Some(None);
+            }
+            let described = &decoded.inputs[i];
+            if let Some(done) = described.finalized {
+                return Some(Some(done));
+            }
+            if let Some(policy) = input_facts.get(i).and_then(|f| f.satisfaction) {
+                return Some(Some(policy));
+            }
+            let coin = spent.get(i)?.as_ref()?;
+            signing::estimated(&coin.script_pubkey, &described.hints).map(Some)
+        })
+        .collect()
 }
 
 /// How many of the inputs carry no signature, in a sentence that agrees
@@ -1159,13 +1360,23 @@ fn unsigned_count(unsigned: usize, total: usize) -> String {
 }
 
 /// The caution for input `index`, already spent. It blocks only once
-/// the spend is in a block: every node then refuses another spend of
-/// the coin. A spend still waiting in the mempool may be this very
-/// transaction, which a node takes again without complaint, or one
-/// this transaction replaces with a higher fee; the node decides.
+/// the spend is in a block, by a transaction seen spending the coin:
+/// every node then refuses another spend of it. A backend that only says
+/// so, naming a transaction it cannot show or one that spends something
+/// else, gets a caution and no say on the send. A spend still waiting in
+/// the mempool may be one this transaction replaces with a higher fee;
+/// the node decides. This very transaction waiting there is said apart.
 fn spent_caution(index: usize, txid: Txid, spent_by: Option<SpentBy>) -> TxWarning {
     let kind = TxWarningKind::InputSpent;
     match spent_by {
+        Some(by) if by.confirmed && !by.verified => TxWarning::new(
+            kind,
+            format!(
+                "The backend says input {index} is already spent in a block, but it could not \
+                 show a transaction that spends it. Broadcast stays available: if the backend \
+                 is right, the network will refuse this one."
+            ),
+        ),
         Some(by) if by.confirmed && by.txid == txid => TxWarning::refused(
             kind,
             format!(
@@ -1178,13 +1389,6 @@ fn spent_caution(index: usize, txid: Txid, spent_by: Option<SpentBy>) -> TxWarni
             format!(
                 "Input {index} is already spent by another transaction, which is in a \
                  block. The network will refuse this one."
-            ),
-        ),
-        Some(by) if by.txid == txid => TxWarning::new(
-            kind,
-            format!(
-                "Input {index} is already spent by this same transaction, which is waiting \
-                 in the mempool: it was broadcast before."
             ),
         ),
         Some(_) => TxWarning::new(
@@ -1228,6 +1432,7 @@ mod tests {
             (InputMismatch, TxSeverity::Alert),
             (UncommittedOutputs, TxSeverity::Alert),
             (InputUnknown, TxSeverity::Info),
+            (InMempool, TxSeverity::Info),
             (Locked, TxSeverity::Info),
             (FeeUnknown, TxSeverity::Info),
             (DustOutput, TxSeverity::Info),
@@ -1674,6 +1879,7 @@ mod tests {
             contradicted_listing: None,
             unknown: false,
             unchecked: false,
+            satisfaction: None,
         }];
         let preview = build_preview(
             &decoded,
@@ -1715,6 +1921,7 @@ mod tests {
             contradicted_listing: None,
             unknown: false,
             unchecked: false,
+            satisfaction: None,
         }];
         let preview = build_preview(&decoded, Network::Mainnet, &facts, &[], Some(100), 0);
         assert!(!preview.ready);
@@ -1775,6 +1982,7 @@ mod tests {
             let facts = spent_coin(Some(SpentBy {
                 txid: spender,
                 confirmed: true,
+                verified: true,
             }));
             let preview = build_preview(&decoded, Network::Signet, &facts, &[], Some(100), 0);
             assert!(!preview.ready, "{says}");
@@ -1792,9 +2000,9 @@ mod tests {
     }
 
     /// A spend still waiting in the mempool is not the last word: this
-    /// transaction may replace it with a higher fee, or be it, sent
-    /// again. The node decides; the caution stays, red, and Broadcast
-    /// stays on. So does a spend nobody could place.
+    /// transaction may replace it with a higher fee. The node decides;
+    /// the caution stays, red, and Broadcast stays on. So does a spend
+    /// nobody could place.
     #[test]
     fn a_coin_spent_in_the_mempool_leaves_the_send_to_the_node() {
         let tx = signed_tx();
@@ -1804,15 +2012,9 @@ mod tests {
                 Some(SpentBy {
                     txid: Txid::from_byte_array([0x77; 32]),
                     confirmed: false,
+                    verified: true,
                 }),
                 "only as a replacement paying a higher fee",
-            ),
-            (
-                Some(SpentBy {
-                    txid: tx.compute_txid(),
-                    confirmed: false,
-                }),
-                "by this same transaction, which is waiting in the mempool",
             ),
             (None, "Either this transaction was broadcast before"),
         ] {
@@ -1825,6 +2027,7 @@ mod tests {
                 0,
             );
             assert!(preview.ready, "{says}");
+            assert_eq!(preview.readiness, TxReadiness::Ready, "{says}");
             assert!(preview.hex.is_some(), "{says}");
             let spent = preview
                 .warnings
@@ -1834,6 +2037,94 @@ mod tests {
             assert!(!spent.blocking, "{says}");
             assert_eq!(spent.severity, TxSeverity::Alert);
             assert!(spent.message.contains(says), "{}", spent.message);
+        }
+    }
+
+    /// This very transaction already waiting in the mempool: it was sent
+    /// before, and sending it again is harmless. No red, and no "Ready"
+    /// beside a caution that says it is already out: the pill says it is
+    /// waiting, one amber line says why, and Broadcast stays on.
+    #[test]
+    fn a_transaction_already_in_the_mempool_says_so_without_red() {
+        let tx = signed_tx();
+        let decoded = decode_transaction(&encode::serialize_hex(&tx)).unwrap();
+        // Whoever named it, the wallet or a backend's word alone: being
+        // told it is out already holds nothing back.
+        for verified in [true, false] {
+            let preview = build_preview(
+                &decoded,
+                Network::Signet,
+                &spent_coin(Some(SpentBy {
+                    txid: tx.compute_txid(),
+                    confirmed: false,
+                    verified,
+                })),
+                &[],
+                Some(100),
+                0,
+            );
+            assert_eq!(preview.readiness, TxReadiness::InMempool);
+            assert!(preview.ready);
+            assert!(preview.hex.is_some());
+            assert!(
+                preview
+                    .warnings
+                    .iter()
+                    .all(|w| w.severity == TxSeverity::Info && !w.blocking),
+                "{:?}",
+                preview.warnings
+            );
+            let waiting: Vec<&TxWarning> = preview
+                .warnings
+                .iter()
+                .filter(|w| w.kind == TxWarningKind::InMempool)
+                .collect();
+            assert_eq!(waiting.len(), 1, "said once for the whole transaction");
+            assert!(
+                waiting[0].message.contains("does no harm"),
+                "{}",
+                waiting[0].message
+            );
+        }
+    }
+
+    /// A backend that says a coin is spent in a block but cannot show the
+    /// transaction that spends it has only its word: a caution, and the
+    /// send stays the user's. One that shows it holds the send back.
+    #[test]
+    fn a_spend_in_a_block_blocks_only_once_seen() {
+        let tx = signed_tx();
+        let decoded = decode_transaction(&encode::serialize_hex(&tx)).unwrap();
+        for verified in [false, true] {
+            let preview = build_preview(
+                &decoded,
+                Network::Signet,
+                &spent_coin(Some(SpentBy {
+                    txid: Txid::from_byte_array([0x77; 32]),
+                    confirmed: true,
+                    verified,
+                })),
+                &[],
+                Some(100),
+                0,
+            );
+            let spent = preview
+                .warnings
+                .iter()
+                .find(|w| w.kind == TxWarningKind::InputSpent)
+                .expect("the backend's word is said either way");
+            assert_eq!(spent.blocking, verified, "{}", spent.message);
+            assert_eq!(preview.ready, !verified);
+            if verified {
+                assert_eq!(preview.readiness, TxReadiness::Refused);
+            } else {
+                assert_eq!(preview.readiness, TxReadiness::Ready);
+                assert!(
+                    spent.message.contains("could not show"),
+                    "{}",
+                    spent.message
+                );
+            }
         }
     }
 
@@ -2263,6 +2554,7 @@ mod tests {
         let spent_in_a_block = Some(SpentBy {
             txid: Txid::from_byte_array([0x77; 32]),
             confirmed: true,
+            verified: true,
         });
         let unsigned = decode_transaction(&encode::serialize_hex(&unsigned_tx())).unwrap();
         let both = build_preview(
@@ -2499,6 +2791,7 @@ mod tests {
             contradicted_listing: None,
             unknown: false,
             unchecked: false,
+            satisfaction: None,
         }]
     }
 
@@ -2674,6 +2967,7 @@ mod tests {
             contradicted_listing: None,
             unknown: false,
             unchecked: false,
+            satisfaction: None,
         }];
         let preview = build_preview(&decoded, Network::Regtest, &from_chain, &[], Some(100), 0);
         let mismatch = preview
@@ -3052,5 +3346,269 @@ mod tests {
         assert!(!looks_like_transaction(
             &data_encoding::BASE64.encode(&psbt.serialize())
         ));
+    }
+
+    // --- the fee rate before the signatures ---------------------------------
+
+    /// [`unsigned_tx`] as a PSBT whose input declares a coin of 100 000
+    /// sats on `spk`: 1 000 sats of fee, or 90 000 with `burn`.
+    fn unsigned_psbt_on(spk: ScriptBuf, burn: bool) -> DecodedTx {
+        let mut tx = unsigned_tx();
+        if burn {
+            tx.output.truncate(1);
+            tx.output[0].value = Amount::from_sat(10_000);
+        }
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: spk,
+        });
+        decode_bytes_as_transaction(&psbt.serialize()).unwrap()
+    }
+
+    /// An unsigned PSBT pays its fee on the transaction it becomes: the
+    /// signature and the key of a P2WPKH input weigh about a third of the
+    /// skeleton, and the rate is read once they are in. The fee itself is
+    /// exact, signatures or not.
+    #[test]
+    fn an_unsigned_psbt_rates_its_fee_once_signed() {
+        let decoded = unsigned_psbt_on(p2wpkh(0x33), false);
+        let preview = build_preview(
+            &decoded,
+            Network::Signet,
+            &[InputFacts::default()],
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(preview.fee_rate_basis, FeeRateBasis::Estimated);
+        assert_eq!(preview.fee_sats, Some(1_000));
+        // The skeleton's own size is still what the technical facts show.
+        assert_eq!(preview.vsize, unsigned_tx().vsize() as u64);
+        let rate = preview.fee_rate_sat_vb.unwrap();
+        let once_signed = (1_000.0 / rate).round() as u64;
+        // The same transaction signed, its signature one byte short of
+        // the largest: the estimate is that size, or a byte over.
+        let real = signed_tx().vsize() as u64;
+        assert!(
+            once_signed >= real && once_signed <= real + 1,
+            "{once_signed} vB estimated, {real} vB signed"
+        );
+        assert!(rate < 1_000.0 / preview.vsize as f64);
+
+        // Signed, the rate is the one paid.
+        let signed = decode_transaction(&encode::serialize_hex(&signed_tx())).unwrap();
+        let exact = build_preview(
+            &signed,
+            Network::Signet,
+            &spent_coin(None)
+                .into_iter()
+                .map(|f| InputFacts {
+                    spent: Some(false),
+                    ..f
+                })
+                .collect::<Vec<_>>(),
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(exact.fee_rate_basis, FeeRateBasis::Exact);
+        assert_eq!(exact.fee_rate_sat_vb, Some(1_000.0 / real as f64));
+    }
+
+    /// A coin behind a script hash whose script the PSBT does not carry:
+    /// nothing tells what its signatures weigh. The rate on the skeleton
+    /// is then the most it can be, too loose a figure to call a high fee
+    /// rate on; the share of the inputs still speaks.
+    #[test]
+    fn a_rate_nobody_can_estimate_is_a_ceiling() {
+        let p2wsh = ScriptBuf::new_p2wsh(&bdk_wallet::bitcoin::WScriptHash::from_byte_array(
+            [0x55; 32],
+        ));
+        let decoded = unsigned_psbt_on(p2wsh.clone(), true);
+        let preview = build_preview(
+            &decoded,
+            Network::Signet,
+            &[InputFacts::default()],
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(preview.fee_rate_basis, FeeRateBasis::UpperBound);
+        assert_eq!(
+            preview.fee_rate_sat_vb,
+            Some(90_000.0 / preview.vsize as f64)
+        );
+        let kinds: Vec<TxWarningKind> = preview.warnings.iter().map(|w| w.kind).collect();
+        assert!(!kinds.contains(&TxWarningKind::HighFeeRate), "{kinds:?}");
+        assert!(kinds.contains(&TxWarningKind::HighFeeShare), "{kinds:?}");
+
+        // A watched wallet that holds the coin knows its policy: the
+        // most it can take to sign is counted, whatever the PSBT says.
+        let policy = Satisfaction {
+            weight: 200,
+            witness: true,
+        };
+        let watched = build_preview(
+            &decoded,
+            Network::Signet,
+            &[InputFacts {
+                satisfaction: Some(policy),
+                ..Default::default()
+            }],
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(watched.fee_rate_basis, FeeRateBasis::Estimated);
+        let skeleton = decoded.tx.weight().to_wu();
+        // Marker, flag and the empty witness count, then the policy's.
+        let once_signed = (skeleton + 3 + 200).div_ceil(4);
+        assert_eq!(watched.fee_rate_sat_vb, Some(90_000.0 / once_signed as f64));
+        let high = watched
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::HighFeeRate)
+            .expect("an estimate is close enough to say a rate is high");
+        assert!(high.message.contains("once signed"), "{}", high.message);
+    }
+
+    // --- whose word an amount is ------------------------------------------
+
+    /// What a watched address's server listed, with nothing to back it:
+    /// unproven, as a PSBT's word is, but not the PSBT's. The preview says
+    /// whose figure it is, and a coin nobody answered about says so too.
+    #[test]
+    fn a_listing_is_unproven_but_not_the_psbts_word() {
+        let decoded = decode_transaction(&encode::serialize_hex(&signed_tx())).unwrap();
+        let listed = InputFacts {
+            prevout: Some(TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: p2wpkh(0x33),
+            }),
+            wallet: Some(WalletRef {
+                id: "w1".into(),
+                name: "Watch".into(),
+            }),
+            listed: true,
+            unchecked: true,
+            ..Default::default()
+        };
+        let preview = build_preview(&decoded, Network::Signet, &[listed], &[], Some(100), 0);
+        assert!(preview.amounts_declared);
+        assert!(preview.amounts_listed);
+        let unknown = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InputUnknown)
+            .expect("nobody checked the listing");
+        assert!(
+            unknown.message.contains("the server listed for Watch"),
+            "{}",
+            unknown.message
+        );
+        assert!(!unknown.message.contains("claims"), "{}", unknown.message);
+
+        // The PSBT's own word is still called that.
+        let declared = unsigned_psbt_on(p2wpkh(0x33), false);
+        let preview = build_preview(
+            &declared,
+            Network::Signet,
+            &nobody_answered(1),
+            &[],
+            Some(100),
+            0,
+        );
+        assert!(preview.amounts_declared);
+        assert!(!preview.amounts_listed);
+    }
+
+    /// A PSBT still missing its signatures, whose transaction already
+    /// waits in the mempool, signed by whoever sent it: no red line that
+    /// sends it back to the signer, one amber line that says it is out,
+    /// and nothing to broadcast from this copy.
+    #[test]
+    fn an_unsigned_copy_of_a_transaction_in_the_mempool_is_not_sent_back() {
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx()).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: p2wpkh(0x33),
+        });
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        let preview = build_preview(
+            &decoded,
+            Network::Signet,
+            &spent_coin(Some(SpentBy {
+                txid: unsigned_tx().compute_txid(),
+                confirmed: false,
+                verified: true,
+            })),
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(preview.readiness, TxReadiness::Unsigned);
+        assert!(!preview.ready);
+        assert!(preview.hex.is_none());
+        let kinds: Vec<TxWarningKind> = preview.warnings.iter().map(|w| w.kind).collect();
+        assert!(!kinds.contains(&TxWarningKind::Unsigned), "{kinds:?}");
+        let waiting = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::InMempool)
+            .expect("it is said to be out");
+        assert!(waiting.message.contains("nothing left to send"));
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .all(|w| w.severity == TxSeverity::Info),
+            "{:?}",
+            preview.warnings
+        );
+    }
+
+    /// A ceiling is no reason to keep quiet about a rate no signature can
+    /// bring down to sense: counted at the heaviest standard signature
+    /// script, the least the rate can be is still far above what the chain
+    /// asks for, and the caution says so, as the least it can be.
+    #[test]
+    fn a_ceiling_far_above_reason_is_still_called_out() {
+        let p2wsh = ScriptBuf::new_p2wsh(&bdk_wallet::bitcoin::WScriptHash::from_byte_array(
+            [0x55; 32],
+        ));
+        let mut tx = unsigned_tx();
+        tx.output.truncate(1);
+        tx.output[0].value = Amount::from_sat(10_000);
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(10_000_000),
+            script_pubkey: p2wsh,
+        });
+        let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+        let preview = build_preview(
+            &decoded,
+            Network::Signet,
+            &[InputFacts::default()],
+            &[],
+            Some(100),
+            0,
+        );
+        assert_eq!(preview.fee_rate_basis, FeeRateBasis::UpperBound);
+        let high = preview
+            .warnings
+            .iter()
+            .find(|w| w.kind == TxWarningKind::HighFeeRate)
+            .expect("even the least it can be is far too high");
+        // A signature script, no witness: the skeleton's weight and its own.
+        let skeleton = decoded.tx.weight().to_wu();
+        let least =
+            9_990_000.0 / ((skeleton + signing::PLAUSIBLE_HEAVIEST.weight).div_ceil(4)) as f64;
+        assert!(
+            high.message
+                .contains(&format!("at least {least:.0} sat/vB once signed")),
+            "{}",
+            high.message
+        );
     }
 }

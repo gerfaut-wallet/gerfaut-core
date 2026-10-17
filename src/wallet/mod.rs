@@ -54,6 +54,16 @@ pub struct AddressTx {
     pub extras: Option<TxExtras>,
 }
 
+impl AddressTx {
+    /// Whether output `vout` pays the watched address `value` sats: what
+    /// a coin of this transaction must be for the wallet to count it.
+    pub(crate) fn pays(&self, vout: u32, value: u64) -> bool {
+        self.outputs
+            .get(vout as usize)
+            .is_some_and(|output| output.is_mine && output.value_sats == Some(value))
+    }
+}
+
 /// One unspent output of a watched address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddressUtxo {

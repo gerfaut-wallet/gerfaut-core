@@ -311,43 +311,88 @@ impl fmt::Display for Version {
 /// Where the releases are read from.
 pub(crate) const GITHUB_API: &str = "https://api.github.com";
 
+/// The version of GitHub's REST API the check is written against, which
+/// GitHub's documentation asks each request to name: the latest, whose
+/// changes leave the release and its tag as they were.
+pub(crate) const GITHUB_API_VERSION: &str = "2026-03-10";
+
 /// Asks for the latest release of `owner/repo` and gives back its tag.
 /// `proxy` is the Tor SOCKS proxy the manager resolved when the check
 /// has to go through Tor; the name of the host then goes to the proxy,
 /// never to a resolver.
+///
+/// A version GitHub no longer supports is answered `410 Gone`: an
+/// install left without updates for years, the one the check is for,
+/// then asks once more without naming one, as GitHub reads it by
+/// default. Once, and both requests within the one budget of the check.
 pub(crate) async fn latest_tag(api: &str, repo: &str, proxy: Option<&str>) -> CoreResult<String> {
-    let mut response = client(proxy)?
-        .get(format!("{api}/repos/{repo}/releases/latest"))
-        .header("Accept", "application/vnd.github+json")
-        .send()
+    latest_tag_within(api, repo, proxy, budget(proxy)).await
+}
+
+/// [`latest_tag`], all of it within `budget`.
+pub(crate) async fn latest_tag_within(
+    api: &str,
+    repo: &str,
+    proxy: Option<&str>,
+    budget: std::time::Duration,
+) -> CoreResult<String> {
+    tokio::time::timeout(budget, ask_latest(api, repo, proxy))
         .await
-        .map_err(|e| check_error(crate::chain::esplora::describe_failure(&e)))?;
+        .map_err(|_| check_error("timed out".to_owned()))?
+}
+
+async fn ask_latest(api: &str, repo: &str, proxy: Option<&str>) -> CoreResult<String> {
+    let client = client(proxy)?;
+    let ask = |version: Option<&'static str>| {
+        let mut request = client
+            .get(format!("{api}/repos/{repo}/releases/latest"))
+            .header("Accept", "application/vnd.github+json");
+        if let Some(version) = version {
+            request = request.header("X-GitHub-Api-Version", version);
+        }
+        request.send()
+    };
+    let mut response = ask(Some(GITHUB_API_VERSION)).await.map_err(failed)?;
+    if response.status() == reqwest::StatusCode::GONE {
+        response = ask(None).await.map_err(failed)?;
+    }
     if !response.status().is_success() {
         return Err(check_error(format!("http {}", response.status())));
     }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| check_error(crate::chain::esplora::describe_failure(&e)))?
-    {
-        if body.len() + chunk.len() > MAX_ANSWER {
-            return Err(check_error("the answer is far too large".to_owned()));
-        }
-        body.extend_from_slice(&chunk);
-    }
+    let body = body_of(response).await?;
     let value: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| check_error(e.to_string()))?;
     read_tag(&value)
 }
 
+fn failed(e: reqwest::Error) -> CoreError {
+    check_error(crate::chain::esplora::describe_failure(&e))
+}
+
+/// The body of an answer, read a chunk at a time and refused past
+/// [`MAX_ANSWER`].
+async fn body_of(mut response: reqwest::Response) -> CoreResult<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(failed)? {
+        if body.len() + chunk.len() > MAX_ANSWER {
+            return Err(check_error("the answer is far too large".to_owned()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// How long a check may take, its every request together: a Tor
+/// circuit is slower to build than a connection is to open.
+fn budget(proxy: Option<&str>) -> std::time::Duration {
+    std::time::Duration::from_secs(if proxy.is_some() { 60 } else { 15 })
+}
+
 /// The client the check goes out with: through the Tor proxy when there
 /// is one, and through no other proxy at all.
 fn client(proxy: Option<&str>) -> CoreResult<reqwest::Client> {
-    // A Tor circuit is slower to build than a connection is to open.
-    let budget = if proxy.is_some() { 60 } else { 15 };
     let mut builder = crate::chain::http_client()
-        .timeout(std::time::Duration::from_secs(budget))
+        .timeout(budget(proxy))
         .user_agent("gerfaut")
         .redirect(crate::chain::redirects());
     if let Some(proxy) = proxy {

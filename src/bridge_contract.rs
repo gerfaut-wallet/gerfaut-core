@@ -47,9 +47,9 @@ use crate::backup::{
     ImportChoices, ImportReport, RefusedWallet,
 };
 use crate::broadcast::{
-    self, BroadcastReport, BroadcastStatus, DecodedInput, DecodedTx, InputFacts, OutputFacts,
-    RecentBroadcast, TxOutputPreview, TxPreview, TxReadiness, TxSeverity, TxSource, TxWarning,
-    TxWarningKind, WalletRef,
+    self, BroadcastReport, BroadcastStatus, DecodedInput, DecodedTx, FeeRateBasis, InputFacts,
+    OutputFacts, RecentBroadcast, SigningHints, TxOutputPreview, TxPreview, TxReadiness,
+    TxSeverity, TxSource, TxWarning, TxWarningKind, WalletRef,
 };
 use crate::chain::connect::{ScannedBackendKind, parse_backend};
 use crate::chain::public::{PublicServer, ServerProtocol, public_servers};
@@ -1915,6 +1915,8 @@ fn spend(signed: bool) -> DecodedTx {
             prevout_proven: false,
             disputed_witness_utxo: None,
             loose_sighash: None,
+            finalized: None,
+            hints: SigningHints::default(),
         }],
         ready: signed,
     }
@@ -1959,6 +1961,22 @@ fn previews() -> Vec<(&'static str, TxPreview)> {
                     spent_by: Some(broadcast::SpentBy {
                         txid: Txid::from_str(&txid("earlier")).expect("a txid"),
                         confirmed: true,
+                        verified: true,
+                    }),
+                    ..mine.clone()
+                },
+            ),
+        ),
+        (
+            "in_mempool",
+            preview(
+                spend(true),
+                InputFacts {
+                    spent: Some(true),
+                    spent_by: Some(broadcast::SpentBy {
+                        txid: spend(true).tx.compute_txid(),
+                        confirmed: false,
+                        verified: true,
                     }),
                     ..mine
                 },
@@ -1972,6 +1990,7 @@ fn broadcasts() -> Vec<Fixture> {
     let ready = previews[0].1.clone();
     let unsigned = previews[1].1.clone();
     let refused = previews[2].1.clone();
+    let in_mempool = previews[3].1.clone();
     let mut warnings: Vec<(String, TxWarning)> = Vec::new();
     for (_, preview) in &previews {
         for warning in &preview.warnings {
@@ -2046,6 +2065,7 @@ fn broadcasts() -> Vec<Fixture> {
                 Locked,
                 InputUnknown,
                 InputSpent,
+                InMempool,
                 InputMismatch,
                 FeeUnknown,
                 DustOutput,
@@ -2061,6 +2081,15 @@ fn broadcasts() -> Vec<Fixture> {
                 Ready,
                 Refused,
                 Unsigned,
+                InMempool,
+            }),
+        ),
+        variants(
+            "FeeRateBasis",
+            every!(FeeRateBasis {
+                Exact,
+                Estimated,
+                UpperBound,
             }),
         ),
         fixture(
@@ -2069,6 +2098,7 @@ fn broadcasts() -> Vec<Fixture> {
                 ("ready", ready.clone()),
                 ("unsigned_psbt", unsigned),
                 ("refused", refused),
+                ("in_mempool", in_mempool),
             ],
         ),
         fixture(
@@ -2131,7 +2161,7 @@ fn settings() -> Vec<Fixture> {
         masked: true,
         fiat: true,
         fiat_currency: FiatCurrency::Chf,
-        price_source: PriceSource::Kraken,
+        price_source: PriceSource::MempoolSpace,
         notify_new_tx: true,
         explorer_ack: true,
     };
@@ -2244,7 +2274,7 @@ fn settings() -> Vec<Fixture> {
                         masked: Some(true),
                         fiat: Some(true),
                         fiat_currency: Some(FiatCurrency::Chf),
-                        price_source: Some(PriceSource::Kraken),
+                        price_source: Some(PriceSource::MempoolSpace),
                         notify_new_tx: Some(true),
                         explorer_ack: Some(true),
                     },
@@ -2336,7 +2366,6 @@ fn prices() -> Vec<Fixture> {
             "PriceSource",
             every!(PriceSource {
                 Coingecko,
-                Kraken,
                 MempoolSpace,
             }),
         ),
@@ -2356,18 +2385,38 @@ fn prices() -> Vec<Fixture> {
             ],
         ),
         fixture("SourceEntry", sources),
+        fixture(
+            "Credit",
+            vec![(
+                "coingecko",
+                PriceSource::Coingecko
+                    .credit()
+                    .expect("CoinGecko asks for one"),
+            )],
+        ),
         fixture("PriceTable", vec![("table", table.clone())]),
         fixture(
             "PriceQuote",
-            vec![(
-                "eur",
-                PriceQuote {
-                    rate: 92_034.25,
-                    currency: FiatCurrency::Eur,
-                    source: PriceSource::Coingecko,
-                    at: NOW,
-                },
-            )],
+            vec![
+                (
+                    "mempool_space",
+                    PriceQuote {
+                        rate: 92_034.25,
+                        currency: FiatCurrency::Eur,
+                        source: PriceSource::MempoolSpace,
+                        at: NOW,
+                    },
+                ),
+                (
+                    "coingecko",
+                    PriceQuote {
+                        rate: 1_532_870.0,
+                        currency: FiatCurrency::Try,
+                        source: PriceSource::Coingecko,
+                        at: NOW,
+                    },
+                ),
+            ],
         ),
         variants(
             "PriceRange",
@@ -2382,16 +2431,28 @@ fn prices() -> Vec<Fixture> {
         fixture("PricePoint", vec![("point", points[0])]),
         fixture(
             "PriceHistory",
-            vec![(
-                "day",
-                PriceHistory {
-                    points,
-                    currency: FiatCurrency::Eur,
-                    source: PriceSource::Kraken,
-                    range: PriceRange::Day,
-                    at: NOW,
-                },
-            )],
+            vec![
+                (
+                    "day",
+                    PriceHistory {
+                        points: points.clone(),
+                        currency: FiatCurrency::Eur,
+                        source: PriceSource::Coingecko,
+                        range: PriceRange::Day,
+                        at: NOW,
+                    },
+                ),
+                (
+                    "year",
+                    PriceHistory {
+                        points,
+                        currency: FiatCurrency::Eur,
+                        source: PriceSource::MempoolSpace,
+                        range: PriceRange::Year,
+                        at: NOW,
+                    },
+                ),
+            ],
         ),
     ]
 }
@@ -2721,6 +2782,10 @@ fn errors() -> Vec<Fixture> {
         CoreError::Sync {
             backend: text("electrum.example.org"),
             detail: text("connection refused"),
+        },
+        CoreError::FalseProof {
+            backend: text("electrum.example.org"),
+            detail: text(crate::chain::proof::FALSE_PROOF),
         },
         CoreError::Broadcast {
             backend: text("electrum.example.org"),

@@ -387,7 +387,7 @@ async fn the_shared_preferences_are_typed_and_persisted() {
     assert_eq!(stored.unit, Unit::Sats);
     let stored = manager
         .set_preferences(PreferencesChange {
-            price_source: Some(PriceSource::Kraken),
+            price_source: Some(PriceSource::MempoolSpace),
             masked: Some(true),
             ..PreferencesChange::default()
         })

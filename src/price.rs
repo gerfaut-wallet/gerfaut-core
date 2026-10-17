@@ -18,56 +18,66 @@ use crate::error::{CoreError, CoreResult};
 use crate::now_secs;
 
 /// Where the quote comes from. All endpoints are public and keyless.
+///
+/// Kraken was a source until its terms were read again: they forbid a
+/// third-party application that reads their data without their written
+/// consent. A vault that stored it reads it as mempool.space, which
+/// quotes the same seven currencies, so its other preferences stand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriceSource {
     Coingecko,
-    Kraken,
+    #[serde(alias = "kraken")]
     MempoolSpace,
 }
 
 impl PriceSource {
-    pub const ALL: [PriceSource; 3] = [
-        PriceSource::Coingecko,
-        PriceSource::Kraken,
-        PriceSource::MempoolSpace,
-    ];
+    /// Display order: the default first.
+    pub const ALL: [PriceSource; 2] = [PriceSource::MempoolSpace, PriceSource::Coingecko];
 
     pub fn label(self) -> &'static str {
         match self {
             PriceSource::Coingecko => "CoinGecko",
-            PriceSource::Kraken => "Kraken",
             PriceSource::MempoolSpace => "mempool.space",
+        }
+    }
+
+    /// The credit the source's terms ask for wherever its data is on
+    /// screen; `None` when they ask for none.
+    ///
+    /// CoinGecko's API terms ask for "Powered by CoinGecko", shown
+    /// prominently in a legible font; its attribution guide puts it
+    /// close to the data, above or below it, as a link to its site.
+    /// mempool.space asks for nothing.
+    pub fn credit(self) -> Option<Credit> {
+        match self {
+            PriceSource::Coingecko => Some(Credit {
+                text: "Powered by CoinGecko".to_owned(),
+                url: "https://www.coingecko.com".to_owned(),
+            }),
+            PriceSource::MempoolSpace => None,
         }
     }
 
     /// Whether this source quotes a currency without an API key.
     ///
-    /// Kraken lists seven fiat pairs against XBT and the mempool
-    /// projects publish the same seven; CoinGecko publishes them all.
+    /// mempool.space publishes seven; CoinGecko publishes them all.
     pub fn supports_currency(self, currency: FiatCurrency) -> bool {
         match self {
             PriceSource::Coingecko => true,
-            PriceSource::Kraken | PriceSource::MempoolSpace => {
-                currency.reach() == CurrencyReach::Every
-            }
+            PriceSource::MempoolSpace => currency.reach() == CurrencyReach::Every,
         }
     }
 
     /// Chart ranges this source can serve without an API key.
     ///
-    /// CoinGecko caps keyless history at 365 days; mempool.space only
-    /// publishes daily closes, too coarse under a month.
+    /// CoinGecko caps keyless history at 365 days. mempool.space serves
+    /// its whole history, a point an hour over the last years and a day
+    /// before: as fine for a day as for a lifetime.
     pub fn supports(self, range: PriceRange) -> bool {
         match self {
-            PriceSource::Kraken => true,
             PriceSource::Coingecko => range != PriceRange::Max,
-            PriceSource::MempoolSpace => {
-                matches!(
-                    range,
-                    PriceRange::Month | PriceRange::Year | PriceRange::Max
-                )
-            }
+            PriceSource::MempoolSpace => true,
         }
     }
 }
@@ -108,8 +118,7 @@ impl PriceRange {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CurrencyReach {
-    /// Every source quotes it: the seven Kraken and the mempool
-    /// projects publish.
+    /// Every source quotes it: the seven mempool.space publishes.
     Every,
     /// CoinGecko alone quotes it.
     CoingeckoOnly,
@@ -237,6 +246,20 @@ pub struct SourceEntry {
     pub label: String,
     /// The chart ranges it serves without a key, shortest first.
     pub ranges: Vec<PriceRange>,
+    /// What its terms ask to be shown with its data
+    /// ([`PriceSource::credit`]): each screen that shows a price or an
+    /// amount it priced shows the credit once, under the data. `None`,
+    /// nothing is shown.
+    pub credit: Option<Credit>,
+}
+
+/// The credit a price source asks for beside its data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Credit {
+    /// Word for word, as its terms write it.
+    pub text: String,
+    /// The page the words link to, opened in the browser.
+    pub url: String,
 }
 
 /// The currencies and sources on offer, and how often a price is asked.
@@ -264,6 +287,7 @@ pub fn price_table() -> PriceTable {
                     .into_iter()
                     .filter(|&range| source.supports(range))
                     .collect(),
+                credit: source.credit(),
             })
             .collect(),
         refresh_secs: REFRESH_SECS,
@@ -331,8 +355,8 @@ async fn get_json(url: &str, proxy: Option<&str>) -> CoreResult<serde_json::Valu
     serde_json::from_slice(&body).map_err(|e| price_error(e.to_string()))
 }
 
-/// Largest price answer read: the whole daily history of every currency
-/// mempool.space serves fits several times over.
+/// Largest price answer read: the whole history mempool.space serves in
+/// one currency fits many times over.
 const MAX_ANSWER: usize = 32 << 20;
 
 fn price_error(detail: String) -> CoreError {
@@ -393,22 +417,6 @@ pub(crate) async fn fetch_price(
             .await?;
             value["bitcoin"][&code]
                 .as_f64()
-                .ok_or_else(|| price_error("unexpected response shape".to_owned()))?
-        }
-        PriceSource::Kraken => {
-            let pair = format!("XBT{}", currency.code());
-            let value = get_json(
-                &format!("https://api.kraken.com/0/public/Ticker?pair={pair}"),
-                proxy,
-            )
-            .await?;
-            let result = value["result"]
-                .as_object()
-                .and_then(|o| o.values().next())
-                .ok_or_else(|| price_error("unexpected response shape".to_owned()))?;
-            result["c"][0]
-                .as_str()
-                .and_then(|s| s.parse::<f64>().ok())
                 .ok_or_else(|| price_error("unexpected response shape".to_owned()))?
         }
         PriceSource::MempoolSpace => {
@@ -482,27 +490,10 @@ pub(crate) async fn fetch_price_history(
             .await?;
             parse_coingecko_history(&value)?
         }
-        PriceSource::Kraken => {
-            // 720 candles per call: the interval decides the span.
-            let interval = match range {
-                PriceRange::Day => 5,
-                PriceRange::Week => 30,
-                PriceRange::Month => 240,
-                PriceRange::Year => 1440,
-                PriceRange::Max => 10080,
-            };
-            let pair = format!("XBT{}", currency.code());
-            let value = get_json(
-                &format!("https://api.kraken.com/0/public/OHLC?pair={pair}&interval={interval}"),
-                proxy,
-            )
-            .await?;
-            parse_kraken_history(&value)?
-        }
         PriceSource::MempoolSpace => {
-            // One endpoint, the full daily history for every currency.
-            let value = get_json("https://mempool.space/api/v1/historical-price", proxy).await?;
-            parse_mempool_history(&value, currency)?
+            let series = mempool_series(currency, proxy).await?;
+            let now = fetch_price(source, currency, proxy).await.ok();
+            closed_by(&series, now.as_ref())
         }
     };
     points.retain(|p| p.rate.is_finite() && p.rate > 0.0);
@@ -544,24 +535,86 @@ fn parse_coingecko_history(value: &serde_json::Value) -> CoreResult<Vec<PricePoi
         .collect())
 }
 
-/// Kraken OHLC: `{"result": {"<pair>": [[time, o, h, l, close, ...]], "last": n}}`.
-/// The pair key varies (`XXBTZUSD`...): take the entry that is an array.
-fn parse_kraken_history(value: &serde_json::Value) -> CoreResult<Vec<PricePoint>> {
-    let result = value["result"]
-        .as_object()
-        .ok_or_else(|| price_error("unexpected response shape".to_owned()))?;
-    let rows = result
-        .iter()
-        .find_map(|(key, entry)| (key != "last").then(|| entry.as_array()).flatten())
-        .ok_or_else(|| price_error("unexpected response shape".to_owned()))?;
-    Ok(rows
-        .iter()
-        .filter_map(|candle| {
-            let t = candle.get(0)?.as_u64()?;
-            let close = candle.get(4)?.as_str()?.parse::<f64>().ok()?;
-            Some(PricePoint { t, rate: close })
-        })
-        .collect())
+/// How long mempool.space's whole series of a currency is kept: it gains
+/// a point an hour, and its API has no parameter that bounds the period,
+/// so a day or a week of it would otherwise cost the whole series, near
+/// 1.5 MB, at each ask.
+const MEMPOOL_SERIES_SECS: u64 = 3600;
+
+/// The series last read of each currency, with when it was read. In
+/// memory only: what a public endpoint answers everyone.
+static MEMPOOL_SERIES: SeriesCache = SeriesCache::new();
+
+/// A whole series, shared between the cache and its readers.
+type Series = std::sync::Arc<Vec<PricePoint>>;
+
+/// A series per currency, kept [`MEMPOOL_SERIES_SECS`].
+struct SeriesCache(std::sync::Mutex<Vec<(FiatCurrency, u64, Series)>>);
+
+impl SeriesCache {
+    const fn new() -> Self {
+        SeriesCache(std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// The series of `currency`, if read less than the time it is kept
+    /// before `now`.
+    fn fresh(&self, currency: FiatCurrency, now: u64) -> Option<Series> {
+        let held = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.iter()
+            .find(|(kept, at, _)| {
+                *kept == currency && now.saturating_sub(*at) < MEMPOOL_SERIES_SECS
+            })
+            .map(|(_, _, series)| series.clone())
+    }
+
+    fn keep(&self, currency: FiatCurrency, now: u64, series: Series) {
+        let mut held = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        held.retain(|(kept, _, _)| *kept != currency);
+        held.push((currency, now, series));
+    }
+}
+
+/// mempool.space's whole series in `currency`, from the cache while it
+/// holds, else asked and kept.
+async fn mempool_series(currency: FiatCurrency, proxy: Option<&str>) -> CoreResult<Series> {
+    let now = now_secs();
+    if let Some(series) = MEMPOOL_SERIES.fresh(currency, now) {
+        return Ok(series);
+    }
+    let value = get_json(&mempool_history_url(currency), proxy).await?;
+    let series = std::sync::Arc::new(parse_mempool_history(&value, currency)?);
+    MEMPOOL_SERIES.keep(currency, now, series.clone());
+    Ok(series)
+}
+
+/// The series with the price now as its last point: mempool.space's
+/// hourly series ends up to an hour before the price shown beside the
+/// chart. A price that did not come leaves the series as it is.
+fn closed_by(series: &[PricePoint], now: Option<&PriceQuote>) -> Vec<PricePoint> {
+    let mut points = series.to_vec();
+    if let Some(now) = now {
+        points.push(PricePoint {
+            t: now.at,
+            rate: now.rate,
+        });
+    }
+    points
+}
+
+/// mempool.space's whole history in the one currency on screen. With no
+/// `currency`, a documented parameter, it answers every currency it
+/// serves; with one, that currency and the dollar.
+fn mempool_history_url(currency: FiatCurrency) -> String {
+    format!(
+        "https://mempool.space/api/v1/historical-price?currency={}",
+        currency.code()
+    )
 }
 
 /// mempool.space historical prices: `{"prices": [{"time": s, "USD": n, ...}]}`.
@@ -621,6 +674,40 @@ mod tests {
         assert_eq!(serde_json::to_string(&PriceRange::Day).unwrap(), "\"day\"");
     }
 
+    /// CoinGecko's terms ask for its credit beside its data, word for
+    /// word, linked to its site; mempool.space asks for none. The table
+    /// carries it with each source.
+    #[test]
+    fn a_source_gives_the_credit_its_terms_ask_for() {
+        let credit = PriceSource::Coingecko.credit().unwrap();
+        assert_eq!(credit.text, "Powered by CoinGecko");
+        assert_eq!(credit.url, "https://www.coingecko.com");
+        assert_eq!(PriceSource::MempoolSpace.credit(), None);
+        for entry in price_table().sources {
+            assert_eq!(entry.credit, entry.source.credit());
+        }
+        assert_eq!(
+            serde_json::to_value(price_table().sources[1].credit.clone()).unwrap(),
+            serde_json::json!({"text": "Powered by CoinGecko", "url": "https://www.coingecko.com"})
+        );
+    }
+
+    /// Kraken left the sources: a vault or an app that still spells it
+    /// reads mempool.space, which quotes the same seven currencies, and
+    /// nothing writes it again.
+    #[test]
+    fn kraken_reads_as_mempool_space() {
+        assert_eq!(
+            serde_json::from_str::<PriceSource>("\"kraken\"").unwrap(),
+            PriceSource::MempoolSpace
+        );
+        assert_eq!(
+            serde_json::to_string(&PriceSource::MempoolSpace).unwrap(),
+            "\"mempool_space\""
+        );
+        assert!(serde_json::from_str::<PriceSource>("\"bitstamp\"").is_err());
+    }
+
     #[test]
     fn currency_codes_are_unique_iso_4217() {
         let codes: std::collections::BTreeSet<&str> =
@@ -671,12 +758,9 @@ mod tests {
         }
         let sources: Vec<PriceSource> = table.sources.iter().map(|entry| entry.source).collect();
         assert_eq!(sources, PriceSource::ALL);
-        let mempool = &table.sources[2];
+        let mempool = &table.sources[0];
         assert_eq!(mempool.label, "mempool.space");
-        assert_eq!(
-            mempool.ranges,
-            [PriceRange::Month, PriceRange::Year, PriceRange::Max]
-        );
+        assert_eq!(mempool.ranges, PriceRange::ALL);
         assert_eq!(
             serde_json::to_value(&table.currencies[0]).unwrap(),
             serde_json::json!({
@@ -684,7 +768,7 @@ mod tests {
                 "code": "EUR",
                 "name": "Euro",
                 "reach": "every",
-                "sources": ["coingecko", "kraken", "mempool_space"],
+                "sources": ["mempool_space", "coingecko"],
             })
         );
     }
@@ -723,7 +807,6 @@ mod tests {
         assert!(wide.len() >= 20, "the wider list is too thin");
         for currency in wide {
             assert!(PriceSource::Coingecko.supports_currency(*currency));
-            assert!(!PriceSource::Kraken.supports_currency(*currency));
             assert!(!PriceSource::MempoolSpace.supports_currency(*currency));
         }
     }
@@ -731,7 +814,7 @@ mod tests {
     #[tokio::test]
     async fn a_source_refuses_a_currency_it_does_not_quote() {
         // Refused before any request goes out.
-        let error = fetch_price(PriceSource::Kraken, FiatCurrency::Inr, None)
+        let error = fetch_price(PriceSource::MempoolSpace, FiatCurrency::Inr, None)
             .await
             .unwrap_err()
             .to_string();
@@ -750,14 +833,19 @@ mod tests {
 
     #[test]
     fn range_support_matches_keyless_capabilities() {
+        // Every range has a source.
         for range in PriceRange::ALL {
-            assert!(PriceSource::Kraken.supports(range));
+            assert!(
+                PriceSource::ALL
+                    .into_iter()
+                    .any(|source| source.supports(range))
+            );
         }
         assert!(PriceSource::Coingecko.supports(PriceRange::Day));
         assert!(!PriceSource::Coingecko.supports(PriceRange::Max));
-        assert!(!PriceSource::MempoolSpace.supports(PriceRange::Day));
-        assert!(!PriceSource::MempoolSpace.supports(PriceRange::Week));
-        assert!(PriceSource::MempoolSpace.supports(PriceRange::Max));
+        for range in PriceRange::ALL {
+            assert!(PriceSource::MempoolSpace.supports(range), "{range:?}");
+        }
     }
 
     #[test]
@@ -772,23 +860,66 @@ mod tests {
         assert_eq!(points[0].rate, 35000.5);
     }
 
+    /// A currency's series is kept an hour, then asked again; another
+    /// currency's is its own.
     #[test]
-    fn kraken_history_skips_the_last_cursor() {
-        // "last" sorts before the pair key in a BTreeMap: the parser must
-        // not trip on it.
-        let value = serde_json::json!({
-            "error": [],
-            "result": {
-                "last": 1700003600,
-                "XXBTZEUR": [
-                    [1700000000, "1.0", "2.0", "0.5", "34000.1", "1.5", "10.0", 42],
-                    [1700003600, "1.0", "2.0", "0.5", "34100.2", "1.5", "10.0", 42]
-                ]
+    fn a_series_is_kept_an_hour() {
+        let cache = SeriesCache::new();
+        let series = std::sync::Arc::new(vec![PricePoint { t: 1, rate: 2.0 }]);
+        cache.keep(FiatCurrency::Eur, 1_000, series.clone());
+        assert_eq!(cache.fresh(FiatCurrency::Eur, 1_000 + 3_599), Some(series));
+        assert_eq!(cache.fresh(FiatCurrency::Eur, 1_000 + 3_600), None);
+        assert_eq!(cache.fresh(FiatCurrency::Usd, 1_000), None);
+        // Kept again, the new one stands alone.
+        let newer = std::sync::Arc::new(vec![PricePoint { t: 2, rate: 3.0 }]);
+        cache.keep(FiatCurrency::Eur, 5_000, newer.clone());
+        assert_eq!(cache.fresh(FiatCurrency::Eur, 5_001), Some(newer));
+        assert_eq!(cache.0.lock().unwrap().len(), 1);
+    }
+
+    /// The price now closes the series, after its last hourly point.
+    #[test]
+    fn the_price_now_closes_the_series() {
+        let series = [
+            PricePoint {
+                t: 3_600,
+                rate: 1.0,
+            },
+            PricePoint {
+                t: 7_200,
+                rate: 2.0,
+            },
+        ];
+        let now = PriceQuote {
+            rate: 2.5,
+            currency: FiatCurrency::Eur,
+            source: PriceSource::MempoolSpace,
+            at: 9_000,
+        };
+        let closed = closed_by(&series, Some(&now));
+        assert_eq!(
+            closed.last(),
+            Some(&PricePoint {
+                t: 9_000,
+                rate: 2.5
+            })
+        );
+        assert_eq!(closed.len(), 3);
+        assert_eq!(closed_by(&series, None), series);
+    }
+
+    /// The history is asked in the currency on screen alone.
+    #[test]
+    fn mempool_history_asks_for_one_currency() {
+        assert_eq!(
+            mempool_history_url(FiatCurrency::Eur),
+            "https://mempool.space/api/v1/historical-price?currency=EUR"
+        );
+        for currency in FiatCurrency::ALL {
+            if PriceSource::MempoolSpace.supports_currency(*currency) {
+                assert!(mempool_history_url(*currency).ends_with(currency.code()));
             }
-        });
-        let points = parse_kraken_history(&value).unwrap();
-        assert_eq!(points.len(), 2);
-        assert_eq!(points[1].rate, 34100.2);
+        }
     }
 
     #[test]
@@ -870,7 +1001,7 @@ mod tests {
             assert!(rate.is_some_and(|r| r > 100.0), "CoinGecko misses {code}");
         }
 
-        // The seven shared ones, from the other two sources.
+        // The seven shared ones, from mempool.space.
         let mempool = get_json("https://mempool.space/api/v1/prices", None)
             .await
             .expect("mempool.space unreachable");
@@ -883,10 +1014,6 @@ mod tests {
                 "mempool.space misses {}",
                 currency.code()
             );
-            let quote = fetch_price(PriceSource::Kraken, *currency, None)
-                .await
-                .unwrap_or_else(|e| panic!("Kraken misses {}: {e}", currency.code()));
-            assert!(quote.rate > 100.0);
         }
     }
 
