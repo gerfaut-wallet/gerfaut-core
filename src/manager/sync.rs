@@ -252,6 +252,13 @@ impl WalletManager {
         reach: Reach,
         prefer: Option<(Network, Endpoint)>,
     ) -> CoreResult<(SyncReport, Option<Endpoint>)> {
+        // A sync that names no server waits for the first pass of a
+        // running watch (`live_first_pass`), and before it takes the
+        // wallet's turn: one that names its server, a rescan or a sync
+        // the watch asked for, is not held behind it.
+        if prefer.is_none() {
+            self.live_first_pass().await;
+        }
         let arrived = Instant::now();
         let slot = match self.syncing.lock() {
             Ok(mut slots) => slots.entry(id.to_owned()).or_default().clone(),
@@ -286,22 +293,6 @@ impl WalletManager {
         reach: Reach,
         prefer: Option<(Network, Endpoint)>,
     ) -> CoreResult<(SyncReport, Reach, Endpoint)> {
-        // A sync that names no server waits for the first session of a
-        // running watch (`live_server_after_first_pass`), before anything
-        // it reads of the settings: they may change while it waits.
-        let prefer = match prefer {
-            Some(prefer) => Some(prefer),
-            None => {
-                let (network, choice) = {
-                    let state = self.state.lock().await;
-                    let network = find_record(&state.payload, id)?.meta.network;
-                    let (config, certs) = state.chain_setup(network);
-                    let servers = crate::watch::servers_for(&config, network, &certs);
-                    (network, servers.is_ok_and(|servers| servers.len() > 1))
-                };
-                self.live_server_after_first_pass(network, choice).await
-            }
-        };
         let started = Instant::now();
 
         // Snapshot what the sync needs; do not hold the lock during I/O.
@@ -316,8 +307,8 @@ impl WalletManager {
         };
         // The server of the watch that asked for this sync: it told of
         // the change, so it holds what changed. For any other sync, the
-        // server a running watch talks to, or last talked to, once it
-        // had its first session: it already sees every script the watch
+        // server a running watch talks to, or last talked to
+        // (`live_server`): it already sees every script the watch
         // follows, and a sync there shows the wallet to no second
         // operator. Only a server a watch of the wallet's own network
         // may talk to under its backend: the watch may have moved to
@@ -326,6 +317,7 @@ impl WalletManager {
         // does not name.
         let allowed = crate::watch::servers_for(&config, meta.network, &certs).unwrap_or_default();
         let first = prefer
+            .or_else(|| self.live_server())
             .filter(|(network, prefer)| *network == meta.network && allowed.contains(prefer))
             .map(|(_, prefer)| prefer);
         let answered = meta
