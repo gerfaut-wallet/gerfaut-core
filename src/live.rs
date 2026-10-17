@@ -266,10 +266,13 @@ impl Asked {
     /// Whether this is the server's word that scripts moved: a change it
     /// pushed, or the scripts whose status differs at a start or after a
     /// reconnection. A block is not, nor a catch-up that cannot say what
-    /// moved, nor what the watch reads of its own accord.
+    /// moved, nor what the watch reads of its own accord, nor
+    /// confirmations it proved: taking them costs the server nothing,
+    /// and their proofs are more than a word.
     fn claimed(&self) -> bool {
-        self.reason == ChangeReason::Activity
-            || (self.scripts.is_some() && self.reason != ChangeReason::NewBlock)
+        self.proven.is_empty()
+            && (self.reason == ChangeReason::Activity
+                || (self.scripts.is_some() && self.reason != ChangeReason::NewBlock))
     }
 
     /// How much of the wallet the sync reads: the scripts that moved; the

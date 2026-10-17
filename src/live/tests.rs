@@ -1729,8 +1729,23 @@ async fn waiting_for_a_block(
     String,
     bdk_wallet::bitcoin::Txid,
 ) {
+    waiting_for_a_block_at(server, dir, timings()).await
+}
+
+/// [`waiting_for_a_block`], the watch running at `pace`.
+async fn waiting_for_a_block_at(
+    server: &FakeElectrum,
+    dir: &std::path::Path,
+    pace: crate::watch::Timings,
+) -> (
+    WalletManager,
+    String,
+    LiveEvents,
+    String,
+    bdk_wallet::bitcoin::Txid,
+) {
     let (manager, wallet) = cold_wallet(dir, server).await;
-    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    let mut events = manager.live_start_with(Some(pace)).await.unwrap();
     quiet_start(&mut events).await;
     let script = receive_script(1);
     let paid: bdk_wallet::bitcoin::Txid = pay(server, 7, &script, 12_000, 0).parse().unwrap();
@@ -2167,4 +2182,34 @@ fn a_confirmation_read_back_without_its_proofs_is_a_sync() {
     let asked = Asked::confirmed(scripts, proven);
     assert!(asked.proven.is_empty());
     assert_eq!(asked.reach(), Reach::Scripts(vec![script]));
+}
+
+/// A server that forged changes no sync found anything behind has its
+/// next claims held back. A confirmation the watch proved is no claim:
+/// it is taken at once, held back by nothing.
+#[tokio::test]
+async fn a_proven_confirmation_is_never_held_back() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let hold = Duration::from_secs(1);
+    let pace = crate::watch::Timings {
+        hold,
+        hold_cap: hold * 2,
+        ..timings()
+    };
+    let (manager, wallet, mut events, script, paid) =
+        waiting_for_a_block_at(&server, dir.path(), pace).await;
+    for forged in 0..=FREE_FUTILE {
+        server.set_status(&script, &format!("forged {forged}"));
+        let (report, _) = next_sync(&mut events, &wallet).await;
+        assert!(report.new_txs.is_empty());
+    }
+
+    server.set_history(&script, &[(paid, 101)]);
+    let pushed = std::time::Instant::now();
+    block(&server, 101, &script, &[(paid, 101)]);
+    let confirmation = next_announcement(&mut events).await;
+    assert_eq!(confirmation.stage, TxStage::Confirmed);
+    assert!(pushed.elapsed() < hold, "{:?}", pushed.elapsed());
+    manager.live_stop().await;
 }
