@@ -19,6 +19,7 @@ use bdk_wallet::bitcoin::{Address, ScriptBuf, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 
 use super::{Reach, SyncSlot, WalletManager, apply_address_state, apply_synced};
+use crate::chain::electrum::status::history_status;
 use crate::chain::{self, Endpoint, has_proof_of_work};
 use crate::error::CoreResult;
 use crate::manager::{ManagerState, ensure_engine, find_record};
@@ -26,7 +27,7 @@ use crate::network::Network;
 use crate::wallet::meta::{WalletKind, WalletMeta};
 use crate::wallet::snapshot::SyncReport;
 use crate::wallet::views;
-use crate::watch::{Headers, Proven, confirmed_at, history_status};
+use crate::watch::{Headers, Proven, confirmed_at};
 
 impl WalletManager {
     /// Takes the confirmations the live watch proved for a wallet, as a

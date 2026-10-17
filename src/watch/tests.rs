@@ -10,6 +10,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use super::*;
+use crate::chain::electrum::status::history_status;
 use crate::chain::tor::{TorMode, TorSettings};
 use crate::testkit::{
     ADDRESS, ADDRESS_SCRIPT, FakeElectrum, FakeMempool, esplora_payment, script, scripthash,

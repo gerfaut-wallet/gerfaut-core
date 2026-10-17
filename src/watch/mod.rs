@@ -386,20 +386,6 @@ impl Headers {
     }
 }
 
-/// The Electrum status of a history: SHA-256 of `txid:height:` for each
-/// transaction, in the order given, in hex.
-pub(crate) fn history_status(history: &[(Txid, i32)]) -> String {
-    use bdk_wallet::bitcoin::hashes::{Hash, HashEngine, sha256};
-    use bdk_wallet::bitcoin::hex::DisplayHex;
-    let mut engine = sha256::Hash::engine();
-    for (txid, height) in history {
-        engine.input(format!("{txid}:{height}:").as_bytes());
-    }
-    sha256::Hash::from_engine(engine)
-        .to_byte_array()
-        .to_lower_hex_string()
-}
-
 /// What `held` comes to once a block at `height` takes every
 /// transaction of it still waiting for one, 0 or -1, in the same order:
 /// the history a server lists then, unless it took only some of them, or

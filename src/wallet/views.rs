@@ -302,7 +302,8 @@ pub(crate) fn watch_scripts(
             |(((script, lookahead), history), facts)| crate::watch::WatchedScript {
                 script: script.to_hex_string(),
                 lookahead,
-                status: (!history.is_empty()).then(|| crate::watch::history_status(&history)),
+                status: (!history.is_empty())
+                    .then(|| crate::chain::electrum::status::history_status(&history)),
                 counts: Some(facts.counts),
                 history: waiting(history),
             },
@@ -385,7 +386,7 @@ fn electrum_status(parts: impl Iterator<Item = String>) -> String {
 /// nothing for: txids and heights, 0 or -1 for the mempool, in the
 /// order the server lists them. Its Electrum status is the SHA-256 of
 /// `txid:height:` for each, in that order
-/// ([`crate::watch::history_status`]).
+/// ([`crate::chain::electrum::status::history_status`]).
 ///
 /// That order is the server's: confirmed transactions by height, then
 /// by their place in the block, which the wallet does not know, then

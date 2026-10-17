@@ -43,8 +43,8 @@ use tokio::time::Instant;
 
 use super::{
     ChangeReason, Exit, Headers, Hub, Proven, Wake, WatchState, WatchTransport, confirmed_at,
-    history_status,
 };
+use crate::chain::electrum::status::history_status;
 use crate::chain::electrum::{CLIENT_NAME, Target, parse, words};
 use crate::chain::net::{self, BoxStream, LineReader, Security};
 use crate::chain::{ANOTHER_NETWORK, Endpoint, has_proof_of_work, is_genesis_of};
