@@ -24,12 +24,13 @@
 //! confirmation, for as long as the session lasts, and the syncs that
 //! follow the watch to it read the same stale state. After two hours
 //! without a block, which happens about once in 160 000 such windows on
-//! mainnet, the tip of another Electrum server of the same operator is
-//! read on a connection of its own that asks for nothing else. The one
-//! of the two that is behind is left alone for a quarter of an hour:
-//! when it is the session's, the watch moves to the other one. No other
-//! operator is ever asked, since it would learn from which address the
-//! app is used, and an onion server is compared with onion servers only.
+//! mainnet, the server is asked for its tip again, and the tip of
+//! another Electrum server of the same operator is read on a connection
+//! of its own that asks for nothing else. The one of the two that is
+//! behind is left alone for a quarter of an hour: when it is the
+//! session's, the watch moves to the other one. No other operator is
+//! ever asked, since it would learn from which address the app is used,
+//! and an onion server is compared with onion servers only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -76,8 +77,24 @@ const PROTOCOL_MAX: &str = "1.4.2";
 
 enum Request {
     Headers,
+    /// The tip asked again, before another server's is read.
+    Tip,
     Subscribe(String),
     Other,
+}
+
+/// Where a session stands in comparing its tip with another server's.
+enum Look {
+    /// Nothing under way: the next look is due [`super::Timings::stale`]
+    /// after the last block.
+    Idle,
+    /// The server was asked for its tip again: a deadline that ran out
+    /// while the device slept, or a notification still on its way, says
+    /// nothing of the server, and the tip compared is the one it gives
+    /// now.
+    Asking,
+    /// The tip of another server being read.
+    Probing(Probe),
 }
 
 /// The tip another server of the same operator announced, and which
@@ -113,10 +130,9 @@ struct Session {
     /// The height of the last block the server announced.
     tip: Option<u32>,
     /// When it last announced one, or when the session opened, or when
-    /// the tip of another server was last read.
+    /// the last look began, or the device woke up.
     block_at: Instant,
-    /// The tip of another server being read.
-    probe: Option<Probe>,
+    look: Look,
 }
 
 pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> Exit {
@@ -166,7 +182,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         ready_told: false,
         tip: None,
         block_at: Instant::now(),
-        probe: None,
+        look: Look::Idle,
     };
     hub.alive();
     hub.serve(Some(endpoint));
@@ -227,6 +243,8 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                     // nothing about the server.
                     if idle > hub.timings.keepalive * 2 {
                         session.pong_by = None;
+                        session.block_at = Instant::now();
+                        session.look = Look::Idle;
                     }
                     session.ping(hub.pong_budget(endpoint)).await
                 }
@@ -242,15 +260,16 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
             () = super::sleep_until(pong_by), if pong_by.is_some() => {
                 Err("the server stopped answering".to_owned())
             }
-            () = tokio::time::sleep_until(stale_at), if session.probe.is_none() => {
+            () = tokio::time::sleep_until(stale_at), if matches!(session.look, Look::Idle) => {
                 session.block_at = Instant::now();
-                session.probe = tip_elsewhere(hub, endpoint);
-                Ok(())
+                session.look = Look::Asking;
+                session.request(Request::Tip, "blockchain.headers.subscribe", json!([])).await
             }
-            found = probed(&mut session.probe) => {
-                session.probe = None;
-                match found {
-                    Some((other, tip)) if tip > session.tip.unwrap_or(0) => {
+            found = probed(&mut session.look) => {
+                session.look = Look::Idle;
+                let ours = session.tip;
+                match found.zip(ours) {
+                    Some(((other, tip), ours)) if tip > ours => {
                         // This one is behind: the watch moves on, and
                         // the syncs with it.
                         hub.shun(endpoint);
@@ -262,7 +281,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                         hub.set_status(|status| status.detail = Some(detail));
                         return Exit::Reprobe;
                     }
-                    Some((other, tip)) if tip < session.tip.unwrap_or(0) => {
+                    Some(((other, tip), ours)) if tip < ours => {
                         hub.shun(&other);
                     }
                     _ => {}
@@ -392,6 +411,24 @@ impl Session {
                         hub.new_tip(height, false);
                     }
                 }
+                Request::Tip => {
+                    let height = height_of(&message["result"]).filter(|_| !refused);
+                    if !matches!(self.look, Look::Asking) {
+                        // A block or a wake-up since: the look is over.
+                    } else if height.is_none() || height != self.tip {
+                        // No tip to compare, or a new one: the server
+                        // moved, or says nothing worth comparing.
+                        self.look = Look::Idle;
+                        if let Some(height) = height {
+                            self.tip = Some(height);
+                            self.block_at = Instant::now();
+                            hub.new_tip(height, false);
+                        }
+                    } else {
+                        self.look =
+                            tip_elsewhere(hub, &self.endpoint).map_or(Look::Idle, Look::Probing);
+                    }
+                }
                 Request::Subscribe(scripthash) if !refused => {
                     self.refused_run.clear();
                     self.acknowledged += 1;
@@ -436,7 +473,7 @@ impl Session {
                     // asked about it.
                     self.tip = Some(height);
                     self.block_at = Instant::now();
-                    self.probe = None;
+                    self.look = Look::Idle;
                     hub.new_tip(height, false);
                 }
             }
@@ -746,10 +783,10 @@ async fn tip_of(
 }
 
 /// What a probe found, once it ends; never, without one.
-async fn probed(probe: &mut Option<Probe>) -> Option<(Endpoint, u32)> {
-    match probe {
-        Some(probe) => probe.await,
-        None => std::future::pending().await,
+async fn probed(look: &mut Look) -> Option<(Endpoint, u32)> {
+    match look {
+        Look::Probing(probe) => probe.await,
+        Look::Idle | Look::Asking => std::future::pending().await,
     }
 }
 

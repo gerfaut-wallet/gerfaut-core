@@ -1173,6 +1173,73 @@ async fn a_server_found_behind_is_left_alone() {
     assert_eq!(behind.subscriptions().len(), 1, "the watch went to it");
 }
 
+/// When the wait without a block runs out, the server is asked for its
+/// tip again before any other is: one that moved without a word, or
+/// whose word is still on its way, is not compared on an old tip.
+#[tokio::test]
+async fn a_stale_tip_is_asked_again_before_it_is_compared() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (listened, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    let _stand_in = automatic(&rotation, &[&listened, &other]);
+    let (watch, mut events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            stale: Duration::from_millis(300),
+            ..timings()
+        }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    listened.state.lock().unwrap().height = 101;
+    other.state.lock().unwrap().height = 101;
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock { height: 101 }
+    );
+    assert!(other.subscriptions().is_empty(), "compared on the old tip");
+    assert_eq!(
+        watch.serving().map(|(_, at)| at),
+        Some(electrum_endpoint(&listened))
+    );
+}
+
+/// A server that tells no tip at all is not compared: there is nothing
+/// to put another one's against.
+#[tokio::test]
+async fn a_server_without_a_tip_is_not_compared() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (silent, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    silent
+        .state
+        .lock()
+        .unwrap()
+        .refuse
+        .insert("blockchain.headers.subscribe", "not now".to_owned());
+    other.state.lock().unwrap().height = 101;
+    let _stand_in = automatic(&rotation, &[&silent, &other]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            stale: Duration::from_millis(200),
+            ..timings()
+        }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(other.subscriptions().is_empty());
+    assert_eq!(
+        watch.serving().map(|(_, at)| at),
+        Some(electrum_endpoint(&silent))
+    );
+}
+
 /// The tip of a stale server is read only from another Electrum server
 /// of its operator: on mainnet, Blockstream's other one, and never the
 /// Esplora servers of the rotation, nor an Electrum server of the
