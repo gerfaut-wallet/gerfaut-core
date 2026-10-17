@@ -771,32 +771,57 @@ const SPENDER_LOOKUPS: usize = 32;
 /// transaction that spends it, which is read, its txid checked, to see
 /// it does. The same server, about a script it already knows from the
 /// transaction it just served: nobody new learns anything.
-pub(crate) async fn fetch_prevout(
+///
+/// Every coin of a preview goes over one connection, in turn: a
+/// consolidation of dozens of inputs costs one handshake, not one each.
+/// The facts of the coins answered about, in order, and the failure that
+/// stopped the rest, if one did: those go to the next endpoint.
+pub(crate) async fn fetch_prevouts(
     target: &Target,
-    outpoint: OutPoint,
+    outpoints: Vec<OutPoint>,
     proxy: Option<&str>,
-) -> Result<crate::chain::PrevoutFacts, Failure> {
+) -> (Vec<crate::chain::PrevoutFacts>, Option<Failure>) {
     let timeout = timeout_for(target);
-    on_one(target, proxy, move |client| {
-        // Only a server that says it has no such transaction says the
-        // coin is unknown; anything else that fails is the way there
-        // failing, and one short of memory is asked again first.
-        let txout = match patiently(|| client.transaction_get(&outpoint.txid)) {
-            Ok(tx) => crate::chain::output_at(&tx, outpoint).map_err(Failure::Transport)?,
-            Err(error) if no_such_transaction(&error) => None,
-            Err(error) => return Err(failure(&error, timeout)),
-        };
-        let (spent, spent_by) = match &txout {
-            Some(txout) => spent_status(client, outpoint, &txout.script_pubkey),
-            None => (None, None),
-        };
-        Ok(crate::chain::PrevoutFacts {
-            txout,
-            spent,
-            spent_by,
-        })
+    // A few calls a coin, each a round trip, and a wait when the server
+    // is short of memory: room for a large consolidation.
+    let deadline = call_deadline(target).saturating_mul(1 + outpoints.len() as u32 / 8);
+    let answered = run(target, proxy, deadline, move |client| {
+        let mut facts = Vec::with_capacity(outpoints.len());
+        for outpoint in outpoints {
+            match prevout_on(client, outpoint, timeout) {
+                Ok(fact) => facts.push(fact),
+                Err(failure) => return Ok((facts, Some(failure))),
+            }
+        }
+        Ok((facts, None))
     })
-    .await
+    .await;
+    answered.unwrap_or_else(|text| (Vec::new(), Some(Failure::Transport(text))))
+}
+
+/// One coin, on a connection already open: see [`fetch_prevouts`].
+fn prevout_on(
+    client: &Connection,
+    outpoint: OutPoint,
+    timeout: Duration,
+) -> Result<crate::chain::PrevoutFacts, Failure> {
+    // Only a server that says it has no such transaction says the coin
+    // is unknown; anything else that fails is the way there failing, and
+    // one short of memory is asked again first.
+    let txout = match patiently(|| client.transaction_get(&outpoint.txid)) {
+        Ok(tx) => crate::chain::output_at(&tx, outpoint).map_err(Failure::Transport)?,
+        Err(error) if no_such_transaction(&error) => None,
+        Err(error) => return Err(failure(&error, timeout)),
+    };
+    let (spent, spent_by) = match &txout {
+        Some(txout) => spent_status(client, outpoint, &txout.script_pubkey),
+        None => (None, None),
+    };
+    Ok(crate::chain::PrevoutFacts {
+        txout,
+        spent,
+        spent_by,
+    })
 }
 
 /// Whether the coin at `outpoint`, on `script`, is spent, and by what.
@@ -820,12 +845,24 @@ fn spent_status(
     let Ok(history) = patiently(|| client.script_get_history(script)) else {
         return (None, None);
     };
-    // The newest first: a coin a preview finds spent is most often spent
-    // by the transaction pasted, just sent, or by the one it replaces.
+    // Only what came at the coin's height or after can spend it: in the
+    // same block or a later one once it is confirmed, in the mempool in
+    // any case. The newest first: a coin a preview finds spent is most
+    // often spent by the transaction pasted, just sent, or by the one it
+    // replaces.
+    let funded = history
+        .iter()
+        .find(|entry| entry.tx_hash == outpoint.txid)
+        .map(|entry| entry.height);
     let candidates: Vec<(Txid, i32)> = history
         .iter()
         .rev()
         .filter(|entry| entry.tx_hash != outpoint.txid)
+        .filter(|entry| match funded {
+            Some(funded) if funded > 0 => entry.height <= 0 || entry.height >= funded,
+            Some(_) => entry.height <= 0,
+            None => true,
+        })
         .map(|entry| (entry.tx_hash, entry.height))
         .collect();
     let read = candidates.len().min(SPENDER_LOOKUPS);
@@ -1460,10 +1497,14 @@ mod tests {
         let pizza: Txid = "a1075db55d416d3ca199f55b6084e2115b9345e16c5cf302fc80e9d5fbf5d48d"
             .parse()
             .unwrap();
-        let txout = fetch_prevout(&accepted, OutPoint::new(pizza, 0), None)
-            .await
-            .expect("an accepted certificate carries Electrum traffic")
+        let (facts, failed) = fetch_prevouts(&accepted, vec![OutPoint::new(pizza, 0)], None).await;
+        assert_eq!(
+            failed, None,
+            "an accepted certificate carries Electrum traffic"
+        );
+        let txout = facts[0]
             .txout
+            .clone()
             .expect("the server knows that transaction");
         assert_eq!(txout.value.to_sat(), 1_000_000_000_000);
 

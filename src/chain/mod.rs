@@ -1097,22 +1097,38 @@ pub(crate) struct PrevoutFacts {
     pub spent_by: Option<crate::broadcast::SpentBy>,
 }
 
-pub(crate) async fn fetch_prevout(
+/// What one endpoint knows about the coins at `outpoints`, asked in turn
+/// over one connection (one HTTP client, one Electrum session): the facts
+/// of the coins it answered about, in order, and the failure that stopped
+/// it before the rest, if one did. A failure is never the node's verdict
+/// here: those coins go to the next endpoint.
+pub(crate) async fn fetch_prevouts(
     endpoint: &Endpoint,
-    outpoint: OutPoint,
+    outpoints: &[OutPoint],
     proxy: Option<&str>,
-) -> Result<PrevoutFacts, Failure> {
+) -> (Vec<PrevoutFacts>, Option<Failure>) {
     match endpoint {
         Endpoint::Esplora(url) => {
-            let client = esplora::client(url, proxy).map_err(Failure::Transport)?;
-            let facts = esplora::fetch_prevout(&client, outpoint).await?;
-            Ok(PrevoutFacts {
-                txout: facts.txout,
-                spent: facts.spent,
-                spent_by: facts.spent_by,
-            })
+            let client = match esplora::client(url, proxy) {
+                Ok(client) => client,
+                Err(text) => return (Vec::new(), Some(Failure::Transport(text))),
+            };
+            let mut facts = Vec::with_capacity(outpoints.len());
+            for outpoint in outpoints {
+                match esplora::fetch_prevout(&client, *outpoint).await {
+                    Ok(fact) => facts.push(PrevoutFacts {
+                        txout: fact.txout,
+                        spent: fact.spent,
+                        spent_by: fact.spent_by,
+                    }),
+                    Err(failure) => return (facts, Some(failure)),
+                }
+            }
+            (facts, None)
         }
-        Endpoint::Electrum(target) => electrum::fetch_prevout(target, outpoint, proxy).await,
+        Endpoint::Electrum(target) => {
+            electrum::fetch_prevouts(target, outpoints.to_vec(), proxy).await
+        }
     }
 }
 

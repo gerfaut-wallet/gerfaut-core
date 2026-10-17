@@ -72,6 +72,8 @@ async fn esplora_serving(
                 Some(("200 OK", "application/octet-stream", raw.clone()))
             } else if path == format!("/api/tx/{txid}/outspend/0") {
                 Some(("200 OK", "application/json", outspend.clone().into_bytes()))
+            } else if path == "/api/blocks/tip/height" {
+                Some(("200 OK", "text/plain", b"200".to_vec()))
             } else if let Some((_, bytes)) = others.iter().find(|(route, _)| route == path) {
                 Some(("200 OK", "application/octet-stream", bytes.clone()))
             } else {
@@ -1618,4 +1620,116 @@ async fn the_preview_asks_the_next_operator_only_when_one_fails() {
         .unwrap();
     let heard = next_log.lock().unwrap().clone();
     assert!(heard.is_empty(), "the next operator heard of it: {heard:?}");
+}
+
+/// A server that stopped answering during a preview is not asked for the
+/// tip after it: its time limit is waited out once, not twice.
+#[tokio::test]
+async fn a_server_down_for_the_coins_is_not_asked_for_the_tip() {
+    use crate::testkit::{nowhere, script, transaction};
+    use bdk_wallet::bitcoin::{OutPoint, absolute};
+
+    let funding = transaction(&[nowhere(1, 0)], &[(script(3).as_str(), 50_000)]);
+    let mut pasted = transaction(
+        &[OutPoint::new(funding.compute_txid(), 0)],
+        &[(script(9).as_str(), 49_000)],
+    );
+    pasted.lock_time = absolute::LockTime::from_height(150).unwrap();
+    let (down, down_log) = esplora_taking(Takes::Down).await;
+    let knowing = esplora_knowing(funding, Unknown::NotFound).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_stand_in, manager) = rotating(dir.path(), &[down, knowing]).await;
+    let preview = manager
+        .preview_transaction(&witnessed(pasted), Network::Regtest)
+        .await
+        .unwrap();
+    assert_eq!(preview.inputs[0].value_sats, Some(50_000));
+    // The tip, 200 at the second server, frees the lock at 150.
+    assert!(
+        !preview
+            .warnings
+            .iter()
+            .any(|w| w.kind == crate::broadcast::TxWarningKind::Locked),
+        "{:?}",
+        preview.warnings
+    );
+    let asked = down_log.lock().unwrap().clone();
+    assert!(
+        asked.iter().all(|line| !line.contains("/blocks/tip")),
+        "{asked:?}"
+    );
+}
+
+/// Every coin of a preview goes over one Electrum connection, and of a
+/// script's history only what came at the coin's height or after is read
+/// for the transaction that spends it.
+#[tokio::test]
+async fn an_electrum_preview_keeps_one_connection_and_reads_from_the_coin_on() {
+    use crate::broadcast::TxWarningKind;
+    use crate::testkit::{FakeElectrum, nowhere, script, transaction};
+    use bdk_wallet::bitcoin::OutPoint;
+
+    let server = FakeElectrum::start().await;
+    let funding = transaction(
+        &[nowhere(1, 0)],
+        &[
+            (script(3).as_str(), 50_000),
+            (script(4).as_str(), 40_000),
+            (script(5).as_str(), 30_000),
+        ],
+    );
+    server.add_tx(&funding);
+    let funded = funding.compute_txid();
+    // The first coin is spent in a block, after older traffic on its
+    // script that cannot be what spends it.
+    let older: Vec<_> = (6..9)
+        .map(|n| transaction(&[nowhere(n, 0)], &[(script(3).as_str(), 1_000)]))
+        .collect();
+    let rival = transaction(&[OutPoint::new(funded, 0)], &[(script(8).as_str(), 49_000)]);
+    for tx in older.iter().chain([&rival]) {
+        server.add_tx(tx);
+    }
+    let mut history: Vec<_> = older
+        .iter()
+        .enumerate()
+        .map(|(n, tx)| (tx.compute_txid(), 10 + n as i64))
+        .collect();
+    history.push((funded, 50));
+    history.push((rival.compute_txid(), 60));
+    server.set_history(&script(3), &history);
+    server.set_unspent(&script(4), &[(funded, 1, 50, 40_000)]);
+    server.set_unspent(&script(5), &[(funded, 2, 50, 30_000)]);
+    let pasted = transaction(
+        &[0, 1, 2].map(|vout| OutPoint::new(funded, vout)),
+        &[(script(9).as_str(), 110_000)],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    manager
+        .set_backend(Network::Regtest, server.backend())
+        .await
+        .unwrap();
+    let opened = server.state.lock().unwrap().connections.len();
+    let preview = manager
+        .preview_transaction(&witnessed(pasted), Network::Regtest)
+        .await
+        .unwrap();
+    assert!(
+        preview
+            .warnings
+            .iter()
+            .any(|w| w.kind == TxWarningKind::InputSpent && w.blocking),
+        "{:?}",
+        preview.warnings
+    );
+    let state = server.state.lock().unwrap();
+    assert_eq!(state.connections.len() - opened, 1, "one connection");
+    // Three funding lookups, and of the first coin's history, the rival
+    // alone: none of the older transactions.
+    let gets = state
+        .asked
+        .iter()
+        .filter(|method| *method == "blockchain.transaction.get")
+        .count();
+    assert_eq!(gets, 4, "{:?}", state.asked);
 }

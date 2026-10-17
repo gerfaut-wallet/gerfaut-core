@@ -206,49 +206,52 @@ impl WalletManager {
                 .iter()
                 .map(|f| (f.prevout.is_some() && f.spent.is_some() && !f.listed) || f.unknown)
                 .collect();
-            for endpoint in &endpoints {
-                for (i, facts) in input_facts.iter_mut().enumerate() {
-                    if settled[i] {
-                        continue;
-                    }
-                    match chain::fetch_prevout(endpoint, outpoints[i], proxy.as_deref()).await {
-                        Ok(chain_facts) => {
-                            settled[i] = true;
-                            if facts.prevout.is_none() || facts.listed {
-                                match chain_facts.txout {
-                                    Some(txout) => backed(facts, txout),
-                                    None => facts.unknown = true,
-                                }
-                            }
-                            if facts.spent.is_none() {
-                                facts.spent = chain_facts.spent;
-                                facts.spent_by = chain_facts.spent_by;
-                            }
+            // The endpoints that stopped answering during this preview: the
+            // tip is not asked of them, which would wait out their time
+            // limit a second time.
+            let mut down = vec![false; endpoints.len()];
+            for (e, endpoint) in endpoints.iter().enumerate() {
+                let asked: Vec<usize> = (0..settled.len()).filter(|&i| !settled[i]).collect();
+                if asked.is_empty() {
+                    break;
+                }
+                let coins: Vec<OutPoint> = asked.iter().map(|&i| outpoints[i]).collect();
+                let (answers, failed) =
+                    chain::fetch_prevouts(endpoint, &coins, proxy.as_deref()).await;
+                for (&i, chain_facts) in asked.iter().zip(answers) {
+                    let facts = &mut input_facts[i];
+                    settled[i] = true;
+                    if facts.prevout.is_none() || facts.listed {
+                        match chain_facts.txout {
+                            Some(txout) => backed(facts, txout),
+                            None => facts.unknown = true,
                         }
-                        // Its answer, a refusal: the coin stays unchecked,
-                        // and no other operator hears of it.
-                        Err(Failure::Refused(_)) => settled[i] = true,
-                        // This one has stopped answering — throttled,
-                        // timed out, cut off. Asking it about the coins
-                        // it has not been asked about yet would only
-                        // make that worse, so they go to the next
-                        // endpoint instead of being dropped.
-                        Err(Failure::Transport(_)) => break,
+                    }
+                    if facts.spent.is_none() {
+                        facts.spent = chain_facts.spent;
+                        facts.spent_by = chain_facts.spent_by;
                     }
                 }
-                if settled.iter().all(|&settled| settled) {
-                    break;
+                // This one has stopped answering — throttled, timed out,
+                // cut off, a proxy's page in place of an answer. Asking it
+                // about the coins it has not answered about would only make
+                // that worse, so they go to the next endpoint instead of
+                // being dropped. Nothing a lookup gets is a refusal.
+                if failed.is_some() {
+                    down[e] = true;
                 }
             }
             if needs_tip {
-                for endpoint in &endpoints {
+                for (e, endpoint) in endpoints.iter().enumerate() {
+                    if down[e] {
+                        continue;
+                    }
                     match chain::tip_height(endpoint, proxy.as_deref()).await {
                         Ok(height) => {
                             tip_height = Some(height);
                             break;
                         }
-                        Err(Failure::Transport(_)) => continue,
-                        Err(Failure::Refused(_)) => break,
+                        Err(_) => down[e] = true,
                     }
                 }
             }
