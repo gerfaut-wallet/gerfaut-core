@@ -470,6 +470,36 @@ async fn electrum_keeps_a_wider_window_on_the_users_node() {
     }
 }
 
+/// ElectrumX keeps the cost of a session it cut against the address,
+/// and refuses a client that comes back too early at its first request:
+/// the watch leaves the server alone, as after a cut, instead of
+/// knocking again at every backoff, each knock adding to that cost.
+#[tokio::test]
+async fn electrum_leaves_alone_a_server_that_refuses_the_hello_for_cost() {
+    let server = FakeElectrum::start().await;
+    server
+        .state
+        .lock()
+        .unwrap()
+        .refuse
+        .insert("server.version", "excessive resource usage".to_owned());
+    let (watch, _events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![wallet("a", &[1, 2], &[], false)],
+        Some(timings()),
+    );
+    until(&watch, "refused", |s| {
+        s.detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("excessive resource usage"))
+    })
+    .await;
+    // Left alone for at least 480 ms; the backoff alone would have come
+    // back within 100.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(asked(&server, "server.version"), 1);
+}
+
 /// A server that takes so many subscriptions on one connection and no
 /// more, whether its refusal says so or it only refuses one after the
 /// other: what it took is watched, and every script past it is reported

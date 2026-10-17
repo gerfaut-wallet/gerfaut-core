@@ -152,9 +152,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
             "params": [CLIENT_NAME, [PROTOCOL_MIN, PROTOCOL_MAX]],
         });
         send(&mut writer, &hello).await.map_err(Exit::Unreachable)?;
-        let version = answer(&mut reader, 0, budget)
-            .await
-            .map_err(Exit::Unreachable)?;
+        let version = answer(&mut reader, 0, budget).await?;
         let negotiated = version[1].as_str().unwrap_or_default().to_owned();
         let software = version[0]
             .as_str()
@@ -169,9 +167,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         send(&mut writer, &genesis)
             .await
             .map_err(Exit::Unreachable)?;
-        let genesis = answer(&mut reader, 1, budget)
-            .await
-            .map_err(Exit::Unreachable)?;
+        let genesis = answer(&mut reader, 1, budget).await?;
         let genesis = genesis
             .as_str()
             .and_then(|hex| deserialize_hex::<Header>(hex).ok());
@@ -565,34 +561,44 @@ impl Session {
 }
 
 /// The result of the request numbered `id`, past whatever the server
-/// says before it, within `budget`.
+/// says before it, within `budget`. A refusal for cost is the server
+/// cutting the watch before it has asked for anything, ElectrumX still
+/// holding the cost of the last session against the address: the
+/// server is left alone as after a cut ([`Exit::Refused`]), not tried
+/// again at every backoff, each try adding to what it holds.
 async fn answer(
     reader: &mut LineReader<ReadHalf<BoxStream>>,
     id: u64,
     budget: Duration,
-) -> Result<Value, String> {
+) -> Result<Value, Exit> {
     let read = async {
         loop {
             let line = reader
                 .next_line()
                 .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "the connection was closed".to_owned())?;
+                .map_err(|e| Exit::Unreachable(e.to_string()))?
+                .ok_or_else(|| Exit::Unreachable("the connection was closed".to_owned()))?;
             let Ok(mut message) = serde_json::from_slice::<Value>(&line) else {
-                return Err("unexpected response".to_owned());
+                return Err(Exit::Unreachable("unexpected response".to_owned()));
             };
             if message.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
             if let Some(error) = message.get("error").filter(|e| !e.is_null()) {
-                return Err(format!("the server refused the request: {}", words(error)));
+                if costs_too_much(error) {
+                    return Err(Exit::Refused(words(error)));
+                }
+                return Err(Exit::Unreachable(format!(
+                    "the server refused the request: {}",
+                    words(error)
+                )));
             }
             return Ok(message["result"].take());
         }
     };
     tokio::time::timeout(budget, read)
         .await
-        .map_err(|_| format!("timed out after {} s", budget.as_secs()))?
+        .map_err(|_| Exit::Unreachable(format!("timed out after {} s", budget.as_secs())))?
 }
 
 async fn send(writer: &mut WriteHalf<BoxStream>, message: &Value) -> Result<(), String> {
