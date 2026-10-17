@@ -692,18 +692,15 @@ pub(crate) async fn fetch_address_state(
     )
     .await?;
 
-    let utxos = client
-        .address_utxos(&address)
-        .await?
-        .into_iter()
-        .map(|utxo| AddressUtxo {
-            txid: utxo.txid.to_string(),
-            vout: utxo.vout,
-            value_sats: utxo.value,
-            height: utxo.status.block_height,
-            timestamp: utxo.status.block_time,
-        })
-        .collect();
+    let utxos = coins(
+        client,
+        network,
+        &our_script,
+        client.address_utxos(&address).await?,
+        &round,
+        held,
+    )
+    .await?;
 
     Ok(AddressWatchState {
         txs: round.txs,
@@ -712,6 +709,139 @@ pub(crate) async fn fetch_address_state(
         truncated: round.cursor.is_some(),
         history_cursor: round.cursor,
     })
+}
+
+/// The coins of the address, as far as what was read vouches for each,
+/// as over Electrum ([`crate::chain::electrum::address`]). A coin of a
+/// transaction of the round must be an output of it that pays the
+/// address that much, or the server is refused, and it is as confirmed as
+/// that transaction. When older transactions remain past the round, a
+/// coin of one of them, no higher than the round's oldest confirmation,
+/// is confirmed where the server puts it if the wallet holds its
+/// transaction there paying it, or once that transaction, read and
+/// found to pay it, is proven there. Any other coin is taken as
+/// unconfirmed. A coin listed twice counts once.
+pub(crate) async fn coins(
+    client: &Client,
+    network: Network,
+    ours: &bdk_wallet::bitcoin::ScriptBuf,
+    utxos: Vec<api::Utxo>,
+    round: &HistoryRound,
+    held: &[AddressTx],
+) -> Result<Vec<AddressUtxo>, String> {
+    use std::collections::{HashMap, HashSet};
+    let pays = |tx: &AddressTx, vout: u32, value: u64| {
+        tx.outputs
+            .get(vout as usize)
+            .is_some_and(|output| output.is_mine && output.value_sats == Some(value))
+    };
+    let in_round: HashMap<&str, &AddressTx> =
+        round.txs.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
+    let oldest = round.txs.iter().filter_map(|tx| tx.height).min();
+    let mut seen = HashSet::new();
+    let utxos: Vec<api::Utxo> = utxos
+        .into_iter()
+        .filter(|utxo| seen.insert((utxo.txid, utxo.vout)))
+        .collect();
+
+    // The coins past the round the wallet cannot vouch for from what it
+    // holds: their transactions are read, and their confirmations proven.
+    let past = |utxo: &api::Utxo| match (utxo.status.block_height, utxo.status.block_hash, oldest) {
+        (Some(height), Some(hash), Some(oldest))
+            if round.cursor.is_some()
+                && height <= oldest
+                && !in_round.contains_key(utxo.txid.to_string().as_str()) =>
+        {
+            Some(bdk_wallet::chain::BlockId { height, hash })
+        }
+        _ => None,
+    };
+    let held_pays = |utxo: &api::Utxo, height: u32| {
+        held.iter().any(|tx| {
+            tx.txid == utxo.txid.to_string()
+                && tx.height == Some(height)
+                && pays(tx, utxo.vout, utxo.value)
+        })
+    };
+    let mut unread: Vec<(Txid, bdk_wallet::chain::BlockId)> = Vec::new();
+    for utxo in &utxos {
+        if let Some(block) = past(utxo)
+            && !held_pays(utxo, block.height)
+            && !unread.contains(&(utxo.txid, block))
+        {
+            unread.push((utxo.txid, block));
+        }
+    }
+    let mut read: HashMap<Txid, Transaction> = HashMap::new();
+    for chunk in unread.chunks(PARALLEL_REQUESTS) {
+        let txs = futures_util::future::try_join_all(chunk.iter().map(|(txid, _)| client.tx(txid)))
+            .await?;
+        for ((txid, _), tx) in chunk.iter().zip(txs) {
+            match tx {
+                Some(tx) if tx.compute_txid() == *txid => {
+                    read.insert(*txid, tx);
+                }
+                Some(_) => {
+                    return Err(
+                        "the server answered with another transaction than the one asked for"
+                            .to_owned(),
+                    );
+                }
+                None => {}
+            }
+        }
+    }
+    for utxo in &utxos {
+        if let Some(tx) = read.get(&utxo.txid) {
+            let paid = tx.output.get(utxo.vout as usize).is_some_and(|output| {
+                output.script_pubkey == *ours && output.value.to_sat() == utxo.value
+            });
+            if !paid {
+                return Err(crate::chain::electrum::address::COIN_NOT_PAID.to_owned());
+            }
+        }
+    }
+    let unread: Vec<(Txid, bdk_wallet::chain::BlockId)> = unread
+        .into_iter()
+        .filter(|(txid, _)| read.contains_key(txid))
+        .collect();
+    let times = sync::prove_confirmations(client, network, &unread).await?;
+    let proven: HashMap<(Txid, u32), u64> = unread
+        .iter()
+        .zip(times)
+        .filter_map(|((txid, block), time)| Some(((*txid, block.height), time?)))
+        .collect();
+
+    let mut coins = Vec::new();
+    for utxo in utxos {
+        let txid = utxo.txid.to_string();
+        let (height, timestamp) = match in_round.get(txid.as_str()) {
+            Some(tx) => {
+                if !pays(tx, utxo.vout, utxo.value) {
+                    return Err(crate::chain::electrum::address::COIN_NOT_PAID.to_owned());
+                }
+                (tx.height, tx.timestamp)
+            }
+            None => match past(&utxo) {
+                Some(block) if held_pays(&utxo, block.height) => {
+                    (Some(block.height), utxo.status.block_time)
+                }
+                Some(block) => match proven.get(&(utxo.txid, block.height)) {
+                    Some(time) => (Some(block.height), Some(*time)),
+                    None => (None, None),
+                },
+                None => (None, None),
+            },
+        };
+        coins.push(AddressUtxo {
+            txid,
+            vout: utxo.vout,
+            value_sats: utxo.value,
+            height,
+            timestamp,
+        });
+    }
+    Ok(coins)
 }
 
 /// Fetches the next round of older transactions, continuing after
@@ -770,6 +900,15 @@ pub(crate) fn parse_address(address: &str, network: Network) -> Result<Address, 
 /// Pages through the address history from `from` (newest first when
 /// `None`), at most [`HISTORY_PAGES_PER_ROUND`] pages.
 ///
+/// Every transaction read must hash to the txid listed, the ones the
+/// wallet holds too: a proof is of a txid, and a server would otherwise
+/// pass off any transaction of a block as one paying the address, or
+/// rewrite what one the wallet holds pays. What the coins its inputs
+/// spend were is the server's word still, as the fee is. A confirmation
+/// read that the wallet does not hold at the same height is then proven
+/// ([`sync::prove_confirmations`]); an unsure proof leaves it
+/// unconfirmed. One it holds there keeps the time it holds.
+///
 /// A page that lists only transactions of `held`, what the wallet holds,
 /// each at the height it holds it, ends the reading: the history below
 /// it is what the wallet holds, and the round is filled from there. An
@@ -789,6 +928,10 @@ async fn history_round(
         .iter()
         .map(|tx| (tx.txid.as_str(), tx.height))
         .collect();
+    let held_times: std::collections::HashMap<(&str, Option<u32>), Option<u64>> = held
+        .iter()
+        .map(|tx| ((tx.txid.as_str(), tx.height), tx.timestamp))
+        .collect();
     // Each page is read into what the app shows as soon as it arrives,
     // and dropped: forty pages are never held as the server spelled them.
     // What is kept of them, every input and output of each transaction,
@@ -796,12 +939,30 @@ async fn history_round(
     let mut txs: Vec<AddressTx> = Vec::new();
     let mut confirmed = 0usize;
     let mut last_seen: Option<Txid> = None;
+    let mut claimed: Vec<(Txid, bdk_wallet::chain::BlockId)> = Vec::new();
     let mut read = |page: Vec<PageTx>, txs: &mut Vec<AddressTx>| {
         let mut all_held = true;
         for tx in page {
             if tx.status.confirmed {
                 confirmed += 1;
                 last_seen = Some(tx.txid);
+            }
+            if tx.to_tx().compute_txid() != tx.txid {
+                return Err(
+                    "the server answered with another transaction than the one it listed"
+                        .to_owned(),
+                );
+            }
+            if let (true, Some(height), Some(hash)) = (
+                tx.status.confirmed,
+                tx.status.block_height,
+                tx.status.block_hash,
+            ) && known.get(tx.txid.to_string().as_str()) != Some(&Some(height))
+            {
+                let block = bdk_wallet::chain::BlockId { height, hash };
+                if !claimed.contains(&(tx.txid, block)) {
+                    claimed.push((tx.txid, block));
+                }
             }
             let tx = to_address_tx(tx, our_script, network);
             all_held &= known.get(tx.txid.as_str()) == Some(&tx.height);
@@ -849,6 +1010,29 @@ async fn history_round(
             break;
         }
         (confirmed_so_far, last, all_held) = read(page, &mut txs)?;
+    }
+    let times = sync::prove_confirmations(client, network, &claimed).await?;
+    let proven: std::collections::HashMap<(String, u32), Option<u64>> = claimed
+        .iter()
+        .zip(times)
+        .map(|((txid, block), time)| ((txid.to_string(), block.height), time))
+        .collect();
+    for tx in &mut txs {
+        let Some(height) = tx.height else {
+            continue;
+        };
+        match proven.get(&(tx.txid.clone(), height)) {
+            Some(Some(time)) => tx.timestamp = Some(*time),
+            Some(None) => {
+                tx.height = None;
+                tx.timestamp = None;
+            }
+            None => {
+                if let Some(time) = held_times.get(&(tx.txid.as_str(), Some(height))) {
+                    tx.timestamp = *time;
+                }
+            }
+        }
     }
     Ok(HistoryRound { txs, cursor })
 }
@@ -965,7 +1149,12 @@ fn to_address_tx(
         txid: tx.txid.to_string(),
         net_sats: crate::chain::net_sats(received, spent),
         fee_sats: (!is_coinbase).then_some(tx.fee),
-        height: tx.status.block_height,
+        // Confirmed in a block it names, or not confirmed at all: a
+        // height alone names no block to prove it in.
+        height: tx
+            .status
+            .block_height
+            .filter(|_| tx.status.confirmed && tx.status.block_hash.is_some()),
         timestamp: tx.status.block_time,
         vsize: tx.weight.div_ceil(4),
         inputs,

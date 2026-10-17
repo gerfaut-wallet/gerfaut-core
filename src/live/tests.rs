@@ -37,8 +37,8 @@ fn staged(claimed: &[LiveTx]) -> Vec<(String, TxStage)> {
         .collect()
 }
 
-fn txid(byte: u8) -> String {
-    format!("{byte:02x}").repeat(32)
+fn txid(label: u8) -> String {
+    crate::testkit::esplora_txid(label)
 }
 
 /// A sync whose caller announces nothing loses nothing: what it found

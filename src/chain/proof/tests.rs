@@ -974,4 +974,387 @@ mod servers {
             assert!(refused.contains("does not pay"), "{vout}: {refused}");
         }
     }
+
+    // --- Esplora ---------------------------------------------------------
+
+    use crate::testkit::{FakeMempool, esplora_payment};
+
+    /// An instance of `network` whose tip is past the payments of
+    /// [`esplora_payment`], at 501.
+    async fn mempool(network: Network) -> FakeMempool {
+        let server = FakeMempool::start(false, 0).await;
+        {
+            let mut state = server.state.lock().unwrap();
+            state.tip = 600;
+            state.genesis = Some(network.to_bitcoin());
+        }
+        server
+    }
+
+    fn esplora(server: &FakeMempool) -> crate::chain::esplora::Client {
+        crate::chain::esplora::client_for_run(&format!("http://{}/api", server.address), None)
+            .unwrap()
+    }
+
+    /// A plan of the script [`esplora_payment`] pays.
+    fn address_plan(network: Network, held: Held) -> Plan {
+        Plan {
+            scripts: vec![ScriptBuf::from_hex(ADDRESS_SCRIPT).unwrap()],
+            held,
+            ..plan(network)
+        }
+    }
+
+    /// Lists `payments` as the history of the script [`esplora_payment`]
+    /// pays, for a descriptor wallet's sync.
+    fn list(server: &FakeMempool, payments: Vec<serde_json::Value>) {
+        server
+            .state
+            .lock()
+            .unwrap()
+            .scripts
+            .insert(FakeMempool::rest_key(ADDRESS_SCRIPT), payments);
+    }
+
+    async fn esplora_sync(server: &FakeMempool, plan: Plan) -> Result<Synced, String> {
+        crate::chain::esplora::sync::run(&esplora(server), plan).await
+    }
+
+    /// The requests asked for so far whose path holds `part`.
+    fn asked(server: &FakeMempool, part: &str) -> usize {
+        let state = server.state.lock().unwrap();
+        state
+            .requests
+            .iter()
+            .filter(|path| path.contains(part))
+            .count()
+    }
+
+    /// An Esplora server proves a confirmation with the branch of its
+    /// block and the block's header: taken, at the time of the header. A
+    /// branch that leads elsewhere refuses the server, where the status
+    /// used to be taken on its word.
+    #[tokio::test]
+    async fn an_esplora_confirmation_is_proven() {
+        let server = mempool(Network::Signet).await;
+        list(&server, vec![esplora_payment(0x31, 0x41, 50_000, true)]);
+        let synced = esplora_sync(&server, address_plan(Network::Signet, Held::default()))
+            .await
+            .unwrap();
+        let txid: Txid = crate::testkit::esplora_txid(0x31).parse().unwrap();
+        let (anchor, anchored_txid) = synced.update.tx_update.anchors.first().unwrap();
+        assert_eq!(*anchored_txid, txid);
+        assert_eq!(anchor.block_id.height, 501);
+        assert_eq!(
+            (asked(&server, "/merkle-proof"), asked(&server, "/header")),
+            (1, 1)
+        );
+
+        server
+            .state
+            .lock()
+            .unwrap()
+            .branches
+            .insert(txid.to_string(), (vec!["ab".repeat(32)], 0));
+        let refused = esplora_sync(&server, address_plan(Network::Signet, Held::default())).await;
+        assert!(refusal(refused).contains(FALSE_PROOF));
+    }
+
+    /// A block the server listed and has no header for, as after a
+    /// reorganisation, proves nothing and refuses no one: the payment is
+    /// left unconfirmed, as seen in the mempool.
+    #[tokio::test]
+    async fn an_esplora_block_without_its_header_is_left_unconfirmed() {
+        let server = mempool(Network::Signet).await;
+        list(&server, vec![esplora_payment(0x3d, 0x4d, 50_000, true)]);
+        server.state.lock().unwrap().headerless = true;
+        let synced = esplora_sync(&server, address_plan(Network::Signet, Held::default()))
+            .await
+            .unwrap();
+        let txid: Txid = crate::testkit::esplora_txid(0x3d).parse().unwrap();
+        assert!(synced.update.tx_update.anchors.is_empty());
+        assert!(
+            synced
+                .update
+                .tx_update
+                .seen_ats
+                .iter()
+                .any(|(seen, _)| *seen == txid)
+        );
+    }
+
+    /// On mainnet, a confirmation in a header no one mined refuses the
+    /// server, where it used to be taken.
+    #[tokio::test]
+    async fn an_esplora_header_without_work_refuses_the_server() {
+        let server = mempool(Network::Mainnet).await;
+        list(&server, vec![esplora_payment(0x32, 0x42, 50_000, true)]);
+        let refused = esplora_sync(&server, address_plan(Network::Mainnet, Held::default())).await;
+        assert!(refusal(refused).contains(FALSE_PROOF));
+    }
+
+    /// A confirmation the wallet holds in the same block is not proven
+    /// again: once a script moves, only what is new on it is.
+    #[tokio::test]
+    async fn an_esplora_confirmation_held_is_not_proven_again() {
+        let server = mempool(Network::Signet).await;
+        let first = esplora_payment(0x33, 0x43, 50_000, true);
+        list(&server, vec![first.clone()]);
+        let synced = esplora_sync(&server, address_plan(Network::Signet, Held::default()))
+            .await
+            .unwrap();
+        let mut held = Held::default();
+        for tx in &synced.update.tx_update.txs {
+            held.txs.insert(tx.compute_txid(), tx.clone());
+        }
+        for (anchor, txid) in &synced.update.tx_update.anchors {
+            held.anchors.insert(*txid, *anchor);
+        }
+        let mut second = esplora_payment(0x34, 0x44, 20_000, true);
+        second["status"]["block_height"] = serde_json::json!(503);
+        list(&server, vec![second, first]);
+        let before = (asked(&server, "/merkle-proof"), asked(&server, "/header"));
+        let synced = esplora_sync(&server, address_plan(Network::Signet, held))
+            .await
+            .unwrap();
+        assert_eq!(synced.update.tx_update.anchors.len(), 2);
+        let after = (asked(&server, "/merkle-proof"), asked(&server, "/header"));
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+    }
+
+    /// What proving costs the first sync of a large wallet: a hundred
+    /// used scripts of five confirmations each, two confirmations a block.
+    /// One branch per confirmation, one header per block, and nothing for
+    /// the rest of the sync; printed with `--nocapture`.
+    #[tokio::test]
+    async fn what_proving_costs_a_first_esplora_sync() {
+        let server = mempool(Network::Signet).await;
+        server.state.lock().unwrap().tip = 900;
+        let mut scripts = Vec::new();
+        let mut label = 0u8;
+        for n in 0..100u32 {
+            let ours = format!("0014{:040x}", n + 1);
+            let payments: Vec<serde_json::Value> = (0..5u32)
+                .map(|k| {
+                    label = label.wrapping_add(1);
+                    let mut payment =
+                        esplora_payment(label, (n % 250) as u8, 1_000 + u64::from(k), true);
+                    payment["vout"][0]["scriptpubkey"] = serde_json::json!(ours);
+                    payment["locktime"] = serde_json::json!(n * 5 + k);
+                    let tx = page_tx(&payment);
+                    payment["txid"] = serde_json::json!(tx.to_string());
+                    payment["status"]["block_height"] = serde_json::json!(300 + (n * 5 + k) / 2);
+                    payment
+                })
+                .collect();
+            server
+                .state
+                .lock()
+                .unwrap()
+                .scripts
+                .insert(FakeMempool::rest_key(&ours), payments);
+            scripts.push(ScriptBuf::from_hex(&ours).unwrap());
+        }
+        let plan = Plan {
+            scripts,
+            ..plan(Network::Signet)
+        };
+        let synced = esplora_sync(&server, plan).await.unwrap();
+        assert_eq!(synced.update.tx_update.anchors.len(), 500);
+        let total = server.state.lock().unwrap().requests.len();
+        let (branches, headers) = (asked(&server, "/merkle-proof"), asked(&server, "/header"));
+        println!(
+            "first sync of 500 confirmations in 250 blocks: {total} requests, of which {branches} \
+             branches and {headers} headers, {} without proving",
+            total - branches - headers
+        );
+        assert_eq!((branches, headers), (500, 250));
+    }
+
+    /// The txid of a transaction as Esplora lists it.
+    fn page_tx(listed: &serde_json::Value) -> Txid {
+        let tx: crate::chain::esplora::page::PageTx =
+            serde_json::from_value(listed.clone()).unwrap();
+        tx.to_tx().compute_txid()
+    }
+
+    async fn esplora_address(
+        server: &FakeMempool,
+        network: Network,
+    ) -> Result<crate::wallet::AddressWatchState, String> {
+        let address = if network == Network::Mainnet {
+            MAINNET_ADDRESS
+        } else {
+            SIGNET_ADDRESS
+        };
+        crate::chain::esplora::fetch_address_state(&esplora(server), address, network, &[]).await
+    }
+
+    /// A watched address over Esplora: a confirmation is proven, one in a
+    /// header no one mined refuses the server, and so does a transaction
+    /// that is not the one its txid names, whose confirmation, proven
+    /// under that txid, would have been taken for its own.
+    #[tokio::test]
+    async fn an_address_confirmation_is_proven_over_esplora() {
+        let server = mempool(Network::Signet).await;
+        server.state.lock().unwrap().address_txs = vec![esplora_payment(0x35, 0x45, 50_000, true)];
+        let state = esplora_address(&server, Network::Signet).await.unwrap();
+        assert_eq!(state.txs[0].height, Some(501));
+        assert_eq!(
+            (asked(&server, "/merkle-proof"), asked(&server, "/header")),
+            (1, 1)
+        );
+
+        let mut passed_off = esplora_payment(0x36, 0x46, 50_000, true);
+        passed_off["vout"][0]["value"] = serde_json::json!(5_000_000);
+        server.state.lock().unwrap().address_txs = vec![passed_off];
+        let refused = esplora_address(&server, Network::Signet).await.unwrap_err();
+        assert!(refused.contains("another transaction"), "{refused}");
+
+        let server = mempool(Network::Mainnet).await;
+        server.state.lock().unwrap().address_txs = vec![esplora_payment(0x37, 0x47, 50_000, true)];
+        let refused = esplora_address(&server, Network::Mainnet)
+            .await
+            .unwrap_err();
+        assert!(refused.contains(FALSE_PROOF), "{refused}");
+    }
+
+    /// The coins of an address over Esplora are read as over Electrum.
+    #[tokio::test]
+    async fn an_address_coin_over_esplora_is_confirmed_as_its_transaction_is() {
+        let server = mempool(Network::Signet).await;
+        let payment = esplora_payment(0x38, 0x48, 50_000, true);
+        let txid = crate::testkit::esplora_txid(0x38);
+        let coin = |txid: &str, vout: u32, value: u64| {
+            serde_json::json!({
+                "txid": txid, "vout": vout, "value": value,
+                "status": { "confirmed": true, "block_height": 480, "block_time": 1_700_000_000 },
+            })
+        };
+        let nobody = "55".repeat(32);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.address_txs = vec![payment];
+            state.utxos = vec![
+                coin(&txid, 0, 50_000),
+                coin(&txid, 0, 50_000),
+                coin(&nobody, 0, 7_000_000),
+            ];
+        }
+        let state = esplora_address(&server, Network::Signet).await.unwrap();
+        assert_eq!(state.utxos.len(), 2);
+        assert_eq!(state.utxos[0].height, Some(501));
+        let balance = crate::wallet::views::address_balance(&state);
+        assert_eq!(balance.confirmed, 50_000);
+        assert_eq!(balance.untrusted_pending, 7_000_000);
+
+        server.state.lock().unwrap().utxos = vec![coin(&txid, 0, 60_000)];
+        let refused = esplora_address(&server, Network::Signet).await.unwrap_err();
+        assert!(refused.contains("does not pay"), "{refused}");
+    }
+
+    /// A coin past the round over Esplora counts as confirmed once its
+    /// transaction, read again, pays it and is proven where the server
+    /// puts it, or once the wallet holds it there. Higher than the round's
+    /// oldest confirmation, it is unconfirmed.
+    #[tokio::test]
+    async fn an_esplora_coin_past_the_round_counts_once_proven() {
+        let server = mempool(Network::Signet).await;
+        let old = esplora_payment(0x39, 0x49, 50_000, true);
+        let txid = crate::testkit::esplora_txid(0x39);
+        let mut newer = esplora_payment(0x3a, 0x4a, 1_000, true);
+        newer["status"]["block_height"] = serde_json::json!(520);
+        server.state.lock().unwrap().address_txs = vec![newer, old];
+        let whole = esplora_address(&server, Network::Signet).await.unwrap();
+        // The round of the newer one alone, older ones past it.
+        let round = crate::chain::esplora::HistoryRound {
+            txs: whole.txs[..1].to_vec(),
+            cursor: Some(whole.txs[0].txid.clone()),
+        };
+        let client = esplora(&server);
+        // The block the old payment is in, as the server lists it.
+        let page: Vec<serde_json::Value> = client.get_json("/address/x/txs").await.unwrap();
+        let block = page
+            .iter()
+            .find(|tx| tx["txid"] == txid)
+            .and_then(|tx| tx["status"]["block_hash"].as_str())
+            .unwrap()
+            .to_owned();
+        let coin = |value: u64, height: u32| {
+            serde_json::from_value::<crate::chain::esplora::api::Utxo>(serde_json::json!({
+                "txid": txid, "vout": 0, "value": value,
+                "status": {
+                    "confirmed": true, "block_height": height,
+                    "block_hash": block, "block_time": 1_700_000_000,
+                },
+            }))
+            .unwrap()
+        };
+        let ours = ScriptBuf::from_hex(ADDRESS_SCRIPT).unwrap();
+        let read = |coins, held: Vec<crate::wallet::AddressTx>| {
+            let (client, ours, round) = (&client, &ours, &round);
+            async move {
+                crate::chain::esplora::coins(client, Network::Signet, ours, coins, round, &held)
+                    .await
+            }
+        };
+
+        let coins = read(vec![coin(50_000, 501)], Vec::new()).await.unwrap();
+        assert_eq!(coins[0].height, Some(501));
+        assert_eq!(asked(&server, "/raw"), 1);
+        // Held there, paying it: not read again.
+        let coins = read(vec![coin(50_000, 501)], whole.txs.clone())
+            .await
+            .unwrap();
+        assert_eq!(coins[0].height, Some(501));
+        assert_eq!(asked(&server, "/raw"), 1);
+        // More than its transaction pays.
+        let refused = read(vec![coin(5_000_000, 501)], Vec::new())
+            .await
+            .unwrap_err();
+        assert!(refused.contains("does not pay"), "{refused}");
+        // Higher than the round's oldest confirmation: unconfirmed.
+        let coins = read(vec![coin(50_000, 530)], Vec::new()).await.unwrap();
+        assert_eq!(coins[0].height, None);
+    }
+
+    /// A status that says confirmed and names no block confirms nothing,
+    /// nor the coin it pays; and a transaction the wallet holds, listed
+    /// again with what it pays rewritten, refuses the server. Both used
+    /// to count, confirmed, at the server's word.
+    #[tokio::test]
+    async fn an_esplora_address_takes_no_confirmation_it_cannot_prove() {
+        let server = mempool(Network::Signet).await;
+        let mut nameless = esplora_payment(0x3b, 0x4b, 50_000, true);
+        nameless["status"] = serde_json::json!({ "confirmed": true, "block_height": 480 });
+        let txid = crate::testkit::esplora_txid(0x3b);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.address_txs = vec![nameless];
+            state.utxos = vec![serde_json::json!({
+                "txid": txid, "vout": 0, "value": 50_000,
+                "status": { "confirmed": true, "block_height": 480 },
+            })];
+        }
+        let state = esplora_address(&server, Network::Signet).await.unwrap();
+        assert_eq!(state.txs[0].height, None);
+        assert_eq!(crate::wallet::views::address_balance(&state).confirmed, 0);
+
+        let server = mempool(Network::Signet).await;
+        server.state.lock().unwrap().address_txs = vec![esplora_payment(0x3c, 0x4c, 1_000, true)];
+        let held = esplora_address(&server, Network::Signet).await.unwrap().txs;
+        let mut rewritten = esplora_payment(0x3c, 0x4c, 1_000, true);
+        rewritten["vout"][0]["value"] = serde_json::json!(1_000_000_000u64);
+        rewritten["txid"] = serde_json::json!(held[0].txid);
+        server.state.lock().unwrap().address_txs = vec![rewritten];
+        let refused = crate::chain::esplora::fetch_address_state(
+            &esplora(&server),
+            SIGNET_ADDRESS,
+            Network::Signet,
+            &held,
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.contains("another transaction"), "{refused}");
+    }
 }

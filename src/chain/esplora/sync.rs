@@ -24,18 +24,28 @@
 //! A transaction the wallet holds is not taken again, only where it now
 //! stands. The keychains walked past what the wallet knows are read
 //! whole, as before: those scripts are empty, or new to the wallet.
+//!
+//! A confirmation the wallet does not hold in the same block is proven
+//! before it is taken ([`prove`]): its merkle branch, and the header of
+//! its block, both from the server that listed it, as an Electrum
+//! server's are. Two requests for the first confirmation of a block, one
+//! for each other one in it; none for a confirmation the wallet holds.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use super::api::{ScriptHashStats, TxStatus};
+use bdk_wallet::bitcoin::block::Header;
+use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
 use bdk_wallet::bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
+use electrum_client::GetMerkleRes;
 use futures_util::future::try_join_all;
 
 use super::page::PageTx;
 use super::{Client, Counts, PAGE, PARALLEL_REQUESTS};
+use crate::chain::proof::{FALSE_PROOF, Proof, check_confirmation};
 use crate::chain::{
     Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX, height_limit,
 };
@@ -203,7 +213,8 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, String> {
         }
     }
 
-    let update = found.update;
+    let mut update = found.update;
+    prove(client, network, &held, start_time, &mut update).await?;
     let chain = meeting.chain(client, &latest, &update.anchors).await?;
     Ok(Synced {
         update: bdk_wallet::Update {
@@ -462,6 +473,119 @@ impl Found {
             .extend(read.evicted.into_iter().map(|txid| (txid, self.start_time)));
         Ok(())
     }
+}
+
+/// Proves the confirmations of `update` the wallet does not hold in the
+/// same block ([`prove_confirmations`]). One proven takes the time of its
+/// block's header; one unsure is taken as unconfirmed, as the server's
+/// word alone is; a false one refuses the server.
+async fn prove(
+    client: &Client,
+    network: Network,
+    held: &Held,
+    start_time: u64,
+    update: &mut TxUpdate<ConfirmationBlockTime>,
+) -> Result<(), String> {
+    let new: Vec<(ConfirmationBlockTime, Txid)> = update
+        .anchors
+        .iter()
+        .filter(|(anchor, txid)| {
+            held.anchors
+                .get(txid)
+                .is_none_or(|held| held.block_id != anchor.block_id)
+        })
+        .copied()
+        .collect();
+    let claimed: Vec<(Txid, BlockId)> = new
+        .iter()
+        .map(|(anchor, txid)| (*txid, anchor.block_id))
+        .collect();
+    let times = prove_confirmations(client, network, &claimed).await?;
+    for ((anchor, txid), time) in new.into_iter().zip(times) {
+        update.anchors.remove(&(anchor, txid));
+        match time {
+            Some(time) => {
+                update.anchors.insert((
+                    ConfirmationBlockTime {
+                        confirmation_time: time,
+                        ..anchor
+                    },
+                    txid,
+                ));
+            }
+            None => {
+                update.seen_ats.insert((txid, start_time));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Proves that each transaction of `claimed` confirmed in the block it
+/// names: its merkle branch (`/tx/:txid/merkle-proof`) against the header
+/// of that block (`/block/:hash/header`), which must be the block named
+/// and is read once however many of them it holds
+/// ([`check_confirmation`]). Gives, for each, the time of its block once
+/// proven, `None` when the proof is unsure, or when the server has no
+/// branch or no header for it, as when a block came in since it listed
+/// it. A proof that does not hold refuses the server ([`FALSE_PROOF`]),
+/// and so does a header that is not the block named.
+pub(crate) async fn prove_confirmations(
+    client: &Client,
+    network: Network,
+    claimed: &[(Txid, BlockId)],
+) -> Result<Vec<Option<u64>>, String> {
+    let mut blocks: Vec<BlockHash> = claimed.iter().map(|(_, block)| block.hash).collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let mut headers: HashMap<BlockHash, Header> = HashMap::with_capacity(blocks.len());
+    for chunk in blocks.chunks(PARALLEL_REQUESTS) {
+        let read = try_join_all(chunk.iter().map(|hash| block_header(client, *hash))).await?;
+        for (hash, header) in chunk.iter().zip(read) {
+            if let Some(header) = header {
+                headers.insert(*hash, header);
+            }
+        }
+    }
+    let mut times = Vec::with_capacity(claimed.len());
+    for chunk in claimed.chunks(PARALLEL_REQUESTS) {
+        let branches = try_join_all(chunk.iter().map(|(txid, _)| async move {
+            let path = format!("/tx/{txid}/merkle-proof");
+            client.get_json_opt::<GetMerkleRes>(&path).await
+        }))
+        .await?;
+        for ((txid, block), branch) in chunk.iter().zip(branches) {
+            let proof = match (branch, headers.get(&block.hash)) {
+                (Some(branch), Some(header)) => {
+                    check_confirmation(network, block.height, header, *txid, &branch)
+                }
+                _ => Proof::Unsure,
+            };
+            match proof {
+                Proof::Holds => times.push(Some(u64::from(headers[&block.hash].time))),
+                Proof::Unsure => times.push(None),
+                Proof::False => return Err(FALSE_PROOF.to_owned()),
+            }
+        }
+    }
+    Ok(times)
+}
+
+/// The header of the block `hash`, which must hash to it; `None` when
+/// the server has no such block, one a reorganisation left behind.
+async fn block_header(client: &Client, hash: BlockHash) -> Result<Option<Header>, String> {
+    let Some(text) = client
+        .fetch(&format!("/block/{hash}/header"), 1 << 10)
+        .await?
+    else {
+        return Ok(None);
+    };
+    std::str::from_utf8(&text)
+        .ok()
+        .and_then(|text| deserialize_hex::<Header>(text.trim()).ok())
+        .filter(|header| header.block_hash() == hash)
+        .map(Some)
+        .ok_or_else(|| FALSE_PROOF.to_owned())
 }
 
 /// The latest blocks, by height: ten on the instances there are,
