@@ -320,7 +320,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
             }
             () = super::sleep_until(proofs_due), if proofs_due.is_some() => {
                 session.expire_proofs(hub);
-                Ok(())
+                session.pump().await
             }
         };
         if let Err(detail) = outcome {
@@ -409,7 +409,9 @@ impl Session {
         for scripthash in gone {
             self.subscribed.remove(&scripthash);
             self.opening.remove(&scripthash);
-            self.provings.remove(&scripthash);
+            if self.provings.remove(&scripthash).is_some() {
+                self.drop_unawaited_proofs();
+            }
             self.queue.retain(|queued| *queued != scripthash);
             hub.statuses.remove(&scripthash);
             hub.announced.forget(&scripthash);
@@ -608,9 +610,12 @@ impl Session {
         let lacking = entry.statuses.iter().any(|held| *held != status);
         let previous = hub.statuses.insert(scripthash.to_owned(), status.clone());
         hub.announced.set(scripthash, status.clone());
-        if !answer && previous.as_ref() != Some(&status) {
+        if !answer
+            && previous.as_ref() != Some(&status)
+            && self.provings.remove(scripthash).is_some()
+        {
             // What was being proven of the status before is moot.
-            self.provings.remove(scripthash);
+            self.drop_unawaited_proofs();
         }
         if !lacking || (!answer && previous.as_ref() == Some(&status)) {
             return;
@@ -802,6 +807,28 @@ impl Session {
                 hub.mark_entry(&proving.hex, ChangeReason::Activity);
             }
         }
+        self.drop_unawaited_proofs();
+    }
+
+    /// Forgets the proofs no confirmation foretold waits on any more:
+    /// asked and never answered, they would hold their place in the
+    /// window of requests in flight for as long as the session lasts,
+    /// and an answer that comes after is not read.
+    fn drop_unawaited_proofs(&mut self) {
+        let awaited: HashSet<(Txid, u32)> = self
+            .provings
+            .values()
+            .flat_map(|proving| {
+                let height = proving.headers.last_height();
+                proving.waiting.iter().map(move |txid| (*txid, height))
+            })
+            .collect();
+        self.in_flight.retain(|_, request| match request {
+            Request::Merkle(txid, height) => awaited.contains(&(*txid, *height)),
+            _ => true,
+        });
+        self.proofs_asked.retain(|asked| awaited.contains(asked));
+        self.proofs_queued.retain(|queued| awaited.contains(queued));
     }
 
     /// A confirmation whose proofs all hold, as the wallet takes it.

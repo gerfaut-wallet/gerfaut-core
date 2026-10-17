@@ -2972,3 +2972,58 @@ async fn a_proof_refused_for_its_cost_leaves_the_session_alone() {
     assert_eq!(server.subscriptions().len(), 1);
     assert_eq!(watch.status().state, WatchState::Connected);
 }
+
+/// Ten proofs the server never sends fill the window of requests a
+/// session keeps in flight. Given up on, they leave it: a script listed
+/// after them is still subscribed.
+#[tokio::test]
+async fn proofs_given_up_on_leave_room_for_the_rest() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().unanswered = Some("blockchain.transaction.get_merkle");
+    let txids: Vec<Txid> = (0..10u8)
+        .map(|n| Txid::from_byte_array([n + 10; 32]))
+        .collect();
+    let pending: Vec<(Txid, i64)> = txids.iter().map(|txid| (*txid, 0)).collect();
+    server.set_history(&script(1), &pending);
+    let mut waiting = wallet("a", &[1], &[], true);
+    waiting.scripts[0].status = Some(status_of(&pending));
+    waiting.scripts[0].history = txids.iter().map(|txid| (*txid, 0)).collect();
+    let (watch, mut events) = LiveWatch::start_with(
+        config(server.backend()),
+        vec![waiting.clone()],
+        Some(timings()),
+    );
+    until(&watch, "subscribed", |s| s.pushed_scripts == 1).await;
+    no_event(&mut events, Duration::from_millis(300)).await;
+
+    let mined: Vec<(Txid, i64)> = txids.iter().map(|txid| (*txid, 101)).collect();
+    server.set_history(&script(1), &mined);
+    let header = {
+        let mut state = server.state.lock().unwrap();
+        state.height = 101;
+        state.header(101)
+    };
+    server.push(
+        json!({
+            "jsonrpc": "2.0", "method": "blockchain.headers.subscribe",
+            "params": [{ "height": 101, "hex": header }],
+        })
+        .to_string(),
+    );
+    server.set_status(&script(1), &status_of(&mined));
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock { height: 101 }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        moved("a", ChangeReason::Activity, false, &[1])
+    );
+
+    watch.set_wallets(vec![waiting, wallet("b", &[2], &[], false)]);
+    until(&watch, "the next script subscribed", |s| {
+        s.pushed_scripts == 2
+    })
+    .await;
+    assert!(server.subscriptions()[0].contains(&scripthash(&script(2))));
+}
