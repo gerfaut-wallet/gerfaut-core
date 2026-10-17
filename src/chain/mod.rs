@@ -184,22 +184,20 @@ pub(crate) fn server_words(text: &str) -> String {
 }
 
 /// The words of a failed request that say the server is down, or asks
-/// for less, whatever was asked: the connection failed, timed out or was
-/// cut, its certificate would not do, the server answered HTTP 429 or a
-/// 5xx, or the electrs of Blockstream ran out of memory for its answers
-/// twice in a row. Each is this crate's own wording.
-const OUTAGES: [&str; 13] = [
+/// for less, whatever was asked: the connection could not be opened or
+/// was cut, the connection or one request timed out, its certificate
+/// would not do, or the server answered HTTP 429 or a 5xx. Each is this
+/// crate's own wording, and each is pinned by a test on the function
+/// that writes it. The deadline of a whole sync is not one: how long a
+/// sync takes depends on the wallet as much as on the server.
+const OUTAGES: [&str; 9] = [
     "could not connect",
     "timed out",
     "the connection was closed",
-    "the connection ended unexpectedly",
     "connection failed",
     "host not found",
     "TLS handshake failed",
     "the server's certificate",
-    "no answer within",
-    "the server stopped reading",
-    "request failed",
     "HTTP 429",
     "HTTP 5",
 ];
@@ -1528,23 +1526,18 @@ mod tests {
     /// say it is out of memory for its answers. Nor is a server that lies.
     #[test]
     fn an_outage_is_told_from_a_refused_request() {
-        for outage in [
-            "could not connect within 10 s",
-            "could not connect through Tor: host unreachable",
-            "timed out after 20 s",
-            "the connection was closed",
-            "no answer within 600 s",
-            "TLS handshake failed: invalid peer certificate: UnknownIssuer",
-            "host not found",
-            "request failed",
-            "HTTP 503: server error",
-            "HTTP 429: rate limited, try again in 5 s",
-            "the server refused the request: response budget exhausted, retry later",
-            "the server refused the history of this address: response budget exhausted, retry later",
-        ] {
-            assert!(is_outage(outage), "{outage}");
-        }
+        let changed = tls::ConnectError::Certificate(tls::Verdict::Changed {
+            stored: "AA".to_owned(),
+            presented: "BB".to_owned(),
+        });
+        assert!(is_outage(&changed.to_string()), "{changed}");
+        assert!(is_outage(
+            "the server refused the history of this address: response budget exhausted, retry later"
+        ));
         for refused in [
+            "no answer within 600 s",
+            "the connection ended unexpectedly",
+            "request failed",
             "the server refused the request: history too large",
             "the server refused the request: request timed out",
             "the server will not send the history of this address, too long for it \

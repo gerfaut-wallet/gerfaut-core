@@ -913,6 +913,17 @@ mod tests {
             let detail = describe_io(&Error::from(kind), TIMEOUT);
             assert!(is_outage(&detail), "{kind:?}: {detail}");
         }
+        for (error, said) in [
+            (
+                Error::other("failed to lookup address information"),
+                "host not found",
+            ),
+            (Error::other("no route"), "connection failed: no route"),
+        ] {
+            let detail = describe_io(&error, TIMEOUT);
+            assert_eq!(detail, said);
+            assert!(is_outage(&detail), "{detail}");
+        }
         assert!(is_outage(&describe(&out_of_memory(), TIMEOUT)));
         let refused = electrum_client::Error::Protocol(serde_json::json!({
             "code": 1, "message": "Too many history entries",

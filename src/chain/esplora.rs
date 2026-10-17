@@ -630,6 +630,26 @@ pub(crate) fn describe_failure(error: &reqwest::Error) -> String {
     if error.is_body() || error.is_decode() {
         return "unexpected response".to_owned();
     }
+    // A server that hangs up before it answers: a reset, or a connection
+    // that ended first, in the words of hyper.
+    if find_cause(error, &mut |cause| {
+        use std::io::ErrorKind;
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            )
+        }) || cause
+            .to_string()
+            .starts_with("connection closed before message completed")
+    })
+    .is_some()
+    {
+        return "the connection was closed".to_owned();
+    }
     "request failed".to_owned()
 }
 
@@ -1166,6 +1186,32 @@ mod error_tests {
         let client = build(&format!("http://{address}"), None, BUDGET).unwrap();
         let error = client.height().await.unwrap_err();
         assert_eq!(error, "timed out after 1 s");
+        assert!(crate::chain::is_outage(&error));
+    }
+
+    /// A server that hangs up before it answers, having read the request
+    /// or not: the connection was closed, and that is an outage.
+    #[tokio::test]
+    async fn a_server_that_hangs_up_closed_the_connection() {
+        for read_first in [true, false] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    if read_first {
+                        let mut request = [0u8; 1024];
+                        let _ = stream.read(&mut request).await;
+                    }
+                }
+            });
+            let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
+            let error = client.height().await.unwrap_err();
+            assert_eq!(
+                error, "the connection was closed",
+                "read first: {read_first}"
+            );
+            assert!(crate::chain::is_outage(&error));
+        }
     }
 
     #[tokio::test]
@@ -1176,6 +1222,7 @@ mod error_tests {
         let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
         let error = client.height().await.unwrap_err();
         assert_eq!(error, "could not connect");
+        assert!(crate::chain::is_outage(&error));
     }
 
     #[tokio::test]
@@ -1184,6 +1231,7 @@ mod error_tests {
         let client = build("http://esplora.invalid", None, PATIENT).unwrap();
         let error = client.height().await.unwrap_err();
         assert_eq!(error, "host not found");
+        assert!(crate::chain::is_outage(&error));
     }
 
     /// A server that answers the handshake with something that is not
@@ -1216,6 +1264,7 @@ mod error_tests {
             described.starts_with("TLS handshake failed: received corrupt message"),
             "{described}"
         );
+        assert!(crate::chain::is_outage(&described));
     }
 
     /// A proxy that turns the handshake down: the SOCKS client's own
