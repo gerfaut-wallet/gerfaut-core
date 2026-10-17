@@ -159,6 +159,10 @@ pub(crate) struct ElectrumState {
     pub txs: HashMap<Txid, String>,
     /// Methods answered with this error message instead.
     pub refuse: HashMap<&'static str, String>,
+    /// Methods turned down this many times more, each, the way the
+    /// electrs of Blockstream turns a request down when the answers it
+    /// holds take all the memory it allows them.
+    pub busy: HashMap<&'static str, usize>,
     /// Script hashes whose history is refused, as too long.
     pub refused_histories: std::collections::HashSet<String>,
     /// The most subscriptions one connection holds, and the words that
@@ -354,6 +358,15 @@ impl FakeElectrum {
         };
         if let Some(message) = state.refuse.get(method) {
             return refusal(message);
+        }
+        if let Some(left) = state.busy.get_mut(method)
+            && *left > 0
+        {
+            *left -= 1;
+            return Answer::Line(json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": { "code": 2, "message": "response budget exhausted, retry later" },
+            }));
         }
         if method == "blockchain.scripthash.get_history"
             && request["params"][0]
