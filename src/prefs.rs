@@ -28,9 +28,12 @@ pub enum Unit {
 }
 
 /// The preferences both apps keep, as the vault holds them. A field a
-/// vault never stored reads as its default.
+/// vault never stored reads as its default, and the pair of currency
+/// and source read is made one that exists, as [`Preferences::change`]
+/// makes it: a record that holds a currency and no source, or a source
+/// that does not quote the currency, never loads a price that fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "Stored")]
 pub struct Preferences {
     /// The unit of every amount. BTC by default.
     pub unit: Unit,
@@ -44,8 +47,11 @@ pub struct Preferences {
     pub fiat: bool,
     /// The currency of the fiat value. The euro by default.
     pub fiat_currency: FiatCurrency,
-    /// Where the price comes from. CoinGecko by default. Always one that
-    /// quotes [`Self::fiat_currency`]: see [`Preferences::change`].
+    /// Where the price comes from. mempool.space by default, for the
+    /// seven currencies it quotes: its terms ask for no credit, and with
+    /// the Automatic server it is one of the operators the syncs may
+    /// already reach. CoinGecko for the others. Always one that quotes
+    /// [`Self::fiat_currency`]: see [`Preferences::change`].
     pub price_source: PriceSource,
     /// A notification when a transaction shows up and when it confirms.
     /// Off by default: watching keeps a connection open, which tells the
@@ -63,10 +69,71 @@ impl Default for Preferences {
             masked: false,
             fiat: false,
             fiat_currency: FiatCurrency::Eur,
-            price_source: PriceSource::Coingecko,
+            price_source: PriceSource::MempoolSpace,
             notify_new_tx: false,
             explorer_ack: false,
         }
+    }
+}
+
+/// The preferences as a record holds them, before the pair of currency
+/// and source is made one that exists.
+#[derive(Deserialize)]
+#[serde(default)]
+struct Stored {
+    unit: Unit,
+    masked: bool,
+    fiat: bool,
+    fiat_currency: FiatCurrency,
+    price_source: PriceSource,
+    notify_new_tx: bool,
+    explorer_ack: bool,
+}
+
+impl Default for Stored {
+    fn default() -> Self {
+        let Preferences {
+            unit,
+            masked,
+            fiat,
+            fiat_currency,
+            price_source,
+            notify_new_tx,
+            explorer_ack,
+        } = Preferences::default();
+        Stored {
+            unit,
+            masked,
+            fiat,
+            fiat_currency,
+            price_source,
+            notify_new_tx,
+            explorer_ack,
+        }
+    }
+}
+
+impl From<Stored> for Preferences {
+    fn from(stored: Stored) -> Self {
+        let Stored {
+            unit,
+            masked,
+            fiat,
+            fiat_currency,
+            price_source,
+            notify_new_tx,
+            explorer_ack,
+        } = stored;
+        Preferences {
+            unit,
+            masked,
+            fiat,
+            fiat_currency,
+            price_source,
+            notify_new_tx,
+            explorer_ack,
+        }
+        .quotable()
     }
 }
 
@@ -101,9 +168,9 @@ impl Preferences {
     /// These preferences with `change` applied, and the pair of currency
     /// and source made one that exists: the currency wins, the source
     /// follows. A currency only CoinGecko publishes, picked while the
-    /// source is Kraken, moves the source to CoinGecko rather than leave
-    /// a pair that no source can quote; a source picked that does not
-    /// quote the currency gives way the same.
+    /// source is mempool.space, moves the source to CoinGecko rather
+    /// than leave a pair that no source can quote; a source picked that
+    /// does not quote the currency gives way the same.
     pub fn change(mut self, change: &PreferencesChange) -> Self {
         let PreferencesChange {
             unit,
@@ -225,16 +292,21 @@ mod tests {
             .collect()
     }
 
-    /// The defaults are the ones both apps had: BTC, nothing hidden, no
-    /// fiat, the euro from CoinGecko, no alerts, the warning still up.
+    /// The defaults: BTC, nothing hidden, no fiat, the euro from
+    /// mempool.space, no alerts, the warning still up.
     #[test]
-    fn the_defaults_are_the_ones_both_apps_had() {
+    fn the_defaults_ask_no_new_third_party() {
         let defaults = Preferences::default();
         assert_eq!(defaults.unit, Unit::Btc);
         assert!(!defaults.masked);
         assert!(!defaults.fiat);
         assert_eq!(defaults.fiat_currency, FiatCurrency::Eur);
-        assert_eq!(defaults.price_source, PriceSource::Coingecko);
+        assert_eq!(defaults.price_source, PriceSource::MempoolSpace);
+        assert!(
+            defaults
+                .price_source
+                .supports_currency(defaults.fiat_currency)
+        );
         assert!(!defaults.notify_new_tx);
         assert!(!defaults.explorer_ack);
         // A vault that stored none of them, or some, reads the rest as
@@ -275,6 +347,66 @@ mod tests {
         );
     }
 
+    /// A record whose source does not quote its currency, or that holds
+    /// a currency and no source, loads with a source that quotes it:
+    /// the default, mempool.space, gives way to CoinGecko, and the rest
+    /// stands.
+    #[test]
+    fn a_record_loads_with_a_source_that_quotes_its_currency() {
+        let alone: Preferences = serde_json::from_str(r#"{"fiat_currency":"inr"}"#).unwrap();
+        assert_eq!(alone.fiat_currency, FiatCurrency::Inr);
+        assert_eq!(alone.price_source, PriceSource::Coingecko);
+
+        let unquoted: Preferences = serde_json::from_str(
+            r#"{"unit":"sats","fiat":true,"fiat_currency":"ngn","price_source":"mempool_space"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            unquoted,
+            Preferences {
+                unit: Unit::Sats,
+                fiat: true,
+                fiat_currency: FiatCurrency::Ngn,
+                price_source: PriceSource::Coingecko,
+                ..Preferences::default()
+            }
+        );
+
+        // A pair that exists loads as it was.
+        let quoted: Preferences =
+            serde_json::from_str(r#"{"fiat_currency":"usd","price_source":"coingecko"}"#).unwrap();
+        assert_eq!(quoted.price_source, PriceSource::Coingecko);
+        let usd: Preferences = serde_json::from_str(r#"{"fiat_currency":"usd"}"#).unwrap();
+        assert_eq!(usd.price_source, PriceSource::MempoolSpace);
+    }
+
+    /// A record that names Kraken, which left the sources, reads as
+    /// mempool.space, and every other preference it holds stands.
+    #[test]
+    fn a_record_on_kraken_reads_as_mempool_space() {
+        let stored: Preferences = serde_json::from_str(
+            r#"{"unit":"sats","masked":true,"fiat":true,"fiat_currency":"jpy",
+                "price_source":"kraken","notify_new_tx":true,"explorer_ack":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stored,
+            Preferences {
+                unit: Unit::Sats,
+                masked: true,
+                fiat: true,
+                fiat_currency: FiatCurrency::Jpy,
+                price_source: PriceSource::MempoolSpace,
+                notify_new_tx: true,
+                explorer_ack: true,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(stored).unwrap()["price_source"],
+            "mempool_space"
+        );
+    }
+
     /// A change names what it changes, and nothing else moves.
     #[test]
     fn a_change_moves_what_it_names_alone() {
@@ -308,21 +440,23 @@ mod tests {
     /// meant would otherwise go nowhere and say nothing.
     #[test]
     fn a_change_with_a_field_nobody_knows_is_refused() {
-        assert!(serde_json::from_str::<PreferencesChange>(r#"{"fiat_source":"kraken"}"#).is_err());
+        assert!(
+            serde_json::from_str::<PreferencesChange>(r#"{"fiat_source":"coingecko"}"#).is_err()
+        );
     }
 
     /// The currency wins, the source follows: whatever is changed, the
     /// pair kept is one a source quotes.
     #[test]
     fn the_currency_wins_and_the_source_follows() {
-        let on_kraken = Preferences::default().change(&PreferencesChange {
-            price_source: Some(PriceSource::Kraken),
+        let on_mempool = Preferences::default().change(&PreferencesChange {
+            price_source: Some(PriceSource::MempoolSpace),
             ..PreferencesChange::default()
         });
-        assert_eq!(on_kraken.price_source, PriceSource::Kraken);
+        assert_eq!(on_mempool.price_source, PriceSource::MempoolSpace);
 
-        // A currency Kraken does not quote takes the source with it.
-        let inr = on_kraken.change(&PreferencesChange {
+        // A currency mempool.space does not quote takes the source with it.
+        let inr = on_mempool.change(&PreferencesChange {
             fiat_currency: Some(FiatCurrency::Inr),
             ..PreferencesChange::default()
         });
@@ -330,11 +464,11 @@ mod tests {
         assert_eq!(inr.price_source, PriceSource::Coingecko);
 
         // One it quotes leaves the source where it is.
-        let usd = on_kraken.change(&PreferencesChange {
+        let usd = on_mempool.change(&PreferencesChange {
             fiat_currency: Some(FiatCurrency::Usd),
             ..PreferencesChange::default()
         });
-        assert_eq!(usd.price_source, PriceSource::Kraken);
+        assert_eq!(usd.price_source, PriceSource::MempoolSpace);
 
         // A source that does not quote the currency gives way to it.
         let refused = inr.change(&PreferencesChange {
@@ -395,7 +529,8 @@ mod tests {
                 masked: true,
                 fiat: true,
                 fiat_currency: FiatCurrency::Usd,
-                price_source: PriceSource::Kraken,
+                // Kraken left the sources: mempool.space quotes the same.
+                price_source: PriceSource::MempoolSpace,
                 notify_new_tx: true,
                 explorer_ack: true,
             }
@@ -430,11 +565,14 @@ mod tests {
             &mut app_prefs,
             [LEGACY_MASKED_MOBILE, LEGACY_MASKED_DESKTOP],
         );
+        // No source stored, and a currency only CoinGecko quotes: the
+        // default source gives way to it.
         assert_eq!(
             adopted,
             Preferences {
                 masked: true,
                 fiat_currency: FiatCurrency::Try,
+                price_source: PriceSource::Coingecko,
                 ..Preferences::default()
             }
         );

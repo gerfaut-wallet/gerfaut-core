@@ -2131,7 +2131,7 @@ fn settings() -> Vec<Fixture> {
         masked: true,
         fiat: true,
         fiat_currency: FiatCurrency::Chf,
-        price_source: PriceSource::Kraken,
+        price_source: PriceSource::MempoolSpace,
         notify_new_tx: true,
         explorer_ack: true,
     };
@@ -2244,7 +2244,7 @@ fn settings() -> Vec<Fixture> {
                         masked: Some(true),
                         fiat: Some(true),
                         fiat_currency: Some(FiatCurrency::Chf),
-                        price_source: Some(PriceSource::Kraken),
+                        price_source: Some(PriceSource::MempoolSpace),
                         notify_new_tx: Some(true),
                         explorer_ack: Some(true),
                     },
@@ -2336,7 +2336,6 @@ fn prices() -> Vec<Fixture> {
             "PriceSource",
             every!(PriceSource {
                 Coingecko,
-                Kraken,
                 MempoolSpace,
             }),
         ),
@@ -2356,18 +2355,38 @@ fn prices() -> Vec<Fixture> {
             ],
         ),
         fixture("SourceEntry", sources),
+        fixture(
+            "Credit",
+            vec![(
+                "coingecko",
+                PriceSource::Coingecko
+                    .credit()
+                    .expect("CoinGecko asks for one"),
+            )],
+        ),
         fixture("PriceTable", vec![("table", table.clone())]),
         fixture(
             "PriceQuote",
-            vec![(
-                "eur",
-                PriceQuote {
-                    rate: 92_034.25,
-                    currency: FiatCurrency::Eur,
-                    source: PriceSource::Coingecko,
-                    at: NOW,
-                },
-            )],
+            vec![
+                (
+                    "mempool_space",
+                    PriceQuote {
+                        rate: 92_034.25,
+                        currency: FiatCurrency::Eur,
+                        source: PriceSource::MempoolSpace,
+                        at: NOW,
+                    },
+                ),
+                (
+                    "coingecko",
+                    PriceQuote {
+                        rate: 1_532_870.0,
+                        currency: FiatCurrency::Try,
+                        source: PriceSource::Coingecko,
+                        at: NOW,
+                    },
+                ),
+            ],
         ),
         variants(
             "PriceRange",
@@ -2382,16 +2401,28 @@ fn prices() -> Vec<Fixture> {
         fixture("PricePoint", vec![("point", points[0])]),
         fixture(
             "PriceHistory",
-            vec![(
-                "day",
-                PriceHistory {
-                    points,
-                    currency: FiatCurrency::Eur,
-                    source: PriceSource::Kraken,
-                    range: PriceRange::Day,
-                    at: NOW,
-                },
-            )],
+            vec![
+                (
+                    "day",
+                    PriceHistory {
+                        points: points.clone(),
+                        currency: FiatCurrency::Eur,
+                        source: PriceSource::Coingecko,
+                        range: PriceRange::Day,
+                        at: NOW,
+                    },
+                ),
+                (
+                    "year",
+                    PriceHistory {
+                        points,
+                        currency: FiatCurrency::Eur,
+                        source: PriceSource::MempoolSpace,
+                        range: PriceRange::Year,
+                        at: NOW,
+                    },
+                ),
+            ],
         ),
     ]
 }

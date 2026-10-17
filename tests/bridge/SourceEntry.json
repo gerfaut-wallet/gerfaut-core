@@ -1,17 +1,17 @@
 {
-  "coingecko": {
-    "source": "coingecko",
-    "label": "CoinGecko",
-    "ranges": ["day", "week", "month", "year"]
-  },
-  "kraken": {
-    "source": "kraken",
-    "label": "Kraken",
-    "ranges": ["day", "week", "month", "year", "max"]
-  },
   "mempool_space": {
     "source": "mempool_space",
     "label": "mempool.space",
-    "ranges": ["month", "year", "max"]
+    "ranges": ["day", "week", "month", "year", "max"],
+    "credit": null
+  },
+  "coingecko": {
+    "source": "coingecko",
+    "label": "CoinGecko",
+    "ranges": ["day", "week", "month", "year"],
+    "credit": {
+      "text": "Powered by CoinGecko",
+      "url": "https://www.coingecko.com"
+    }
   }
 }
