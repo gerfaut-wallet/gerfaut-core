@@ -8,6 +8,19 @@
     "currency": "eur",
     "source": "coingecko",
     "range": "day",
-    "at": 1750000000
+    "at": 1750000000,
+    "credit": "Powered by CoinGecko"
+  },
+  "year": {
+    "points": [
+      {"t": 1749992800, "rate": 91250.5},
+      {"t": 1749996400, "rate": 91810.0},
+      {"t": 1750000000, "rate": 92034.25}
+    ],
+    "currency": "eur",
+    "source": "mempool_space",
+    "range": "year",
+    "at": 1750000000,
+    "credit": null
   }
 }

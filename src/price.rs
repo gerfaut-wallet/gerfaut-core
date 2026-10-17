@@ -42,6 +42,20 @@ impl PriceSource {
         }
     }
 
+    /// The credit the source's terms ask for wherever its data is on
+    /// screen, word for word; `None` when they ask for none.
+    ///
+    /// CoinGecko's API terms ask for "Powered by CoinGecko", shown
+    /// prominently in a legible font, and its attribution guide puts it
+    /// close to the data, above or below it. mempool.space asks for
+    /// nothing.
+    pub fn credit(self) -> Option<&'static str> {
+        match self {
+            PriceSource::Coingecko => Some("Powered by CoinGecko"),
+            PriceSource::MempoolSpace => None,
+        }
+    }
+
     /// Whether this source quotes a currency without an API key.
     ///
     /// mempool.space publishes seven; CoinGecko publishes them all.
@@ -275,6 +289,12 @@ pub struct PriceQuote {
     pub source: PriceSource,
     /// Unix timestamp, seconds, when the quote was fetched.
     pub at: u64,
+    /// What the source asks to be shown with its data, word for word
+    /// ([`PriceSource::credit`]). A screen that shows this price, or an
+    /// amount priced by it, shows the credit once, under the data; with
+    /// none, it shows nothing.
+    #[serde(default)]
+    pub credit: Option<String>,
 }
 
 /// An HTTP client, optionally through a SOCKS proxy.
@@ -406,6 +426,7 @@ pub(crate) async fn fetch_price(
         currency,
         source,
         at: now_secs(),
+        credit: source.credit().map(str::to_owned),
     })
 }
 
@@ -429,6 +450,10 @@ pub struct PriceHistory {
     pub range: PriceRange,
     /// Unix timestamp, seconds, when the series was fetched.
     pub at: u64,
+    /// What the source asks to be shown with its data, word for word,
+    /// as for [`PriceQuote::credit`].
+    #[serde(default)]
+    pub credit: Option<String>,
 }
 
 /// Enough for a chart at any width; series are thinned above this.
@@ -486,6 +511,7 @@ pub(crate) async fn fetch_price_history(
         source,
         range,
         at: now,
+        credit: source.credit().map(str::to_owned),
     })
 }
 
@@ -562,6 +588,28 @@ mod tests {
         );
         assert_eq!(serde_json::to_string(&PriceRange::Max).unwrap(), "\"max\"");
         assert_eq!(serde_json::to_string(&PriceRange::Day).unwrap(), "\"day\"");
+    }
+
+    /// CoinGecko's terms ask for its credit beside its data, word for
+    /// word; mempool.space asks for none.
+    #[test]
+    fn a_source_gives_the_credit_its_terms_ask_for() {
+        assert_eq!(
+            PriceSource::Coingecko.credit(),
+            Some("Powered by CoinGecko")
+        );
+        assert_eq!(PriceSource::MempoolSpace.credit(), None);
+        let quote = PriceQuote {
+            rate: 1.0,
+            currency: FiatCurrency::Eur,
+            source: PriceSource::Coingecko,
+            at: 0,
+            credit: Some("Powered by CoinGecko".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_value(&quote).unwrap()["credit"],
+            "Powered by CoinGecko"
+        );
     }
 
     /// Kraken left the sources: a vault or an app that still spells it

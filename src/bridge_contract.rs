@@ -2321,15 +2321,28 @@ fn prices() -> Vec<Fixture> {
         fixture("PriceTable", vec![("table", table.clone())]),
         fixture(
             "PriceQuote",
-            vec![(
-                "eur",
-                PriceQuote {
-                    rate: 92_034.25,
-                    currency: FiatCurrency::Eur,
-                    source: PriceSource::Coingecko,
-                    at: NOW,
-                },
-            )],
+            vec![
+                (
+                    "mempool_space",
+                    PriceQuote {
+                        rate: 92_034.25,
+                        currency: FiatCurrency::Eur,
+                        source: PriceSource::MempoolSpace,
+                        at: NOW,
+                        credit: None,
+                    },
+                ),
+                (
+                    "coingecko",
+                    PriceQuote {
+                        rate: 1_532_870.0,
+                        currency: FiatCurrency::Try,
+                        source: PriceSource::Coingecko,
+                        at: NOW,
+                        credit: PriceSource::Coingecko.credit().map(str::to_owned),
+                    },
+                ),
+            ],
         ),
         variants(
             "PriceRange",
@@ -2344,16 +2357,30 @@ fn prices() -> Vec<Fixture> {
         fixture("PricePoint", vec![("point", points[0])]),
         fixture(
             "PriceHistory",
-            vec![(
-                "day",
-                PriceHistory {
-                    points,
-                    currency: FiatCurrency::Eur,
-                    source: PriceSource::Coingecko,
-                    range: PriceRange::Day,
-                    at: NOW,
-                },
-            )],
+            vec![
+                (
+                    "day",
+                    PriceHistory {
+                        points: points.clone(),
+                        currency: FiatCurrency::Eur,
+                        source: PriceSource::Coingecko,
+                        range: PriceRange::Day,
+                        at: NOW,
+                        credit: PriceSource::Coingecko.credit().map(str::to_owned),
+                    },
+                ),
+                (
+                    "year",
+                    PriceHistory {
+                        points,
+                        currency: FiatCurrency::Eur,
+                        source: PriceSource::MempoolSpace,
+                        range: PriceRange::Year,
+                        at: NOW,
+                        credit: None,
+                    },
+                ),
+            ],
         ),
     ]
 }
