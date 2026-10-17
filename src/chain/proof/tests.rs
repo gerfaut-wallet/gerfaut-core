@@ -1302,11 +1302,17 @@ mod servers {
         let coins = read(vec![coin(50_000, 501)], Vec::new()).await.unwrap();
         assert_eq!(coins[0].height, Some(501));
         assert_eq!(asked(&server, "/raw"), 1);
-        // Held there, paying it: not read again.
-        let coins = read(vec![coin(50_000, 501)], whole.txs.clone())
-            .await
-            .unwrap();
+        // Proven this session: not read again.
+        let again = read(vec![coin(50_000, 501)], Vec::new()).await.unwrap();
+        assert_eq!(again, coins);
+        assert_eq!(asked(&server, "/raw"), 1);
+        // Held there, paying it: at the time the wallet holds, whatever
+        // time the server gives the coin.
+        let mut held = whole.txs.clone();
+        held[1].timestamp = Some(1_234);
+        let coins = read(vec![coin(50_000, 501)], held).await.unwrap();
         assert_eq!(coins[0].height, Some(501));
+        assert_eq!(coins[0].timestamp, Some(1_234));
         assert_eq!(asked(&server, "/raw"), 1);
         // More than its transaction pays.
         let refused = read(vec![coin(5_000_000, 501)], Vec::new())

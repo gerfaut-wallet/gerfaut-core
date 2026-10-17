@@ -717,10 +717,13 @@ pub(crate) async fn fetch_address_state(
 /// address that much, or the server is refused, and it is as confirmed as
 /// that transaction. When older transactions remain past the round, a
 /// coin of one of them, no higher than the round's oldest confirmation,
-/// is confirmed where the server puts it if the wallet holds its
-/// transaction there paying it, or once that transaction, read and
-/// found to pay it, is proven there. Any other coin is taken as
-/// unconfirmed. A coin listed twice counts once.
+/// is confirmed where the server puts it, at the time the wallet has for
+/// it, if the wallet holds its transaction there paying it, or if this
+/// session proved it there on the same server
+/// ([`crate::chain::proof::proven_coin`]). Otherwise its transaction is
+/// read again, counted against what the sync may keep, found to pay it,
+/// and its confirmation proven. Any other coin is taken as unconfirmed.
+/// A coin listed twice counts once.
 pub(crate) async fn coins(
     client: &Client,
     network: Network,
@@ -729,107 +732,130 @@ pub(crate) async fn coins(
     round: &HistoryRound,
     held: &[AddressTx],
 ) -> Result<Vec<AddressUtxo>, String> {
+    use crate::chain::proof::{ProvenCoin, pays, proven_coin, remember_coin};
+    use bdk_wallet::chain::BlockId;
     use std::collections::{HashMap, HashSet};
-    let pays = |tx: &AddressTx, vout: u32, value: u64| {
-        tx.outputs
-            .get(vout as usize)
-            .is_some_and(|output| output.is_mine && output.value_sats == Some(value))
-    };
     let in_round: HashMap<&str, &AddressTx> =
         round.txs.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
+    let held: HashMap<&str, &AddressTx> = held.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
     let oldest = round.txs.iter().filter_map(|tx| tx.height).min();
     let mut seen = HashSet::new();
-    let utxos: Vec<api::Utxo> = utxos
+    let utxos: Vec<(String, api::Utxo)> = utxos
         .into_iter()
         .filter(|utxo| seen.insert((utxo.txid, utxo.vout)))
+        .map(|utxo| (utxo.txid.to_string(), utxo))
         .collect();
+    let proven_as = |utxo: &api::Utxo, height: u32| ProvenCoin {
+        script: ours.clone(),
+        value: utxo.value,
+        height,
+        time: None,
+    };
+    let outpoint = |utxo: &api::Utxo| OutPoint::new(utxo.txid, utxo.vout);
 
-    // The coins past the round the wallet cannot vouch for from what it
-    // holds: their transactions are read, and their confirmations proven.
-    let past = |utxo: &api::Utxo| match (utxo.status.block_height, utxo.status.block_hash, oldest) {
-        (Some(height), Some(hash), Some(oldest))
-            if round.cursor.is_some()
-                && height <= oldest
-                && !in_round.contains_key(utxo.txid.to_string().as_str()) =>
-        {
-            Some(bdk_wallet::chain::BlockId { height, hash })
-        }
-        _ => None,
-    };
-    let held_pays = |utxo: &api::Utxo, height: u32| {
-        held.iter().any(|tx| {
-            tx.txid == utxo.txid.to_string()
-                && tx.height == Some(height)
-                && pays(tx, utxo.vout, utxo.value)
-        })
-    };
-    let mut unread: Vec<(Txid, bdk_wallet::chain::BlockId)> = Vec::new();
-    for utxo in &utxos {
-        if let Some(block) = past(utxo)
-            && !held_pays(utxo, block.height)
-            && !unread.contains(&(utxo.txid, block))
-        {
-            unread.push((utxo.txid, block));
+    // Where each coin past the round stands: vouched for, at the time
+    // given, or its transaction to read again and prove.
+    let mut vouched: HashMap<(Txid, u32), Option<u64>> = HashMap::new();
+    let mut unread: Vec<(Txid, BlockId)> = Vec::new();
+    let mut to_read: HashSet<(Txid, BlockId)> = HashSet::new();
+    for (txid, utxo) in &utxos {
+        let block = match (utxo.status.block_height, utxo.status.block_hash, oldest) {
+            (Some(height), Some(hash), Some(oldest))
+                if round.cursor.is_some()
+                    && height <= oldest
+                    && !in_round.contains_key(txid.as_str()) =>
+            {
+                BlockId { height, hash }
+            }
+            _ => continue,
+        };
+        let from_held = held
+            .get(txid.as_str())
+            .filter(|tx| tx.height == Some(block.height) && tx.pays(utxo.vout, utxo.value))
+            .map(|tx| tx.timestamp);
+        match from_held.or_else(|| {
+            proven_coin(
+                network,
+                &client.base,
+                outpoint(utxo),
+                &proven_as(utxo, block.height),
+            )
+        }) {
+            Some(time) => {
+                vouched.insert((utxo.txid, utxo.vout), time);
+            }
+            None => {
+                if to_read.insert((utxo.txid, block)) {
+                    unread.push((utxo.txid, block));
+                }
+            }
         }
     }
-    let mut read: HashMap<Txid, Transaction> = HashMap::new();
+
+    // Each transaction read again is counted, checked against every coin
+    // listed of it, and dropped.
+    let mut listed_of: HashMap<Txid, Vec<&api::Utxo>> = HashMap::new();
+    for (_, utxo) in &utxos {
+        listed_of.entry(utxo.txid).or_default().push(utxo);
+    }
+    let mut read: HashSet<Txid> = HashSet::new();
     for chunk in unread.chunks(PARALLEL_REQUESTS) {
         let txs = futures_util::future::try_join_all(chunk.iter().map(|(txid, _)| client.tx(txid)))
             .await?;
         for ((txid, _), tx) in chunk.iter().zip(txs) {
-            match tx {
-                Some(tx) if tx.compute_txid() == *txid => {
-                    read.insert(*txid, tx);
-                }
-                Some(_) => {
-                    return Err(
-                        "the server answered with another transaction than the one asked for"
-                            .to_owned(),
-                    );
-                }
-                None => {}
+            let Some(tx) = tx else {
+                continue;
+            };
+            if tx.compute_txid() != *txid {
+                return Err(
+                    "the server answered with another transaction than the one asked for"
+                        .to_owned(),
+                );
             }
-        }
-    }
-    for utxo in &utxos {
-        if let Some(tx) = read.get(&utxo.txid) {
-            let paid = tx.output.get(utxo.vout as usize).is_some_and(|output| {
-                output.script_pubkey == *ours && output.value.to_sat() == utxo.value
-            });
+            client.keep(tx.total_size())?;
+            let paid = listed_of
+                .get(txid)
+                .into_iter()
+                .flatten()
+                .all(|utxo| pays(&tx, utxo.vout, ours, utxo.value));
             if !paid {
                 return Err(crate::chain::electrum::address::COIN_NOT_PAID.to_owned());
             }
+            read.insert(*txid);
         }
     }
-    let unread: Vec<(Txid, bdk_wallet::chain::BlockId)> = unread
+    let unread: Vec<(Txid, BlockId)> = unread
         .into_iter()
-        .filter(|(txid, _)| read.contains_key(txid))
+        .filter(|(txid, _)| read.contains(txid))
         .collect();
     let times = sync::prove_confirmations(client, network, &unread).await?;
-    let proven: HashMap<(Txid, u32), u64> = unread
-        .iter()
-        .zip(times)
-        .filter_map(|((txid, block), time)| Some(((*txid, block.height), time?)))
-        .collect();
+    for ((txid, block), time) in unread.iter().zip(times) {
+        let Some(time) = time else {
+            continue;
+        };
+        for utxo in listed_of.get(txid).into_iter().flatten() {
+            if utxo.status.block_height == Some(block.height) {
+                vouched.insert((utxo.txid, utxo.vout), Some(time));
+                let coin = ProvenCoin {
+                    time: Some(time),
+                    ..proven_as(utxo, block.height)
+                };
+                remember_coin(network, &client.base, outpoint(utxo), coin);
+            }
+        }
+    }
 
-    let mut coins = Vec::new();
-    for utxo in utxos {
-        let txid = utxo.txid.to_string();
+    let mut coins = Vec::with_capacity(utxos.len());
+    for (txid, utxo) in utxos {
         let (height, timestamp) = match in_round.get(txid.as_str()) {
             Some(tx) => {
-                if !pays(tx, utxo.vout, utxo.value) {
+                if !tx.pays(utxo.vout, utxo.value) {
                     return Err(crate::chain::electrum::address::COIN_NOT_PAID.to_owned());
                 }
                 (tx.height, tx.timestamp)
             }
-            None => match past(&utxo) {
-                Some(block) if held_pays(&utxo, block.height) => {
-                    (Some(block.height), utxo.status.block_time)
-                }
-                Some(block) => match proven.get(&(utxo.txid, block.height)) {
-                    Some(time) => (Some(block.height), Some(*time)),
-                    None => (None, None),
-                },
+            None => match vouched.get(&(utxo.txid, utxo.vout)) {
+                Some(time) => (utxo.status.block_height, *time),
                 None => (None, None),
             },
         };

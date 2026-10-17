@@ -39,7 +39,9 @@ use electrum_client::GetMerkleRes;
 use super::rpc::{CallError, Connection};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
-use crate::chain::proof::{FALSE_PROOF, Proof, check_confirmation};
+use crate::chain::proof::{
+    FALSE_PROOF, Proof, ProvenCoin, check_confirmation, proven_coin, remember_coin,
+};
 use crate::chain::{KEEP_MAX, Kept};
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
@@ -148,7 +150,9 @@ async fn state_in_rounds_of(
         .iter()
         .filter_map(|tx| Some((tx.height?, tx.timestamp?)))
         .collect();
-    let (mut past, unread) = past_the_round(&unspent, &history, &round, held);
+    let listed = first_heights(&history);
+    let (mut past, unread) =
+        past_the_round(network, &target.url, &ours, &unspent, &listed, &round, held);
     // The blocks to prove in first, those of the coins past the round
     // among them, then those whose time is still to read.
     let heights: Vec<u32> = unproven
@@ -163,7 +167,14 @@ async fn state_in_rounds_of(
         .collect();
     let headers = block_headers(&mut connection, heights).await?;
     let unsure = prove(&mut connection, network, &unproven, &headers).await?;
-    past.extend(prove_past(&mut connection, network, &ours, &unspent, &unread, &headers).await?);
+    let read_again = ReadAgain {
+        server: &target.url,
+        network,
+        ours: &ours,
+        unspent: &unspent,
+        kept: &kept,
+    };
+    past.extend(read_again.prove(&mut connection, &unread, &headers).await?);
     times.extend(
         headers
             .found
@@ -176,13 +187,7 @@ async fn state_in_rounds_of(
         }
         tx.timestamp = tx.height.and_then(|height| times.get(&height).copied());
     }
-    // The time of the blocks of what the wallet holds past the round.
-    times.extend(
-        held.iter()
-            .filter(|tx| tx.txid.parse().is_ok_and(|txid: Txid| past.contains(&txid)))
-            .filter_map(|tx| Some((tx.height?, tx.timestamp?))),
-    );
-    let utxos = coins(unspent, &history, &txs, &past, &times)?;
+    let utxos = coins(unspent, &listed, &txs, &past, &times)?;
     Ok(AddressWatchState {
         txs,
         utxos,
@@ -613,25 +618,43 @@ async fn prove(
         .collect())
 }
 
-/// The transactions past the round whose coins may be confirmed where
-/// the history puts them: those the wallet holds there, paying the coin
-/// as listed, vouched for already; and the others, to read again and
-/// prove there ([`prove_past`]), with their height.
-fn past_the_round(
-    unspent: &[Unspent],
-    history: &[Entry],
-    round: &[Picked],
-    held: &[AddressTx],
-) -> (HashSet<Txid>, Vec<(Txid, u32)>) {
-    let in_round: HashSet<Txid> = round.iter().map(|(txid, _)| *txid).collect();
-    let mut listed: HashMap<Txid, Option<u32>> = HashMap::new();
+/// The height the history first lists each transaction at: the one
+/// [`round_of`] reads it at, `None` in the mempool.
+fn first_heights(history: &[Entry]) -> HashMap<Txid, Option<u32>> {
+    let mut listed: HashMap<Txid, Option<u32>> = HashMap::with_capacity(history.len());
     for entry in history {
         listed
             .entry(entry.tx_hash)
             .or_insert_with(|| height_of(entry.height));
     }
-    let mut vouched = HashSet::new();
-    let mut unread: Vec<(Txid, u32)> = Vec::new();
+    listed
+}
+
+/// Transactions past the round vouched for, with the time of their block.
+type Vouched = HashMap<Txid, Option<u64>>;
+
+/// The transactions past the round whose coins may be confirmed where
+/// the history puts them, and the time of their block. Vouched for
+/// already: those the wallet holds there, each coin of them paying as
+/// listed, and those this session proved on the same server for every
+/// coin listed of them ([`proven_coin`]). The
+/// others are returned, with their height, to read again and prove
+/// ([`ReadAgain::prove`]).
+fn past_the_round(
+    network: Network,
+    server: &str,
+    ours: &ScriptBuf,
+    unspent: &[Unspent],
+    listed: &HashMap<Txid, Option<u32>>,
+    round: &[Picked],
+    held: &[AddressTx],
+) -> (Vouched, Vec<(Txid, u32)>) {
+    let in_round: HashSet<Txid> = round.iter().map(|(txid, _)| *txid).collect();
+    let held: HashMap<&str, &AddressTx> = held.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
+    // Each transaction past the round, its height, and whether every coin
+    // of it is vouched for so far, and when.
+    let mut past: HashMap<Txid, (u32, Option<Option<u64>>)> = HashMap::new();
+    let mut order: Vec<Txid> = Vec::new();
     for coin in unspent {
         if in_round.contains(&coin.tx_hash) {
             continue;
@@ -640,82 +663,136 @@ fn past_the_round(
             continue;
         };
         let txid = coin.tx_hash.to_string();
-        let holds = held.iter().any(|tx| {
-            tx.txid == txid
-                && tx.height == Some(height)
-                && tx
-                    .outputs
-                    .get(coin.tx_pos as usize)
-                    .is_some_and(|output| output.is_mine && output.value_sats == Some(coin.value))
+        let from_held = held
+            .get(txid.as_str())
+            .filter(|tx| tx.height == Some(height) && tx.pays(coin.tx_pos, coin.value))
+            .map(|tx| tx.timestamp);
+        let proven = || {
+            let coin_proven = ProvenCoin {
+                script: ours.clone(),
+                value: coin.value,
+                height,
+                time: None,
+            };
+            proven_coin(
+                network,
+                server,
+                OutPoint::new(coin.tx_hash, coin.tx_pos),
+                &coin_proven,
+            )
+        };
+        let vouched = from_held.or_else(proven);
+        let entry = past.entry(coin.tx_hash).or_insert_with(|| {
+            order.push(coin.tx_hash);
+            (height, vouched)
         });
-        if holds {
-            vouched.insert(coin.tx_hash);
-        } else if !unread.contains(&(coin.tx_hash, height)) {
-            unread.push((coin.tx_hash, height));
+        // One coin not vouched for leaves the transaction to read again.
+        if vouched.is_none() {
+            entry.1 = None;
+        }
+    }
+    let mut vouched = HashMap::new();
+    let mut unread = Vec::new();
+    for txid in order {
+        match past[&txid] {
+            (_, Some(time)) => {
+                vouched.insert(txid, time);
+            }
+            (height, None) => unread.push((txid, height)),
         }
     }
     (vouched, unread)
 }
 
-/// Reads again each transaction of `unread`, past the round, and proves
-/// it where the history puts it ([`prove`]). One read that does not pay
-/// the coins listed of it refuses the server, as a proof that does not
-/// hold does; one whose proof is unsure is left out of those returned.
-async fn prove_past(
-    connection: &mut Connection,
+/// What reading again the transactions past the round needs.
+struct ReadAgain<'a> {
+    server: &'a str,
     network: Network,
-    ours: &ScriptBuf,
-    unspent: &[Unspent],
-    unread: &[(Txid, u32)],
-    headers: &Headers,
-) -> Result<HashSet<Txid>, String> {
-    if unread.is_empty() {
-        return Ok(HashSet::new());
-    }
-    let txids: Vec<Txid> = unread.iter().map(|(txid, _)| *txid).collect();
-    let read: HashMap<Txid, Transaction> = txids
-        .iter()
-        .copied()
-        .zip(fetch_txs(connection, &txids).await?)
-        .collect();
-    for coin in unspent {
-        if let Some(tx) = read.get(&coin.tx_hash) {
-            let pays = tx.output.get(coin.tx_pos as usize).is_some_and(|output| {
-                output.script_pubkey == *ours && output.value.to_sat() == coin.value
-            });
-            if !pays {
-                return Err(COIN_NOT_PAID.to_owned());
+    ours: &'a ScriptBuf,
+    unspent: &'a [Unspent],
+    kept: &'a Kept,
+}
+
+impl ReadAgain<'_> {
+    /// Reads again each transaction of `unread`, a few at a time, each
+    /// counted against what the sync may keep and dropped once its coins
+    /// are checked, then proves it where the history puts it ([`prove`]).
+    /// One read that does not pay the coins listed of it refuses the
+    /// server, as a proof that does not hold does; one whose proof is
+    /// unsure is left out of those returned. The others are remembered
+    /// for the session ([`remember_coin`]), with the time of their block.
+    async fn prove(
+        &self,
+        connection: &mut Connection,
+        unread: &[(Txid, u32)],
+        headers: &Headers,
+    ) -> Result<Vouched, String> {
+        if unread.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut coins: HashMap<Txid, Vec<&Unspent>> = HashMap::new();
+        for coin in self.unspent {
+            coins.entry(coin.tx_hash).or_default().push(coin);
+        }
+        for chunk in unread.chunks(TXS_AT_ONCE) {
+            let txids: Vec<Txid> = chunk.iter().map(|(txid, _)| *txid).collect();
+            for (txid, tx) in txids.iter().zip(fetch_txs(connection, &txids).await?) {
+                self.kept.add(tx.total_size())?;
+                let paid =
+                    coins.get(txid).into_iter().flatten().all(|coin| {
+                        crate::chain::proof::pays(&tx, coin.tx_pos, self.ours, coin.value)
+                    });
+                if !paid {
+                    return Err(COIN_NOT_PAID.to_owned());
+                }
             }
         }
+        let unsure = prove(connection, self.network, unread, headers).await?;
+        let mut proven = HashMap::new();
+        for (txid, height) in unread {
+            if unsure.contains(&txid.to_string()) {
+                continue;
+            }
+            let time = headers
+                .found
+                .get(height)
+                .map(|header| u64::from(header.time));
+            for coin in coins.get(txid).into_iter().flatten() {
+                let coin_proven = ProvenCoin {
+                    script: self.ours.clone(),
+                    value: coin.value,
+                    height: *height,
+                    time,
+                };
+                remember_coin(
+                    self.network,
+                    self.server,
+                    OutPoint::new(*txid, coin.tx_pos),
+                    coin_proven,
+                );
+            }
+            proven.insert(*txid, time);
+        }
+        Ok(proven)
     }
-    let unsure = prove(connection, network, unread, headers).await?;
-    Ok(txids
-        .into_iter()
-        .filter(|txid| !unsure.contains(&txid.to_string()))
-        .collect())
 }
 
 /// The coins of the address, as far as what was read vouches for each.
 /// A coin of a transaction of the round must be an output of it that
 /// pays the address that much, or the server is refused, and it is as
 /// confirmed as that transaction. One of a transaction past the round is
-/// confirmed where the history puts it once [`past_the_round`] vouches
-/// for it. Any other one is taken as unconfirmed: what the server says of
-/// a coin alone confirms nothing. A coin listed twice counts once.
+/// confirmed where the history puts it once [`past_the_round`] or
+/// [`ReadAgain::prove`] vouches for it, at the time they give. Any other
+/// one is taken as unconfirmed: what the server says of a coin alone
+/// confirms nothing. A coin listed twice counts once.
 fn coins(
     unspent: Vec<Unspent>,
-    history: &[Entry],
+    listed: &HashMap<Txid, Option<u32>>,
     txs: &[AddressTx],
-    past: &HashSet<Txid>,
+    past: &Vouched,
     times: &HashMap<u32, u64>,
 ) -> Result<Vec<AddressUtxo>, String> {
     let in_round: HashMap<&str, &AddressTx> = txs.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
-    let mut listed: HashMap<Txid, Option<u32>> = HashMap::new();
-    for entry in history {
-        listed
-            .entry(entry.tx_hash)
-            .or_insert_with(|| height_of(entry.height));
-    }
     let mut seen = HashSet::new();
     let mut coins = Vec::new();
     for coin in unspent {
@@ -723,29 +800,33 @@ fn coins(
             continue;
         }
         let txid = coin.tx_hash.to_string();
-        let height = match in_round.get(txid.as_str()) {
+        let (height, timestamp) = match in_round.get(txid.as_str()) {
             Some(tx) => {
-                let pays = tx
-                    .outputs
-                    .get(coin.tx_pos as usize)
-                    .is_some_and(|output| output.is_mine && output.value_sats == Some(coin.value));
-                if !pays {
+                if !tx.pays(coin.tx_pos, coin.value) {
                     return Err(COIN_NOT_PAID.to_owned());
                 }
-                tx.height
+                let height = tx.height;
+                (
+                    height,
+                    height.and_then(|height| times.get(&height).copied()),
+                )
             }
-            None => listed
-                .get(&coin.tx_hash)
-                .copied()
-                .flatten()
-                .filter(|_| past.contains(&coin.tx_hash)),
+            None => match (
+                listed.get(&coin.tx_hash).copied().flatten(),
+                past.get(&coin.tx_hash),
+            ) {
+                (Some(height), Some(time)) => {
+                    (Some(height), time.or_else(|| times.get(&height).copied()))
+                }
+                _ => (None, None),
+            },
         };
         coins.push(AddressUtxo {
             txid,
             vout: coin.tx_pos,
             value_sats: coin.value,
             height,
-            timestamp: height.and_then(|height| times.get(&height).copied()),
+            timestamp,
         });
     }
     Ok(coins)
@@ -1130,64 +1211,111 @@ mod tests {
     /// that transaction, read again, pays it and is proven where the
     /// history puts it, or once the wallet holds it there: a server that
     /// fills the round with what it can prove and lists a coin past it,
-    /// of any value, confirms nothing it cannot back.
+    /// of any value, confirms nothing it cannot back. Proven once, it is
+    /// not read and proven again for the rest of the session.
     #[tokio::test]
     async fn a_coin_past_the_round_counts_once_proven() {
-        let server = FakeElectrum::start().await;
         let (parent, payment, _) = story();
         let newer = transaction(&[nowhere(3, 0)], &[(OURS, 1_000)]);
-        for tx in [&parent, &payment, &newer] {
-            server.add_tx(tx);
-        }
         let paid = payment.compute_txid();
-        server.set_history(OURS, &[(paid, 90), (newer.compute_txid(), 95)]);
-        let state_with = |held: Vec<AddressTx>| {
-            let target = target(&server);
+        let start = || async {
+            let server = FakeElectrum::start().await;
+            for tx in [&parent, &payment, &newer] {
+                server.add_tx(tx);
+            }
+            server.set_history(OURS, &[(paid, 90), (newer.compute_txid(), 95)]);
+            server.set_unspent(OURS, &[(paid, 0, 90, 50_000)]);
+            server
+        };
+        let state_with = |server: &FakeElectrum, held: Vec<AddressTx>| {
+            let target = target(server);
             async move { state_in_rounds_of(&target, ADDRESS, Network::Signet, None, 1, &held).await }
         };
-        let asked = |method: &str| {
+        let asked = |server: &FakeElectrum, method: &str| {
             let state = server.state.lock().unwrap();
             state.asked.iter().filter(|asked| *asked == method).count()
         };
+        let reads = |server: &FakeElectrum| {
+            (
+                asked(server, "blockchain.transaction.get"),
+                asked(server, "blockchain.transaction.get_merkle"),
+            )
+        };
 
-        server.set_unspent(OURS, &[(paid, 0, 90, 50_000)]);
-        let state = state_with(Vec::new()).await.unwrap();
+        let server = start().await;
+        let state = state_with(&server, Vec::new()).await.unwrap();
         assert_eq!(state.txs.len(), 1, "the round holds the newer one alone");
         assert_eq!(state.utxos[0].height, Some(90));
         assert_eq!(state.utxos[0].timestamp, Some(1_700_000_090));
+        // Proven this session: nothing read again for it, the round
+        // held as it was.
+        let before = reads(&server);
+        let again = state_with(&server, state.txs.clone()).await.unwrap();
+        assert_eq!(again.utxos, state.utxos);
+        assert_eq!(reads(&server), before);
 
-        // Held there, paying it: nothing read again for it.
-        let held = {
-            let whole =
-                state_in_rounds_of(&target(&server), ADDRESS, Network::Signet, None, 10, &[])
-                    .await
-                    .unwrap();
-            whole.txs
-        };
-        let (got, proofs) = (
-            asked("blockchain.transaction.get"),
-            asked("blockchain.transaction.get_merkle"),
-        );
-        let state = state_with(held).await.unwrap();
+        // Held there, paying it, on another server: nothing read for it.
+        let server = start().await;
+        let held = state_in_rounds_of(&target(&server), ADDRESS, Network::Signet, None, 10, &[])
+            .await
+            .unwrap()
+            .txs;
+        let before = reads(&server);
+        let state = state_with(&server, held).await.unwrap();
         assert_eq!(state.utxos[0].height, Some(90));
-        assert_eq!(asked("blockchain.transaction.get"), got);
-        assert_eq!(asked("blockchain.transaction.get_merkle"), proofs);
+        assert_eq!(reads(&server), before);
 
         // More than its transaction pays.
         server.set_unspent(OURS, &[(paid, 0, 90, 5_000_000)]);
-        let refused = state_with(Vec::new()).await.unwrap_err();
+        let refused = state_with(&server, Vec::new()).await.unwrap_err();
         assert!(refused.contains("does not pay"), "{refused}");
 
         // A branch that does not hold, for the coin past the round.
-        server.set_unspent(OURS, &[(paid, 0, 90, 50_000)]);
+        let server = start().await;
         server
             .state
             .lock()
             .unwrap()
             .branches
             .insert(paid, (vec!["ab".repeat(32)], 0));
-        let refused = state_with(Vec::new()).await.unwrap_err();
+        let refused = state_with(&server, Vec::new()).await.unwrap_err();
         assert_eq!(refused, crate::chain::proof::FALSE_PROOF);
+    }
+
+    /// What is read again past the round counts against what one sync
+    /// may keep, as what a round reads does.
+    #[tokio::test]
+    async fn what_is_read_past_the_round_keeps_so_much_and_no_more() {
+        let server = FakeElectrum::start().await;
+        let (parent, payment, _) = story();
+        server.add_tx(&parent);
+        server.add_tx(&payment);
+        let paid = payment.compute_txid();
+        server.set_history(OURS, &[(paid, 90)]);
+        let unspent = vec![Unspent {
+            tx_hash: paid,
+            tx_pos: 0,
+            value: 50_000,
+        }];
+        let ours = ScriptBuf::from_hex(OURS).unwrap();
+        let tight = Kept::up_to(payment.total_size() - 1);
+        let read_again = ReadAgain {
+            server: "nowhere",
+            network: Network::Signet,
+            ours: &ours,
+            unspent: &unspent,
+            kept: &tight,
+        };
+        let mut connection = Connection::open(&target(&server), None).await.unwrap();
+        let headers = block_headers(&mut connection, [90]).await.unwrap();
+        let refused = read_again
+            .prove(&mut connection, &[(paid, 90)], &headers)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.starts_with("the server sent more than"),
+            "{refused}"
+        );
     }
 
     /// An onion server without a route to it: nothing is opened.

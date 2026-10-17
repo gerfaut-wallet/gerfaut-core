@@ -35,11 +35,16 @@
 //! the same branch for a transaction: such a branch proves nothing, and
 //! refuses no server ([`Proof::Unsure`]).
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use bdk_wallet::bitcoin::block::Header;
 use bdk_wallet::bitcoin::consensus::encode::deserialize;
 use bdk_wallet::bitcoin::hashes::{Hash, sha256d};
 use bdk_wallet::bitcoin::params::Params;
-use bdk_wallet::bitcoin::{CompactTarget, Target, Transaction, TxMerkleNode, Txid};
+use bdk_wallet::bitcoin::{
+    CompactTarget, OutPoint, Script, ScriptBuf, Target, Transaction, TxMerkleNode, Txid,
+};
 use electrum_client::GetMerkleRes;
 
 use crate::network::Network;
@@ -189,4 +194,77 @@ fn merkle_root(txid: Txid, pos: usize, branch: &[[u8; 32]]) -> Result<TxMerkleNo
         return Err(Fault::Shape);
     }
     Ok(TxMerkleNode::from_byte_array(node))
+}
+
+/// Whether output `vout` of `tx` pays `ours` `value` sats: what a coin of
+/// it a server lists must be.
+pub(crate) fn pays(tx: &Transaction, vout: u32, ours: &Script, value: u64) -> bool {
+    tx.output
+        .get(vout as usize)
+        .is_some_and(|output| output.script_pubkey == *ours && output.value.to_sat() == value)
+}
+
+/// A coin past the round of a watched address, proven: what its
+/// transaction pays, where it confirmed, and the time of its block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvenCoin {
+    pub script: ScriptBuf,
+    pub value: u64,
+    pub height: u32,
+    pub time: Option<u64>,
+}
+
+/// Where a coin was proven: its network, the server, its outpoint.
+type ProvenAt = (Network, String, OutPoint);
+
+/// The coins past the round proven in this session, by network, server
+/// and outpoint: one the same server lists again at the same height,
+/// paying the same script as much, is not read and proven again at each
+/// sync. Forgotten all at once past [`PROVEN_COINS_MAX`], and with the
+/// process.
+static PROVEN_COINS: LazyLock<Mutex<HashMap<ProvenAt, ProvenCoin>>> =
+    LazyLock::new(Default::default);
+
+/// Coins kept proven at most: a few hundred kilobytes.
+const PROVEN_COINS_MAX: usize = 10_000;
+
+/// The time of the block a coin was proven in this session on `server`,
+/// when it was proven as `coin` says; `None` when it was not.
+pub(crate) fn proven_coin(
+    network: Network,
+    server: &str,
+    outpoint: OutPoint,
+    coin: &ProvenCoin,
+) -> Option<Option<u64>> {
+    let proven = PROVEN_COINS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    proven
+        .get(&(network, server.to_owned(), outpoint))
+        .filter(|held| {
+            held.script == coin.script && held.value == coin.value && held.height == coin.height
+        })
+        .map(|held| held.time)
+}
+
+/// Remembers a coin proven on `server` for the rest of the session.
+pub(crate) fn remember_coin(network: Network, server: &str, outpoint: OutPoint, coin: ProvenCoin) {
+    let mut proven = PROVEN_COINS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if proven.len() >= PROVEN_COINS_MAX {
+        proven.clear();
+    }
+    proven.insert((network, server.to_owned(), outpoint), coin);
+}
+
+/// Forgets what was proven on the servers whose address holds `server`:
+/// a server of the tests starts on a port a test before it may have
+/// used, and inherits nothing from it.
+#[cfg(test)]
+pub(crate) fn forget_proven_coins(server: &str) {
+    let mut proven = PROVEN_COINS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    proven.retain(|(_, at, _), _| !at.contains(server));
 }

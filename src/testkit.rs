@@ -345,6 +345,7 @@ pub(crate) struct FakeElectrum {
 impl FakeElectrum {
     pub(crate) async fn start() -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        crate::chain::proof::forget_proven_coins(&listener.local_addr().unwrap().to_string());
         let fake = FakeElectrum {
             address: listener.local_addr().unwrap(),
             state: Arc::new(Mutex::new(ElectrumState {
@@ -908,6 +909,7 @@ pub(crate) struct FakeMempool {
 impl FakeMempool {
     pub(crate) async fn start(websocket: bool, limit: usize) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        crate::chain::proof::forget_proven_coins(&listener.local_addr().unwrap().to_string());
         let fake = FakeMempool {
             address: listener.local_addr().unwrap(),
             state: Arc::new(Mutex::new(MempoolState {
