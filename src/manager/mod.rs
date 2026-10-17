@@ -299,41 +299,45 @@ fn fresh_meta(
 /// single address is re-checked against its network as a defense in
 /// depth, whatever validated it upstream.
 fn build_record(meta: WalletMeta) -> CoreResult<(WalletRecord, Option<bdk_wallet::Wallet>)> {
-    let kind = meta.kind.clone();
-    match &kind {
+    let mut engine = engine_for(&meta.kind, meta.network)?;
+    let changeset = match &mut engine {
+        Some(engine) => Some(engine.take_staged().ok_or_else(|| {
+            CoreError::Internal("new wallet produced no initial change set".to_owned())
+        })?),
+        None => None,
+    };
+    Ok((
+        WalletRecord {
+            meta,
+            changeset,
+            address_state: None,
+        },
+        engine,
+    ))
+}
+
+/// What a wallet of this material is watched with on `network`: the
+/// engine of a descriptor wallet, nothing for a single address, which is
+/// checked against the network instead. Whatever makes the material
+/// unwatchable fails here, so a restore can tell it before it begins.
+pub(crate) fn engine_for(
+    kind: &WalletKind,
+    network: Network,
+) -> CoreResult<Option<bdk_wallet::Wallet>> {
+    match kind {
         WalletKind::Descriptors {
             external, internal, ..
-        } => {
-            let mut engine = create_engine(external, internal.as_deref(), meta.network)?;
-            let changeset = engine.take_staged().ok_or_else(|| {
-                CoreError::Internal("new wallet produced no initial change set".to_owned())
-            })?;
-            Ok((
-                WalletRecord {
-                    meta,
-                    changeset: Some(changeset),
-                    address_state: None,
-                },
-                Some(engine),
-            ))
-        }
+        } => create_engine(external, internal.as_deref(), network).map(Some),
         WalletKind::SingleAddress { address } => {
             address
                 .parse::<bdk_wallet::bitcoin::Address<_>>()
                 .ok()
-                .and_then(|a| a.require_network(meta.network.to_bitcoin()).ok())
+                .and_then(|a| a.require_network(network.to_bitcoin()).ok())
                 .ok_or_else(|| CoreError::NetworkMismatch {
-                    expected: meta.network.to_string(),
+                    expected: network.to_string(),
                     found: "address".to_owned(),
                 })?;
-            Ok((
-                WalletRecord {
-                    meta,
-                    changeset: None,
-                    address_state: None,
-                },
-                None,
-            ))
+            Ok(None)
         }
     }
 }

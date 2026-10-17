@@ -12,7 +12,8 @@
           "internal": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)#0wkfxrv7",
           "script": "segwit"
         },
-        "already_watched": false
+        "already_watched": false,
+        "refused": null
       },
       {
         "index": 1,
@@ -22,7 +23,21 @@
           "type": "single_address",
           "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
         },
-        "already_watched": true
+        "already_watched": true,
+        "refused": null
+      },
+      {
+        "index": 2,
+        "name": "Handed over",
+        "network": "signet",
+        "kind": {
+          "type": "descriptors",
+          "external": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)#76ngmkux",
+          "internal": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)#0wkfxrv7",
+          "script": "segwit"
+        },
+        "already_watched": false,
+        "refused": "descriptor error: the change descriptor does not spend under the receive descriptor's keys and conditions: change would go to another wallet"
       }
     ],
     "has_settings": true,
@@ -42,7 +57,8 @@
           "internal": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)#0wkfxrv7",
           "script": "segwit"
         },
-        "already_watched": false
+        "already_watched": false,
+        "refused": null
       },
       {
         "index": 1,
@@ -52,7 +68,21 @@
           "type": "single_address",
           "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
         },
-        "already_watched": true
+        "already_watched": true,
+        "refused": null
+      },
+      {
+        "index": 2,
+        "name": "Handed over",
+        "network": "signet",
+        "kind": {
+          "type": "descriptors",
+          "external": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)#76ngmkux",
+          "internal": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)#0wkfxrv7",
+          "script": "segwit"
+        },
+        "already_watched": false,
+        "refused": "descriptor error: the change descriptor does not spend under the receive descriptor's keys and conditions: change would go to another wallet"
       }
     ],
     "has_settings": false,

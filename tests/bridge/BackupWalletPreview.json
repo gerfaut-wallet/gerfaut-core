@@ -9,7 +9,8 @@
       "internal": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)#0wkfxrv7",
       "script": "segwit"
     },
-    "already_watched": false
+    "already_watched": false,
+    "refused": null
   },
   "already_watched": {
     "index": 1,
@@ -19,6 +20,7 @@
       "type": "single_address",
       "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
     },
-    "already_watched": true
+    "already_watched": true,
+    "refused": null
   }
 }

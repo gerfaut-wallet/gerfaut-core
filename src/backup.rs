@@ -165,6 +165,12 @@ pub struct BackupWalletPreview {
     /// A wallet watching the same thing on the same network exists
     /// already; restoring it would be skipped.
     pub already_watched: bool,
+    /// Why a restore cannot take this wallet, in the core's words: its
+    /// material does not read as a wallet to watch, or its two
+    /// descriptors are not one wallet. A restore asked for it fails, and
+    /// names it. `None` for a wallet a restore takes.
+    #[serde(default)]
+    pub refused: Option<String>,
 }
 
 /// What to restore out of a backup.

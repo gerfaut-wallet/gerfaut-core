@@ -1677,6 +1677,7 @@ fn files() -> Vec<Fixture> {
             network: Network::Signet,
             kind: descriptors_kind(),
             already_watched: false,
+            refused: None,
         },
         BackupWalletPreview {
             index: 1,
@@ -1686,6 +1687,19 @@ fn files() -> Vec<Fixture> {
                 address: MAINNET_ADDRESS.to_owned(),
             },
             already_watched: true,
+            refused: None,
+        },
+        BackupWalletPreview {
+            index: 2,
+            name: "Handed over".to_owned(),
+            network: Network::Signet,
+            kind: descriptors_kind(),
+            already_watched: false,
+            refused: Some(
+                "descriptor error: the change descriptor does not spend under the receive \
+                 descriptor's keys and conditions: change would go to another wallet"
+                    .to_owned(),
+            ),
         },
     ];
     let backend = BackupBackendPreview {

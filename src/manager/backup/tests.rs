@@ -635,9 +635,10 @@ async fn backup_needs_its_password_and_scans_as_a_qr() {
 /// A backup pairing the receive descriptor of one wallet with the
 /// change descriptor of another, which no export makes: the policy
 /// page would vouch for the first while change went to the second. The
-/// restore refuses it in the words an import uses and leaves the vault
-/// as it was; the same pair handed back as a parsed input is refused
-/// alike.
+/// preview marks it, and says why; a restore that asks for it anyway
+/// refuses it, naming it, and leaves the vault as it was, while the
+/// other wallets of the backup restore; the same pair handed back as a
+/// parsed input is refused alike.
 #[tokio::test]
 async fn a_backup_pairing_two_wallets_is_not_restored() {
     const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
@@ -647,18 +648,29 @@ async fn a_backup_pairing_two_wallets_is_not_restored() {
         internal: Some(format!("wpkh({XPUB_B}/1/*)")),
         script: crate::input::ScriptKind::Segwit,
     };
+    let wallet = |name: &str, kind: WalletKind| BackupWallet {
+        name: name.to_owned(),
+        network: Network::Mainnet,
+        kind,
+        gap_limit: 20,
+        labels: Default::default(),
+        created_at: 1_755_000_000,
+        live_pinned: false,
+    };
     let payload = BackupPayload {
         version: BACKUP_VERSION,
         created_at: 1_756_000_000,
-        wallets: vec![BackupWallet {
-            name: "Handed over".to_owned(),
-            network: Network::Mainnet,
-            kind: kind.clone(),
-            gap_limit: 20,
-            labels: Default::default(),
-            created_at: 1_755_000_000,
-            live_pinned: false,
-        }],
+        wallets: vec![
+            wallet("Handed over", kind.clone()),
+            wallet(
+                "Own",
+                WalletKind::Descriptors {
+                    external: format!("wpkh({XPUB_B}/0/*)"),
+                    internal: Some(format!("wpkh({XPUB_B}/1/*)")),
+                    script: crate::input::ScriptKind::Segwit,
+                },
+            ),
+        ],
         backends: None,
         electrum_certs: None,
         gap_limit: None,
@@ -666,15 +678,43 @@ async fn a_backup_pairing_two_wallets_is_not_restored() {
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(dir.path()).await;
     let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    let refused: Vec<Option<&str>> = preview
+        .wallets
+        .iter()
+        .map(|wallet| wallet.refused.as_deref())
+        .collect();
+    assert!(
+        matches!(refused[..], [Some(reason), None] if reason.contains("another wallet")),
+        "{refused:?}"
+    );
+
     let error = manager
         .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
         .await
         .unwrap_err();
     assert!(
-        matches!(&error, CoreError::Descriptor(detail) if detail.contains("another wallet")),
+        matches!(&error, CoreError::Descriptor(detail)
+            if detail.starts_with("\"Handed over\" cannot be restored") && detail.contains("another wallet")),
         "{error}"
     );
     assert!(manager.list_wallets(None).await.is_empty());
+    let choices = ImportChoices {
+        indexes: Some(vec![1]),
+        apply_settings: false,
+    };
+    let report = manager
+        .import_backup(&text, BACKUP_PASSWORD, &choices)
+        .await
+        .unwrap();
+    assert_eq!(report.added.len(), 1);
+    assert_eq!(report.added[0].name, "Own");
+    let restored = manager.list_wallets(None).await;
+    assert_eq!(restored.len(), 1);
+    manager.remove_wallet(&restored[0].id).await.unwrap();
 
     // The same material as an input the app hands back.
     let WalletKind::Descriptors {

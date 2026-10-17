@@ -14,7 +14,7 @@ use crate::now_secs;
 use crate::store::WalletRecord;
 use crate::wallet::meta::WalletKind;
 
-use super::{WalletManager, build_record, find_record, find_watched, fresh_meta};
+use super::{WalletManager, build_record, engine_for, find_record, find_watched, fresh_meta};
 
 impl WalletManager {
     /// Seals the chosen wallets (every wallet by default) and, on
@@ -85,6 +85,18 @@ impl WalletManager {
     /// answer to a question the screen actually asked.
     pub async fn preview_backup(&self, source: &str, password: &str) -> CoreResult<BackupPreview> {
         let payload = backup::open(&backup::decode_source(source)?, password)?;
+        // Each wallet is put through what a restore puts it through, so
+        // the screen can leave out, and say why, one a restore would
+        // refuse, instead of the whole restore failing on it.
+        let refused: Vec<Option<String>> = payload
+            .wallets
+            .iter()
+            .map(|wallet| {
+                engine_for(&wallet.kind, wallet.network)
+                    .err()
+                    .map(|error| error.to_string())
+            })
+            .collect();
         let state = self.state.lock().await;
         Ok(BackupPreview {
             created_at: payload.created_at,
@@ -112,13 +124,15 @@ impl WalletManager {
                 .wallets
                 .iter()
                 .enumerate()
-                .map(|(index, wallet)| BackupWalletPreview {
+                .zip(refused)
+                .map(|((index, wallet), refused)| BackupWalletPreview {
                     index: index as u32,
                     name: wallet.name.clone(),
                     network: wallet.network,
                     kind: wallet.kind.clone(),
                     already_watched: find_watched(&state.payload, wallet.network, &wallet.kind)
                         .is_some(),
+                    refused,
                 })
                 .collect(),
         })
@@ -134,8 +148,9 @@ impl WalletManager {
     /// changed is exactly what pinning refuses to switch in silence),
     /// the gap limit is bounded like [`Self::set_gap_limit`]. A wallet
     /// whose material does not hold together, a change descriptor of
-    /// another wallet among it, fails the restore, which then leaves
-    /// the vault as it was.
+    /// another wallet among it, fails the restore, named, and the vault
+    /// is left as it was: the preview marks such a wallet
+    /// ([`BackupWalletPreview::refused`]) so it is never asked for.
     pub async fn import_backup(
         &self,
         source: &str,
@@ -201,7 +216,7 @@ impl WalletManager {
                 );
                 meta.labels = wallet.labels.clone();
                 meta.live_pinned = wallet.live_pinned;
-                pending.push(build_record(meta)?);
+                pending.push(build_record(meta).map_err(|error| refused_wallet(name, error))?);
             }
 
             // The vault changes as a whole or not at all, and the engines
@@ -286,6 +301,22 @@ fn restorable_certs(payload: &BackupPayload) -> BTreeMap<String, String> {
         })
         .map(|(host, fingerprint)| (host, fingerprint.to_ascii_uppercase()))
         .collect()
+}
+
+/// A wallet of the backup a restore refused, named where the error has
+/// words of its own: a backup may hold many, and the error is all a
+/// person who asked for it anyway sees.
+fn refused_wallet(name: &str, error: CoreError) -> CoreError {
+    match error {
+        CoreError::Descriptor(detail) => {
+            CoreError::Descriptor(format!("\"{name}\" cannot be restored: {detail}"))
+        }
+        CoreError::InvalidInput { kind, detail } => CoreError::InvalidInput {
+            kind,
+            detail: format!("\"{name}\" cannot be restored: {detail}"),
+        },
+        other => other,
+    }
 }
 
 /// What the import screen would have recognized a restored wallet as:
