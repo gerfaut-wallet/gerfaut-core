@@ -23,13 +23,12 @@ use std::collections::{HashMap, HashSet};
 
 use bdk_wallet::bitcoin::block::Header;
 use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
-use bdk_wallet::bitcoin::hashes::{Hash, sha256};
 use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use serde::Deserialize;
 use serde_json::json;
 
 use super::rpc::{CallError, Connection};
-use super::status::{Told, Verdict, verdict};
+use super::status::{Told, Verdict, scripthash, verdict};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
 use crate::chain::{KEEP_MAX, Kept};
@@ -74,13 +73,6 @@ type Picked = (Txid, Option<u32>);
 /// A height the chain has, from what a server wrote.
 fn height_of(height: i64) -> Option<u32> {
     u32::try_from(height).ok().filter(|height| *height > 0)
-}
-
-/// The Electrum script hash of a script: SHA-256, reversed, in hex.
-fn scripthash(script: &ScriptBuf) -> String {
-    let mut digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
-    digest.reverse();
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Fetches the complete state of a single watched address. `held` is

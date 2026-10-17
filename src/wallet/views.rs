@@ -326,21 +326,28 @@ pub(crate) type HistoryOrders =
 
 /// The Electrum status of the history a watched address holds, the
 /// same way: its transactions by height and txid, then the mempool.
+/// `None` when it holds none, or a txid or a height does not read.
 pub(crate) fn address_status(state: &AddressWatchState) -> Option<String> {
-    let mut history: Vec<(&str, i64)> = state
+    address_entries(state)
+        .filter(|history| !history.is_empty())
+        .map(|history| crate::chain::electrum::status::history_status(&history))
+}
+
+/// The history a watched address holds, in the order its status hashes
+/// it: by height and txid, then the mempool. `None` when a txid or a
+/// height does not read.
+fn address_entries(state: &AddressWatchState) -> Option<Vec<(Txid, i32)>> {
+    let mut history = state
         .txs
         .iter()
-        .map(|tx| (tx.txid.as_str(), tx.height.map_or(0, i64::from)))
-        .collect();
-    if history.is_empty() {
-        return None;
-    }
-    history.sort_by_key(|(txid, height)| (*height <= 0, *height, *txid));
-    Some(electrum_status(
-        history
-            .iter()
-            .map(|(txid, height)| format!("{txid}:{height}:")),
-    ))
+        .map(|tx| {
+            let txid = tx.txid.parse::<Txid>().ok()?;
+            let height = i32::try_from(tx.height.unwrap_or(0)).ok()?;
+            Some((txid, height))
+        })
+        .collect::<Option<Vec<(Txid, i32)>>>()?;
+    history.sort_by_key(|(txid, height)| (*height <= 0, *height, txid.to_string()));
+    Some(history)
 }
 
 /// The history behind a status, kept when a transaction of it waits
@@ -355,31 +362,9 @@ fn waiting(history: Vec<(Txid, i32)>) -> Vec<(Txid, i32)> {
 
 /// The history behind [`address_status`], when a transaction of it
 /// waits for a block: see [`crate::watch::WatchedScript::history`].
-/// Empty when none does, or a txid does not read.
+/// Empty when none does, or a txid or a height does not read.
 pub(crate) fn address_history(state: &AddressWatchState) -> Vec<(Txid, i32)> {
-    let mut history: Vec<(Txid, i32)> = Vec::with_capacity(state.txs.len());
-    for tx in &state.txs {
-        let (Ok(txid), Ok(height)) = (
-            tx.txid.parse::<Txid>(),
-            i32::try_from(tx.height.unwrap_or(0)),
-        ) else {
-            return Vec::new();
-        };
-        history.push((txid, height));
-    }
-    history.sort_by_key(|(txid, height)| (*height <= 0, *height, txid.to_string()));
-    waiting(history)
-}
-
-/// The SHA-256 of the parts of a status, in hex.
-fn electrum_status(parts: impl Iterator<Item = String>) -> String {
-    use bdk_wallet::bitcoin::hashes::{Hash, HashEngine, sha256};
-    let mut engine = sha256::Hash::engine();
-    for part in parts {
-        engine.input(part.as_bytes());
-    }
-    let digest = sha256::Hash::from_engine(engine).to_byte_array();
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    address_entries(state).map(waiting).unwrap_or_default()
 }
 
 /// The history the wallet holds for each script, empty for one it holds

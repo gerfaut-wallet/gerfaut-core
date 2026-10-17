@@ -120,7 +120,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
-use crate::chain::electrum::status::Announced;
+use crate::chain::electrum::status::{Announced, scripthash};
 use crate::chain::tor::TorSettings;
 use crate::chain::{self, BackendConfig, Endpoint, TrustedCerts};
 use crate::network::Network;
@@ -1049,8 +1049,6 @@ impl Refusals {
 
 impl Watched {
     fn new(wallets: Vec<WatchedWallet>, limits: WatchLimits) -> Self {
-        use bdk_wallet::bitcoin::hashes::{Hash, sha256};
-        use bdk_wallet::bitcoin::hex::DisplayHex;
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
         let mut watched = Watched {
             wallets: wallets
@@ -1117,9 +1115,7 @@ impl Watched {
                     let Ok(script) = ScriptBuf::from_hex(&listed.script) else {
                         continue;
                     };
-                    let mut digest = sha256::Hash::hash(script.as_bytes()).to_byte_array();
-                    digest.reverse();
-                    let scripthash = digest.to_lower_hex_string();
+                    let scripthash = scripthash(&script);
                     watched.by_hex.insert(hex.clone(), watched.entries.len());
                     watched
                         .by_scripthash
