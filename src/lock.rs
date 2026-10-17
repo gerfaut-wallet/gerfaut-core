@@ -125,6 +125,7 @@ impl LockAttempts {
     /// missing or unreadable file is an empty record: the lock must open
     /// for its owner whatever happened to a file that is not the vault.
     pub fn load(path: PathBuf) -> Self {
+        remove_stale_temporaries(&path);
         let stored = std::fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<StoredAttempts>(&bytes).ok())
@@ -231,29 +232,65 @@ impl LockAttempts {
 
 fn write_whole(path: &Path, stored: &StoredAttempts) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(stored).map_err(std::io::Error::other)?;
-    // Not `with_extension`: that would land on the same name the vault
-    // uses for its own temporary file, and the two are written under
-    // different locks.
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    {
+    let tmp = temporary_path(path);
+    let written = (|| {
         use std::io::Write;
-        // Always a new file, its owner's alone: one left by a write that
-        // never finished is removed first, and whatever stands at that
-        // name when the file is created, a link planted there among
-        // others, fails the write instead of being followed and
-        // truncated.
-        match std::fs::remove_file(&tmp) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
-            _ => {}
-        }
+        // A new file of its own, its owner's alone: a name no other
+        // write picks, so two writers never truncate, remove or rename
+        // each other's file, and one that already stands there, a link
+        // planted there among others, fails the write instead of being
+        // followed.
         let mut file =
             crate::store::owner_only(std::fs::OpenOptions::new().write(true).create_new(true))
                 .open(&tmp)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path)
+    written
+}
+
+/// `gerfaut.attempts.<random>.tmp` beside `gerfaut.attempts`. Not
+/// `with_extension`: that would land on a name the vault uses for its
+/// own temporary file, and the two are written under different locks.
+fn temporary_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{:016x}.tmp", rand::random::<u64>()));
+    path.with_file_name(name)
+}
+
+/// Removes the temporary files of writes that never finished: those
+/// named after the record, and the one fixed name older builds used.
+/// One that another writer is still filling goes too, which only fails
+/// its rename: the record it was replacing stays whole.
+fn remove_stale_temporaries(path: &Path) {
+    let Some(name) = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+    else {
+        return;
+    };
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let entry_name = entry.file_name();
+        let entry_name = entry_name.to_string_lossy();
+        let ours = entry_name
+            .strip_prefix(name.as_str())
+            .is_some_and(|rest| rest.starts_with('.') && rest.ends_with(".tmp"));
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(true);
+        if ours && !is_dir {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Checks that a secret is acceptable for its kind, before it is ever
@@ -574,9 +611,9 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
-    /// A link planted at the name of the temporary file is never
-    /// followed: the file it points to keeps its content, and the
-    /// record is written all the same.
+    /// A link planted at a temporary name is never followed: the file
+    /// it points to keeps its content, and the record is written all
+    /// the same.
     #[cfg(unix)]
     #[test]
     fn the_record_never_writes_through_a_link() {
@@ -591,6 +628,34 @@ mod tests {
         assert_eq!(LockAttempts::load(path).failures(), 1);
     }
 
+    /// Two writers of the same record with no lock in common, two
+    /// copies of the app on one vault: whatever either reads is a whole
+    /// record, never one half written or cut by the other's write.
+    #[test]
+    fn two_writers_never_leave_half_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.attempts");
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut attempts = LockAttempts::load(path.clone());
+                    for _ in 0..150 {
+                        attempts.fail(Instant::now());
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            serde_json::from_slice::<StoredAttempts>(&bytes)
+                                .expect("a whole record");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert!(LockAttempts::load(path).failures() > 0);
+    }
+
     #[test]
     fn the_record_survives_in_its_file_and_a_success_removes_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -603,7 +668,11 @@ mod tests {
         attempts.fail(now);
         attempts.fail(now);
         assert!(path.exists());
-        assert!(!dir.path().join("gerfaut.attempts.tmp").exists());
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["gerfaut.attempts"], "no temporary file left behind");
 
         // Another process, later: the block is still on.
         let again = LockAttempts::load(path.clone());
