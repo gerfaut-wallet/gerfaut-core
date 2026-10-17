@@ -213,13 +213,16 @@ impl LockAttempts {
     /// beside it, then a rename, the way the vault is saved. Best
     /// effort, since a verdict has no room for a disk error: the record
     /// in memory keeps counting either way, and the file is only what
-    /// carries it across a restart.
+    /// carries it across a restart. A write that fails, the rename
+    /// included, is logged: the count would not survive a restart.
     fn mirror(&self) {
         let Some(path) = &self.path else {
             return;
         };
         let stored = self.stored(now_secs(), Instant::now());
-        let _ = write_whole(path, &stored);
+        if let Err(error) = write_whole(path, &stored) {
+            log::warn!("the record of failed unlocks could not be written: {error}");
+        }
     }
 
     /// Removes the file: a success ends the count.
@@ -265,10 +268,15 @@ fn temporary_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// How old a temporary file of the record is before it is taken for
+/// the leftover of a write that never finished. A write takes
+/// milliseconds; one of another copy of the app, under way, is younger.
+const STALE_TEMPORARY: Duration = Duration::from_secs(60);
+
 /// Removes the temporary files of writes that never finished: those
-/// named after the record, and the one fixed name older builds used.
-/// One that another writer is still filling goes too, which only fails
-/// its rename: the record it was replacing stays whole.
+/// named after the record, and the one fixed name older builds used,
+/// once [`STALE_TEMPORARY`] old. A younger one may be another copy of
+/// the app writing the record at this moment, and is left to it.
 fn remove_stale_temporaries(path: &Path) {
     let Some(name) = path
         .file_name()
@@ -290,7 +298,15 @@ fn remove_stale_temporaries(path: &Path) {
             .strip_prefix(name.as_str())
             .is_some_and(|rest| rest.starts_with('.') && rest.ends_with(".tmp"));
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(true);
-        if ours && !is_dir {
+        // The entry itself, a link not followed; one whose age cannot be
+        // read, or that is dated ahead, is left alone.
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
+            .is_some_and(|age| age >= STALE_TEMPORARY);
+        if ours && !is_dir && stale {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -637,6 +653,28 @@ mod tests {
         attempts.fail(Instant::now());
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
         assert_eq!(LockAttempts::load(path).failures(), 1);
+    }
+
+    /// The leftover of a write that never finished goes when the record
+    /// is loaded; the file another copy of the app is writing at that
+    /// moment, younger than a minute, stays.
+    #[test]
+    fn only_old_temporary_files_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.attempts");
+        let old = dir.path().join("gerfaut.attempts.00000000000000aa.tmp");
+        let fresh = dir.path().join("gerfaut.attempts.00000000000000bb.tmp");
+        std::fs::write(&old, b"half").unwrap();
+        std::fs::write(&fresh, b"half").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        LockAttempts::load(path);
+        assert!(!old.exists(), "a leftover stays");
+        assert!(fresh.exists(), "a write under way was removed");
     }
 
     /// Two writers of the same record with no lock in common, two
