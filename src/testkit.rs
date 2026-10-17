@@ -175,6 +175,9 @@ pub(crate) struct ElectrumState {
     /// A method whose answer starts and never ends: the connection
     /// answers nothing more after it.
     pub stall: Option<&'static str>,
+    /// Methods answered this many times more, each, and then left
+    /// unanswered while every other request still is.
+    pub answered_only: HashMap<&'static str, usize>,
     /// A method answered with this many bytes and no line end.
     pub flood: Option<(&'static str, usize)>,
     /// A method whose answer, read from the state when the request
@@ -299,6 +302,12 @@ impl FakeElectrum {
                         state.asked.push(method.clone());
                         if state.silent || stalled {
                             continue;
+                        }
+                        if let Some(left) = state.answered_only.get_mut(method.as_str()) {
+                            if *left == 0 {
+                                continue;
+                            }
+                            *left -= 1;
                         }
                         let gate = state
                             .gate

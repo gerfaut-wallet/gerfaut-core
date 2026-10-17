@@ -28,11 +28,12 @@
 //! another Electrum server of the same operator is read on a connection
 //! of its own that asks for nothing else. The one of the two that is two
 //! blocks behind or more is left alone for a quarter of an hour: when it
-//! is the session's, the watch moves to the other one. A session that
-//! opens two blocks below one the watch already heard of compares at
-//! once. No other operator is ever asked, since it would learn from
-//! which address the app is used, and an onion server is compared with
-//! onion servers only.
+//! is the session's, the watch moves to the other one. A server that
+//! does not answer for its tip in time is compared on the last one it
+//! gave. A session that opens two blocks below one the watch already
+//! heard of, or a server that goes back, is compared at once. No other
+//! operator is ever asked, since it would learn from which address the
+//! app is used, and an onion server is compared with onion servers only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -94,11 +95,13 @@ enum Look {
     /// Nothing under way: the next look is due [`super::Timings::stale`]
     /// after the last block.
     Idle,
-    /// The server was asked for its tip again: a deadline that ran out
-    /// while the device slept, or a notification still on its way, says
-    /// nothing of the server, and the tip compared is the one it gives
-    /// now.
-    Asking,
+    /// The server was asked for its tip again, by request `id`, and has
+    /// until `by` to answer. A deadline that ran out while the device
+    /// slept, or a notification still on its way, says nothing of the
+    /// server: the tip compared is the one it gives now, after whatever
+    /// it sent before. One that does not answer in time, or refuses, is
+    /// compared on the tip it last gave.
+    Asking { id: u64, by: Instant },
     /// The tip of another server being read.
     Probing(Probe),
 }
@@ -216,6 +219,10 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
     loop {
         let pong_by = session.pong_by;
         let stale_at = session.block_at + hub.timings.stale;
+        let asking_by = match session.look {
+            Look::Asking { by, .. } => Some(by),
+            Look::Idle | Look::Probing(_) => None,
+        };
         let outcome: Result<(), String> = tokio::select! {
             line = reader.next_line() => match line {
                 Ok(Some(line)) => {
@@ -268,8 +275,11 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
             }
             () = tokio::time::sleep_until(stale_at), if matches!(session.look, Look::Idle) => {
                 session.block_at = Instant::now();
-                session.look = Look::Asking;
-                session.request(Request::Tip, "blockchain.headers.subscribe", json!([])).await
+                session.ask_tip(hub.pong_budget(endpoint)).await
+            }
+            () = super::sleep_until(asking_by), if asking_by.is_some() => {
+                session.look_now(hub);
+                Ok(())
             }
             found = probed(&mut session.look) => {
                 session.look = Look::Idle;
@@ -387,6 +397,26 @@ impl Session {
         self.pump().await
     }
 
+    /// Asks the server for its tip again, to be answered within `within`:
+    /// see [`Look::Asking`].
+    async fn ask_tip(&mut self, within: Duration) -> Result<(), String> {
+        self.look = Look::Asking {
+            id: self.next_id,
+            by: Instant::now() + within,
+        };
+        self.request(Request::Tip, "blockchain.headers.subscribe", json!([]))
+            .await
+    }
+
+    /// Reads the tip of another server of the operator now, to compare
+    /// with the last one this server gave; nothing to do without one.
+    fn look_now(&mut self, hub: &Hub) {
+        self.look = self
+            .tip
+            .and_then(|_| tip_elsewhere(hub, &self.endpoint))
+            .map_or(Look::Idle, Look::Probing);
+    }
+
     async fn ping(&mut self, pong: std::time::Duration) -> Result<(), String> {
         if self.pong_by.is_none() {
             self.pong_by = Some(Instant::now() + pong);
@@ -422,28 +452,32 @@ impl Session {
                             .tip
                             .is_some_and(|heard| height.saturating_add(BEHIND) <= heard)
                         {
-                            self.look = tip_elsewhere(hub, &self.endpoint)
-                                .map_or(Look::Idle, Look::Probing);
+                            self.look_now(hub);
                         }
                         hub.new_tip(height, false);
                     }
                 }
                 Request::Tip => {
-                    let height = height_of(&message["result"]).filter(|_| !refused);
-                    if !matches!(self.look, Look::Asking) {
-                        // A block or a wake-up since: the look is over.
-                    } else if height.is_none() || height != self.tip {
-                        // No tip to compare, or a new one: the server
-                        // moved, or says nothing worth comparing.
-                        self.look = Look::Idle;
-                        if let Some(height) = height {
+                    // The answer to a look since given up, a block or a
+                    // wake-up after it, is no answer.
+                    if !matches!(self.look, Look::Asking { id: asked, .. } if asked == id) {
+                        return;
+                    }
+                    match height_of(&message["result"]).filter(|_| !refused) {
+                        // A block it did not announce: the server moved.
+                        Some(height) if self.tip.is_none_or(|tip| height > tip) => {
                             self.tip = Some(height);
                             self.block_at = Instant::now();
+                            self.look = Look::Idle;
                             hub.new_tip(height, false);
                         }
-                    } else {
-                        self.look =
-                            tip_elsewhere(hub, &self.endpoint).map_or(Look::Idle, Look::Probing);
+                        // The same tip, or one lower.
+                        Some(height) => {
+                            self.tip = Some(height);
+                            self.look_now(hub);
+                        }
+                        // No tip: compared on the last one it gave.
+                        None => self.look_now(hub),
                     }
                 }
                 Request::Subscribe(scripthash) if !refused => {
@@ -486,12 +520,21 @@ impl Session {
             }
             Some("blockchain.headers.subscribe") => {
                 if let Some(height) = height_of(&params[0]) {
-                    // A block: the server indexes, and no other one is
-                    // asked about it.
+                    let back = self.tip.is_some_and(|tip| height < tip);
                     self.tip = Some(height);
-                    self.block_at = Instant::now();
-                    self.look = Look::Idle;
                     hub.new_tip(height, false);
+                    if back {
+                        // A server that goes back is the most suspect
+                        // of all: it is compared at once.
+                        if !matches!(self.look, Look::Probing(_)) {
+                            self.look_now(hub);
+                        }
+                    } else {
+                        // A block: the server indexes, and no other one
+                        // is asked about it.
+                        self.block_at = Instant::now();
+                        self.look = Look::Idle;
+                    }
                 }
             }
             _ => {}
@@ -803,7 +846,7 @@ async fn tip_of(
 async fn probed(look: &mut Look) -> Option<(Endpoint, u32)> {
     match look {
         Look::Probing(probe) => probe.await,
-        Look::Idle | Look::Asking => std::future::pending().await,
+        Look::Idle | Look::Asking { .. } => std::future::pending().await,
     }
 }
 

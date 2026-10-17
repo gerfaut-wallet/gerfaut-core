@@ -1310,6 +1310,68 @@ async fn a_block_apart_is_not_behind() {
     );
 }
 
+/// A server that answers its pings but no longer the request for its
+/// tip is compared on the last tip it gave, once the time to answer has
+/// run out: an indexer that stopped is the case looked for.
+#[tokio::test]
+async fn a_server_that_does_not_say_its_tip_is_compared_on_the_last_one() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (stuck, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    stuck
+        .state
+        .lock()
+        .unwrap()
+        .answered_only
+        .insert("blockchain.headers.subscribe", 1);
+    other.state.lock().unwrap().height = 102;
+    let _stand_in = automatic(&rotation, &[&stuck, &other]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            stale: Duration::from_millis(300),
+            refused: Duration::from_secs(3600),
+            ..timings()
+        }),
+    );
+    until(&watch, "on the other", |_| {
+        watch.serving().map(|(_, at)| at) == Some(electrum_endpoint(&other))
+    })
+    .await;
+    let asked = stuck.state.lock().unwrap().asked.clone();
+    let tips = asked
+        .iter()
+        .filter(|method| *method == "blockchain.headers.subscribe")
+        .count();
+    assert_eq!(tips, 2, "{asked:?}");
+}
+
+/// A server that announces a tip below its last one is compared at
+/// once, without the hours without a block.
+#[tokio::test]
+async fn a_server_that_goes_back_is_compared_at_once() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (back, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    let _stand_in = automatic(&rotation, &[&back, &other]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            refused: Duration::from_secs(3600),
+            ..timings()
+        }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    block(&back, 98);
+    until(&watch, "on the other", |_| {
+        watch.serving().map(|(_, at)| at) == Some(electrum_endpoint(&other))
+    })
+    .await;
+}
+
 /// The tip of a stale server is read only from another Electrum server
 /// of its operator: on mainnet, Blockstream's other one, and never the
 /// Esplora servers of the rotation, nor an Electrum server of the
