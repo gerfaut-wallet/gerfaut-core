@@ -954,14 +954,13 @@ pub(crate) async fn fetch_address_history(
     .await
 }
 
-/// The server's tip, refused past any height a chain of `network` can
-/// have reached ([`crate::chain::height_limit`]).
+/// The server's tip, proven as a descriptor wallet's is: its latest
+/// blocks chain, each with the work of its height, under any height a
+/// chain of `network` can have reached ([`sync::proven_tip`]). It once
+/// was the height alone, which made every confirmation as deep as a
+/// server cared to say.
 async fn read_tip(client: &Client, network: Network) -> Result<u32, String> {
-    let tip = client.height().await?;
-    if tip > crate::chain::height_limit(network, crate::now_secs()) {
-        return Err(crate::chain::IMPOSSIBLE_TIP.to_owned());
-    }
-    Ok(tip)
+    sync::proven_tip(client, network).await
 }
 
 /// Refuses a server whose genesis block is not the network's. Testnet,

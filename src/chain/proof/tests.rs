@@ -1546,21 +1546,30 @@ mod servers {
         assert!(refused.contains(crate::chain::IMPOSSIBLE_TIP), "{refused}");
     }
 
-    /// The limit of Esplora, pinned: no run of headers to chain to the
-    /// checkpoints, so the genesis block's own transaction, claimed
-    /// confirmed at height 1,000 under the genesis header, is taken on
-    /// that header's work alone, which Electrum refuses
-    /// ([`an_early_electrum_confirmation_must_chain_to_its_checkpoint`]).
-    /// A header of an early period is cheap to forge: over Esplora, an
-    /// early confirmation costs what that header costs.
-    #[tokio::test]
-    async fn an_early_esplora_confirmation_stands_on_its_header_alone() {
-        let genesis = bdk_wallet::bitcoin::constants::genesis_block(Network::Mainnet.to_bitcoin());
-        let coinbase = &genesis.txdata[0];
+    /// A mainnet instance whose latest blocks are the last checkpoint and
+    /// the seven below it, real, listing `listed` blocks a request, and
+    /// no more than those eight as its latest.
+    async fn mainnet_mempool(listed: u32) -> FakeMempool {
         let server = mempool(Network::Mainnet).await;
-        let listed = serde_json::json!({
-            "txid": coinbase.compute_txid().to_string(), "version": 1, "locktime": 0,
-            "size": coinbase.total_size(), "weight": coinbase.weight().to_wu(), "fee": 0,
+        {
+            let mut state = server.state.lock().unwrap();
+            state.tip = 963_647;
+            state.latest_listed = Some(listed.min(8));
+            state.blocks_listed = Some(listed);
+            for (at, hex) in (963_640..).zip(BELOW_LAST) {
+                state.served.insert(at, header(hex));
+            }
+            state.served.insert(963_647, last_checkpoint());
+        }
+        server
+    }
+
+    /// A coinbase as Esplora lists it, confirmed at `height`.
+    fn listed_coinbase(coinbase: &Transaction, height: u32, time: u32) -> serde_json::Value {
+        serde_json::json!({
+            "txid": coinbase.compute_txid().to_string(), "version": coinbase.version.0,
+            "locktime": 0, "size": coinbase.total_size(), "weight": coinbase.weight().to_wu(),
+            "fee": 0,
             "vin": [{
                 "txid": "00".repeat(32), "vout": u32::MAX, "is_coinbase": true,
                 "scriptsig": serialize_hex_of(&coinbase.input[0].script_sig),
@@ -1571,18 +1580,141 @@ mod servers {
                 "value": coinbase.output[0].value.to_sat(),
             }],
             "status": {
-                "confirmed": true, "block_height": 1_000, "block_hash": "00".repeat(32),
-                "block_time": genesis.header.time,
+                "confirmed": true, "block_height": height, "block_hash": "00".repeat(32),
+                "block_time": time,
             },
-        });
+        })
+    }
+
+    /// The genesis block's own transaction, claimed confirmed at height
+    /// 1,000 under the genesis header: the work of difficulty one, which
+    /// a server mines in seconds. Over Esplora too its block is chained
+    /// to the checkpoint of its period, read down from it ten blocks a
+    /// request, and the server is refused, for a descriptor wallet and a
+    /// watched address alike, where the header's work alone let it
+    /// through.
+    #[tokio::test]
+    async fn an_early_esplora_confirmation_must_chain_to_its_checkpoint() {
+        let genesis = bdk_wallet::bitcoin::constants::genesis_block(Network::Mainnet.to_bitcoin());
+        let early = |server: &FakeMempool| {
+            let mut state = server.state.lock().unwrap();
+            state.served.insert(1_000, genesis.header);
+            listed_coinbase(&genesis.txdata[0], 1_000, genesis.header.time)
+        };
+        let server = mainnet_mempool(10).await;
+        let listed = early(&server);
+        server.state.lock().unwrap().address_txs = vec![listed];
+        let refused = esplora_address(&server, Network::Mainnet)
+            .await
+            .unwrap_err();
+        assert!(refused.contains(FALSE_PROOF), "{refused}");
+        // From 2,015 down to 1,000: 102 requests of ten.
+        assert_eq!(asked(&server, "/blocks/"), 102);
+
+        let server = mainnet_mempool(10).await;
+        let listed = early(&server);
+        list(&server, vec![listed]);
+        let refused = esplora_sync(&server, address_plan(Network::Mainnet, Held::default())).await;
+        assert!(refusal(refused).contains(FALSE_PROOF));
+    }
+
+    /// The real block 2,010 and the nine around it, the last of them the
+    /// checkpoint of the first period: their headers as Esplora lists
+    /// them, 2,006 first, and the coinbase of 2,010, alone in its block.
+    const EARLY: [&str; 10] = [
+        "0100000085aedcd5a2f8b6ae72b57ffd77a3058a5b34f06970a0c65bea39645c00000000ada15f8a2dd66cc9ef30394554c5ac7cbdfbeb580108f71433860a04bc51472e81e07e49ffff001d2750f0b3",
+        "01000000cc65667f494f489c82b37e38756da9769bfaad88b2934084cacbfbbb00000000534a15012974b6c177ae6558cbe6ce24d6663ec0dfeff7596b75469c49388a1ea5e27e49ffff001d1e6ae2f8",
+        "01000000f3e388d62906fa19af28f323d71489585c9bcef8a46c0f219d45289f000000009602a72be34a2eb2545af3d9b3a891e4e65f97ac3192c191dc848084669200b388e77e49ffff001d048fc9db",
+        "0100000092d4423cb9d3c7753a194611cca4074bec17fe4897985f25d3221d110000000082971b255a55141c921b9f79e30e7dad8261c39872a77d771f4790ef9a44ac84aaed7e49ffff001d1904c134",
+        "010000004f29a0af6afbaa60129214b1d51699ecba44914d28b9f95d3493b5d00000000096003a966e3859a6b3a7dc7c23bc4fe5424953eb289951c8e89d2870863cf31646f27e49ffff001d3309fc07",
+        "010000002bdf82913a66761ba56d0f6956cf7de0328116598aac1335acdd2c61000000000ba8937b556454bcc9f5e209059cd1142ad7781a23c614ea1183661ec06ca41d68f57e49ffff001d195a72a0",
+        "010000001e630b09c69476e69f1820594e99a3f6faa1fd4b8f554c57fee534cf0000000015243d994b1c93934e8f049543f4daee5f3c8cffce20b58dbb4530109873945111fb7e49ffff001d1b6b3dc7",
+        "01000000b4504993fa09436d6562803aa636e6ebb9d717fc934bb7047bf2f425000000002416b927094d634f45fb5feaa1abeea6816fced1b4311505ad91da7de735d24ef1007f49ffff001d31a4bcf8",
+        "010000008261d8b07aa0ffbf4043fbee2499b04cb9a06fd2ded0c39907e3f7c200000000b496cbc6d52777991345b8c72e46d803140bb030a870995036773567fe149f71ea067f49ffff001d2cfb7680",
+        "01000000e25509cde707c3d02a693e4fe9e7cdd57c38a0d2c8d6341f20dae84b000000000c113df1185e162ee92d031fe21d1400ff7d705a3e9b9c860eea855313cd8ca26c087f49ffff001d30b73231",
+    ];
+    const EARLY_COINBASE: &str = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0804ffff001d02d501ffffffff0100f2052a01000000434104d2da23887ad49d7118b47f2c30f55b8c96146d630066acd9c182acd45d40afb5ed3d230cecb9a167e5c16befb7c6e6c5bc570058b209d06856badb08879b9975ac00000000";
+
+    /// A real confirmation of 2009, in block 2,010: its block chains to
+    /// the checkpoint at 2,015, read four blocks a request from a server
+    /// that lists no more, in two requests, and it confirms. The session
+    /// keeps the chain: the next sync reads none.
+    #[tokio::test]
+    async fn a_real_early_esplora_confirmation_chains_to_its_checkpoint() {
+        let coinbase: Transaction = deserialize_hex(EARLY_COINBASE).unwrap();
+        let server = mainnet_mempool(4).await;
         {
             let mut state = server.state.lock().unwrap();
-            state.tip = 2_000;
-            state.served.insert(1_000, genesis.header);
-            state.address_txs = vec![listed];
+            for (at, hex) in (2_006..).zip(EARLY) {
+                state.served.insert(at, header(hex));
+            }
+            state.address_txs = vec![listed_coinbase(&coinbase, 2_010, header(EARLY[4]).time)];
+        }
+        assert_eq!(
+            header(EARLY[9]).block_hash(),
+            targets::MAINNET_ENDS[0].parse::<BlockHash>().unwrap()
+        );
+        let state = esplora_address(&server, Network::Mainnet).await.unwrap();
+        assert_eq!(state.txs[0].height, Some(2_010));
+        assert_eq!(
+            state.txs[0].timestamp,
+            Some(u64::from(header(EARLY[4]).time))
+        );
+        assert_eq!(asked(&server, "/blocks/"), 2);
+
+        list(&server, vec![listed_coinbase(&coinbase, 2_010, 0)]);
+        let synced = esplora_sync(&server, address_plan(Network::Mainnet, Held::default()))
+            .await
+            .unwrap();
+        assert_eq!(anchored(&synced)[0].1, 2_010);
+        assert_eq!(asked(&server, "/blocks/"), 2);
+    }
+
+    /// A confirmation whose chain does not fit in what a sync may spend
+    /// on chains is left unconfirmed, never taken for a false proof: the
+    /// genesis header at height 10, from a server that lists one block a
+    /// request, would cost two thousand of them.
+    #[tokio::test]
+    async fn an_early_esplora_confirmation_past_the_budget_is_unsure() {
+        let genesis = bdk_wallet::bitcoin::constants::genesis_block(Network::Mainnet.to_bitcoin());
+        let server = mainnet_mempool(1).await;
+        {
+            let mut state = server.state.lock().unwrap();
+            state.served.insert(10, genesis.header);
+            state.address_txs = vec![listed_coinbase(&genesis.txdata[0], 10, genesis.header.time)];
         }
         let state = esplora_address(&server, Network::Mainnet).await.unwrap();
-        assert_eq!(state.txs[0].height, Some(1_000));
+        assert_eq!(state.txs[0].height, None);
+        assert_eq!(asked(&server, "/blocks/"), 404);
+    }
+
+    /// The tip a mainnet server gives is proven by its latest blocks'
+    /// work, for a watched address as for a descriptor wallet: a tip in a
+    /// header no one mined, or a real one whose summary names another
+    /// block, refuses the server, where a watched address took any
+    /// height under the limit.
+    #[tokio::test]
+    async fn an_esplora_tip_without_work_is_refused() {
+        let server = mainnet_mempool(10).await;
+        let state = esplora_address(&server, Network::Mainnet).await.unwrap();
+        assert_eq!(state.tip_height, 963_647);
+
+        let server = mempool(Network::Mainnet).await;
+        let refused = esplora_address(&server, Network::Mainnet)
+            .await
+            .unwrap_err();
+        assert!(refused.contains("do not chain"), "{refused}");
+        let refused = esplora_sync(&server, address_plan(Network::Mainnet, Held::default())).await;
+        assert!(refusal(refused).contains("do not chain"));
+
+        let server = mainnet_mempool(10).await;
+        let mut forged = last_checkpoint();
+        forged.nonce ^= 1;
+        server.state.lock().unwrap().served.insert(963_647, forged);
+        let refused = esplora_address(&server, Network::Mainnet)
+            .await
+            .unwrap_err();
+        assert!(refused.contains("do not chain"), "{refused}");
     }
 
     /// A script in hex.
@@ -1594,7 +1726,7 @@ mod servers {
     /// server, where it used to be taken.
     #[tokio::test]
     async fn an_esplora_header_without_work_refuses_the_server() {
-        let server = mempool(Network::Mainnet).await;
+        let server = mainnet_mempool(10).await;
         list(&server, vec![esplora_payment(0x32, 0x42, 50_000, true)]);
         let refused = esplora_sync(&server, address_plan(Network::Mainnet, Held::default())).await;
         assert!(refusal(refused).contains(FALSE_PROOF));
@@ -1718,7 +1850,7 @@ mod servers {
         let refused = esplora_address(&server, Network::Signet).await.unwrap_err();
         assert!(refused.contains("another transaction"), "{refused}");
 
-        let server = mempool(Network::Mainnet).await;
+        let server = mainnet_mempool(10).await;
         server.state.lock().unwrap().address_txs = vec![esplora_payment(0x37, 0x47, 50_000, true)];
         let refused = esplora_address(&server, Network::Mainnet)
             .await
