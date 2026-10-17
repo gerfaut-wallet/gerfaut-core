@@ -87,7 +87,7 @@ use crate::wallet::meta::WalletKind;
 use crate::wallet::snapshot::SyncReport;
 use crate::wallet::views;
 use crate::watch::{
-    ChangeReason, LiveWatch, Timings, WatchConfig, WatchEvent, WatchEvents, WatchLimits,
+    ChangeReason, LiveWatch, Proven, Timings, WatchConfig, WatchEvent, WatchEvents, WatchLimits,
     WatchStatus, WatchedScript, WatchedWallet,
 };
 
@@ -201,11 +201,15 @@ impl Running {
 }
 
 /// What the watch asked of a wallet: the strongest reason, and the
-/// scripts that moved, `None` for the whole wallet.
+/// scripts that moved, `None` for the whole wallet; or the confirmations
+/// it proved on some of them, which a sync of those scripts stands in
+/// for when the wallet cannot take them as they are.
 #[derive(Debug, Clone)]
 struct Asked {
     reason: ChangeReason,
     scripts: Option<BTreeSet<String>>,
+    /// Empty unless all that was asked is these.
+    proven: Vec<Proven>,
 }
 
 impl Asked {
@@ -213,10 +217,28 @@ impl Asked {
         Asked {
             reason,
             scripts: (!scripts.is_empty()).then(|| scripts.into_iter().collect()),
+            proven: Vec::new(),
         }
     }
 
+    /// Confirmations the watch proved: pushed by the server, so a
+    /// change it claims.
+    fn proven(proven: Vec<Proven>) -> Asked {
+        Asked {
+            reason: ChangeReason::Activity,
+            scripts: Some(proven.iter().map(|proven| proven.script.clone()).collect()),
+            proven,
+        }
+    }
+
+    /// Both together. Confirmations proven stay so only with nothing
+    /// else asked: a sync that reads anything reads their scripts too.
     fn and(self, other: Asked) -> Asked {
+        let proven = if self.proven.is_empty() || other.proven.is_empty() {
+            Vec::new()
+        } else {
+            self.proven.into_iter().chain(other.proven).collect()
+        };
         Asked {
             reason: self.reason.max(other.reason),
             scripts: match (self.scripts, other.scripts) {
@@ -226,6 +248,7 @@ impl Asked {
                 }
                 _ => None,
             },
+            proven,
         }
     }
 
@@ -401,6 +424,11 @@ fn watched_wallet(
                     // Its history may be cut short: nothing to compare
                     // counters with.
                     counts: None,
+                    history: record
+                        .address_state
+                        .as_ref()
+                        .map(views::address_history)
+                        .unwrap_or_default(),
                 }],
                 0,
             );
@@ -843,6 +871,13 @@ impl WalletManager {
                             self.ask(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, wallet_id, asked);
                             continue;
                         }
+                        WatchEvent::Confirmed { wallet_id, proven } => {
+                            if !proven.is_empty() {
+                                let asked = Asked::proven(proven);
+                                self.ask(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, wallet_id, asked);
+                            }
+                            continue;
+                        }
                         WatchEvent::NewBlock { height } => {
                             self.look(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, &mut owed, &mut tried, &mut rechecked).await;
                             LiveEvent::NewBlock { height }
@@ -1149,6 +1184,15 @@ impl WalletManager {
     ) -> Synced {
         if !hold.is_zero() {
             tokio::time::sleep(hold).await;
+        }
+        if !asked.proven.is_empty() {
+            match self.take_confirmations(&wallet_id, &asked.proven).await {
+                Ok(Some(report)) => return Ok(report),
+                // The wallet no longer holds what they were foretold
+                // from: their scripts are read.
+                Ok(None) => {}
+                Err(error) => return Err(error.to_string()),
+            }
         }
         let reach = asked.reach();
         let sync = async || {

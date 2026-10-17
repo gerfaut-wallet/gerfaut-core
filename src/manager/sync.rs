@@ -774,5 +774,6 @@ fn finish_sync(
     Ok(())
 }
 
+mod foretold;
 #[cfg(test)]
 mod tests;

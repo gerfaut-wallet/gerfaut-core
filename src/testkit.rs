@@ -87,6 +87,8 @@ enum Answer {
     Stall,
     /// Bytes without a line end.
     Flood(usize),
+    /// Nothing at all, the connection going on.
+    Nothing,
 }
 
 /// A block header at `height`, in hex, whose time is 1 700 000 000 plus
@@ -173,6 +175,9 @@ pub(crate) struct ElectrumState {
     pub stall: Option<&'static str>,
     /// A method answered with this many bytes and no line end.
     pub flood: Option<(&'static str, usize)>,
+    /// A method never answered: the request is read and dropped, and
+    /// the connection goes on.
+    pub unanswered: Option<&'static str>,
     /// A method whose answer, read from the state when the request
     /// arrives, is held back until a permit is added here.
     pub gate: Option<(&'static str, Arc<tokio::sync::Semaphore>)>,
@@ -196,7 +201,7 @@ const CHAINED_UP_TO: u32 = 100_000;
 
 impl ElectrumState {
     /// The header at `height`, in hex: see [`Self::header_of`].
-    fn header(&self, height: u32) -> String {
+    pub(crate) fn header(&self, height: u32) -> String {
         serialize_hex(&self.header_of(height))
     }
 
@@ -319,6 +324,7 @@ impl FakeElectrum {
                             format!("{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":", request["id"]).into_bytes()
                         }
                         Answer::Flood(size) => vec![b'x'; size],
+                        Answer::Nothing => continue,
                     };
                     if writer.write_all(&bytes).await.is_err() {
                         return;
@@ -340,6 +346,9 @@ impl FakeElectrum {
     fn answer(state: &mut ElectrumState, index: usize, request: &Value, method: &str) -> Answer {
         if state.stall == Some(method) {
             return Answer::Stall;
+        }
+        if state.unanswered == Some(method) {
+            return Answer::Nothing;
         }
         if let Some((flooded, size)) = state.flood
             && flooded == method

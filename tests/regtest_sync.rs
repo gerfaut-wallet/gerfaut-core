@@ -551,27 +551,24 @@ async fn a_sync_reads_only_what_the_wallet_lacks() {
     );
     assert!(window.bytes < 16_000, "{} bytes", window.bytes);
 
-    // A block takes it: that script again, no transaction fetched, one
-    // confirmation proven.
+    // A block takes it. The status electrs pushes for that script is the
+    // one the wallet foretells from what it holds: no sync, so no new
+    // connection and no history read, only the proof of the payment in
+    // the block the server pushed, asked on the watch's connection.
     let mark = wire.mark();
     chain.mine();
     announced(&mut events, &paid, TxStage::Confirmed).await;
     let window = wire.since(mark);
     println!(
-        "electrum, a confirmation pushed and synced: {} bytes, {:?}",
+        "electrum, a confirmation pushed and foretold: {} bytes, {:?}",
         window.bytes,
         window.calls()
     );
     assert_eq!(
-        window.params_of("blockchain.scripthash.get_history"),
-        vec![electrum_hash(&third)]
+        window.calls(),
+        vec![("blockchain.transaction.get_merkle".to_owned(), paid.clone())]
     );
-    assert!(window.params_of("blockchain.transaction.get").is_empty());
-    assert_eq!(
-        window.params_of("blockchain.transaction.get_merkle"),
-        vec![paid.clone()]
-    );
-    assert!(window.bytes < 16_000, "{} bytes", window.bytes);
+    assert!(window.bytes < 2_000, "{} bytes", window.bytes);
     manager.live_stop().await;
 
     // The fee of the payment is known: the coins it spends were fetched.

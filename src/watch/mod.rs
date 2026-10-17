@@ -8,7 +8,10 @@
 //! block arrived. It is a trigger and nothing more. It fetches no
 //! transaction, holds no balance and never opens the vault: whoever
 //! owns the vault runs the usual sync of the wallet that was named,
-//! and the usual diff of that sync says what happened. In the apps
+//! and the usual diff of that sync says what happened. One thing it
+//! asks for besides: the proof of a confirmation it foretold, so that
+//! the block that takes a payment costs that proof instead of a sync
+//! ([`Proven`]). In the apps
 //! that owner is [`crate::WalletManager`], whose `live_start` wires
 //! the two together; this module can be driven on its own as well.
 //!
@@ -60,6 +63,13 @@
 //!   names the scripts that moved when the transport can say: a sync
 //!   of those scripts is enough. With `rescan` set, the change was seen
 //!   past the addresses the wallet has revealed.
+//! - [`WatchEvent::Confirmed`] means "take these confirmations": an
+//!   Electrum server pushed, for a script whose wallet waits for a
+//!   block, the status that what it holds comes to once the latest
+//!   block took it, and proved each of those transactions in that
+//!   block. The wallet checks the block against its own chain, and that
+//!   it still holds what the guess was made from, and syncs the scripts
+//!   named otherwise.
 //! - Each script is listed with the status of the history the wallet
 //!   holds for it ([`WatchedScript::status`]). An Electrum server is
 //!   asked for every status once the connection is up, and a script
@@ -101,9 +111,11 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use bdk_wallet::bitcoin::ScriptBuf;
+use bdk_wallet::bitcoin::block::Header;
+use bdk_wallet::bitcoin::{ScriptBuf, Txid};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -235,6 +247,11 @@ pub struct WatchedScript {
     /// where it stands.
     #[serde(skip)]
     pub(crate) counts: Option<poll::Fingerprint>,
+    /// The history `status` hashes, in its order, when a transaction of
+    /// it waits for a block; empty otherwise. What a block that takes
+    /// them makes of the status is guessed from it ([`confirmed_at`]).
+    #[serde(skip)]
+    pub(crate) history: Vec<(Txid, i32)>,
 }
 
 /// One wallet to watch.
@@ -300,11 +317,104 @@ pub enum WatchEvent {
         #[serde(default)]
         scripts: Vec<String>,
     },
+    /// A block took what the wallet waited for on the scripts named, as
+    /// the status the server pushed for each foretold, and the watch
+    /// holds the proof of each transaction in that block: the wallet
+    /// takes the confirmations as they are, and syncs those scripts
+    /// only if it no longer holds what the guess was made from.
+    Confirmed {
+        wallet_id: String,
+        #[serde(skip)]
+        proven: Vec<Proven>,
+    },
     /// The chain has a new tip.
     NewBlock { height: u32 },
     /// The status changed; also readable at any time from
     /// [`LiveWatch::status`].
     Status(WatchStatus),
+}
+
+/// The confirmations of one script, foretold by the status its server
+/// pushed and proven in the block that took them ([`WatchEvent::Confirmed`]).
+///
+/// The status a server gives a script hashes its history. When a block
+/// takes what waited in the mempool there, that history becomes, in all
+/// likelihood, the one the wallet holds with those transactions at the
+/// height of the block, in the same order: the watch hashes that and
+/// compares, as Electrum does, instead of having the history read
+/// again. A status that matches is only the server's word, so each of
+/// those transactions is proven in the block before anything is said:
+/// the merkle branch the server hands for it must lead to the root of
+/// the header it pushed. The wallet then checks that header against its
+/// own chain ([`crate::manager`]) and that it still holds what the guess
+/// was made from, and syncs the script when anything differs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proven {
+    /// The script, in hex.
+    pub(crate) script: String,
+    /// The status the server pushed for it, which the guess matched.
+    pub(crate) status: String,
+    /// The transactions the block took, each proven in it.
+    pub(crate) txids: Vec<Txid>,
+    /// The latest headers the watch was given, up to that block, oldest
+    /// first, each the parent of the next, and each with the work its
+    /// network asks for.
+    pub(crate) headers: Arc<Headers>,
+    /// The server that pushed the status and the proofs.
+    pub(crate) server: Endpoint,
+}
+
+/// Headers in a row, oldest first, from `first`: each the parent of the
+/// next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Headers {
+    pub first: u32,
+    pub chain: Vec<Header>,
+}
+
+impl Headers {
+    /// The height of the last one.
+    pub fn last_height(&self) -> u32 {
+        let len = u32::try_from(self.chain.len()).unwrap_or(u32::MAX);
+        self.first.saturating_add(len).saturating_sub(1)
+    }
+
+    /// The header at `height`, if this holds it.
+    pub fn at(&self, height: u32) -> Option<&Header> {
+        let offset = height.checked_sub(self.first)?;
+        self.chain.get(usize::try_from(offset).ok()?)
+    }
+}
+
+/// The Electrum status of a history: SHA-256 of `txid:height:` for each
+/// transaction, in the order given, in hex.
+pub(crate) fn history_status(history: &[(Txid, i32)]) -> String {
+    use bdk_wallet::bitcoin::hashes::{Hash, HashEngine, sha256};
+    use bdk_wallet::bitcoin::hex::DisplayHex;
+    let mut engine = sha256::Hash::engine();
+    for (txid, height) in history {
+        engine.input(format!("{txid}:{height}:").as_bytes());
+    }
+    sha256::Hash::from_engine(engine)
+        .to_byte_array()
+        .to_lower_hex_string()
+}
+
+/// What `held` comes to once a block at `height` takes every
+/// transaction of it still waiting for one, 0 or -1, in the same order:
+/// the history a server lists then, unless it took only some of them, or
+/// put two of them in its block in another order. `None` when none
+/// waits, or the history holds one past that height.
+pub(crate) fn confirmed_at(held: &[(Txid, i32)], height: u32) -> Option<Vec<(Txid, i32)>> {
+    let at = i32::try_from(height).ok()?;
+    if !held.iter().any(|(_, height)| *height <= 0) || held.iter().any(|(_, height)| *height > at) {
+        return None;
+    }
+    Some(
+        held.iter()
+            .map(|(txid, height)| (*txid, if *height <= 0 { at } else { *height }))
+            .collect(),
+    )
 }
 
 /// Where the watcher stands.
@@ -838,6 +948,10 @@ pub(crate) struct Entry {
     pub statuses: Vec<Option<String>>,
     /// The counters each owner holds for it, in the same order.
     pub counts: Vec<Option<poll::Fingerprint>>,
+    /// The history behind each owner's status, in the same order, when
+    /// a transaction of it waits for a block: see
+    /// [`WatchedScript::history`].
+    pub histories: Vec<Vec<(Txid, i32)>>,
 }
 
 /// The list in the order transports cover it, a transport that covers
@@ -991,6 +1105,7 @@ impl Watched {
                             entry.owners.push(owner);
                             entry.statuses.push(status());
                             entry.counts.push(listed.counts);
+                            entry.histories.push(listed.history.clone());
                         }
                         entry.lookahead &= listed.lookahead;
                         continue;
@@ -1016,6 +1131,7 @@ impl Watched {
                         owners: vec![owner],
                         statuses: vec![status()],
                         counts: vec![listed.counts],
+                        histories: vec![listed.history.clone()],
                     });
                 }
             }
@@ -1106,6 +1222,36 @@ struct Pending {
     rescan: bool,
     /// The scripts that moved, in hex; `None` for the whole wallet.
     scripts: Option<BTreeSet<String>>,
+    /// Confirmations the watch proved, which need no sync: see
+    /// [`Debouncer::mark_proven`].
+    proven: Vec<Proven>,
+}
+
+impl Pending {
+    /// What goes out for it: the confirmations proven, when nothing
+    /// else was marked, or a sync of what moved and of the scripts of
+    /// those confirmations.
+    fn event(&self, wallet_id: &str) -> WatchEvent {
+        if self.scripts.as_ref().is_some_and(BTreeSet::is_empty) && !self.proven.is_empty() {
+            return WatchEvent::Confirmed {
+                wallet_id: wallet_id.to_owned(),
+                proven: self.proven.clone(),
+            };
+        }
+        WatchEvent::WalletChanged {
+            wallet_id: wallet_id.to_owned(),
+            reason: self.reason,
+            rescan: self.rescan,
+            scripts: match &self.scripts {
+                Some(scripts) => {
+                    let proven = self.proven.iter().map(|proven| proven.script.clone());
+                    let all: BTreeSet<String> = scripts.iter().cloned().chain(proven).collect();
+                    all.into_iter().collect()
+                }
+                None => Vec::new(),
+            },
+        }
+    }
 }
 
 /// One report per wallet per burst, and never two closer than the gap.
@@ -1145,6 +1291,30 @@ impl Debouncer {
                 reason,
                 rescan,
                 scripts: script.map(|script| BTreeSet::from([script])),
+                proven: Vec::new(),
+            });
+    }
+
+    /// Marks a wallet whose confirmations on one script the watch
+    /// proved. Alone in its burst, it goes out as those confirmations;
+    /// with a script that moved, or the whole wallet, it goes out as the
+    /// sync of what moved, which reads its script too: one sync reads
+    /// everything once.
+    fn mark_proven(&mut self, wallet_id: &str, proven: Proven, now: Instant) {
+        self.pending
+            .entry(wallet_id.to_owned())
+            .and_modify(|pending| {
+                pending.last = now;
+                pending.reason = pending.reason.max(ChangeReason::Activity);
+                pending.proven.push(proven.clone());
+            })
+            .or_insert(Pending {
+                first: now,
+                last: now,
+                reason: ChangeReason::Activity,
+                rescan: false,
+                scripts: Some(BTreeSet::new()),
+                proven: vec![proven],
             });
     }
 
@@ -1401,6 +1571,24 @@ impl Hub {
         }
     }
 
+    /// The confirmations of a script were proven: its wallets are
+    /// reported once the burst settles, with them.
+    pub fn mark_proven(&mut self, proven: &Proven) {
+        let Some(entry) = self.watched.by_hex(&proven.script) else {
+            return;
+        };
+        let owners: Vec<String> = entry
+            .owners
+            .iter()
+            .filter_map(|&owner| self.watched.wallets.get(owner))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let now = Instant::now();
+        for id in owners {
+            self.debounce.mark_proven(&id, proven.clone(), now);
+        }
+    }
+
     /// Every wallet, whole.
     pub fn mark_all(&mut self, reason: ChangeReason) {
         let now = Instant::now();
@@ -1485,17 +1673,7 @@ impl Hub {
 
     fn flush(&mut self) {
         for (wallet_id, pending) in self.debounce.take_due(Instant::now(), &self.timings) {
-            let event = WatchEvent::WalletChanged {
-                wallet_id: wallet_id.clone(),
-                reason: pending.reason,
-                rescan: pending.rescan,
-                scripts: pending
-                    .scripts
-                    .clone()
-                    .map(|scripts| scripts.into_iter().collect())
-                    .unwrap_or_default(),
-            };
-            match self.events.try_send(event) {
+            match self.events.try_send(pending.event(&wallet_id)) {
                 Ok(()) => {
                     self.debounce.reported.insert(wallet_id, Instant::now());
                 }

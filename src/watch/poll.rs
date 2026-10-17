@@ -429,6 +429,7 @@ mod tests {
                     lookahead: false,
                     status: None,
                     counts: None,
+                    history: Vec::new(),
                 })
                 .collect(),
             has_pending: false,

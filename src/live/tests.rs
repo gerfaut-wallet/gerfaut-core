@@ -1673,3 +1673,245 @@ fn a_batch_of_several_wallets_is_said_under_each_name() {
     );
     assert_ne!(said[0].id, said[1].id);
 }
+
+// --- a confirmation the status foretold ---------------------------------------------
+
+/// Where the server's log of requests and connections stands.
+fn server_mark(server: &FakeElectrum) -> (usize, usize) {
+    let state = server.state.lock().unwrap();
+    (state.asked.len(), state.connections.len())
+}
+
+/// What the server was asked since `mark`, and how many connections
+/// were opened to it.
+fn asked_since(server: &FakeElectrum, mark: (usize, usize)) -> (Vec<String>, usize) {
+    let state = server.state.lock().unwrap();
+    (
+        state.asked[mark.0..].to_vec(),
+        state.connections.len() - mark.1,
+    )
+}
+
+/// A block at `height` on the server: its header pushed, chained to the
+/// blocks under it, then the status of `script` hashing `status`.
+fn block(
+    server: &FakeElectrum,
+    height: u32,
+    script: &str,
+    status: &[(bdk_wallet::bitcoin::Txid, i64)],
+) {
+    let header = {
+        let mut state = server.state.lock().unwrap();
+        state.height = height;
+        state.header(height)
+    };
+    server.push(
+        serde_json::json!({
+            "jsonrpc": "2.0", "method": "blockchain.headers.subscribe",
+            "params": [{ "height": height, "hex": header }],
+        })
+        .to_string(),
+    );
+    server.set_status(script, &crate::testkit::status_of(status));
+}
+
+/// A watch over the descriptor wallet of [`cold_wallet`], once a payment
+/// to its second receive address has come into the mempool, been
+/// announced, and the sync that found it handed out: the wallet waits
+/// for a block, and the watch holds what the wallet holds.
+async fn waiting_for_a_block(
+    server: &FakeElectrum,
+    dir: &std::path::Path,
+) -> (
+    WalletManager,
+    String,
+    LiveEvents,
+    String,
+    bdk_wallet::bitcoin::Txid,
+) {
+    let (manager, wallet) = cold_wallet(dir, server).await;
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    let script = receive_script(1);
+    let paid: bdk_wallet::bitcoin::Txid = pay(server, 7, &script, 12_000, 0).parse().unwrap();
+    server.set_status(&script, &crate::testkit::status_of(&[(paid, 0)]));
+    let arrival = next_announcement(&mut events).await;
+    assert_eq!(staged(&[arrival]), [(paid.to_string(), TxStage::Mempool)]);
+    next_sync(&mut events, &wallet).await;
+    // The watch takes the wallet as that sync left it.
+    tokio::time::sleep(QUIET).await;
+    (manager, wallet, events, script, paid)
+}
+
+/// The confirmations the wallet shows for `txid`.
+async fn confirmations(manager: &WalletManager, wallet: &str, txid: &str) -> u32 {
+    manager
+        .wallet_snapshot(wallet)
+        .await
+        .unwrap()
+        .txs
+        .iter()
+        .find(|tx| tx.txid == txid)
+        .expect("the wallet shows the payment")
+        .confirmations
+}
+
+/// A block confirms the payment a wallet waits for, and the server
+/// pushes the status the wallet's history comes to once that block took
+/// it. The watch asks for the proof of that one transaction in the
+/// header it was pushed, on its own connection, and the confirmation is
+/// announced with no sync: no new connection, no history read. A sync
+/// cost a connection and five requests: the version, the tip, the
+/// latest headers, the history, the proof.
+#[tokio::test]
+async fn a_confirmation_the_status_foretold_costs_one_proof() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, mut events, script, paid) =
+        waiting_for_a_block(&server, dir.path()).await;
+
+    let mark = server_mark(&server);
+    server.set_history(&script, &[(paid, 101)]);
+    block(&server, 101, &script, &[(paid, 101)]);
+    let confirmation = next_announcement(&mut events).await;
+    assert_eq!(
+        staged(&[confirmation]),
+        [(paid.to_string(), TxStage::Confirmed)]
+    );
+    let (report, _) = next_sync(&mut events, &wallet).await;
+    assert_eq!(report.tip_height, 101);
+    tokio::time::sleep(QUIET).await;
+    let (asked, connections) = asked_since(&server, mark);
+    println!("a confirmation foretold asked {asked:?} over {connections} new connection(s)");
+    assert_eq!(asked, ["blockchain.transaction.get_merkle"]);
+    assert_eq!(connections, 0);
+    assert_eq!(confirmations(&manager, &wallet, &paid.to_string()).await, 1);
+
+    // The wallet holds what the server lists: a watch that starts over
+    // finds every status as the wallet holds it, and syncs nothing.
+    manager.live_stop().await;
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    manager.live_stop().await;
+}
+
+/// A server pushes the status of a payment confirmed in its new block
+/// while that block does not hold it: its header commits to no such
+/// transaction, so no branch the server hands proves it there. Nothing
+/// is shown confirmed on that guess: the script is synced, and the
+/// sync, which reads the payment still in the mempool, leaves it
+/// waiting.
+#[tokio::test]
+async fn a_status_the_block_does_not_bear_out_confirms_nothing() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, mut events, script, paid) =
+        waiting_for_a_block(&server, dir.path()).await;
+
+    let mark = server_mark(&server);
+    block(&server, 101, &script, &[(paid, 101)]);
+    loop {
+        match tokio::time::timeout(WAIT, events.next()).await {
+            Ok(Some(LiveEvent::WalletSynced { report })) if report.wallet_id == wallet => break,
+            Ok(Some(LiveEvent::Transaction(tx))) => panic!("announced {tx:?}"),
+            Ok(Some(LiveEvent::SyncFailed { message, .. })) => panic!("the sync failed: {message}"),
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the watch stopped"),
+            Err(_) => panic!("no sync within {WAIT:?}"),
+        }
+    }
+    let (asked, _) = asked_since(&server, mark);
+    let proof = asked
+        .iter()
+        .position(|method| method == "blockchain.transaction.get_merkle");
+    let history = asked
+        .iter()
+        .position(|method| method == "blockchain.scripthash.get_history");
+    assert!(proof.is_some() && history > proof, "{asked:?}");
+    assert_eq!(confirmations(&manager, &wallet, &paid.to_string()).await, 0);
+    manager.live_stop().await;
+}
+
+/// The server's tip moves two blocks at once, and the block that takes
+/// the payment is the second: the watch was given no header between the
+/// wallet's tip and it, so nothing ties that block to the wallet's
+/// chain. The confirmation is foretold and proven all the same, and the
+/// wallet syncs the script instead of taking it as it is.
+#[tokio::test]
+async fn a_block_the_wallet_cannot_chain_to_is_synced() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, mut events, script, paid) =
+        waiting_for_a_block(&server, dir.path()).await;
+
+    let mark = server_mark(&server);
+    server.set_history(&script, &[(paid, 102)]);
+    block(&server, 102, &script, &[(paid, 102)]);
+    let confirmation = next_announcement(&mut events).await;
+    assert_eq!(
+        staged(&[confirmation]),
+        [(paid.to_string(), TxStage::Confirmed)]
+    );
+    let (report, _) = next_sync(&mut events, &wallet).await;
+    assert_eq!(report.tip_height, 102);
+    let (asked, connections) = asked_since(&server, mark);
+    let proof = asked
+        .iter()
+        .position(|method| method == "blockchain.transaction.get_merkle");
+    let history = asked
+        .iter()
+        .position(|method| method == "blockchain.scripthash.get_history");
+    assert!(proof.is_some() && history > proof, "{asked:?}");
+    assert_eq!(connections, 1);
+    assert_eq!(confirmations(&manager, &wallet, &paid.to_string()).await, 1);
+    manager.live_stop().await;
+}
+
+/// A watched address waits for a block the same way: the block that
+/// takes its payment costs the proof of that payment, the coin it holds
+/// confirmed with it. A sync cost a connection and eight requests: the
+/// version, the genesis block, the tip, the history, the coins, the
+/// payment and the coin it spends, and the time of the block.
+#[tokio::test]
+async fn a_watched_address_takes_a_confirmation_the_status_foretold() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = watching(dir.path(), server.backend()).await;
+    manager.sync_wallet(&wallet).await.unwrap();
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    let payment = transaction(&[nowhere(4, 0)], &[(ADDRESS_SCRIPT, 12_000)]);
+    let paid = payment.compute_txid();
+    server.add_tx(&payment);
+    server.set_history(ADDRESS_SCRIPT, &[(paid, 0)]);
+    server.set_unspent(ADDRESS_SCRIPT, &[(paid, 0, 0, 12_000)]);
+    server.set_status(ADDRESS_SCRIPT, &crate::testkit::status_of(&[(paid, 0)]));
+    let arrival = next_announcement(&mut events).await;
+    assert_eq!(staged(&[arrival]), [(paid.to_string(), TxStage::Mempool)]);
+    next_sync(&mut events, &wallet).await;
+    tokio::time::sleep(QUIET).await;
+
+    let mark = server_mark(&server);
+    server.set_history(ADDRESS_SCRIPT, &[(paid, 101)]);
+    server.set_unspent(ADDRESS_SCRIPT, &[(paid, 0, 101, 12_000)]);
+    block(&server, 101, ADDRESS_SCRIPT, &[(paid, 101)]);
+    let confirmation = next_announcement(&mut events).await;
+    assert_eq!(
+        staged(&[confirmation]),
+        [(paid.to_string(), TxStage::Confirmed)]
+    );
+    let (report, _) = next_sync(&mut events, &wallet).await;
+    assert_eq!(report.tip_height, 101);
+    assert_eq!(report.balance.confirmed, 12_000);
+    tokio::time::sleep(QUIET).await;
+    let (asked, connections) = asked_since(&server, mark);
+    println!("a confirmation foretold asked {asked:?} over {connections} new connection(s)");
+    assert_eq!(asked, ["blockchain.transaction.get_merkle"]);
+    assert_eq!(connections, 0);
+    assert_eq!(confirmations(&manager, &wallet, &paid.to_string()).await, 1);
+
+    manager.live_stop().await;
+    let mut events = manager.live_start_with(Some(timings())).await.unwrap();
+    quiet_start(&mut events).await;
+    manager.live_stop().await;
+}

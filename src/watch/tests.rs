@@ -13,7 +13,9 @@ use super::*;
 use crate::chain::tor::{TorMode, TorSettings};
 use crate::testkit::{
     ADDRESS, ADDRESS_SCRIPT, FakeElectrum, FakeMempool, esplora_payment, script, scripthash,
+    status_of,
 };
+use bdk_wallet::bitcoin::hashes::Hash;
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -62,6 +64,7 @@ fn wallet(id: &str, scripts: &[u8], lookahead: &[u8], has_pending: bool) -> Watc
                 lookahead: lookahead.contains(n),
                 status: None,
                 counts: None,
+                history: Vec::new(),
             })
             .collect(),
         has_pending,
@@ -210,6 +213,7 @@ async fn electrum_pushes_a_change_once_per_burst() {
                 lookahead: false,
                 status: Some("ab".to_owned()),
                 counts: None,
+                history: Vec::new(),
             }],
             ..wallet("a", &[], &[], false)
         },
@@ -1407,6 +1411,7 @@ fn wallets_the_whole_list_cut_short_are_caught_up_whole() {
                     lookahead: false,
                     status: None,
                     counts: None,
+                    history: Vec::new(),
                 })
                 .collect(),
             has_pending: false,
@@ -1431,6 +1436,7 @@ fn a_list_is_cut_to_what_can_be_watched() {
         lookahead: false,
         status: None,
         counts: None,
+        history: Vec::new(),
     });
     wallets.push(wallet("b", &[1, 1, 250], &[1], false));
     let watched = Watched::new(wallets, WatchLimits::DEFAULT);
@@ -1460,6 +1466,7 @@ fn numbered(id: &str, first: u32, count: u32) -> WatchedWallet {
                 lookahead: false,
                 status: None,
                 counts: None,
+                history: Vec::new(),
             })
             .collect(),
         has_pending: false,
@@ -2333,6 +2340,7 @@ async fn the_manager_announces_a_payment_twice_and_no_more() {
                 // watch syncs it once it starts.
                 status: Some(String::new()),
                 counts: None,
+                history: Vec::new(),
             }],
             has_pending: false,
             pinned: false,
@@ -2663,6 +2671,7 @@ async fn live_the_three_transports_see_signet_move() {
                 lookahead: false,
                 status: None,
                 counts: None,
+                history: Vec::new(),
             })
             .collect(),
         has_pending: true,
@@ -2754,4 +2763,178 @@ async fn live_the_three_transports_see_signet_move() {
     }
     // A little longer, for the stragglers of the same block.
     tokio::time::sleep(Duration::from_secs(90)).await;
+}
+
+// --- a confirmation foretold ------------------------------------------------------
+
+/// A wallet waiting for a block on `script(n)`: its one transaction,
+/// `txid`, in the mempool, as the wallet and the server hold it.
+fn waiting_on(server: &FakeElectrum, id: &str, n: u8, txid: Txid) -> WatchedWallet {
+    server.set_history(&script(n), &[(txid, 0)]);
+    let mut waiting = wallet(id, &[n], &[], true);
+    waiting.scripts[0].status = Some(status_of(&[(txid, 0)]));
+    waiting.scripts[0].history = vec![(txid, 0)];
+    waiting
+}
+
+/// The server's next block takes `txid`, the one transaction of
+/// `script(n)`: the header is pushed, chained to the ones under it,
+/// then the status that history hashes to.
+fn mined(server: &FakeElectrum, n: u8, txid: Txid, height: u32) {
+    server.set_history(&script(n), &[(txid, i64::from(height))]);
+    let header = {
+        let mut state = server.state.lock().unwrap();
+        state.height = height;
+        state.header(height)
+    };
+    server.push(
+        json!({
+            "jsonrpc": "2.0", "method": "blockchain.headers.subscribe",
+            "params": [{ "height": height, "hex": header }],
+        })
+        .to_string(),
+    );
+    server.set_status(&script(n), &status_of(&[(txid, i64::from(height))]));
+}
+
+/// A status that says the latest block took what a wallet waited for,
+/// the history it holds at that height, comes out as that confirmation,
+/// once the server has proven the transaction in the block: with the
+/// headers that tie the block to the ones before it, and the server.
+#[tokio::test]
+async fn a_status_that_foretells_a_confirmation_comes_out_proven() {
+    let server = FakeElectrum::start().await;
+    let txid = Txid::from_byte_array([5; 32]);
+    let waiting = waiting_on(&server, "a", 1, txid);
+    let (watch, mut events) =
+        LiveWatch::start_with(config(server.backend()), vec![waiting], Some(timings()));
+    until(&watch, "subscribed", |s| s.pushed_scripts == 1).await;
+    no_event(&mut events, Duration::from_millis(300)).await;
+
+    mined(&server, 1, txid, 101);
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock { height: 101 }
+    );
+    let WatchEvent::Confirmed { wallet_id, proven } = next_event(&mut events).await else {
+        panic!("expected a confirmation");
+    };
+    assert_eq!(wallet_id, "a");
+    let [proven] = proven.as_slice() else {
+        panic!("one script: {proven:?}");
+    };
+    assert_eq!(proven.script, script(1));
+    assert_eq!(proven.status, status_of(&[(txid, 101)]));
+    assert_eq!(proven.txids, [txid]);
+    assert_eq!(
+        (proven.headers.first, proven.headers.last_height()),
+        (100, 101)
+    );
+    let state = server.state.lock().unwrap().header(101);
+    assert_eq!(
+        bdk_wallet::bitcoin::consensus::encode::serialize_hex(proven.headers.at(101).unwrap()),
+        state
+    );
+    assert_eq!(
+        Some(proven.server.clone()),
+        watch.serving().map(|(_, at)| at)
+    );
+    no_event(&mut events, Duration::from_millis(300)).await;
+}
+
+/// A status that foretells a confirmation the server then never proves
+/// is given up on in the time a ping may go unanswered: the script is
+/// reported as any change, for a sync, and nothing is said confirmed.
+#[tokio::test]
+async fn a_proof_the_server_never_sends_is_given_up_on() {
+    let server = FakeElectrum::start().await;
+    server.state.lock().unwrap().unanswered = Some("blockchain.transaction.get_merkle");
+    let txid = Txid::from_byte_array([5; 32]);
+    let waiting = waiting_on(&server, "a", 1, txid);
+    let (watch, mut events) =
+        LiveWatch::start_with(config(server.backend()), vec![waiting], Some(timings()));
+    until(&watch, "subscribed", |s| s.pushed_scripts == 1).await;
+    no_event(&mut events, Duration::from_millis(300)).await;
+
+    mined(&server, 1, txid, 101);
+    assert_eq!(
+        next_event(&mut events).await,
+        WatchEvent::NewBlock { height: 101 }
+    );
+    let asked = std::time::Instant::now();
+    assert_eq!(
+        next_event(&mut events).await,
+        moved("a", ChangeReason::Activity, false, &[1])
+    );
+    assert!(server.was_asked("blockchain.transaction.get_merkle"));
+    assert!(
+        asked.elapsed() >= timings().pong / 2,
+        "{:?}",
+        asked.elapsed()
+    );
+}
+
+/// A confirmation proven alone in its burst goes out as such. With a
+/// script that moved in the same burst, or the whole wallet, it goes out
+/// as the one sync of them, its script read with the rest.
+#[test]
+fn a_confirmation_proven_with_a_change_goes_out_as_one_sync() {
+    let timings = timings();
+    let start = Instant::now();
+    let proven = |n: u8| Proven {
+        script: script(n),
+        status: "ff".to_owned(),
+        txids: vec![Txid::from_byte_array([n; 32])],
+        headers: Arc::new(Headers {
+            first: 100,
+            chain: Vec::new(),
+        }),
+        server: Endpoint::Esplora("http://127.0.0.1".to_owned()),
+    };
+    let mut debounce = Debouncer::default();
+    debounce.mark_proven("a", proven(1), start);
+    debounce.mark_proven("a", proven(2), start);
+    let due = debounce.take_due(start + timings.burst, &timings);
+    assert_eq!(
+        due[0].1.event("a"),
+        WatchEvent::Confirmed {
+            wallet_id: "a".to_owned(),
+            proven: vec![proven(1), proven(2)],
+        }
+    );
+
+    debounce.mark_proven("a", proven(1), start);
+    debounce.mark("a", ChangeReason::Activity, false, Some(&script(3)), start);
+    let due = debounce.take_due(start + timings.burst, &timings);
+    assert_eq!(
+        due[0].1.event("a"),
+        moved("a", ChangeReason::Activity, false, &[1, 3])
+    );
+
+    debounce.mark("a", ChangeReason::NewBlock, false, None, start);
+    debounce.mark_proven("a", proven(1), start);
+    let due = debounce.take_due(start + timings.burst, &timings);
+    assert_eq!(
+        due[0].1.event("a"),
+        changed("a", ChangeReason::Activity, false)
+    );
+}
+
+/// A block takes every transaction still waiting, in the mempool or on
+/// one that is, to its height, and leaves the order and the rest as
+/// they were; with nothing waiting, or a confirmation above that height,
+/// there is nothing to foretell.
+#[test]
+fn a_block_takes_what_waits_at_its_height() {
+    let [a, b, c] = [1u8, 2, 3].map(|n| Txid::from_byte_array([n; 32]));
+    assert_eq!(
+        confirmed_at(&[(a, 90), (b, 0), (c, -1)], 101),
+        Some(vec![(a, 90), (b, 101), (c, 101)])
+    );
+    assert_eq!(confirmed_at(&[(a, 90)], 101), None);
+    assert_eq!(confirmed_at(&[(a, 102), (b, 0)], 101), None);
+    assert_eq!(
+        history_status(&[(a, 90), (b, 101)]),
+        status_of(&[(a, 90), (b, 101)])
+    );
 }
