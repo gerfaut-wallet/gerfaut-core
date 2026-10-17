@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
@@ -63,6 +63,16 @@ impl From<CallError> for String {
     fn from(error: CallError) -> String {
         error.to_string()
     }
+}
+
+/// One request as it goes on the wire, its parameters borrowed: a batch
+/// keeps them for the requests it asks again, and copies none.
+#[derive(Serialize)]
+struct Outgoing<'a> {
+    jsonrpc: &'static str,
+    id: u64,
+    method: &'a str,
+    params: &'a Value,
 }
 
 /// One answer as it comes off the wire: the result is kept as its text
@@ -143,21 +153,24 @@ impl Connection {
         mut each: impl FnMut(usize, Result<T, CallError>) -> Result<(), CallError>,
     ) -> Result<(), CallError> {
         let mut busy = Vec::new();
-        let first = params.iter().cloned().enumerate();
-        self.round(method, first, |index, result| match result {
-            Err(CallError::Busy(_)) => {
-                busy.push(index);
-                Ok(())
-            }
-            result => each(index, result),
-        })
+        self.round(
+            method,
+            params.iter().enumerate(),
+            |index, result| match result {
+                Err(CallError::Busy(_)) => {
+                    busy.push(index);
+                    Ok(())
+                }
+                result => each(index, result),
+            },
+        )
         .await?;
         if busy.is_empty() {
             return Ok(());
         }
         tokio::time::sleep(super::busy_pause()).await;
         busy.sort_unstable();
-        let again = busy.into_iter().map(|index| (index, params[index].clone()));
+        let again = busy.into_iter().map(|index| (index, &params[index]));
         self.round(method, again, |index, result| match result {
             Err(CallError::Busy(words)) => each(index, Err(CallError::Refused(words))),
             result => each(index, result),
@@ -170,7 +183,7 @@ impl Connection {
     async fn round<T: DeserializeOwned>(
         &mut self,
         method: &str,
-        mut queue: impl Iterator<Item = (usize, Value)>,
+        mut queue: impl Iterator<Item = (usize, &Value)>,
         mut each: impl FnMut(usize, Result<T, CallError>) -> Result<(), CallError>,
     ) -> Result<(), CallError> {
         let mut waiting: HashMap<u64, usize> = HashMap::new();
@@ -192,11 +205,17 @@ impl Connection {
         }
     }
 
-    async fn send(&mut self, method: &str, params: Value) -> Result<u64, CallError> {
+    async fn send(&mut self, method: &str, params: &Value) -> Result<u64, CallError> {
         let id = self.next_id;
         self.next_id += 1;
-        let mut line =
-            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
+        let request = Outgoing {
+            jsonrpc: "2.0",
+            id,
+            method,
+            params,
+        };
+        let mut line = serde_json::to_string(&request)
+            .map_err(|_| CallError::Failed("the request could not be written".to_owned()))?;
         line.push('\n');
         let write = async {
             self.writer.write_all(line.as_bytes()).await?;
