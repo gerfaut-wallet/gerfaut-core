@@ -5,7 +5,8 @@ Run by .github/workflows/upstream.yml, from the repository root:
     REVIEWED="0.5.0" python3 .github/saturating-time-upstream.py
 
 The fork's version is the one Cargo.lock records for the git source of
-the [patch.crates-io] section. A release counts when it is not yanked,
+the [patch.crates-io] section: the fork keeps the version of the release
+it patches, never one of its own. A release counts when it is not yanked,
 not a pre-release, newer than the fork, and missing from REVIEWED, the
 space-separated releases already read and found without the fix. A list
 rather than a ceiling: a fixed 0.4.x published after 0.5.0 still counts.
@@ -57,8 +58,11 @@ def show(fields):
 
 def fetch():
     """Every published version of the crate, as crates.io lists them."""
-    versions, url = [], f"{API}?per_page=100"
+    versions, url, seen = [], f"{API}?per_page=100", set()
     while url:
+        if url in seen or len(seen) == 50:
+            raise RuntimeError(f"crates.io pagination does not end ({url})")
+        seen.add(url)
         request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         for attempt in range(3):
             try:
@@ -82,9 +86,9 @@ def fetch():
 
 def main():
     reviewed_texts = os.environ.get("REVIEWED", "").split()
+    if not reviewed_texts or not all(is_release(text) for text in reviewed_texts):
+        sys.exit("::error::REVIEWED must list releases, such as 0.5.0, separated by spaces, without pre-releases")
     reviewed = {numbers(text) for text in reviewed_texts}
-    if not reviewed_texts or None in reviewed:
-        sys.exit("::error::REVIEWED must list releases, such as 0.5.0, separated by spaces")
 
     with open("Cargo.lock", "rb") as lock:
         cargo_lock = tomllib.load(lock)
@@ -115,6 +119,8 @@ def main():
         for entry in fetch()
         if not entry.get("yanked") and is_release(entry.get("num", ""))
     }
+    if not releases:
+        sys.exit(f"::error::crates.io lists no release of {CRATE}: its API has changed, or the crate is gone")
     unread = sorted(release for release in releases if release > fork and release not in reviewed)
     if unread:
         print(
@@ -123,7 +129,7 @@ def main():
             f"or add the release to REVIEWED in .github/workflows/upstream.yml"
         )
         sys.exit(1)
-    latest = show(max(releases)) if releases else "none"
+    latest = show(max(releases))
     print(f"{CRATE}: newest release {latest}, fork {show(fork)}, reviewed {' '.join(reviewed_texts)}: nothing new")
 
 
