@@ -536,7 +536,9 @@ fn script_kind_of(descriptor: &Descriptor<DescriptorPublicKey>) -> ScriptKind {
 /// Candidate networks of a descriptor, from the version bytes of the
 /// extended keys it contains. A descriptor without extended keys is
 /// network-agnostic; one mixing mainnet and test keys is rejected.
-fn descriptor_networks(descriptor: &Descriptor<DescriptorPublicKey>) -> CoreResult<Vec<Network>> {
+pub(crate) fn descriptor_networks(
+    descriptor: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<Vec<Network>> {
     let mut kinds: Vec<NetworkKind> = Vec::new();
     descriptor.for_each_key(|key| {
         let key_kind = match key {

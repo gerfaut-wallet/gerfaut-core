@@ -14,7 +14,7 @@ use crate::now_secs;
 use crate::store::WalletRecord;
 use crate::wallet::meta::WalletKind;
 
-use super::{WalletManager, build_record, engine_for, find_record, find_watched, fresh_meta};
+use super::{WalletManager, build_record, check_material, find_record, find_watched, fresh_meta};
 
 impl WalletManager {
     /// Seals the chosen wallets (every wallet by default) and, on
@@ -85,18 +85,6 @@ impl WalletManager {
     /// answer to a question the screen actually asked.
     pub async fn preview_backup(&self, source: &str, password: &str) -> CoreResult<BackupPreview> {
         let payload = backup::open(&backup::decode_source(source)?, password)?;
-        // Each wallet is put through what a restore puts it through, so
-        // the screen can leave out, and say why, one a restore would
-        // refuse, instead of the whole restore failing on it.
-        let refused: Vec<Option<String>> = payload
-            .wallets
-            .iter()
-            .map(|wallet| {
-                engine_for(&wallet.kind, wallet.network)
-                    .err()
-                    .map(|error| error.to_string())
-            })
-            .collect();
         let state = self.state.lock().await;
         Ok(BackupPreview {
             created_at: payload.created_at,
@@ -124,15 +112,25 @@ impl WalletManager {
                 .wallets
                 .iter()
                 .enumerate()
-                .zip(refused)
-                .map(|((index, wallet), refused)| BackupWalletPreview {
-                    index: index as u32,
-                    name: wallet.name.clone(),
-                    network: wallet.network,
-                    kind: wallet.kind.clone(),
-                    already_watched: find_watched(&state.payload, wallet.network, &wallet.kind)
-                        .is_some(),
-                    refused,
+                .map(|(index, wallet)| {
+                    let already_watched =
+                        find_watched(&state.payload, wallet.network, &wallet.kind).is_some();
+                    // What a restore checks of each wallet it takes, so
+                    // the screen can leave out, and say why, one it would
+                    // refuse. One already watched is skipped before that:
+                    // a single state, the one that happens.
+                    let refused = (!already_watched)
+                        .then(|| check_material(&wallet.kind, wallet.network).err())
+                        .flatten()
+                        .map(|error| error.to_string());
+                    BackupWalletPreview {
+                        index: index as u32,
+                        name: wallet.name.clone(),
+                        network: wallet.network,
+                        kind: wallet.kind.clone(),
+                        already_watched,
+                        refused,
+                    }
                 })
                 .collect(),
         })
