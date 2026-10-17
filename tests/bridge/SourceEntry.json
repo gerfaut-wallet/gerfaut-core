@@ -1,12 +1,12 @@
 {
-  "coingecko": {
-    "source": "coingecko",
-    "label": "CoinGecko",
-    "ranges": ["day", "week", "month", "year"]
-  },
   "mempool_space": {
     "source": "mempool_space",
     "label": "mempool.space",
     "ranges": ["month", "year", "max"]
+  },
+  "coingecko": {
+    "source": "coingecko",
+    "label": "CoinGecko",
+    "ranges": ["day", "week", "month", "year"]
   }
 }

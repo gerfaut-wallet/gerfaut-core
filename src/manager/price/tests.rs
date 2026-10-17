@@ -143,8 +143,8 @@ async fn with_an_onion_backend_the_price_goes_through_tor() {
     assert_eq!(
         *asked.lock().unwrap(),
         vec![
-            ("api.coingecko.com".to_owned(), 443),
             ("mempool.space".to_owned(), 443),
+            ("api.coingecko.com".to_owned(), 443),
             ("mempool.space".to_owned(), 443),
         ],
         "every host went to the proxy, by name, and nowhere else"

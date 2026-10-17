@@ -32,7 +32,8 @@ pub enum PriceSource {
 }
 
 impl PriceSource {
-    pub const ALL: [PriceSource; 2] = [PriceSource::Coingecko, PriceSource::MempoolSpace];
+    /// Display order: the default first.
+    pub const ALL: [PriceSource; 2] = [PriceSource::MempoolSpace, PriceSource::Coingecko];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -629,7 +630,7 @@ mod tests {
         }
         let sources: Vec<PriceSource> = table.sources.iter().map(|entry| entry.source).collect();
         assert_eq!(sources, PriceSource::ALL);
-        let mempool = &table.sources[1];
+        let mempool = &table.sources[0];
         assert_eq!(mempool.label, "mempool.space");
         assert_eq!(
             mempool.ranges,
@@ -642,7 +643,7 @@ mod tests {
                 "code": "EUR",
                 "name": "Euro",
                 "reach": "every",
-                "sources": ["coingecko", "mempool_space"],
+                "sources": ["mempool_space", "coingecko"],
             })
         );
     }

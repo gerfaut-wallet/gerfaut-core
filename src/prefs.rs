@@ -44,8 +44,11 @@ pub struct Preferences {
     pub fiat: bool,
     /// The currency of the fiat value. The euro by default.
     pub fiat_currency: FiatCurrency,
-    /// Where the price comes from. CoinGecko by default. Always one that
-    /// quotes [`Self::fiat_currency`]: see [`Preferences::change`].
+    /// Where the price comes from. mempool.space by default, for the
+    /// seven currencies it quotes: it is already among the servers the
+    /// syncs ask, so the price adds no third party. CoinGecko for the
+    /// others. Always one that quotes [`Self::fiat_currency`]: see
+    /// [`Preferences::change`].
     pub price_source: PriceSource,
     /// A notification when a transaction shows up and when it confirms.
     /// Off by default: watching keeps a connection open, which tells the
@@ -63,7 +66,7 @@ impl Default for Preferences {
             masked: false,
             fiat: false,
             fiat_currency: FiatCurrency::Eur,
-            price_source: PriceSource::Coingecko,
+            price_source: PriceSource::MempoolSpace,
             notify_new_tx: false,
             explorer_ack: false,
         }
@@ -101,9 +104,9 @@ impl Preferences {
     /// These preferences with `change` applied, and the pair of currency
     /// and source made one that exists: the currency wins, the source
     /// follows. A currency only CoinGecko publishes, picked while the
-    /// source is mempool.space, moves the source to CoinGecko rather than leave
-    /// a pair that no source can quote; a source picked that does not
-    /// quote the currency gives way the same.
+    /// source is mempool.space, moves the source to CoinGecko rather
+    /// than leave a pair that no source can quote; a source picked that
+    /// does not quote the currency gives way the same.
     pub fn change(mut self, change: &PreferencesChange) -> Self {
         let PreferencesChange {
             unit,
@@ -225,16 +228,21 @@ mod tests {
             .collect()
     }
 
-    /// The defaults are the ones both apps had: BTC, nothing hidden, no
-    /// fiat, the euro from CoinGecko, no alerts, the warning still up.
+    /// The defaults: BTC, nothing hidden, no fiat, the euro from
+    /// mempool.space, no alerts, the warning still up.
     #[test]
-    fn the_defaults_are_the_ones_both_apps_had() {
+    fn the_defaults_ask_no_new_third_party() {
         let defaults = Preferences::default();
         assert_eq!(defaults.unit, Unit::Btc);
         assert!(!defaults.masked);
         assert!(!defaults.fiat);
         assert_eq!(defaults.fiat_currency, FiatCurrency::Eur);
-        assert_eq!(defaults.price_source, PriceSource::Coingecko);
+        assert_eq!(defaults.price_source, PriceSource::MempoolSpace);
+        assert!(
+            defaults
+                .price_source
+                .supports_currency(defaults.fiat_currency)
+        );
         assert!(!defaults.notify_new_tx);
         assert!(!defaults.explorer_ack);
         // A vault that stored none of them, or some, reads the rest as
@@ -460,11 +468,14 @@ mod tests {
             &mut app_prefs,
             [LEGACY_MASKED_MOBILE, LEGACY_MASKED_DESKTOP],
         );
+        // No source stored, and a currency only CoinGecko quotes: the
+        // default source gives way to it.
         assert_eq!(
             adopted,
             Preferences {
                 masked: true,
                 fiat_currency: FiatCurrency::Try,
+                price_source: PriceSource::Coingecko,
                 ..Preferences::default()
             }
         );

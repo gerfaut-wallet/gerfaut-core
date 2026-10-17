@@ -6,49 +6,49 @@
         "code": "EUR",
         "name": "Euro",
         "reach": "every",
-        "sources": ["coingecko", "mempool_space"]
+        "sources": ["mempool_space", "coingecko"]
       },
       {
         "currency": "usd",
         "code": "USD",
         "name": "US dollar",
         "reach": "every",
-        "sources": ["coingecko", "mempool_space"]
+        "sources": ["mempool_space", "coingecko"]
       },
       {
         "currency": "gbp",
         "code": "GBP",
         "name": "Pound sterling",
         "reach": "every",
-        "sources": ["coingecko", "mempool_space"]
+        "sources": ["mempool_space", "coingecko"]
       },
       {
         "currency": "chf",
         "code": "CHF",
         "name": "Swiss franc",
         "reach": "every",
-        "sources": ["coingecko", "mempool_space"]
+        "sources": ["mempool_space", "coingecko"]
       },
       {
         "currency": "jpy",
         "code": "JPY",
         "name": "Japanese yen",
         "reach": "every",
-        "sources": ["coingecko", "mempool_space"]
+        "sources": ["mempool_space", "coingecko"]
       },
       {
         "currency": "cad",
         "code": "CAD",
         "name": "Canadian dollar",
         "reach": "every",
-        "sources": ["coingecko", "mempool_space"]
+        "sources": ["mempool_space", "coingecko"]
       },
       {
         "currency": "aud",
         "code": "AUD",
         "name": "Australian dollar",
         "reach": "every",
-        "sources": ["coingecko", "mempool_space"]
+        "sources": ["mempool_space", "coingecko"]
       },
       {
         "currency": "inr",
@@ -214,14 +214,14 @@
     ],
     "sources": [
       {
-        "source": "coingecko",
-        "label": "CoinGecko",
-        "ranges": ["day", "week", "month", "year"]
-      },
-      {
         "source": "mempool_space",
         "label": "mempool.space",
         "ranges": ["month", "year", "max"]
+      },
+      {
+        "source": "coingecko",
+        "label": "CoinGecko",
+        "ranges": ["day", "week", "month", "year"]
       }
     ],
     "refresh_secs": 60
