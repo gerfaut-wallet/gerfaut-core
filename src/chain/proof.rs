@@ -20,9 +20,10 @@
 //! height it claims: in the first years of the chain that work is close
 //! to nothing. So over Electrum, a confirmation in a period whose forged
 //! header would cost less than [`CHAIN_BELOW_DIFFICULTY`] is chained: the
-//! headers from its block to the end of its period, one request of 2,016
-//! headers at most, must follow one another up to the hash the
-//! checkpoints give for that block ([`chain_to_checkpoint`]). The periods
+//! headers from its block to the end of its period, 2,016 at most, in
+//! one request unless a server sends fewer at a time, must follow one
+//! another up to the hash the checkpoints give for that block
+//! ([`chain_to_checkpoint`]). The periods
 //! read are kept for the session. Esplora has no way to send a run of
 //! headers short of one request per block: over Esplora, a confirmation
 //! is taken on its header's work alone, and one claimed in an early
