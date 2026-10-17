@@ -40,10 +40,10 @@ use super::status::{Check, Told, Verdict, scripthash};
 use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
 use crate::chain::proof::{
-    COIN_NOT_PAID, FALSE_PROOF, Proof, ProvenCoin, above_the_tip, chain_to_checkpoint, chained,
-    chains_to_read, check_confirmation, proven_coin, recheck, remember_coin,
+    Proof, ProvenCoin, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
+    check_confirmation, proven_coin, recheck, remember_coin,
 };
-use crate::chain::{IMPOSSIBLE_TIP, KEEP_MAX, Kept, height_limit};
+use crate::chain::{Fault, IMPOSSIBLE_TIP, KEEP_MAX, Kept, height_limit};
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
 use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
@@ -101,7 +101,7 @@ pub(crate) async fn fetch_state(
     proxy: Option<&str>,
     held: &[AddressTx],
     told: Option<&Told>,
-) -> Result<Option<AddressWatchState>, String> {
+) -> Result<Option<AddressWatchState>, Fault> {
     state_in_rounds_of(
         target,
         address,
@@ -121,7 +121,7 @@ pub(crate) async fn fetch_history(
     network: Network,
     from: &str,
     proxy: Option<&str>,
-) -> Result<HistoryRound, String> {
+) -> Result<HistoryRound, Fault> {
     history_in_rounds_of(target, address, network, from, proxy, CONFIRMED_PER_ROUND).await
 }
 
@@ -133,7 +133,7 @@ async fn state_in_rounds_of(
     per_round: usize,
     held: &[AddressTx],
     told: Option<&Told>,
-) -> Result<Option<AddressWatchState>, String> {
+) -> Result<Option<AddressWatchState>, Fault> {
     let ours = parse_address(address, network)?.script_pubkey();
     let hash = scripthash(&ours);
     let mut connection = Connection::open(target, proxy).await?;
@@ -215,7 +215,7 @@ async fn stood_by(
     ours: &ScriptBuf,
     hash: &str,
     history: Vec<Entry>,
-) -> Result<Option<Vec<Entry>>, String> {
+) -> Result<Option<Vec<Entry>>, Fault> {
     let expected: HashSet<Txid> = held.iter().filter_map(|tx| tx.txid.parse().ok()).collect();
     let mut check = Check::new(told, ours, &expected);
     let mut history = history;
@@ -239,7 +239,7 @@ async fn history_in_rounds_of(
     from: &str,
     proxy: Option<&str>,
     per_round: usize,
-) -> Result<HistoryRound, String> {
+) -> Result<HistoryRound, Fault> {
     let ours = parse_address(address, network)?.script_pubkey();
     let from: Txid = from
         .parse()
@@ -269,13 +269,13 @@ async fn history_in_rounds_of(
 
 /// The whole history of a script. A server that will not send one this
 /// long says so in its own words, and the message says what reads it.
-async fn history(connection: &mut Connection, hash: &str) -> Result<Vec<Entry>, String> {
+async fn history(connection: &mut Connection, hash: &str) -> Result<Vec<Entry>, Fault> {
     match connection
         .call::<Vec<Entry>>("blockchain.scripthash.get_history", json!([hash]))
         .await
     {
         Ok(history) => Ok(history),
-        Err(CallError::Refused(words)) => {
+        Err(CallError::Refused { words, busy }) => {
             let lower = words.to_ascii_lowercase();
             let about_size = [
                 "too large",
@@ -287,7 +287,9 @@ async fn history(connection: &mut Connection, hash: &str) -> Result<Vec<Entry>, 
             ]
             .iter()
             .any(|phrase| lower.contains(phrase));
-            Err(if about_size {
+            // The words choose the sentence, never the kind: only a
+            // server out of memory for its answers is down.
+            let said = if about_size {
                 format!(
                     "the server will not send the history of this address, too long for it \
                      ({words}); an Esplora backend, or an Electrum server that allows longer \
@@ -295,13 +297,18 @@ async fn history(connection: &mut Connection, hash: &str) -> Result<Vec<Entry>, 
                 )
             } else {
                 format!("the server refused the history of this address: {words}")
+            };
+            Err(if busy {
+                Fault::outage(said)
+            } else {
+                Fault::other(said)
             })
         }
-        Err(CallError::TooLong) => Err(format!(
+        Err(CallError::TooLong) => Err(Fault::other(format!(
             "the history of this address is longer than an Electrum answer read here may be \
              ({} MiB); an Esplora backend can read it",
             MAX_LINE >> 20
-        )),
+        ))),
         Err(other) => Err(other.into()),
     }
 }
@@ -313,7 +320,7 @@ fn round_of(
     history: &[Entry],
     from: Option<Txid>,
     per_round: usize,
-) -> Result<(Vec<Picked>, Option<String>), String> {
+) -> Result<(Vec<Picked>, Option<String>), Fault> {
     // A server may list a transaction twice; it is read once.
     let mut seen = HashSet::new();
     let unique: Vec<&Entry> = history
@@ -372,9 +379,9 @@ fn round_of(
 /// another as this one.
 fn decode(hex: &str, expected: Txid) -> Result<Transaction, CallError> {
     let tx: Transaction =
-        deserialize_hex(hex).map_err(|_| CallError::Failed("unexpected response".to_owned()))?;
+        deserialize_hex(hex).map_err(|_| CallError::Failed(Fault::other("unexpected response")))?;
     if tx.compute_txid() != expected {
-        return Err(CallError::Failed("unexpected response".to_owned()));
+        return Err(CallError::Failed(Fault::other("unexpected response")));
     }
     Ok(tx)
 }
@@ -390,7 +397,7 @@ async fn read(
     network: Network,
     kept: &Kept,
     held: &[AddressTx],
-) -> Result<Vec<AddressTx>, String> {
+) -> Result<Vec<AddressTx>, Fault> {
     let held: HashMap<&str, &AddressTx> = held.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
     // Outputs paying the address, from the transactions read so far:
     // what a spend from it takes as input, no fetch needed.
@@ -462,10 +469,7 @@ async fn read(
 
 /// Transactions by txid, in the order asked. One the server does not
 /// have fails the round: the history it sent named it.
-async fn fetch_txs(
-    connection: &mut Connection,
-    txids: &[Txid],
-) -> Result<Vec<Transaction>, String> {
+async fn fetch_txs(connection: &mut Connection, txids: &[Txid]) -> Result<Vec<Transaction>, Fault> {
     let mut found: Vec<Option<Transaction>> = vec![None; txids.len()];
     connection
         .batch::<String>(
@@ -481,7 +485,9 @@ async fn fetch_txs(
     found
         .into_iter()
         .zip(txids)
-        .map(|(tx, txid)| tx.ok_or_else(|| format!("the server did not send transaction {txid}")))
+        .map(|(tx, txid)| {
+            tx.ok_or_else(|| Fault::other(format!("the server did not send transaction {txid}")))
+        })
         .collect()
 }
 
@@ -492,7 +498,7 @@ async fn fetch_outputs(
     connection: &mut Connection,
     wanted: HashMap<Txid, Vec<u32>>,
     prevouts: &mut HashMap<OutPoint, TxOut>,
-) -> Result<(), String> {
+) -> Result<(), Fault> {
     let wanted: Vec<(Txid, Vec<u32>)> = wanted.into_iter().collect();
     connection
         .batch::<String>(
@@ -505,7 +511,7 @@ async fn fetch_outputs(
                 let (txid, vouts) = &wanted[index];
                 let hex = match answer {
                     Ok(hex) => hex,
-                    Err(CallError::Refused(_)) => return Ok(()),
+                    Err(CallError::Refused { .. }) => return Ok(()),
                     Err(other) => return Err(other),
                 };
                 let tx = decode(&hex, *txid)?;
@@ -523,13 +529,13 @@ async fn fetch_outputs(
 
 /// Refuses a server whose genesis block is not the network's, as
 /// [`crate::chain::esplora::check_network`] does over Esplora.
-async fn check_network(connection: &mut Connection, network: Network) -> Result<(), String> {
+async fn check_network(connection: &mut Connection, network: Network) -> Result<(), Fault> {
     let hex: String = connection
         .call("blockchain.block.header", json!([0]))
         .await?;
-    let genesis: Header = deserialize_hex(&hex).map_err(|_| "unexpected response".to_owned())?;
+    let genesis: Header = deserialize_hex(&hex).map_err(|_| Fault::other("unexpected response"))?;
     if !crate::chain::is_genesis_of(network, genesis.block_hash()) {
-        return Err(crate::chain::ANOTHER_NETWORK.to_owned());
+        return Err(Fault::other(crate::chain::ANOTHER_NETWORK));
     }
     Ok(())
 }
@@ -549,7 +555,7 @@ struct Headers {
 async fn block_headers(
     connection: &mut Connection,
     heights: impl IntoIterator<Item = u32>,
-) -> Result<Headers, String> {
+) -> Result<Headers, Fault> {
     let mut seen = HashSet::new();
     let heights: Vec<u32> = heights
         .into_iter()
@@ -570,7 +576,7 @@ async fn block_headers(
                     Ok(Ok(header)) => {
                         headers.found.insert(heights[index], header);
                     }
-                    Err(CallError::Refused(words)) => {
+                    Err(CallError::Refused { words, .. }) => {
                         headers.refused.insert(heights[index], words);
                     }
                     // Not a header: what it would prove is a false proof.
@@ -620,12 +626,12 @@ async fn prove(
     tip: u32,
     unproven: &[(Txid, u32)],
     headers: &Headers,
-) -> Result<HashSet<String>, String> {
+) -> Result<HashSet<String>, Fault> {
     let mut unsure = HashSet::new();
     let mut proven: Vec<(Txid, u32, BlockHash)> = Vec::new();
     for (txid, height) in unproven {
         match above_the_tip(*height, tip) {
-            Some(Proof::False) => return Err(FALSE_PROOF.to_owned()),
+            Some(Proof::False) => return Err(Fault::false_proof()),
             Some(_) => {
                 unsure.insert(txid.to_string());
             }
@@ -659,7 +665,7 @@ async fn prove(
                         check_confirmation(network, height, header, txid, &branch),
                         Some(branch),
                     ),
-                    (Err(CallError::Refused(_)), _) => (Proof::Unsure, None),
+                    (Err(CallError::Refused { .. }), _) => (Proof::Unsure, None),
                     _ => (Proof::False, None),
                 };
                 Ok(())
@@ -681,7 +687,7 @@ async fn prove(
             (Proof::Unsure, _) => {
                 unsure.insert(txid.to_string());
             }
-            _ => return Err(FALSE_PROOF.to_owned()),
+            _ => return Err(Fault::false_proof()),
         }
     }
 
@@ -695,8 +701,7 @@ async fn prove(
         let Some(headers) = headers_from(connection, from, count).await? else {
             continue;
         };
-        let hashes =
-            chain_to_checkpoint(network, from, &headers).ok_or_else(|| FALSE_PROOF.to_owned())?;
+        let hashes = chain_to_checkpoint(network, from, &headers).ok_or_else(Fault::false_proof)?;
         read.insert(from, hashes);
     }
     for (txid, height, hash) in proven {
@@ -705,7 +710,7 @@ async fn prove(
             Proof::Unsure => {
                 unsure.insert(txid.to_string());
             }
-            Proof::False | Proof::Elsewhere => return Err(FALSE_PROOF.to_owned()),
+            Proof::False | Proof::Elsewhere => return Err(Fault::false_proof()),
         }
     }
     Ok(unsure)
@@ -724,7 +729,7 @@ async fn headers_from(
     connection: &mut Connection,
     from: u32,
     count: u32,
-) -> Result<Option<Vec<Header>>, String> {
+) -> Result<Option<Vec<Header>>, Fault> {
     let mut headers: Vec<Header> = Vec::with_capacity(count as usize);
     while (headers.len() as u32) < count {
         let next = from + headers.len() as u32;
@@ -734,18 +739,18 @@ async fn headers_from(
             .await
         {
             Ok(answer) => answer,
-            Err(CallError::Refused(_)) => return Ok(None),
+            Err(CallError::Refused { .. }) => return Ok(None),
             Err(other) => return Err(other.into()),
         };
         let bytes = data_encoding::HEXLOWER_PERMISSIVE
             .decode(answer.hex.as_bytes())
-            .map_err(|_| "unexpected response".to_owned())?;
+            .map_err(|_| Fault::other("unexpected response"))?;
         if bytes.is_empty() || bytes.len() % 80 != 0 {
             break;
         }
         for chunk in bytes.chunks(80) {
             let header: Header = bdk_wallet::bitcoin::consensus::encode::deserialize(chunk)
-                .map_err(|_| "unexpected response".to_owned())?;
+                .map_err(|_| Fault::other("unexpected response"))?;
             headers.push(header);
         }
     }
@@ -755,26 +760,26 @@ async fn headers_from(
 
 /// The server's tip, refused past any height a chain of `network` can
 /// have reached ([`height_limit`]).
-async fn read_tip(connection: &mut Connection, network: Network) -> Result<u32, String> {
+async fn read_tip(connection: &mut Connection, network: Network) -> Result<u32, Fault> {
     let tip: Tip = connection
         .call("blockchain.headers.subscribe", json!([]))
         .await?;
     if tip.height > height_limit(network, crate::now_secs()) {
-        return Err(IMPOSSIBLE_TIP.to_owned());
+        return Err(Fault::other(IMPOSSIBLE_TIP));
     }
     Ok(tip.height)
 }
 
 /// The header at `height`, read again; `None` when the server refuses it.
-async fn header_again(connection: &mut Connection, height: u32) -> Result<Option<Header>, String> {
+async fn header_again(connection: &mut Connection, height: u32) -> Result<Option<Header>, Fault> {
     match connection
         .call::<String>("blockchain.block.header", json!([height]))
         .await
     {
         Ok(hex) => deserialize_hex::<Header>(&hex)
             .map(Some)
-            .map_err(|_| "unexpected response".to_owned()),
-        Err(CallError::Refused(_)) => Ok(None),
+            .map_err(|_| Fault::other("unexpected response")),
+        Err(CallError::Refused { .. }) => Ok(None),
         Err(other) => Err(other.into()),
     }
 }
@@ -888,7 +893,7 @@ impl ReadAgain<'_> {
         connection: &mut Connection,
         unread: &[(Txid, u32)],
         headers: &Headers,
-    ) -> Result<Vouched, String> {
+    ) -> Result<Vouched, Fault> {
         if unread.is_empty() {
             return Ok(HashMap::new());
         }
@@ -905,7 +910,7 @@ impl ReadAgain<'_> {
                         crate::chain::proof::pays(&tx, coin.tx_pos, self.ours, coin.value)
                     });
                 if !paid {
-                    return Err(COIN_NOT_PAID.to_owned());
+                    return Err(Fault::coin_not_paid());
                 }
             }
         }
@@ -953,7 +958,7 @@ fn coins(
     txs: &[AddressTx],
     past: &Vouched,
     times: &HashMap<u32, u64>,
-) -> Result<Vec<AddressUtxo>, String> {
+) -> Result<Vec<AddressUtxo>, Fault> {
     let in_round: HashMap<&str, &AddressTx> = txs.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
     let mut seen = HashSet::new();
     let mut coins = Vec::new();
@@ -965,7 +970,7 @@ fn coins(
         let (height, timestamp) = match in_round.get(txid.as_str()) {
             Some(tx) => {
                 if !tx.pays(coin.tx_pos, coin.value) {
-                    return Err(COIN_NOT_PAID.to_owned());
+                    return Err(Fault::coin_not_paid());
                 }
                 let height = tx.height;
                 (
@@ -1097,7 +1102,7 @@ mod tests {
         network: Network,
         proxy: Option<&str>,
         held: &[AddressTx],
-    ) -> Result<AddressWatchState, String> {
+    ) -> Result<AddressWatchState, Fault> {
         super::fetch_state(target, address, network, proxy, held, None)
             .await
             .map(|state| state.expect("nothing is set aside with no status heard"))

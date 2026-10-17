@@ -82,28 +82,15 @@ mod tests;
 
 /// What a server whose proof of a confirmation does not hold is refused
 /// with: a header without the work of its height, or a branch that does
-/// not lead to its root.
+/// not lead to its root. Raised as a [`crate::chain::Fault`] of its own
+/// kind ([`crate::chain::Fault::false_proof`]), which is what a sync's
+/// code is decided on: the same words in a server's refusal are none.
 pub(crate) const FALSE_PROOF: &str = "the server sent a false proof of a confirmation";
 
 /// What a server that lists a coin its own transaction does not pay is
-/// refused with.
+/// refused with, under the same kind
+/// ([`crate::chain::Fault::coin_not_paid`]).
 pub(crate) const COIN_NOT_PAID: &str = "the server listed a coin its transaction does not pay";
-
-/// Whether a server was refused, in `detail`, for a proof that does not
-/// hold: [`FALSE_PROOF`] or [`COIN_NOT_PAID`], said by the core. The same
-/// words in a server's own refusal, which a sync quotes after
-/// "refused the request", do not count: a server does not choose the
-/// code it is refused with.
-pub(crate) fn is_false_proof(detail: &str) -> bool {
-    [FALSE_PROOF, COIN_NOT_PAID].iter().any(|said| {
-        detail.match_indices(said).any(|(at, _)| {
-            !detail[..at]
-                .trim_end()
-                .trim_end_matches(':')
-                .ends_with("refused the request")
-        })
-    })
-}
 
 /// Blocks between two retargets.
 const RETARGET_PERIOD: u32 = 2_016;

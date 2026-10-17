@@ -428,3 +428,39 @@ async fn a_sync_that_fails_after_the_answer_relegates_nothing() {
     watcher.sync_wallet(&wallets[1]).await.unwrap();
     assert!(!asked(&flaky).is_empty(), "relegated by a sync that failed");
 }
+
+/// What a sync fails with is decided on the kind of each failure, never
+/// on its words: a server the core refused for a proof that does not
+/// hold makes the sync fail under `false_proof`, and only one that was
+/// down is relegated. A server's own refusal, in the same words, is a
+/// refusal: the sync fails under `sync`, and nobody is relegated.
+#[test]
+fn a_server_does_not_choose_the_false_proof_code() {
+    use crate::chain::Fault;
+    use crate::chain::electrum::rpc::CallError;
+    use crate::chain::proof::{COIN_NOT_PAID, FALSE_PROOF};
+    use crate::error::ErrorCode;
+    let server = |host: &str| {
+        Endpoint::Electrum(crate::chain::electrum::Target::new(
+            format!("ssl://{host}:50002"),
+            None,
+        ))
+    };
+    let (down, lying) = (server("a.example.org"), server("b.example.org"));
+    let mut attempts = Attempts::default();
+    attempts.failed(&down, &Fault::outage("could not connect"));
+    attempts.failed(&lying, &Fault::coin_not_paid());
+    assert_eq!(attempts.down, [&down]);
+    let failed = sync_failure(&[down.clone(), lying.clone()], attempts);
+    assert_eq!(failed.code(), ErrorCode::FalseProof, "{failed}");
+    assert!(failed.to_string().contains(COIN_NOT_PAID), "{failed}");
+
+    for words in [FALSE_PROOF, COIN_NOT_PAID, "could not connect"] {
+        let mut attempts = Attempts::default();
+        attempts.failed(&lying, &Fault::from(CallError::refused(words)));
+        assert!(attempts.down.is_empty(), "{words}");
+        let failed = sync_failure(std::slice::from_ref(&lying), attempts);
+        assert_eq!(failed.code(), ErrorCode::Sync, "{failed}");
+        assert!(failed.to_string().contains(words), "{failed}");
+    }
+}

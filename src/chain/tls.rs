@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
+
+use crate::chain::Fault;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
@@ -57,14 +59,19 @@ pub(crate) enum Verdict {
 pub(crate) enum ConnectError {
     /// The certificate was refused; the verdict says what to tell the user.
     Certificate(Verdict),
-    /// Everything else: name resolution, refused connection, timeout.
+    /// The server could not be reached: its name does not resolve, it
+    /// refused the connection or did not take it in time, or it cut the
+    /// opening short. An outage, told by the kind of the error.
+    Unreachable(String),
+    /// Everything else: a name that is no host name, an onion without
+    /// Tor, a handshake that failed otherwise.
     Io(String),
 }
 
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ConnectError::Io(detail) => write!(f, "{detail}"),
+            ConnectError::Unreachable(detail) | ConnectError::Io(detail) => write!(f, "{detail}"),
             ConnectError::Certificate(Verdict::Unknown {
                 fingerprint,
                 reason,
@@ -83,6 +90,45 @@ impl std::fmt::Display for ConnectError {
             ConnectError::Certificate(_) => write!(f, "certificate refused"),
         }
     }
+}
+
+/// A certificate refused is an outage: the server cannot be used until
+/// someone decides about it, and a later one may answer meanwhile.
+impl From<ConnectError> for Fault {
+    fn from(error: ConnectError) -> Fault {
+        match error {
+            ConnectError::Certificate(_) => Fault::outage(error.to_string()),
+            ConnectError::Unreachable(detail) => Fault::outage(detail),
+            ConnectError::Io(detail) => Fault::other(detail),
+        }
+    }
+}
+
+/// A failure of the protocol on a connection being opened, of its kind.
+impl From<Fault> for ConnectError {
+    fn from(fault: Fault) -> ConnectError {
+        if fault.is_outage() {
+            ConnectError::Unreachable(fault.to_string())
+        } else {
+            ConnectError::Io(fault.to_string())
+        }
+    }
+}
+
+/// Whether a socket that would not open says the server is down: it
+/// refused the connection, could not be reached or did not answer in
+/// time. Read from the kind of the error, never from its words.
+pub(crate) fn unreachable(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::NetworkDown
+            | ErrorKind::TimedOut
+            | ErrorKind::WouldBlock
+    )
 }
 
 /// SHA-256 of the certificate, in the shape every tool prints it:
@@ -383,7 +429,7 @@ pub(crate) fn onion_handshake<S: Read + Write>(
         .map_err(|e| ConnectError::Io(e.to_string()))?;
     session
         .complete_io(&mut socket)
-        .map_err(|e| ConnectError::Io(format!("TLS handshake failed: {e}")))?;
+        .map_err(|e| ConnectError::Unreachable(format!("TLS handshake failed: {e}")))?;
     Ok(rustls::StreamOwned::new(session, socket))
 }
 
@@ -556,7 +602,7 @@ pub(crate) fn tcp_connect(
     }
     let addresses = (host, port)
         .to_socket_addrs()
-        .map_err(|e| ConnectError::Io(format!("{host} does not resolve: {e}")))?;
+        .map_err(|e| ConnectError::Unreachable(format!("{host} does not resolve: {e}")))?;
     let mut last = None;
     for address in addresses {
         match TcpStream::connect_timeout(&address, timeout) {
@@ -567,12 +613,14 @@ pub(crate) fn tcp_connect(
                     .map_err(|e| ConnectError::Io(e.to_string()))?;
                 return Ok(socket);
             }
-            Err(error) => last = Some(error.to_string()),
+            Err(error) => last = Some(error),
         }
     }
-    Err(ConnectError::Io(last.unwrap_or_else(|| {
-        format!("{host}:{port} has no address to connect to")
-    })))
+    Err(match last {
+        Some(error) if unreachable(&error) => ConnectError::Unreachable(error.to_string()),
+        Some(error) => ConnectError::Io(error.to_string()),
+        None => ConnectError::Io(format!("{host}:{port} has no address to connect to")),
+    })
 }
 
 #[cfg(test)]
@@ -644,10 +692,25 @@ mod tests {
         assert!(!is_fingerprint(&"AB".repeat(32)));
     }
 
+    /// A port nothing listens on is a server out of reach, told by the
+    /// kind of the error the system gives, whatever its words.
     #[test]
-    fn an_unusable_host_name_is_an_io_error_not_a_certificate_one() {
+    fn a_closed_port_is_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let error = tcp_connect("127.0.0.1", port, Duration::from_secs(2)).unwrap_err();
+        assert!(matches!(error, ConnectError::Unreachable(_)), "{error}");
+        assert!(Fault::from(error).is_outage());
+    }
+
+    /// A name that does not resolve is a server out of reach, not a
+    /// certificate refused.
+    #[test]
+    fn an_unusable_host_name_is_unreachable_not_a_certificate_refusal() {
         let error = connect("not a host", 50002, None, Duration::from_millis(200))
             .expect_err("connecting to a broken name must fail");
-        assert!(matches!(error, ConnectError::Io(_)));
+        assert!(matches!(error, ConnectError::Unreachable(_)), "{error}");
+        assert!(Fault::from(error).is_outage());
     }
 }

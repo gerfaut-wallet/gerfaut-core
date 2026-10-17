@@ -12,7 +12,7 @@ pub(crate) mod sync;
 
 use page::PageTx;
 
-use crate::chain::Failure;
+use crate::chain::{Failure, Fault};
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
 use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
@@ -104,7 +104,7 @@ impl Client {
     /// before it answered is asked again at once, a single time: a
     /// connection kept open for the next request, which the server
     /// closes as that request goes out, is the lot of every client.
-    async fn open(&self, path: &str) -> Result<Option<reqwest::Response>, String> {
+    async fn open(&self, path: &str) -> Result<Option<reqwest::Response>, Fault> {
         let url = format!("{}{path}", self.base);
         let mut wait = Duration::from_millis(250);
         let mut tries = 1;
@@ -150,7 +150,7 @@ impl Client {
 
     /// The body of `path`, decompressed and held to `max`; `None` when
     /// the server has nothing there.
-    async fn fetch(&self, path: &str, max: usize) -> Result<Option<Vec<u8>>, String> {
+    async fn fetch(&self, path: &str, max: usize) -> Result<Option<Vec<u8>>, Fault> {
         match self.open(path).await? {
             Some(response) => self.body(response, max).await.map(Some),
             None => Ok(None),
@@ -160,7 +160,7 @@ impl Client {
     /// The JSON answer to `path`, parsed as it arrives and decompresses,
     /// never held whole: what the reading skips, it never keeps. `None`
     /// when the server has nothing there.
-    async fn stream_json<T>(&self, path: &str) -> Result<Option<T>, String>
+    async fn stream_json<T>(&self, path: &str) -> Result<Option<T>, Fault>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
     {
@@ -180,7 +180,7 @@ impl Client {
             serde_json::from_reader::<_, T>(reader)
         });
         let mut read = 0usize;
-        let pumped: Result<(), String> = async {
+        let pumped: Result<(), Fault> = async {
             while let Some(chunk) = response
                 .chunk()
                 .await
@@ -188,7 +188,7 @@ impl Client {
             {
                 read = read.saturating_add(chunk.len());
                 if read > JSON_MAX {
-                    return Err(too_long(JSON_MAX));
+                    return Err(Fault::other(too_long(JSON_MAX)));
                 }
                 // The parsing ended early: it says why below.
                 if chunks.send(chunk).await.is_err() {
@@ -201,11 +201,11 @@ impl Client {
         drop(chunks);
         let parsed = parsing
             .await
-            .map_err(|_| "unexpected response".to_owned())?;
+            .map_err(|_| Fault::other("unexpected response"))?;
         pumped?;
         parsed
             .map(Some)
-            .map_err(|_| "unexpected response".to_owned())
+            .map_err(|_| Fault::other("unexpected response"))
     }
 
     /// Notes that the server asked for `pause` before the next request.
@@ -229,13 +229,13 @@ impl Client {
     }
 
     /// Counts `bytes` of transactions against what one sync may keep.
-    pub(crate) fn keep(&self, bytes: usize) -> Result<(), String> {
-        self.kept.add(bytes)
+    pub(crate) fn keep(&self, bytes: usize) -> Result<(), Fault> {
+        Ok(self.kept.add(bytes)?)
     }
 
     /// The body of an answer, read a chunk at a time, decompressed, and
     /// refused past `max` bytes.
-    async fn body(&self, mut response: reqwest::Response, max: usize) -> Result<Vec<u8>, String> {
+    async fn body(&self, mut response: reqwest::Response, max: usize) -> Result<Vec<u8>, Fault> {
         let mut body = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -243,7 +243,7 @@ impl Client {
             .map_err(|e| describe_request(&e, self.budget))?
         {
             if body.len() + chunk.len() > max {
-                return Err(too_long(max));
+                return Err(Fault::other(too_long(max)));
             }
             body.extend_from_slice(&chunk);
         }
@@ -251,20 +251,20 @@ impl Client {
     }
 
     /// The body of `path`, which must be there.
-    pub(crate) async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, String> {
+    pub(crate) async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, Fault> {
         self.fetch(path, MAX_BODY)
             .await?
             .ok_or_else(|| describe_status(404))
     }
 
     /// A page of a history, read as it is listed: see [`PageTx`].
-    pub(crate) async fn get_page(&self, path: &str) -> Result<Vec<PageTx>, String> {
+    pub(crate) async fn get_page(&self, path: &str) -> Result<Vec<PageTx>, Fault> {
         self.get_json(path).await
     }
 
     /// The JSON answer to `path`, which must be there: see
     /// [`Self::stream_json`].
-    pub(crate) async fn get_json<T>(&self, path: &str) -> Result<T, String>
+    pub(crate) async fn get_json<T>(&self, path: &str) -> Result<T, Fault>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
     {
@@ -274,7 +274,7 @@ impl Client {
     }
 
     /// The same, `None` when the server has nothing there.
-    async fn get_json_opt<T>(&self, path: &str) -> Result<Option<T>, String>
+    async fn get_json_opt<T>(&self, path: &str) -> Result<Option<T>, Fault>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
     {
@@ -282,21 +282,21 @@ impl Client {
     }
 
     /// The body of `path` as one line of text, parsed.
-    async fn get_parsed<T: std::str::FromStr>(&self, path: &str) -> Result<T, String> {
+    async fn get_parsed<T: std::str::FromStr>(&self, path: &str) -> Result<T, Fault> {
         let body = self.get_bytes(path).await?;
         std::str::from_utf8(&body)
             .ok()
             .and_then(|text| text.trim().parse().ok())
-            .ok_or_else(|| "unexpected response".to_owned())
+            .ok_or_else(|| Fault::other("unexpected response"))
     }
 
     /// The height of the server's tip.
-    pub(crate) async fn height(&self) -> Result<u32, String> {
+    pub(crate) async fn height(&self) -> Result<u32, Fault> {
         self.get_parsed("/blocks/tip/height").await
     }
 
     /// The hash of the server's tip.
-    pub(crate) async fn tip_hash(&self) -> Result<BlockHash, String> {
+    pub(crate) async fn tip_hash(&self) -> Result<BlockHash, Fault> {
         self.get_parsed("/blocks/tip/hash").await
     }
 
@@ -304,11 +304,11 @@ impl Client {
     pub(crate) async fn scripthash_stats(
         &self,
         script: &ScriptBuf,
-    ) -> Result<api::ScriptHashStats, String> {
+    ) -> Result<api::ScriptHashStats, Fault> {
         self.get_json(&sync::script_path(script)).await
     }
 
-    async fn address_stats(&self, address: &Address) -> Result<api::AddressStats, String> {
+    async fn address_stats(&self, address: &Address) -> Result<api::AddressStats, Fault> {
         self.get_json(&format!("/address/{address}")).await
     }
 
@@ -318,7 +318,7 @@ impl Client {
         &self,
         address: &Address,
         after: Option<Txid>,
-    ) -> Result<Vec<PageTx>, String> {
+    ) -> Result<Vec<PageTx>, Fault> {
         match after {
             Some(txid) => {
                 self.get_page(&format!("/address/{address}/txs/chain/{txid}"))
@@ -328,29 +328,29 @@ impl Client {
         }
     }
 
-    async fn address_utxos(&self, address: &Address) -> Result<Vec<api::Utxo>, String> {
+    async fn address_utxos(&self, address: &Address) -> Result<Vec<api::Utxo>, Fault> {
         self.get_json(&format!("/address/{address}/utxo")).await
     }
 
     /// A transaction, `None` when the server does not know it.
-    pub(crate) async fn tx(&self, txid: &Txid) -> Result<Option<Transaction>, String> {
+    pub(crate) async fn tx(&self, txid: &Txid) -> Result<Option<Transaction>, Fault> {
         match self.fetch(&format!("/tx/{txid}/raw"), MAX_BODY).await? {
             Some(bytes) => bdk_wallet::bitcoin::consensus::deserialize(&bytes)
                 .map(Some)
-                .map_err(|_| "unexpected response".to_owned()),
+                .map_err(|_| Fault::other("unexpected response")),
             None => Ok(None),
         }
     }
 
     /// Whether the server knows a transaction. What it says of it is
     /// skipped as it is parsed.
-    async fn knows_tx(&self, txid: &Txid) -> Result<bool, String> {
+    async fn knows_tx(&self, txid: &Txid) -> Result<bool, Fault> {
         self.get_json_opt::<serde::de::IgnoredAny>(&format!("/tx/{txid}"))
             .await
             .map(|found| found.is_some())
     }
 
-    async fn tx_status(&self, txid: &Txid) -> Result<api::TxStatus, String> {
+    async fn tx_status(&self, txid: &Txid) -> Result<api::TxStatus, Fault> {
         self.get_json(&format!("/tx/{txid}/status")).await
     }
 
@@ -359,7 +359,7 @@ impl Client {
         &self,
         txid: &Txid,
         vout: u32,
-    ) -> Result<Option<api::OutputStatus>, String> {
+    ) -> Result<Option<api::OutputStatus>, Fault> {
         self.get_json_opt(&format!("/tx/{txid}/outspend/{vout}"))
             .await
     }
@@ -387,10 +387,10 @@ impl Client {
         if (200..300).contains(&status) {
             // Esplora answers with the txid, and nothing else.
             return text.trim().parse().map_err(|_| {
-                Failure::Transport(format!(
+                Failure::Transport(Fault::other(format!(
                     "the server answered {} instead of a txid",
                     crate::chain::server_words(text.trim())
-                ))
+                )))
             });
         }
         if status == 400
@@ -441,7 +441,7 @@ impl Counts {
 /// A client for one instance. `proxy` is the Tor SOCKS proxy the caller
 /// resolved for onion hosts; an onion URL without one is refused here,
 /// before anything could look the name up.
-pub(crate) fn client(url: &str, proxy: Option<&str>) -> Result<Client, String> {
+pub(crate) fn client(url: &str, proxy: Option<&str>) -> Result<Client, Fault> {
     let budget = if crate::chain::is_onion(url) {
         Budget {
             connect: TOR_CONNECT_TIMEOUT,
@@ -460,7 +460,7 @@ pub(crate) fn client(url: &str, proxy: Option<&str>) -> Result<Client, String> {
 /// builder, which knows one timeout: connecting and answering are two
 /// different waits, and a host that is down must not get the budget of
 /// a host that is slow.
-fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, String> {
+fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, Fault> {
     // An Esplora API does not redirect. One that does would send the
     // scripts of the wallet where the route was never checked: in the
     // clear, or an onion name to the system's resolver.
@@ -489,7 +489,7 @@ fn build(url: &str, proxy: Option<&str>, budget: Budget) -> Result<Client, Strin
 
 /// A client for one sync: the same, and what it keeps of the
 /// transactions it reads held to [`crate::chain::KEEP_MAX`].
-pub(crate) fn client_for_run(url: &str, proxy: Option<&str>) -> Result<Client, String> {
+pub(crate) fn client_for_run(url: &str, proxy: Option<&str>) -> Result<Client, Fault> {
     let mut client = client(url, proxy)?;
     client.kept = crate::chain::Kept::up_to(crate::chain::KEEP_MAX);
     Ok(client)
@@ -587,16 +587,19 @@ fn http_date(text: &str) -> Option<u64> {
         .checked_add(hours * 3_600 + minutes * 60 + seconds)
 }
 
-/// A server that limited the rate of requests, and the wait it asked for.
-fn rate_limited(pause: Duration) -> String {
-    format!(
+/// A server that limited the rate of requests, and the wait it asked for:
+/// an outage.
+fn rate_limited(pause: Duration) -> Fault {
+    Fault::outage(format!(
         "{}, try again in {} s",
         describe_status(429),
         pause.as_secs()
-    )
+    ))
 }
 
-fn describe_status(status: u16) -> String {
+/// A status that is no success, in words: an outage for a 429 or a 5xx,
+/// read from the status, not from the words.
+fn describe_status(status: u16) -> Fault {
     let reason = match status {
         400 => "bad request",
         401 | 403 => "access refused",
@@ -605,61 +608,73 @@ fn describe_status(status: u16) -> String {
         500..=599 => "server error",
         _ => "unexpected status",
     };
-    format!("HTTP {status}: {reason}")
+    let words = format!("HTTP {status}: {reason}");
+    if status == 429 || (500..=599).contains(&status) {
+        Fault::outage(words)
+    } else {
+        Fault::other(words)
+    }
 }
 
 /// What went wrong on the way to the server, by asking the error and
 /// what it wraps rather than reading their text: `reqwest` says only
 /// "error sending request", the cause sits several layers below.
-fn describe_request(error: &reqwest::Error, budget: Budget) -> String {
+fn describe_request(error: &reqwest::Error, budget: Budget) -> Fault {
     if error.is_timeout() {
-        return if error.is_connect() {
+        return Fault::outage(if error.is_connect() {
             format!("could not connect within {} s", budget.connect.as_secs())
         } else {
             format!("timed out after {} s", budget.total.as_secs())
-        };
+        });
     }
-    describe_failure(error)
+    fault_of(error)
 }
 
-/// The same, a timeout aside: what the budgets say about one is the
-/// caller's, the rest reads the same for every client of the crate.
+/// The same, a timeout aside, in words: what the budgets say about one is
+/// the caller's, the rest reads the same for every client of the crate.
 pub(crate) fn describe_failure(error: &reqwest::Error) -> String {
+    fault_of(error).detail().to_owned()
+}
+
+/// [`describe_failure`], and its kind, read from what the error is: a
+/// connection that failed, its TLS or its name, or one cut short, is an
+/// outage; a failure through the Tor proxy is this device's.
+fn fault_of(error: &reqwest::Error) -> Fault {
     if error.is_connect() {
         // The TLS library's own error type, however deep it is wrapped.
         // Its words are the ones to keep: which certificate check
         // failed, or what came back in place of a handshake.
         if let Some(cause) = find_cause(error, &mut |cause| cause.is::<rustls::Error>()) {
-            return format!("TLS handshake failed: {cause}");
+            return Fault::outage(format!("TLS handshake failed: {cause}"));
         }
         // The connector names the step that failed; the resolver's own
         // words hang below it and vary by platform.
         if find_cause(error, &mut |cause| cause.to_string() == "dns error").is_some() {
-            return "host not found".to_owned();
+            return Fault::outage("host not found");
         }
         // The proxy step names itself too, and the SOCKS client's own
         // words hang below it: a refusal, or a handshake cut short.
         if let Some(cause) = find_cause(error, &mut |cause| {
             cause.to_string().contains("socks proxy")
         }) {
-            return match cause.source() {
+            return Fault::other(match cause.source() {
                 Some(reason) => {
                     let reason = reason.to_string();
                     let reason = reason.strip_prefix("SOCKS error: ").unwrap_or(&reason);
                     format!("could not connect through Tor: {reason}")
                 }
                 None => "could not connect through Tor".to_owned(),
-            };
+            });
         }
-        return "could not connect".to_owned();
+        return Fault::outage("could not connect");
     }
     if error.is_body() || error.is_decode() {
-        return "unexpected response".to_owned();
+        return Fault::other("unexpected response");
     }
     if closed_early(error) {
-        return "the connection was closed".to_owned();
+        return Fault::outage("the connection was closed");
     }
-    "request failed".to_owned()
+    Fault::other("request failed")
 }
 
 /// Whether the server hung up before it answered, once connected: a
@@ -724,7 +739,7 @@ pub(crate) async fn fetch_address_state(
     address: &str,
     network: Network,
     held: &[AddressTx],
-) -> Result<AddressWatchState, String> {
+) -> Result<AddressWatchState, Fault> {
     let address = parse_address(address, network)?;
     let our_script = address.script_pubkey();
     check_network(client, network).await?;
@@ -786,7 +801,7 @@ pub(crate) async fn coins(
     utxos: Vec<api::Utxo>,
     round: &HistoryRound,
     held: &[AddressTx],
-) -> Result<Vec<AddressUtxo>, String> {
+) -> Result<Vec<AddressUtxo>, Fault> {
     use crate::chain::proof::{ProvenCoin, pays, proven_coin, remember_coin};
     use bdk_wallet::chain::BlockId;
     use std::collections::{HashMap, HashSet};
@@ -862,10 +877,10 @@ pub(crate) async fn coins(
                 continue;
             };
             if tx.compute_txid() != *txid {
-                return Err(
+                return Err(Fault::other(
                     "the server answered with another transaction than the one asked for"
                         .to_owned(),
-                );
+                ));
             }
             client.keep(tx.total_size())?;
             let paid = listed_of
@@ -874,7 +889,7 @@ pub(crate) async fn coins(
                 .flatten()
                 .all(|utxo| pays(&tx, utxo.vout, ours, utxo.value));
             if !paid {
-                return Err(crate::chain::proof::COIN_NOT_PAID.to_owned());
+                return Err(Fault::coin_not_paid());
             }
             read.insert(*txid);
         }
@@ -905,7 +920,7 @@ pub(crate) async fn coins(
         let (height, timestamp) = match in_round.get(txid.as_str()) {
             Some(tx) => {
                 if !tx.pays(utxo.vout, utxo.value) {
-                    return Err(crate::chain::proof::COIN_NOT_PAID.to_owned());
+                    return Err(Fault::coin_not_paid());
                 }
                 (tx.height, tx.timestamp)
             }
@@ -933,7 +948,7 @@ pub(crate) async fn fetch_address_history(
     address: &str,
     network: Network,
     from: &str,
-) -> Result<HistoryRound, String> {
+) -> Result<HistoryRound, Fault> {
     let address = parse_address(address, network)?;
     let our_script = address.script_pubkey();
     let from: Txid = from
@@ -956,10 +971,10 @@ pub(crate) async fn fetch_address_history(
 
 /// The server's tip, refused past any height a chain of `network` can
 /// have reached ([`crate::chain::height_limit`]).
-async fn read_tip(client: &Client, network: Network) -> Result<u32, String> {
+async fn read_tip(client: &Client, network: Network) -> Result<u32, Fault> {
     let tip = client.height().await?;
     if tip > crate::chain::height_limit(network, crate::now_secs()) {
-        return Err(crate::chain::IMPOSSIBLE_TIP.to_owned());
+        return Err(Fault::other(crate::chain::IMPOSSIBLE_TIP));
     }
     Ok(tip)
 }
@@ -970,14 +985,14 @@ async fn read_tip(client: &Client, network: Network) -> Result<u32, String> {
 /// saw. A descriptor wallet's sync finds that out walking the wallet's
 /// chain down to the server's; a watched address keeps no chain, and
 /// asks.
-pub(crate) async fn check_network(client: &Client, network: Network) -> Result<(), String> {
+pub(crate) async fn check_network(client: &Client, network: Network) -> Result<(), Fault> {
     let text = client.get_bytes("/block-height/0").await?;
     let genesis: BlockHash = std::str::from_utf8(&text)
         .ok()
         .and_then(|text| text.trim().parse().ok())
-        .ok_or_else(|| "unexpected response".to_owned())?;
+        .ok_or_else(|| Fault::other("unexpected response"))?;
     if !crate::chain::is_genesis_of(network, genesis) {
-        return Err(crate::chain::ANOTHER_NETWORK.to_owned());
+        return Err(Fault::other(crate::chain::ANOTHER_NETWORK));
     }
     Ok(())
 }
@@ -1021,7 +1036,7 @@ async fn history_round(
     from: Option<Txid>,
     confirmed_total: Option<usize>,
     held: &[AddressTx],
-) -> Result<HistoryRound, String> {
+) -> Result<HistoryRound, Fault> {
     let known: std::collections::HashMap<&str, Option<u32>> = held
         .iter()
         .map(|tx| (tx.txid.as_str(), tx.height))
@@ -1047,10 +1062,9 @@ async fn history_round(
             }
             let whole = tx.to_tx();
             if whole.compute_txid() != tx.txid {
-                return Err(
-                    "the server answered with another transaction than the one it listed"
-                        .to_owned(),
-                );
+                return Err(Fault::other(
+                    "the server answered with another transaction than the one it listed",
+                ));
             }
             if let (true, Some(height), Some(hash)) = (
                 tx.status.confirmed,
@@ -1068,7 +1082,7 @@ async fn history_round(
             client.keep(crate::chain::held_by(&tx))?;
             txs.push(tx);
         }
-        Ok::<_, String>((confirmed, last_seen, all_held))
+        Ok::<_, Fault>((confirmed, last_seen, all_held))
     };
     let (mut confirmed_so_far, mut last, mut all_held) =
         read(client.address_txs(address, from).await?, &mut txs)?;
@@ -1147,7 +1161,7 @@ fn fill_from_held(
     held: &[AddressTx],
     confirmed_so_far: usize,
     total: usize,
-) -> Result<Option<usize>, String> {
+) -> Result<Option<usize>, Fault> {
     let Some(below) = txs.iter().rev().find_map(|tx| tx.height) else {
         return Ok(None);
     };
@@ -1373,7 +1387,7 @@ pub(crate) async fn tx_standing(
     client: &Client,
     network: Network,
     txid: &Txid,
-) -> Result<TxStanding, String> {
+) -> Result<TxStanding, Fault> {
     let tip_height = client.height().await?;
     let found = client.knows_tx(txid).await?;
     if !found {
@@ -1433,7 +1447,8 @@ mod error_tests {
             )
         };
         let refused = |words: &str| Err(Failure::Refused(words.to_owned()));
-        let transport = |text: &str| Err::<Txid, _>(Failure::Transport(text.to_owned()));
+        let transport = |text: &str| Err::<Txid, _>(Failure::Transport(Fault::other(text)));
+        let down = |text: &str| Err::<Txid, _>(Failure::Transport(Fault::outage(text)));
         let txid = tx.compute_txid().to_string();
         for (status, body, expected) in [
             ("200 OK", txid.as_str(), Ok(tx.compute_txid())),
@@ -1490,13 +1505,9 @@ mod error_tests {
             (
                 "503 Service Unavailable",
                 "busy",
-                transport("HTTP 503: server error"),
+                down("HTTP 503: server error"),
             ),
-            (
-                "429 Too Many Requests",
-                "",
-                transport("HTTP 429: rate limited"),
-            ),
+            ("429 Too Many Requests", "", down("HTTP 429: rate limited")),
             (
                 "200 OK",
                 "<html>maintenance</html>",
@@ -1565,7 +1576,7 @@ mod error_tests {
         let client = build(&format!("http://{address}"), None, BUDGET).unwrap();
         let error = client.height().await.unwrap_err();
         assert_eq!(error, "timed out after 1 s");
-        assert!(crate::chain::is_outage(&error));
+        assert!(error.is_outage());
     }
 
     /// A server that hangs up before it answers, having read the request
@@ -1593,7 +1604,7 @@ mod error_tests {
                 error, "the connection was closed",
                 "read first: {read_first}"
             );
-            assert!(crate::chain::is_outage(&error));
+            assert!(error.is_outage());
             assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
         }
     }
@@ -1621,7 +1632,7 @@ mod error_tests {
         let client = build(&format!("http://{address}"), None, PATIENT).unwrap();
         let error = client.height().await.unwrap_err();
         assert_eq!(error, "could not connect");
-        assert!(crate::chain::is_outage(&error));
+        assert!(error.is_outage());
     }
 
     #[tokio::test]
@@ -1630,7 +1641,7 @@ mod error_tests {
         let client = build("http://esplora.invalid", None, PATIENT).unwrap();
         let error = client.height().await.unwrap_err();
         assert_eq!(error, "host not found");
-        assert!(crate::chain::is_outage(&error));
+        assert!(error.is_outage());
     }
 
     /// A server that answers the handshake with something that is not
@@ -1663,7 +1674,7 @@ mod error_tests {
             described.starts_with("TLS handshake failed: received corrupt message"),
             "{described}"
         );
-        assert!(crate::chain::is_outage(&described));
+        assert!(described.is_outage());
     }
 
     /// A proxy that turns the handshake down: the SOCKS client's own
@@ -1690,7 +1701,7 @@ mod error_tests {
             "could not connect through Tor: server does not support user/pass authentication"
         );
         // The route, not the server: it relegates nothing.
-        assert!(!crate::chain::is_outage(&error));
+        assert!(!error.is_outage());
     }
 
     /// A server that answers with `status` and `body` gzipped, whatever
@@ -1754,7 +1765,7 @@ mod error_tests {
         };
         assert_eq!(
             broadcast(&client, &tx).await.unwrap_err(),
-            Failure::Transport("the server sent an answer longer than 64 KiB".to_owned())
+            Failure::Transport(Fault::other("the server sent an answer longer than 64 KiB"))
         );
     }
 
@@ -1828,16 +1839,15 @@ mod error_tests {
         assert_eq!(short.take_rate_limit(), Some(RATE_WAIT_MIN));
     }
 
-    /// A server error or a limited rate is an outage, in the words this
-    /// client puts them in; a request the server finds bad is not.
+    /// A server error or a limited rate is an outage, told by its status;
+    /// a request the server finds bad is not.
     #[test]
     fn server_errors_and_limited_rates_are_outages() {
-        use crate::chain::is_outage;
-        assert!(is_outage(&describe_status(500)));
-        assert!(is_outage(&describe_status(503)));
-        assert!(is_outage(&rate_limited(RATE_WAIT_MIN)));
-        assert!(!is_outage(&describe_status(400)));
-        assert!(!is_outage(&describe_status(404)));
+        assert!(describe_status(500).is_outage());
+        assert!(describe_status(503).is_outage());
+        assert!(rate_limited(RATE_WAIT_MIN).is_outage());
+        assert!(!describe_status(400).is_outage());
+        assert!(!describe_status(404).is_outage());
     }
 
     /// `Retry-After` names a wait in seconds, or the date to come back at.
