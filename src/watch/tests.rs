@@ -1185,7 +1185,7 @@ fn a_stale_server_is_compared_with_its_operator_only() {
     let others = |endpoint: &Endpoint| -> Vec<String> {
         electrum::siblings(listed.clone(), endpoint)
             .iter()
-            .map(Endpoint::label)
+            .map(|(other, _)| other.label())
             .collect()
     };
     assert_eq!(others(&listed[0]), ["electrum.blockstream.info"]);
@@ -1196,10 +1196,11 @@ fn a_stale_server_is_compared_with_its_operator_only() {
     ));
     let mut with_another = listed.clone();
     with_another.insert(1, diynodes.clone());
-    assert_eq!(
-        electrum::siblings(with_another, &listed[0]),
-        [listed[1].clone()]
-    );
+    let found: Vec<Endpoint> = electrum::siblings(with_another, &listed[0])
+        .into_iter()
+        .map(|(other, _)| other)
+        .collect();
+    assert_eq!(found, [listed[1].clone()]);
     assert!(electrum::siblings(listed.clone(), &diynodes).is_empty());
     let own = candidates(&config(BackendConfig::CustomElectrum {
         url: "ssl://node.example.org:50002".to_owned(),

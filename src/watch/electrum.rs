@@ -44,7 +44,7 @@ use tokio::time::Instant;
 
 use super::{ChangeReason, Exit, Hub, Wake, WatchState, WatchTransport};
 use crate::chain::electrum::{CLIENT_NAME, Target, parse, words};
-use crate::chain::net::{self, BoxStream, LineReader, Security};
+use crate::chain::net::{self, BoxStream, LineReader};
 use crate::chain::{ANOTHER_NETWORK, Endpoint, is_genesis_of};
 use crate::network::Network;
 
@@ -120,10 +120,6 @@ struct Session {
 }
 
 pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> Exit {
-    let (tls, host, port) = match parse(&target.url) {
-        Ok(parts) => parts,
-        Err(detail) => return Exit::Unreachable(detail),
-    };
     let label = endpoint.label();
     hub.set_status(|status| {
         if status.state != WatchState::Reconnecting {
@@ -138,18 +134,9 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
         Err(exit) => return exit,
     };
     let budget = hub.connect_budget(endpoint);
-    let pin = target.pin.clone();
     let network = hub.config.network;
-    let opening = async move {
-        let security = if tls {
-            Security::Electrum {
-                pin: pin.as_deref(),
-            }
-        } else {
-            Security::Plain
-        };
-        open(&host, port, security, proxy.as_deref(), network, budget).await
-    };
+    let target = target.clone();
+    let opening = async move { open(&target, proxy.as_deref(), network, budget).await };
     let Opened {
         mut reader,
         writer,
@@ -622,14 +609,13 @@ struct Opened {
 /// of any script. A server of another network, a signet port typed for
 /// testnet4, would report changes that never happened on the wallet's.
 async fn open(
-    host: &str,
-    port: u16,
-    security: Security<'_>,
+    target: &Target,
     proxy: Option<&str>,
     network: Network,
     budget: Duration,
 ) -> Result<Opened, Exit> {
-    let stream = net::open(host, port, security, proxy, budget)
+    let (tls, host, port) = parse(&target.url).map_err(Exit::Unreachable)?;
+    let stream = net::open(&host, port, target.security(tls), proxy, budget)
         .await
         .map_err(Exit::Unreachable)?;
     let (reader, mut writer) = tokio::io::split(stream);
@@ -672,23 +658,26 @@ async fn open(
 
 /// The Electrum servers of `candidates` other than `endpoint` that its
 /// operator runs, in their order: through Tor when it is, in the clear
-/// when it is not.
-pub(super) fn siblings(candidates: Vec<Endpoint>, endpoint: &Endpoint) -> Vec<Endpoint> {
+/// when it is not. One runs the other when its host is the other's, or
+/// one under it ([`super::runs`]), as the watch picks the Electrum
+/// servers of an operator of the rotation.
+pub(super) fn siblings(candidates: Vec<Endpoint>, endpoint: &Endpoint) -> Vec<(Endpoint, Target)> {
+    let ours = endpoint.label();
     candidates
         .into_iter()
-        .filter(|other| matches!(other, Endpoint::Electrum(_)))
-        .filter(|other| other != endpoint && same_operator(other, endpoint))
-        .filter(|other| other.is_onion() == endpoint.is_onion())
+        .filter(|other| other != endpoint && other.is_onion() == endpoint.is_onion())
+        .filter(|other| {
+            let theirs = other.label();
+            super::runs(&ours, &theirs) || super::runs(&theirs, &ours)
+        })
+        .filter_map(|other| match &other {
+            Endpoint::Electrum(target) => {
+                let target = target.clone();
+                Some((other, target))
+            }
+            Endpoint::Esplora(_) => None,
+        })
         .collect()
-}
-
-/// Whether two servers are run by one operator: the same host, or one
-/// under the other, `electrum.blockstream.info` under `blockstream.info`,
-/// the way the watch picks the Electrum servers of an operator of the
-/// rotation ([`super::servers_for`]).
-fn same_operator(one: &Endpoint, other: &Endpoint) -> bool {
-    let (one, other) = (one.label(), other.label());
-    one == other || one.ends_with(&format!(".{other}")) || other.ends_with(&format!(".{one}"))
 }
 
 /// Reads the tip of the other Electrum servers the watch may talk to
@@ -700,14 +689,10 @@ fn tip_elsewhere(hub: &Hub, endpoint: &Endpoint) -> Option<Probe> {
     let candidates = super::candidates(&hub.config).unwrap_or_default();
     let others: Vec<(Endpoint, Target, Duration)> = siblings(candidates, endpoint)
         .into_iter()
-        .filter(|other| hub.shunned_until(other).is_none())
-        .filter_map(|other| match &other {
-            Endpoint::Electrum(target) => {
-                let target = target.clone();
-                let budget = hub.connect_budget(&other);
-                Some((other, target, budget))
-            }
-            Endpoint::Esplora(_) => None,
+        .filter(|(other, _)| hub.shunned_until(other).is_none())
+        .map(|(other, target)| {
+            let budget = hub.connect_budget(&other);
+            (other, target, budget)
         })
         .collect();
     if others.is_empty() {
@@ -743,20 +728,11 @@ async fn tip_of(
     network: Network,
     budget: Duration,
 ) -> Result<u32, String> {
-    let (tls, host, port) = parse(&target.url)?;
-    let security = if tls {
-        Security::Electrum {
-            pin: target.pin.as_deref(),
-        }
-    } else {
-        Security::Plain
-    };
-    let proxy = proxy.filter(|_| crate::chain::is_onion(&target.url));
     let Opened {
         mut reader,
         mut writer,
         ..
-    } = open(&host, port, security, proxy, network, budget)
+    } = open(target, proxy, network, budget)
         .await
         .map_err(|exit| format!("{exit:?}"))?;
     let tip = json!({

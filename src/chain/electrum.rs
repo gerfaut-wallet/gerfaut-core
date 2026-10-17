@@ -77,6 +77,20 @@ impl Target {
             pin,
         }
     }
+
+    /// How a connection to this server is secured, `tls` as [`parse`]
+    /// read the address: TLS checked by the verifier every Electrum
+    /// connection goes through, the fingerprint accepted for this server
+    /// included, or nothing over plain TCP.
+    pub(crate) fn security(&self, tls: bool) -> crate::chain::net::Security<'_> {
+        if tls {
+            crate::chain::net::Security::Electrum {
+                pin: self.pin.as_deref(),
+            }
+        } else {
+            crate::chain::net::Security::Plain
+        }
+    }
 }
 
 /// What a settings screen needs to know about a server's certificate.

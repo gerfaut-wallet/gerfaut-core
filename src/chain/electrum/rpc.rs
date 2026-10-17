@@ -24,7 +24,7 @@ use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use super::{
     CLIENT_NAME, MAX_LINE, MAX_READ, PROTOCOL, TIMEOUT, TOR_TIMEOUT, Target, parse, too_long, words,
 };
-use crate::chain::net::{self, BoxStream, LineReader, LineTooLong, Security};
+use crate::chain::net::{self, BoxStream, LineReader, LineTooLong};
 
 /// Requests awaiting their answer at any time.
 const WINDOW: usize = 16;
@@ -96,15 +96,8 @@ impl Connection {
         let (tls, host, port) = parse(&target.url)?;
         let onion = super::is_onion(target, &host);
         let timeout = if onion { TOR_TIMEOUT } else { TIMEOUT };
-        let security = if tls {
-            Security::Electrum {
-                pin: target.pin.as_deref(),
-            }
-        } else {
-            Security::Plain
-        };
         let proxy = proxy.filter(|_| onion);
-        let stream = net::open(&host, port, security, proxy, timeout).await?;
+        let stream = net::open(&host, port, target.security(tls), proxy, timeout).await?;
         let (reader, writer) = tokio::io::split(stream);
         let mut connection = Connection {
             reader: LineReader::new(reader, MAX_LINE),
