@@ -1372,6 +1372,50 @@ async fn a_server_that_goes_back_is_compared_at_once() {
     .await;
 }
 
+/// A host that wakes the watch up more often than the wait without a
+/// block keeps it counting: the time awake adds up, and the server is
+/// asked for its tip once the wait has run out, from one wake-up to the
+/// next.
+#[tokio::test]
+async fn wake_ups_do_not_put_the_look_off() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (quiet, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    let _stand_in = automatic(&rotation, &[&quiet, &other]);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            keepalive: Duration::from_millis(100),
+            pong: Duration::from_secs(5),
+            stale: Duration::from_millis(600),
+            ..timings()
+        }),
+    );
+    until(&watch, "connected", |s| {
+        s.state == WatchState::Connected && s.pushed_scripts == 1
+    })
+    .await;
+    // Nothing more from the server: each wake-up finds it idle.
+    quiet.state.lock().unwrap().silent = true;
+    let asked_tips = || {
+        let state = quiet.state.lock().unwrap();
+        state
+            .asked
+            .iter()
+            .filter(|method| *method == "blockchain.headers.subscribe")
+            .count()
+    };
+    let started = std::time::Instant::now();
+    while asked_tips() < 2 {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the look never came"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        watch.tick();
+    }
+}
+
 /// The tip of a stale server is read only from another Electrum server
 /// of its operator: on mainnet, Blockstream's other one, and never the
 /// Esplora servers of the rotation, nor an Electrum server of the

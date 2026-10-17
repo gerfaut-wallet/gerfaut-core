@@ -254,9 +254,11 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
                 Wake::Tick { idle } => {
                     // A deadline set before the device slept says
                     // nothing about the server.
+                    // A look under way began before: it starts over,
+                    // at once if its time came during the sleep. The
+                    // time awake without a block still counts.
                     if idle > hub.timings.keepalive * 2 {
                         session.pong_by = None;
-                        session.block_at = Instant::now();
                         session.look = Look::Idle;
                     }
                     session.ping(hub.pong_budget(endpoint)).await
