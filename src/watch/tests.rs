@@ -1857,6 +1857,31 @@ fn a_node_is_told_the_setting_of_its_software() {
     assert_eq!(raise(None), Some((None, Vec::new())));
 }
 
+/// What a server says it runs is read one way for all it decides: an
+/// ElectrumX that puts a space before its name is told its own setting
+/// and keeps the narrow window on the user's node, as any ElectrumX.
+#[test]
+fn a_server_is_read_the_same_way_for_its_setting_and_its_window() {
+    for words in ["ElectrumX 1.18.0", " ElectrumX 1.18.0", "electrumx 2.0.0\t"] {
+        assert_eq!(
+            Software::of(Some(words)),
+            Software::Named(ServerSoftware::ElectrumX),
+            "{words:?}"
+        );
+        assert_eq!(electrum::window_for(true, Some(words)), electrum::WINDOW);
+    }
+    assert_eq!(Software::of(Some(" electrs/0.12.0")), Software::Electrs);
+    assert_eq!(
+        electrum::window_for(true, Some(" electrs/0.12.0")),
+        electrum::OWN_NODE_WINDOW
+    );
+    assert_eq!(
+        electrum::window_for(false, Some("electrs/0.12.0")),
+        electrum::WINDOW
+    );
+    assert_eq!(Software::of(None), Software::Unknown);
+}
+
 /// The verdict: the server as soon as it refused a script, the limits of
 /// the watch otherwise; and the way out, a node of one's own anywhere
 /// else, and on it, the setting of the server when its limit on one

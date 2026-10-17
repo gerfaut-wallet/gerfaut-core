@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::time::Instant;
 
-use super::{ChangeReason, Exit, Hub, Wake, WatchState, WatchTransport};
+use super::{ChangeReason, Exit, Hub, ServerSoftware, Software, Wake, WatchState, WatchTransport};
 use crate::chain::electrum::{CLIENT_NAME, Target, parse, words};
 use crate::chain::net::{self, BoxStream, LineReader, Security};
 use crate::chain::{ANOTHER_NETWORK, Endpoint, is_genesis_of};
@@ -644,9 +644,8 @@ fn names_a_limit(refusal: &str) -> bool {
 
 /// The window of a session: [`OWN_NODE_WINDOW`] on the user's own node,
 /// unless it runs ElectrumX, and [`WINDOW`] everywhere else.
-fn window_for(own_node: bool, software: Option<&str>) -> usize {
-    let electrumx =
-        software.is_some_and(|software| software.to_ascii_lowercase().starts_with("electrumx"));
+pub(super) fn window_for(own_node: bool, software: Option<&str>) -> usize {
+    let electrumx = Software::of(software) == Software::Named(ServerSoftware::ElectrumX);
     if own_node && !electrumx {
         OWN_NODE_WINDOW
     } else {
