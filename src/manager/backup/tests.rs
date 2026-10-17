@@ -1033,9 +1033,199 @@ fn signet_wallet(name: &str, branch: u32) -> BackupWallet {
     }
 }
 
+fn settings_only(
+    backends: Vec<(Network, BackendConfig)>,
+    certs: Vec<(&str, String)>,
+) -> BackupPayload {
+    BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: Vec::new(),
+        backends: Some(backends.into_iter().collect()),
+        electrum_certs: Some(
+            certs
+                .into_iter()
+                .map(|(host, fingerprint)| (host.to_owned(), fingerprint))
+                .collect(),
+        ),
+        gap_limit: None,
+    }
+}
+
+fn electrum(url: &str) -> BackendConfig {
+    BackendConfig::CustomElectrum {
+        url: url.to_owned(),
+        own_node: false,
+    }
+}
+
+const APPLY: ImportChoices = ImportChoices {
+    indexes: None,
+    apply_settings: true,
+};
+
+/// Previews then restores `payload` on `manager`, settings applied, and
+/// checks the preview promised exactly the pins the restore made.
+async fn restore_pins(manager: &WalletManager, payload: &BackupPayload) -> Vec<String> {
+    let before = manager.settings().await.electrum_certs;
+    let text = data_encoding::BASE64.encode(&backup::seal(payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    manager
+        .import_backup(&text, BACKUP_PASSWORD, &APPLY)
+        .await
+        .unwrap();
+    let after = manager.settings().await.electrum_certs;
+    let added: Vec<String> = after
+        .keys()
+        .filter(|host| before.get(*host) != after.get(*host))
+        .cloned()
+        .collect();
+    assert_eq!(preview.electrum_hosts, added, "the preview promised these");
+    added
+}
+
+/// A pin of the backup for the Electrum server the vault already uses,
+/// on a network the restore leaves alone, is restored: that server is
+/// reached without anyone typing it. Once the backup replaces that
+/// network's backend, the server is no longer in service, and its pin
+/// stays out.
+#[tokio::test]
+async fn a_backup_pins_the_server_the_vault_keeps_using() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    manager
+        .set_backend(Network::Signet, electrum("ssl://mine.example.org:50002"))
+        .await
+        .unwrap();
+    let kept = settings_only(
+        vec![(Network::Mainnet, electrum("ssl://theirs.example.org:50002"))],
+        vec![
+            ("mine.example.org:50002", fingerprint("AA")),
+            ("theirs.example.org:50002", fingerprint("BB")),
+        ],
+    );
+    assert_eq!(
+        restore_pins(&manager, &kept).await,
+        vec![
+            "mine.example.org:50002".to_owned(),
+            "theirs.example.org:50002".to_owned()
+        ]
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let manager = crate::manager::tests::support::manager(dir.path()).await;
+    manager
+        .set_backend(Network::Signet, electrum("ssl://mine.example.org:50002"))
+        .await
+        .unwrap();
+    let replaced = settings_only(
+        vec![(Network::Signet, electrum("ssl://theirs.example.org:50002"))],
+        vec![
+            ("mine.example.org:50002", fingerprint("AA")),
+            ("theirs.example.org:50002", fingerprint("BB")),
+        ],
+    );
+    assert_eq!(
+        restore_pins(&manager, &replaced).await,
+        vec!["theirs.example.org:50002".to_owned()]
+    );
+}
+
+/// Two entries of a backup for one host under two spellings: when they
+/// agree, the host is pinned once; when they do not, it is not pinned
+/// at all, and the preview does not promise it.
+#[tokio::test]
+async fn two_spellings_of_one_host_pin_it_only_when_they_agree() {
+    let backends = vec![(Network::Signet, electrum("ssl://node.example.org:50002"))];
+
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let agree = settings_only(
+        backends.clone(),
+        vec![
+            ("ssl://Node.Example.org.:50002", fingerprint("aa")),
+            ("node.example.org:50002", fingerprint("AA")),
+        ],
+    );
+    assert_eq!(
+        restore_pins(&manager, &agree).await,
+        vec!["node.example.org:50002".to_owned()]
+    );
+    assert_eq!(
+        manager.settings().await.electrum_certs["node.example.org:50002"],
+        fingerprint("AA")
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let manager = crate::manager::tests::support::manager(dir.path()).await;
+    let disagree = settings_only(
+        backends,
+        vec![
+            ("ssl://Node.Example.org.:50002", fingerprint("AA")),
+            ("node.example.org:50002", fingerprint("BB")),
+        ],
+    );
+    assert!(restore_pins(&manager, &disagree).await.is_empty());
+    assert!(manager.settings().await.electrum_certs.is_empty());
+}
+
+/// A host the vault pins already keeps its own pin, whatever the
+/// backup says, and the preview does not announce the backup's.
+#[tokio::test]
+async fn a_pin_already_in_the_vault_is_neither_replaced_nor_promised() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    manager
+        .trust_certificate("ssl://node.example.org:50002", &fingerprint("AA"))
+        .await
+        .unwrap();
+    let payload = settings_only(
+        vec![(Network::Signet, electrum("ssl://node.example.org:50002"))],
+        vec![("node.example.org:50002", fingerprint("BB"))],
+    );
+    assert!(restore_pins(&manager, &payload).await.is_empty());
+    assert_eq!(
+        manager.settings().await.electrum_certs["node.example.org:50002"],
+        fingerprint("AA")
+    );
+}
+
+/// Two copies of one wallet in a backup come back as one: the preview
+/// marks the second as watched, which is what the restore makes of it.
+#[tokio::test]
+async fn two_copies_of_a_wallet_in_a_backup_restore_once() {
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: vec![signet_wallet("First", 0), signet_wallet("Copy", 0)],
+        backends: None,
+        electrum_certs: None,
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    let watched: Vec<_> = preview.wallets.iter().map(|w| w.already_watched).collect();
+    assert_eq!(watched, vec![false, true]);
+    let report = manager
+        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+        .await
+        .unwrap();
+    assert_eq!(report.added.len(), 1);
+    assert_eq!(report.added[0].name, "First");
+    assert_eq!(report.skipped, 1);
+}
+
 /// A wallet whose keys are of another network than the one it says
-/// is refused in words that name the network its keys are for; an
-/// address the same.
+/// is refused in words that name the network its keys are for, in the
+/// preview and in the restore alike; an address the same.
 #[tokio::test]
 async fn a_wallet_on_the_wrong_network_names_the_network_of_its_keys() {
     let mut test_keys = signet_wallet("Test keys", 0);
@@ -1077,4 +1267,72 @@ async fn a_wallet_on_the_wrong_network_names_the_network_of_its_keys() {
             "network mismatch: input is for signet or testnet4, expected mainnet",
         ]
     );
+    let report = manager
+        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+        .await
+        .unwrap();
+    let left_out: Vec<_> = report.refused.iter().map(|r| r.reason.clone()).collect();
+    assert_eq!(left_out, reasons);
+
+    let only = ImportChoices {
+        indexes: Some(vec![0]),
+        apply_settings: false,
+    };
+    let error = manager
+        .import_backup(&text, BACKUP_PASSWORD, &only)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid backup: \"Test keys\" cannot be restored: network mismatch: input is for \
+         signet, testnet4 or regtest, expected mainnet"
+    );
+}
+
+/// A descriptor the engine would refuse before deriving anything, two
+/// branches in one or the same key twice, is refused by the preview as
+/// by the restore: what the preview lets through is what the engine
+/// takes.
+#[tokio::test]
+async fn the_preview_refuses_what_the_engine_refuses() {
+    let mut multipath = signet_wallet("Both branches", 0);
+    multipath.kind = WalletKind::Descriptors {
+        external: format!("wpkh({TPUB}/<0;1>/*)"),
+        internal: None,
+        script: crate::input::ScriptKind::Segwit,
+    };
+    let mut repeated = signet_wallet("Same key twice", 0);
+    repeated.kind = WalletKind::Descriptors {
+        external: format!("wsh(multi(2,{TPUB}/0/*,{TPUB}/0/*))"),
+        internal: None,
+        script: crate::input::ScriptKind::WitnessScript,
+    };
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: vec![multipath, repeated, signet_wallet("Fine", 3)],
+        backends: None,
+        electrum_certs: None,
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    let refused: Vec<_> = preview
+        .wallets
+        .iter()
+        .map(|w| w.refused.is_some())
+        .collect();
+    assert_eq!(refused, vec![true, true, false]);
+    let report = manager
+        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+        .await
+        .unwrap();
+    assert_eq!(report.added.len(), 1);
+    let left_out: Vec<_> = report.refused.iter().map(|r| r.index).collect();
+    assert_eq!(left_out, vec![0, 1]);
 }

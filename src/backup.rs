@@ -139,8 +139,10 @@ pub struct BackupPreview {
     #[serde(default)]
     pub backends: Vec<BackupBackendPreview>,
     /// The `host:port` of every Electrum certificate the settings would
-    /// accept, the ones a restore would pin. Empty when the backup
-    /// carries no settings.
+    /// accept, the ones a restore would pin: a host this vault pins
+    /// already keeps its own pin and is not listed, nor one the backup
+    /// gives two fingerprints for. Empty when the backup carries no
+    /// settings.
     #[serde(default)]
     pub electrum_hosts: Vec<String>,
 }
@@ -163,7 +165,8 @@ pub struct BackupWalletPreview {
     pub network: Network,
     pub kind: WalletKind,
     /// A wallet watching the same thing on the same network exists
-    /// already; restoring it would be skipped.
+    /// already, or comes back with a wallet before it in the same
+    /// backup; restoring it would be skipped.
     pub already_watched: bool,
     /// Why a restore cannot take this wallet, in the core's words: its
     /// material does not read as a wallet to watch, or its two

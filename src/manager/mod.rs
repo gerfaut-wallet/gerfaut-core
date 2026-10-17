@@ -368,6 +368,17 @@ pub(crate) fn check_material(kind: &WalletKind, network: Network) -> CoreResult<
                 if !networks.contains(&network) {
                     return Err(network_mismatch(network, &networks));
                 }
+                // What the engine checks of each descriptor before it
+                // derives anything, so that a material this passes is
+                // one the engine takes.
+                if descriptor.is_multipath() {
+                    return Err(CoreError::Descriptor(
+                        "a stored descriptor cannot hold both branches in one".to_owned(),
+                    ));
+                }
+                descriptor
+                    .sanity_check()
+                    .map_err(|e| CoreError::Descriptor(e.to_string()))?;
             }
             Ok(())
         }
