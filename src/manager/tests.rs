@@ -63,7 +63,26 @@ async fn private_keys_never_reach_the_vault() {
         };
         let sealed = backup::seal(&payload, BACKUP_PASSWORD).unwrap();
         let source = data_encoding::BASE64.encode(&sealed);
+        // Asked for by index, it fails the restore; with every wallet,
+        // it is left out and named. Either way it never lands.
         let error = manager
+            .import_backup(
+                &source,
+                BACKUP_PASSWORD,
+                &ImportChoices {
+                    indexes: Some(vec![0]),
+                    apply_settings: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, CoreError::InvalidInput { kind: "backup", detail }
+                if detail.starts_with("\"Hot\" cannot be restored")
+                    && detail.contains("private key material")),
+            "{error}"
+        );
+        let report = manager
             .import_backup(
                 &source,
                 BACKUP_PASSWORD,
@@ -73,11 +92,11 @@ async fn private_keys_never_reach_the_vault() {
                 },
             )
             .await
-            .unwrap_err();
-        assert!(
-            matches!(error, CoreError::PrivateMaterialRejected),
-            "{error}"
-        );
+            .unwrap();
+        assert!(report.added.is_empty());
+        assert_eq!(report.refused.len(), 1);
+        assert!(report.refused[0].reason.contains("private key"));
+        assert!(!report.refused[0].reason.contains("prv"));
     }
 
     assert!(manager.list_wallets(None).await.is_empty());

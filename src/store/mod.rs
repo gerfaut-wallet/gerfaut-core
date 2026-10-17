@@ -399,6 +399,15 @@ impl Vault {
         // cannot be looked at (a permission, a storage error) fails the
         // open rather than being replaced by an empty one.
         if vault.path.try_exists()? {
+            // A vault an earlier build created with the default mode is
+            // closed to others now, not at the next save, which a vault
+            // that is only read may not see for weeks. One that cannot
+            // be changed, on a file system without modes, opens all the
+            // same.
+            #[cfg(unix)]
+            if let Err(error) = keep_to_owner(&vault.path) {
+                log::warn!("the vault could not be made its owner's alone: {error}");
+            }
             let (payload, retired) = vault.read()?;
             // What earlier builds kept and this one dropped, secrets
             // among it, leaves the file now rather than at the next
@@ -686,6 +695,36 @@ pub fn owner_only(options: &mut std::fs::OpenOptions) -> &mut std::fs::OpenOptio
         options.mode(0o600);
     }
     options
+}
+
+/// Takes from a file every right of its group and of everyone else,
+/// and leaves its owner's as they are. Nothing when there were none.
+/// Only a regular file at that very name: it is opened without
+/// following a link, and without waiting on a pipe, then held to be the
+/// file the name points at, and the mode is set on the file opened.
+#[cfg(unix)]
+fn keep_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        // A link at that name, refused by `O_NOFOLLOW`.
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let opened = file.metadata()?;
+    let seen = std::fs::symlink_metadata(path)?;
+    if !opened.file_type().is_file() || (opened.dev(), opened.ino()) != (seen.dev(), seen.ino()) {
+        return Ok(());
+    }
+    let mode = opened.permissions().mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        file.set_permissions(std::fs::Permissions::from_mode(mode & 0o700))?;
+    }
+    Ok(())
 }
 
 /// Creates `dir` so that only its owner may list or enter it on Unix,
@@ -1432,6 +1471,45 @@ mod tests {
         drop(Vault::open_or_create(mine.join("gerfaut.vault"), key()).unwrap());
         assert_eq!(mode(&mine), 0o755);
         assert_eq!(mode(&mine.join("gerfaut.vault")), 0o600);
+
+        // A vault an earlier build left open to others is closed as it
+        // opens, before any save.
+        drop(vault);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (vault, _) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(mode(&path), 0o600);
+
+        // A link at the vault's name is not followed: the file it points
+        // to keeps its mode.
+        drop(vault);
+        let elsewhere = dir.path().join("elsewhere.vault");
+        std::fs::rename(&path, &elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        let (_vault, _) = Vault::open_or_create(&path, key()).unwrap();
+        assert_eq!(mode(&elsewhere), 0o644);
+    }
+
+    /// Closing an old vault to others neither waits on a pipe planted
+    /// at its name nor changes one.
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_vault_never_waits_on_a_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gerfaut.vault");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o644) }, 0);
+        let mode = || {
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let before = mode();
+        keep_to_owner(&path).unwrap();
+        assert_eq!(mode(), before);
     }
 
     /// The rule the apps write their exports with: a file created is

@@ -9,7 +9,8 @@
       "internal": "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/1/*)#0wkfxrv7",
       "script": "segwit"
     },
-    "already_watched": false
+    "already_watched": false,
+    "refused": null
   },
   "already_watched": {
     "index": 1,
@@ -19,6 +20,20 @@
       "type": "single_address",
       "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
     },
-    "already_watched": true
+    "already_watched": true,
+    "refused": null
+  },
+  "refused": {
+    "index": 2,
+    "name": "Handed over",
+    "network": "mainnet",
+    "kind": {
+      "type": "descriptors",
+      "external": "wpkh(xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/0/*)",
+      "internal": "wpkh(xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw/1/*)",
+      "script": "segwit"
+    },
+    "already_watched": false,
+    "refused": "descriptor error: the change descriptor does not spend under the receive descriptor's keys and conditions: change would go to another wallet"
   }
 }

@@ -92,6 +92,12 @@ tor-rtcompat = { version = "0.45", default-features = false, features = ["tokio"
 # compiled.
 tor-config = { version = "0.45", default-features = false, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# The flags an old vault is opened with to close it to others: never
+# through a link, never stuck on a pipe. The version the tree already
+# pulls in, so nothing new is compiled.
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 # `test-util`: a test can hold the clock of its runtime still, so that a

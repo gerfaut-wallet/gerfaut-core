@@ -551,27 +551,60 @@ async fn a_sync_reads_only_what_the_wallet_lacks() {
     );
     assert!(window.bytes < 16_000, "{} bytes", window.bytes);
 
-    // A block takes it: that script again, no transaction fetched, one
-    // confirmation proven.
+    // A block takes it. The status electrs pushes for that script is the
+    // one the wallet foretells from what it holds: no sync, so no new
+    // connection and no history read, only the proof of the payment in
+    // the block the server pushed, asked on the watch's connection.
     let mark = wire.mark();
     chain.mine();
     announced(&mut events, &paid, TxStage::Confirmed).await;
     let window = wire.since(mark);
     println!(
-        "electrum, a confirmation pushed and synced: {} bytes, {:?}",
+        "electrum, a confirmation pushed and foretold: {} bytes, {:?}",
         window.bytes,
         window.calls()
     );
     assert_eq!(
-        window.params_of("blockchain.scripthash.get_history"),
-        vec![electrum_hash(&third)]
+        window.calls(),
+        vec![("blockchain.transaction.get_merkle".to_owned(), paid.clone())]
     );
-    assert!(window.params_of("blockchain.transaction.get").is_empty());
-    assert_eq!(
-        window.params_of("blockchain.transaction.get_merkle"),
-        vec![paid.clone()]
-    );
-    assert!(window.bytes < 16_000, "{} bytes", window.bytes);
+    assert!(window.bytes < 2_000, "{} bytes", window.bytes);
+
+    // Two payments to one address while the watch runs, the second on
+    // the change of the first. electrs lists its mempool in the order
+    // its status hashes: a sync on its server reads each history once,
+    // as the status the watch heard says, and sets none aside.
+    let fourth = receive_address(3);
+    let twice = [chain.pay(&fourth, "0.01"), chain.pay(&fourth, "0.02")];
+    holds(
+        &manager,
+        &wallet,
+        &mut events,
+        "two payments to one address",
+        |txs| twice.iter().all(|txid| txs.contains(txid)),
+    )
+    .await;
+    let mark = wire.mark();
+    let again = manager.sync_wallet(&wallet).await.unwrap();
+    assert!(again.new_txs.is_empty());
+    let histories = wire
+        .since(mark)
+        .params_of("blockchain.scripthash.get_history");
+    let read: std::collections::HashSet<&String> = histories.iter().collect();
+    assert_eq!(read.len(), histories.len(), "{histories:?}");
+    assert!(histories.contains(&electrum_hash(&fourth)), "{histories:?}");
+    let shown: Vec<String> = manager
+        .wallet_snapshot(&wallet)
+        .await
+        .unwrap()
+        .txs
+        .into_iter()
+        .map(|tx| tx.txid)
+        .collect();
+    assert!(twice.iter().all(|txid| shown.contains(txid)), "{shown:?}");
+    // Mined, for what follows to start from a chain with nothing waiting.
+    chain.mine();
+    chain.indexed().await;
     manager.live_stop().await;
 
     // The fee of the payment is known: the coins it spends were fetched.
@@ -592,9 +625,9 @@ async fn a_sync_reads_only_what_the_wallet_lacks() {
     )
     .await;
     let import = esplora_manager.sync_wallet(&esplora_wallet).await.unwrap();
-    assert_eq!(import.new_txs.len(), 3);
+    assert_eq!(import.new_txs.len(), 5);
 
-    // Nothing new: the counters of each of the three scripts, and the
+    // Nothing new: the counters of each of the four scripts, and the
     // twenty receive addresses past them; no history of a script the
     // wallet holds, no transaction.
     let mark = esplora_wire.mark();
@@ -607,7 +640,7 @@ async fn a_sync_reads_only_what_the_wallet_lacks() {
         window.bytes,
         paths.len()
     );
-    for held in [&first, &second, &third] {
+    for held in [&first, &second, &third, &fourth] {
         let counters = format!("/scripthash/{}", esplora_hash(held));
         assert!(paths.contains(&counters), "{paths:?}");
         assert!(
@@ -637,7 +670,7 @@ async fn a_sync_reads_only_what_the_wallet_lacks() {
     let read: Vec<&String> = paths
         .iter()
         .filter(|path| {
-            [&first, &second, &third]
+            [&first, &second, &third, &fourth]
                 .iter()
                 .any(|held| path.starts_with(&format!("/scripthash/{}/", esplora_hash(held))))
         })

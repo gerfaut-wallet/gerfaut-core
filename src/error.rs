@@ -58,6 +58,11 @@ pub enum ErrorCode {
     NewerFormat,
     /// A chain backend failed during a sync.
     Sync,
+    /// A server answered a sync with a proof that does not hold: a
+    /// confirmation its block's header and branch do not back, or a coin
+    /// its own transaction does not pay. It lies, or is broken: another
+    /// server, or one's own node, is the way out.
+    FalseProof,
     /// The network refused a transaction, or no backend took it.
     Broadcast,
     /// The configured backend cannot serve this request.
@@ -86,6 +91,7 @@ impl ErrorCode {
         ErrorCode::UnreadableBackup,
         ErrorCode::NewerFormat,
         ErrorCode::Sync,
+        ErrorCode::FalseProof,
         ErrorCode::Broadcast,
         ErrorCode::BackendUnavailable,
         ErrorCode::Tor,
@@ -109,6 +115,7 @@ impl ErrorCode {
             ErrorCode::UnreadableBackup => "unreadable_backup",
             ErrorCode::NewerFormat => "newer_format",
             ErrorCode::Sync => "sync",
+            ErrorCode::FalseProof => "false_proof",
             ErrorCode::Broadcast => "broadcast",
             ErrorCode::BackendUnavailable => "backend_unavailable",
             ErrorCode::Tor => "tor",
@@ -152,6 +159,16 @@ pub enum CoreError {
     #[error("invalid qr: this QR code announces {0} parts, more than Gerfaut reads")]
     TooManyParts(u32),
 
+    /// A scan brought more distinct frames than one code of its size
+    /// needs, the count it reached, without coming together: a fountain
+    /// code that never ends, or frames of several codes. Under the same
+    /// code as [`CoreError::TooManyParts`]: to the person, the code has
+    /// more than Gerfaut reads.
+    #[error(
+        "invalid qr: {0} frames scanned without the code coming together, more than Gerfaut reads"
+    )]
+    TooManyFrames(u32),
+
     /// The input belongs to a different network than the requested one.
     #[error("network mismatch: input is for {found}, expected {expected}")]
     NetworkMismatch { expected: String, found: String },
@@ -182,6 +199,11 @@ pub enum CoreError {
     /// Chain backend errors during sync.
     #[error("sync failed via {backend}: {detail}")]
     Sync { backend: String, detail: String },
+
+    /// A sync that failed on a server whose proof did not hold, among the
+    /// servers tried: see [`ErrorCode::FalseProof`].
+    #[error("sync failed via {backend}: {detail}")]
+    FalseProof { backend: String, detail: String },
 
     /// The network refused a transaction handed to it, or no backend
     /// could be reached to try. `detail` is the node's own words.
@@ -214,7 +236,7 @@ impl CoreError {
             CoreError::UnrecognizedInput(_) => ErrorCode::UnrecognizedInput,
             CoreError::PrivateMaterialRejected => ErrorCode::PrivateMaterial,
             CoreError::InvalidInput { .. } => ErrorCode::InvalidInput,
-            CoreError::TooManyParts(_) => ErrorCode::TooManyParts,
+            CoreError::TooManyParts(_) | CoreError::TooManyFrames(_) => ErrorCode::TooManyParts,
             CoreError::NetworkMismatch { .. } => ErrorCode::NetworkMismatch,
             CoreError::WalletNotFound(_) => ErrorCode::WalletNotFound,
             CoreError::DuplicateWallet(_) => ErrorCode::DuplicateWallet,
@@ -222,6 +244,7 @@ impl CoreError {
             CoreError::UnreadableBackup(_) => ErrorCode::UnreadableBackup,
             CoreError::NewerBackup(_) => ErrorCode::NewerFormat,
             CoreError::Sync { .. } => ErrorCode::Sync,
+            CoreError::FalseProof { .. } => ErrorCode::FalseProof,
             CoreError::Broadcast { .. } => ErrorCode::Broadcast,
             CoreError::BackendUnavailable(_) => ErrorCode::BackendUnavailable,
             CoreError::Tor(_) => ErrorCode::Tor,
@@ -315,6 +338,7 @@ mod tests {
                 "unreadable_backup",
                 "newer_format",
                 "sync",
+                "false_proof",
                 "broadcast",
                 "backend_unavailable",
                 "tor",
@@ -382,6 +406,7 @@ mod tests {
                 ErrorCode::InvalidInput,
             ),
             (CoreError::TooManyParts(5_001), ErrorCode::TooManyParts),
+            (CoreError::TooManyFrames(2_001), ErrorCode::TooManyParts),
             (
                 CoreError::NetworkMismatch {
                     expected: "signet".to_owned(),
@@ -405,6 +430,13 @@ mod tests {
                     detail: text(),
                 },
                 ErrorCode::Sync,
+            ),
+            (
+                CoreError::FalseProof {
+                    backend: text(),
+                    detail: text(),
+                },
+                ErrorCode::FalseProof,
             ),
             (
                 CoreError::Broadcast {
