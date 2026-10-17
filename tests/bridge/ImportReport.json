@@ -32,6 +32,13 @@
       }
     ],
     "skipped": 1,
-    "settings_applied": true
+    "settings_applied": true,
+    "refused": [
+      {
+        "index": 2,
+        "name": "Handed over",
+        "reason": "descriptor error: the change descriptor does not spend under the receive descriptor's keys and conditions: change would go to another wallet"
+      }
+    ]
   }
 }

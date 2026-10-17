@@ -536,7 +536,9 @@ fn script_kind_of(descriptor: &Descriptor<DescriptorPublicKey>) -> ScriptKind {
 /// Candidate networks of a descriptor, from the version bytes of the
 /// extended keys it contains. A descriptor without extended keys is
 /// network-agnostic; one mixing mainnet and test keys is rejected.
-fn descriptor_networks(descriptor: &Descriptor<DescriptorPublicKey>) -> CoreResult<Vec<Network>> {
+pub(crate) fn descriptor_networks(
+    descriptor: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<Vec<Network>> {
     let mut kinds: Vec<NetworkKind> = Vec::new();
     descriptor.for_each_key(|key| {
         let key_kind = match key {
@@ -779,6 +781,30 @@ fn check_pair(
     external: &Descriptor<DescriptorPublicKey>,
     internal: &Descriptor<DescriptorPublicKey>,
 ) -> CoreResult<()> {
+    pair_holds(external, internal, true)
+}
+
+/// [`check_pair`] for a pair that reaches the engine without the
+/// parser's two-line reading: read back from a backup, handed back by
+/// the app, or split out of one multipath descriptor. It refuses what
+/// proves the two are not one wallet, and does not refuse a policy that
+/// cannot be lifted for being unreadable: two such branches are held to
+/// the same script on the same keys instead, and one that lifts beside
+/// one that does not is refused.
+pub(crate) fn check_stored_pair(
+    external: &Descriptor<DescriptorPublicKey>,
+    internal: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<()> {
+    pair_holds(external, internal, false)
+}
+
+/// The two checks above: `unliftable_refused` says whether a policy that
+/// does not lift fails the pair.
+fn pair_holds(
+    external: &Descriptor<DescriptorPublicKey>,
+    internal: &Descriptor<DescriptorPublicKey>,
+    unliftable_refused: bool,
+) -> CoreResult<()> {
     let refuse = |detail: &str| {
         Err(CoreError::InvalidInput {
             kind: "descriptor",
@@ -791,15 +817,38 @@ fn check_pair(
     if external.desc_type() != internal.desc_type() {
         return refuse("the change descriptor is not of the receive descriptor's script type");
     }
-    if crate::wallet::policy::policy_by_material(external)?
-        != crate::wallet::policy::policy_by_material(internal)?
-    {
-        return refuse(
+    let another_wallet = || {
+        refuse(
             "the change descriptor does not spend under the receive descriptor's keys and \
              conditions: change would go to another wallet",
-        );
+        )
+    };
+    match (
+        crate::wallet::policy::policy_by_material(external),
+        crate::wallet::policy::policy_by_material(internal),
+    ) {
+        (Ok(receive), Ok(change)) if receive != change => another_wallet(),
+        (Ok(_), Ok(_)) => Ok(()),
+        (Err(unliftable), _) | (_, Err(unliftable)) if unliftable_refused => Err(unliftable),
+        // Two branches of one wallet lift alike: one that lifts beside
+        // one that does not, a raw hash swapped in for a key, is
+        // another wallet.
+        (Ok(_), Err(_)) | (Err(_), Ok(_)) => another_wallet(),
+        // Neither lifts: the two are held to the same script on the
+        // same keys, read whole instead of through their policies.
+        (Err(_), Err(_)) => {
+            let receive = crate::wallet::policy::descriptor_by_material(external);
+            match receive {
+                Some(receive)
+                    if Some(&receive)
+                        == crate::wallet::policy::descriptor_by_material(internal).as_ref() =>
+                {
+                    Ok(())
+                }
+                _ => another_wallet(),
+            }
+        }
     }
-    Ok(())
 }
 
 // --- extended keys -----------------------------------------------------
@@ -875,6 +924,22 @@ fn derivation_error(detail: String) -> CoreError {
     }
 }
 
+/// Longest step an error quotes: an index and its hardened mark,
+/// `2147483647'`, fits with room to spare.
+const MAX_QUOTED_STEP: usize = 12;
+
+/// A step as an error about it quotes it, after a space: one short
+/// enough to be an index, and nothing for a longer one. What was typed
+/// stays on screen in its field; a message never copies a long run of
+/// it, which could be a key pasted in the wrong place.
+fn quoted_step(step: &str) -> String {
+    if step.chars().count() <= MAX_QUOTED_STEP {
+        format!(" (`{step}`)")
+    } else {
+        String::new()
+    }
+}
+
 /// One step of a path: its index and whether it is hardened. The error
 /// is a sentence tail to hang after the path's name.
 fn parse_step(step: &str) -> Result<(u32, bool), String> {
@@ -886,13 +951,22 @@ fn parse_step(step: &str) -> Result<(u32, bool), String> {
         None => (step, false),
     };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!("has a step that is not a number (`{step}`)"));
+        return Err(format!(
+            "has a step that is not a number{}",
+            quoted_step(step)
+        ));
     }
     let index = digits
         .parse::<u32>()
         .ok()
         .filter(|index| *index < HARDENED_INDEX)
-        .ok_or_else(|| format!("has an index above {} (`{step}`)", HARDENED_INDEX - 1))?;
+        .ok_or_else(|| {
+            format!(
+                "has an index above {}{}",
+                HARDENED_INDEX - 1,
+                quoted_step(step)
+            )
+        })?;
     Ok((index, hardened))
 }
 
@@ -906,7 +980,7 @@ fn canonical_branch(path: &str, which: &str) -> CoreResult<String> {
             "the {which} path is empty; wallets use `0/*` for receive and `1/*` for change"
         )));
     }
-    let refuse = |reason: String| derivation_error(format!("the {which} path `{path}` {reason}"));
+    let refuse = |reason: String| derivation_error(format!("the {which} path {reason}"));
     let steps = match path.strip_suffix('*') {
         Some("") => "",
         Some(steps) => steps
@@ -930,8 +1004,9 @@ fn canonical_branch(path: &str, which: &str) -> CoreResult<String> {
             let (index, hardened) = parse_step(step).map_err(&refuse)?;
             if hardened {
                 return Err(refuse(format!(
-                    "has a hardened step (`{step}`): an extended public key cannot derive \
-                     hardened children"
+                    "has a hardened step{}: an extended public key cannot derive hardened \
+                     children",
+                    quoted_step(step)
                 )));
             }
             canonical.push(index.to_string());
@@ -941,13 +1016,34 @@ fn canonical_branch(path: &str, which: &str) -> CoreResult<String> {
     Ok(canonical.join("/"))
 }
 
+/// Where a key origin was read, which decides what an error about it
+/// quotes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OriginSource {
+    /// Typed by hand: it is on screen in its field already, and a
+    /// message never copies it back, since it could be a key pasted in
+    /// the wrong place.
+    Typed,
+    /// Read from a wallet export, every string of which went through the
+    /// private key filter: the message quotes what it read, the one way
+    /// to find the fault in a file nobody sees.
+    File,
+}
+
 /// Checks a key origin and returns it in canonical form,
 /// `[fingerprint/path]` with `'` on hardened steps, the way the
 /// descriptor prints it. Hardened steps are fine here: the origin
 /// records what the signer derived, not what this key will.
-fn canonical_origin(origin: &str) -> CoreResult<String> {
+fn canonical_origin(origin: &str, source: OriginSource) -> CoreResult<String> {
     let origin = origin.trim();
-    let refuse = |reason: String| derivation_error(format!("the key origin `{origin}` {reason}"));
+    let quoted = source == OriginSource::File;
+    let refuse = |reason: String| {
+        derivation_error(if quoted {
+            format!("the key origin `{origin}` {reason}")
+        } else {
+            format!("the key origin {reason}")
+        })
+    };
     let inner = match origin
         .strip_prefix('[')
         .and_then(|inner| inner.strip_suffix(']'))
@@ -963,10 +1059,12 @@ fn canonical_origin(origin: &str) -> CoreResult<String> {
     let mut steps = inner.split('/');
     let fingerprint = steps.next().unwrap_or_default();
     if fingerprint.len() != 8 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(refuse(format!(
-            "must start with the master key fingerprint, 8 hexadecimal characters, not \
-             `{fingerprint}`"
-        )));
+        let reason = "must start with the master key fingerprint, 8 hexadecimal characters";
+        return Err(refuse(if quoted {
+            format!("{reason}, not `{fingerprint}`")
+        } else {
+            reason.to_owned()
+        }));
     }
     let mut canonical = fingerprint.to_ascii_lowercase();
     for step in steps {
@@ -994,6 +1092,19 @@ fn effective_derivation(
 ) -> CoreResult<DerivationChoice> {
     let default = DerivationChoice::default();
     let choice = choice.unwrap_or(&default);
+    // The three fields are typed by hand, beside the one the key was
+    // pasted in: a private key pasted in one of them is refused the way
+    // that field refuses it, before any message could quote it.
+    for field in [
+        Some(choice.receive.as_str()),
+        choice.change.as_deref(),
+        choice.origin.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        reject_private_material(field)?;
+    }
     let receive = canonical_branch(&choice.receive, "receive")?;
     let change = choice
         .change
@@ -1011,7 +1122,7 @@ fn effective_derivation(
         .map(str::trim)
         .filter(|origin| !origin.is_empty())
         .or(input_origin)
-        .map(canonical_origin)
+        .map(|origin| canonical_origin(origin, OriginSource::Typed))
         .transpose()?;
     Ok(DerivationChoice {
         receive,
@@ -1323,10 +1434,11 @@ fn coldcard_account(
         .and_then(|v| v.as_str())
         .map(|deriv| deriv.trim_start_matches('m').trim_start_matches('/'));
     let origin = match (fingerprint, path) {
-        (Some(fingerprint), Some("")) => Some(canonical_origin(fingerprint)?),
-        (Some(fingerprint), Some(path)) => {
-            Some(canonical_origin(&format!("[{fingerprint}/{path}]"))?)
-        }
+        (Some(fingerprint), Some("")) => Some(canonical_origin(fingerprint, OriginSource::File)?),
+        (Some(fingerprint), Some(path)) => Some(canonical_origin(
+            &format!("[{fingerprint}/{path}]"),
+            OriginSource::File,
+        )?),
         _ => None,
     };
     let derivation = DerivationChoice {
@@ -2238,6 +2350,19 @@ mod tests {
         assert!(external.contains("[0f056943/84'/1'/0']"));
     }
 
+    /// A wallet export whose origin does not read is refused naming what
+    /// it read: the file is out of sight, unlike a field of the app.
+    #[test]
+    fn an_export_origin_that_does_not_read_is_quoted() {
+        let json = format!(
+            "{{\"xfp\": \"0F05694\", \"bip84\": {{\"xpub\": \"{TPUB}\", \
+             \"deriv\": \"m/84'/1'/0'\", \"name\": \"p2wpkh\"}}}}"
+        );
+        let error = parse_input(&json).unwrap_err().to_string();
+        assert!(error.contains("`[0F05694/84'/1'/0']`"), "{error}");
+        assert!(error.contains("not `0F05694`"), "{error}");
+    }
+
     /// A Coldcard export gives each account the fingerprint of the
     /// account key itself; the master fingerprint, the one a signer
     /// knows the wallet by, is the file's, and the one in the account's
@@ -2502,6 +2627,50 @@ mod tests {
         assert!(rejected("*/0/*", Some("1/*")).contains("last"));
     }
 
+    /// A pair whose policy does not lift, here a height and a time lock
+    /// on one path, which only a permissive reading lets through: the
+    /// two-line import refuses it as unreadable, a stored pair goes
+    /// through, since nothing in it proves two wallets; a stored pair
+    /// that does prove it is still refused.
+    #[test]
+    fn a_stored_pair_is_refused_only_on_proof() {
+        use bdk_wallet::miniscript::{ExtParams, Miniscript, Segwitv0};
+        let read = |branch: u32, key: &str| {
+            let ms = Miniscript::<DescriptorPublicKey, Segwitv0>::from_str_ext(
+                &format!("and_v(v:pk({key}/{branch}/*),and_v(v:after(100),after(500000001)))"),
+                &ExtParams::allow_all(),
+            )
+            .unwrap();
+            Descriptor::new_wsh(ms).unwrap()
+        };
+        let (receive, change) = (read(0, TPUB), read(1, TPUB));
+        assert!(crate::wallet::policy::policy_by_material(&receive).is_err());
+        assert!(check_pair(&receive, &change).is_err());
+        check_stored_pair(&receive, &change).unwrap();
+
+        let receive = read_descriptor(&format!("wpkh({XPUB}/0/*)")).unwrap();
+        let change = read_descriptor(&format!("wpkh({XPUB_B}/1/*)")).unwrap();
+        assert!(check_stored_pair(&receive, &change).is_err());
+
+        // A raw hash does not lift. Swapped in on one branch only, beside
+        // another key, it is another wallet; on both branches, around the
+        // same keys, it is one.
+        const HASH: &str = "1234567890123456789012345678901234567890";
+        let raw = |key: &str, branch: u32| {
+            read_descriptor(&format!(
+                "wsh(or_d(pk({key}/{branch}/*),c:expr_raw_pkh({HASH})))"
+            ))
+            .unwrap()
+        };
+        let multi = read_descriptor(&format!("wsh(multi(2,{XPUB}/0/*,{XPUB_B}/0/*))")).unwrap();
+        let refused = check_stored_pair(&multi, &raw(XPUB_C, 1)).unwrap_err();
+        assert!(refused.to_string().contains("another wallet"), "{refused}");
+        assert!(check_stored_pair(&raw(XPUB, 0), &multi).is_err());
+        check_stored_pair(&raw(XPUB, 0), &raw(XPUB, 1)).unwrap();
+        assert!(check_stored_pair(&raw(XPUB, 0), &raw(XPUB_C, 1)).is_err());
+        assert!(check_pair(&raw(XPUB, 0), &raw(XPUB, 1)).is_err());
+    }
+
     #[test]
     fn bad_origins_are_refused_as_derivation_paths() {
         let rejected = |origin: &str| {
@@ -2520,6 +2689,43 @@ mod tests {
         assert!(rejected("[deadbeef/84'/x]").contains("not a number"));
         assert!(rejected("[deadbeef/84'/]").contains("empty step"));
         assert!(rejected("[deadbeef/84'").contains("brackets"));
+    }
+
+    /// A private key pasted into the receive, change or origin field is
+    /// refused as private material, as in the main field, and no error
+    /// about a path ever quotes a long run of what was typed.
+    #[test]
+    fn derivation_fields_refuse_private_keys_without_quoting_them() {
+        let refused = |options: ImportOptions| {
+            assert!(
+                matches!(
+                    parse_input_with_options(TPUB, &options),
+                    Err(CoreError::PrivateMaterialRejected)
+                ),
+                "{options:?}"
+            );
+        };
+        refused(with_derivation(&format!("{TPRV}/*"), Some("1/*"), None));
+        refused(with_derivation("0/*", Some(TPRV), None));
+        refused(with_derivation(
+            "0/*",
+            Some("1/*"),
+            Some(&format!("[deadbeef]{TPRV}")),
+        ));
+
+        let long = "a".repeat(64);
+        for options in [
+            with_derivation(&format!("{long}/*"), Some("1/*"), None),
+            with_derivation("0/*", Some(&long), None),
+            with_derivation("0/*", Some("1/*"), Some(&long)),
+            with_derivation("0/*", Some("1/*"), Some(&format!("[deadbeef/{long}]"))),
+        ] {
+            let error = parse_input_with_options(TPUB, &options).unwrap_err();
+            assert!(!error.to_string().contains(&long), "{error}");
+        }
+        let short = with_derivation("0/x1/*", Some("1/*"), None);
+        let error = parse_input_with_options(TPUB, &short).unwrap_err();
+        assert!(error.to_string().contains("(`x1`)"), "{error}");
     }
 
     #[test]
