@@ -318,13 +318,16 @@ pub enum WatchEvent {
         #[serde(default)]
         scripts: Vec<String>,
     },
-    /// A block took what the wallet waited for on the scripts named, as
-    /// the status the server pushed for each foretold, and the watch
-    /// holds the proof of each transaction in that block: the wallet
-    /// takes the confirmations as they are, and syncs those scripts
-    /// only if it no longer holds what the guess was made from.
+    /// A block took what the wallet waited for on the scripts named, in
+    /// hex, as the status the server pushed for each foretold, and the
+    /// watch holds the proof of each transaction in that block: the
+    /// wallet takes the confirmations as they are, and syncs those
+    /// scripts only if it no longer holds what the guess was made from.
+    /// The proofs stay in the process: read back through serde, the
+    /// event has none, and is a sync of the scripts named.
     Confirmed {
         wallet_id: String,
+        scripts: Vec<String>,
         #[serde(skip)]
         proven: Vec<Proven>,
     },
@@ -1231,8 +1234,14 @@ impl Pending {
     /// those confirmations.
     fn event(&self, wallet_id: &str) -> WatchEvent {
         if self.scripts.as_ref().is_some_and(BTreeSet::is_empty) && !self.proven.is_empty() {
+            let scripts: BTreeSet<String> = self
+                .proven
+                .iter()
+                .map(|proven| proven.script.clone())
+                .collect();
             return WatchEvent::Confirmed {
                 wallet_id: wallet_id.to_owned(),
+                scripts: scripts.into_iter().collect(),
                 proven: self.proven.clone(),
             };
         }

@@ -2817,7 +2817,10 @@ async fn a_status_that_foretells_a_confirmation_comes_out_proven() {
         next_event(&mut events).await,
         WatchEvent::NewBlock { height: 101 }
     );
-    let WatchEvent::Confirmed { wallet_id, proven } = next_event(&mut events).await else {
+    let WatchEvent::Confirmed {
+        wallet_id, proven, ..
+    } = next_event(&mut events).await
+    else {
         panic!("expected a confirmation");
     };
     assert_eq!(wallet_id, "a");
@@ -2900,6 +2903,7 @@ fn a_confirmation_proven_with_a_change_goes_out_as_one_sync() {
         due[0].1.event("a"),
         WatchEvent::Confirmed {
             wallet_id: "a".to_owned(),
+            scripts: vec![script(1), script(2)],
             proven: vec![proven(1), proven(2)],
         }
     );

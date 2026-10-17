@@ -222,6 +222,16 @@ impl Asked {
         }
     }
 
+    /// What a confirmation the watch reported asks: its proofs taken as
+    /// they are, or, read back without them, a sync of its scripts.
+    fn confirmed(scripts: Vec<String>, proven: Vec<Proven>) -> Asked {
+        if proven.is_empty() {
+            Asked::of(ChangeReason::Activity, scripts)
+        } else {
+            Asked::proven(proven)
+        }
+    }
+
     /// Confirmations the watch proved: pushed by the server, so a
     /// change it claims.
     fn proven(proven: Vec<Proven>) -> Asked {
@@ -872,11 +882,9 @@ impl WalletManager {
                             self.ask(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, wallet_id, asked);
                             continue;
                         }
-                        WatchEvent::Confirmed { wallet_id, proven } => {
-                            if !proven.is_empty() {
-                                let asked = Asked::proven(proven);
-                                self.ask(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, wallet_id, asked);
-                            }
+                        WatchEvent::Confirmed { wallet_id, scripts, proven } => {
+                            let asked = Asked::confirmed(scripts, proven);
+                            self.ask(&mut syncs, &mut wallet_of, &mut again, &futile, &permits, &pace, wallet_id, asked);
                             continue;
                         }
                         WatchEvent::NewBlock { height } => {

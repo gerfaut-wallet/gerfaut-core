@@ -2134,3 +2134,37 @@ async fn a_sync_that_set_a_history_aside_is_not_complete() {
     assert_eq!(complete_at(&manager, &wallet).await, Some(old));
     manager.live_stop().await;
 }
+
+/// A confirmation the watch reports keeps its scripts through serde, the
+/// proofs left behind: what reads it back syncs those scripts, where a
+/// confirmation with nothing in it would be dropped.
+#[test]
+fn a_confirmation_read_back_without_its_proofs_is_a_sync() {
+    let script = ScriptBuf::from_bytes(vec![0x51]);
+    let proven = crate::watch::Proven {
+        script: script.to_hex_string(),
+        status: "ff".to_owned(),
+        txids: Vec::new(),
+        headers: Arc::new(crate::watch::Headers {
+            first: 100,
+            chain: Vec::new(),
+        }),
+        server: Endpoint::Esplora("http://127.0.0.1".to_owned()),
+    };
+    let reported = WatchEvent::Confirmed {
+        wallet_id: "w".to_owned(),
+        scripts: vec![script.to_hex_string()],
+        proven: vec![proven],
+    };
+    let read_back: WatchEvent =
+        serde_json::from_str(&serde_json::to_string(&reported).unwrap()).unwrap();
+    let WatchEvent::Confirmed {
+        scripts, proven, ..
+    } = read_back
+    else {
+        panic!("not a confirmation: {read_back:?}");
+    };
+    let asked = Asked::confirmed(scripts, proven);
+    assert!(asked.proven.is_empty());
+    assert_eq!(asked.reach(), Reach::Scripts(vec![script]));
+}
