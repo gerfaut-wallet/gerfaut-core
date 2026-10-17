@@ -1276,6 +1276,13 @@ mod servers {
             "{refused}"
         );
         assert!(refused.to_string().contains(FALSE_PROOF), "{refused}");
+        // A sync of every wallet says it by the same code.
+        let all = manager.sync_all(None).await;
+        assert!(all.reports.is_empty());
+        let failed = &all.failures[0];
+        assert_eq!(failed.wallet_id, wallet.id);
+        assert_eq!(failed.kind, crate::error::ErrorCode::FalseProof);
+        assert!(failed.message.contains(FALSE_PROOF), "{}", failed.message);
     }
 
     /// On mainnet, a real confirmation of the last checkpoint's block is

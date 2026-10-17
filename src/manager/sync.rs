@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::{self, Endpoint};
-use crate::error::{CoreError, CoreResult};
+use crate::error::{CoreError, CoreResult, ErrorCode};
 use crate::network::Network;
 use crate::now_secs;
 use crate::wallet::meta::{CachedTotals, SyncStamp, WalletKind, WalletMeta};
@@ -32,7 +32,30 @@ pub struct SyncAllReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncFailure {
     pub wallet_id: String,
+    /// The core's words, for logs and for a failure an app has no
+    /// sentence of its own for.
     pub message: String,
+    /// The code of the failure, the one [`CoreError::code`] gives: what
+    /// an app picks its sentence on, a false proof's among them. A
+    /// failure written before it had one reads as [`ErrorCode::Sync`].
+    #[serde(default = "sync_code")]
+    pub kind: ErrorCode,
+}
+
+impl SyncFailure {
+    /// The failure of the sync of `wallet_id`, in its words and by its code.
+    pub fn of(wallet_id: impl Into<String>, error: &CoreError) -> Self {
+        SyncFailure {
+            wallet_id: wallet_id.into(),
+            message: error.to_string(),
+            kind: error.code(),
+        }
+    }
+}
+
+/// The code of a failure that came without one.
+pub(crate) fn sync_code() -> ErrorCode {
+    ErrorCode::Sync
 }
 
 /// How long routine syncs may go on reading only the counters of the
@@ -576,10 +599,7 @@ impl WalletManager {
         for meta in metas {
             match self.sync_wallet(&meta.id).await {
                 Ok(sync) => report.reports.push(sync),
-                Err(error) => report.failures.push(SyncFailure {
-                    wallet_id: meta.id,
-                    message: error.to_string(),
-                }),
+                Err(error) => report.failures.push(SyncFailure::of(meta.id, &error)),
             }
         }
         report

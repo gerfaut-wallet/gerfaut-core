@@ -464,3 +464,28 @@ fn a_server_does_not_choose_the_false_proof_code() {
         assert!(failed.to_string().contains(words), "{failed}");
     }
 }
+
+/// A failure handed over before failures carried their code reads as a
+/// sync failure, as the one a sync of every wallet keeps, and as the one
+/// of a sync the live watch ran.
+#[test]
+fn a_failure_without_its_code_reads_as_a_sync_failure() {
+    use crate::error::ErrorCode;
+    use crate::live::LiveEvent;
+    let failure: SyncFailure =
+        serde_json::from_str(r#"{"wallet_id":"w1","message":"timed out"}"#).unwrap();
+    assert_eq!(failure.kind, ErrorCode::Sync);
+    let event: LiveEvent =
+        serde_json::from_str(r#"{"type":"sync_failed","wallet_id":"w1","message":"timed out"}"#)
+            .unwrap();
+    assert!(
+        matches!(
+            event,
+            LiveEvent::SyncFailed {
+                kind: ErrorCode::Sync,
+                ..
+            }
+        ),
+        "{event:?}"
+    );
+}
