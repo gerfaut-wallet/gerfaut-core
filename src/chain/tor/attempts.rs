@@ -107,6 +107,19 @@ pub(super) struct Routes<C> {
 struct Route<C> {
     current: C,
     next: Option<C>,
+    /// `current` was put in place because nothing connected, and gives
+    /// way to the first client that does.
+    untried: bool,
+}
+
+impl<C: Clone> Route<C> {
+    fn on(base: &C) -> Self {
+        Route {
+            current: base.clone(),
+            next: None,
+            untried: false,
+        }
+    }
 }
 
 impl<C: Isolate> Routes<C> {
@@ -135,10 +148,9 @@ impl<C: Isolate> Routes<C> {
     /// else the one the second attempts beside `first` share.
     fn second(&self, host: &str, first: &C) -> C {
         let mut hosts = self.hosts();
-        let route = hosts.entry(host.to_owned()).or_insert_with(|| Route {
-            current: self.base.clone(),
-            next: None,
-        });
+        let route = hosts
+            .entry(host.to_owned())
+            .or_insert_with(|| Route::on(&self.base));
         if !route.current.same(first) {
             return route.current.clone();
         }
@@ -148,15 +160,18 @@ impl<C: Isolate> Routes<C> {
     /// After a second attempt beside `first`, unless another stream
     /// moved the service on already: the client that connected, or one
     /// of a new isolation when none did, in the place of `first`. The
-    /// next stream then never waits again on what hung.
+    /// next stream then never waits again on what hung. A client that
+    /// connected also replaces one put in place because nothing had: a
+    /// stream that gave up a moment before another connected through
+    /// the same second client does not send the service elsewhere.
     fn settle(&self, host: &str, first: &C, used: Option<&C>) {
         let mut hosts = self.hosts();
-        let route = hosts.entry(host.to_owned()).or_insert_with(|| Route {
-            current: self.base.clone(),
-            next: None,
-        });
-        if route.current.same(first) {
+        let route = hosts
+            .entry(host.to_owned())
+            .or_insert_with(|| Route::on(&self.base));
+        if route.current.same(first) || (route.untried && used.is_some()) {
             route.current = used.map_or_else(|| first.isolated(), C::clone);
+            route.untried = used.is_none();
             route.next = None;
         }
     }
@@ -386,12 +401,12 @@ mod tests {
         })
     }
 
-    /// What a client does with a host: connects or fails after a while,
-    /// or never answers (`None`).
-    type Behaviour = fn(usize, &str) -> Option<(Duration, bool)>;
-
     /// A stream to `host`: the number of the client it went through.
-    async fn stream(routes: &Routes<Fake>, host: &str, behave: Behaviour) -> io::Result<usize> {
+    async fn stream(
+        routes: &Routes<Fake>,
+        host: &str,
+        behave: impl Fn(usize, &str) -> Option<(Duration, bool)>,
+    ) -> io::Result<usize> {
         routes
             .connect(host.to_owned(), 80, |client: Fake, host, _| {
                 let outcome = behave(client.id, &host);
@@ -482,5 +497,32 @@ mod tests {
         assert_eq!(stream(&routes, "x.onion", late).await.unwrap(), 0);
         assert_eq!(routes.first("x.onion").id, 0);
         assert_eq!(stream(&routes, "x.onion", first_hangs).await.unwrap(), 2);
+    }
+
+    /// A stream that gives up just before the shared second client
+    /// connects leaves the service on that client, once another stream
+    /// connected through it.
+    #[tokio::test(start_paused = true)]
+    async fn a_success_right_after_a_give_up_still_counts() {
+        let routes = routes();
+        let begun = tokio::time::Instant::now();
+        // The second client connects at 62 s, whoever asks it.
+        let at_62 = |id: usize, _: &str| {
+            (id == 1).then(|| {
+                let at = begun + Duration::from_secs(62);
+                (
+                    at.saturating_duration_since(tokio::time::Instant::now()),
+                    true,
+                )
+            })
+        };
+        let late = async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            stream(&routes, "x.onion", at_62).await
+        };
+        let (a, b) = tokio::join!(stream(&routes, "x.onion", at_62), late);
+        assert_eq!(a.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(b.unwrap(), 1);
+        assert_eq!(routes.first("x.onion").id, 1);
     }
 }
