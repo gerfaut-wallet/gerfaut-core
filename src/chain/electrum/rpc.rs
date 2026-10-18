@@ -268,7 +268,9 @@ impl Connection {
             Ok(Err(error)) => Err(CallError::Failed(Fault::outage(format!(
                 "the connection was closed: {error}"
             )))),
-            Err(_) => Err(CallError::Failed(Fault::other(
+            // A server that takes no more of what it is sent is as
+            // down as one that sends nothing back.
+            Err(_) => Err(CallError::Failed(Fault::outage(
                 "the server stopped reading",
             ))),
         }
