@@ -61,10 +61,11 @@ pub(crate) enum ConnectError {
     Certificate(Verdict),
     /// The server could not be reached: its name does not resolve, it
     /// refused the connection or did not take it in time, or it cut the
-    /// opening short. An outage, told by the kind of the error.
+    /// opening short, the handshake included. An outage, told by the kind
+    /// of the error.
     Unreachable(String),
     /// Everything else: a name that is no host name, an onion without
-    /// Tor, a handshake that failed otherwise.
+    /// Tor.
     Io(String),
 }
 
@@ -474,14 +475,14 @@ impl Handshake {
     }
 
     /// Why the handshake failed: what the verifier concluded about the
-    /// certificate when that is the reason, the error as it reads
-    /// otherwise.
+    /// certificate when that is the reason; otherwise a server that cut
+    /// the opening short, an outage as it is over Tor and over Esplora.
     pub(crate) fn refusal(&self, error: &dyn std::fmt::Display) -> ConnectError {
         match self.verifier.verdict.lock().ok().and_then(|v| v.clone()) {
             Some(verdict @ (Verdict::Unknown { .. } | Verdict::Changed { .. })) => {
                 ConnectError::Certificate(verdict)
             }
-            _ => ConnectError::Io(error.to_string()),
+            _ => ConnectError::Unreachable(format!("TLS handshake failed: {error}")),
         }
     }
 }
