@@ -647,7 +647,13 @@ pub(crate) async fn prove_confirmations(
     // Proven as the first one was: a height alone would let a server
     // raise the bound it is held to.
     if too_high(tip) {
-        tip = tip.max(proven_tip(client, network).await?);
+        match proven_tip(client, network).await {
+            Ok(again) => tip = tip.max(again),
+            Err(fault) if fault.is_outage() => return Err(fault),
+            // A tip that does not hold either is no excuse for the
+            // confirmation above the first one: it is refused for that.
+            Err(_) => {}
+        }
     }
     if too_high(tip) {
         return Err(Fault::false_proof());
