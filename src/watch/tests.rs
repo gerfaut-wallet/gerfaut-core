@@ -3857,3 +3857,145 @@ async fn a_header_without_its_work_foretells_nothing() {
     );
     assert!(!server.was_asked("blockchain.transaction.get_merkle"));
 }
+
+/// How long the first pass of `watch` holds a sync that names no server.
+async fn first_pass_takes(watch: &LiveWatch) -> Duration {
+    let started = std::time::Instant::now();
+    watch.first_pass().await;
+    started.elapsed()
+}
+
+/// A list the server refuses whole, its limit reached at the first
+/// script: the session is open all the same, and the first pass is over
+/// with it. A sync does not wait out the deadline for a session that
+/// hears nothing.
+#[tokio::test]
+async fn a_list_refused_whole_ends_the_first_pass() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (refusing, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    refusing.state.lock().unwrap().subscription_limit =
+        Some((0, "subscription limit reached (0 max per client)"));
+    other.state.lock().unwrap().silent = true;
+    let _stand_in = automatic(&rotation, &[&refusing, &other]);
+    let budget = Duration::from_secs(3);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1, 2], &[], false)],
+        Some(Timings {
+            connect: Duration::from_secs(60),
+            refused: Duration::from_secs(3600),
+            first_session: budget,
+            ..timings()
+        }),
+    );
+    let waited = first_pass_takes(&watch).await;
+    assert!(waited < budget / 2, "the first pass held a sync {waited:?}");
+    // Once the server refused the list, still nothing to wait for.
+    let started = std::time::Instant::now();
+    while !refusing.was_asked("blockchain.scripthash.subscribe") {
+        assert!(started.elapsed() < WAIT, "nothing was asked of the server");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let waited = first_pass_takes(&watch).await;
+    assert!(waited < budget / 2, "the refusal held a sync {waited:?}");
+}
+
+/// A list the watch's own limits keep nothing of, a script longer than
+/// any a transaction holds: the watch follows nothing, and its first
+/// pass is over at once. The first list it can follow then opens one,
+/// which a sync waits for, as for the first wallet of an empty vault;
+/// it used to be taken for a list that changed, and the sync went its
+/// own way while the watch reached its server.
+#[tokio::test]
+async fn a_list_the_limits_keep_nothing_of_follows_nothing() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (stalled, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    stalled.state.lock().unwrap().silent = true;
+    other.state.lock().unwrap().silent = true;
+    let _stand_in = automatic(&rotation, &[&stalled, &other]);
+    let budget = Duration::from_millis(800);
+    let mut cut = wallet("a", &[1], &[], false);
+    cut.scripts[0].script = "51".repeat(MAX_SCRIPT_BYTES + 1);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![cut],
+        Some(Timings {
+            connect: Duration::from_secs(60),
+            first_session: budget,
+            ..timings()
+        }),
+    );
+    let waited = first_pass_takes(&watch).await;
+    assert!(
+        waited < budget / 2,
+        "nothing to follow held a sync {waited:?}"
+    );
+
+    watch.set_wallets(vec![wallet("a", &[1], &[], false)]);
+    let waited = first_pass_takes(&watch).await;
+    assert!(
+        waited >= budget * 3 / 4,
+        "the first list to follow opened no pass: {waited:?}"
+    );
+}
+
+/// Lists that cross while a session opens. The first wallet of an
+/// empty watch opens a pass, and the list goes empty again before the
+/// server answers: until a session opens, the pass is not over. The
+/// session opens on nothing, which ends it. The next wallet comes with
+/// that session open: its pass is over at once, where its syncs waited
+/// out the deadline for a session there already was.
+#[tokio::test]
+async fn lists_that_cross_while_a_session_opens() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (gated, other) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    other.state.lock().unwrap().silent = true;
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    gated.state.lock().unwrap().gate = Some(("server.version", gate.clone()));
+    let _stand_in = automatic(&rotation, &[&gated, &other]);
+    let budget = Duration::from_secs(3);
+    let (watch, _events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        Vec::new(),
+        Some(Timings {
+            connect: Duration::from_secs(60),
+            first_session: budget,
+            ..timings()
+        }),
+    );
+    assert!(first_pass_takes(&watch).await < budget / 2);
+
+    watch.set_wallets(vec![wallet("a", &[1], &[], false)]);
+    let started = std::time::Instant::now();
+    while !gated.was_asked("server.version") {
+        assert!(
+            started.elapsed() < WAIT,
+            "the watch never reached its server"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    watch.set_wallets(Vec::new());
+    let pending = tokio::spawn(watch.first_pass());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!pending.is_finished(), "the pass ended before any session");
+    gate.add_permits(100);
+    let started = std::time::Instant::now();
+    pending.await.unwrap();
+    assert!(
+        started.elapsed() < budget / 2,
+        "the session did not end the pass"
+    );
+    while watch.serving().is_none() {
+        assert!(started.elapsed() < WAIT, "no session opened");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    watch.set_wallets(vec![wallet("b", &[2], &[], false)]);
+    let waited = first_pass_takes(&watch).await;
+    assert!(
+        waited < budget / 2,
+        "a pass held a sync with a session open: {waited:?}"
+    );
+    until(&watch, "subscribed", |s| s.pushed_scripts == 1).await;
+}

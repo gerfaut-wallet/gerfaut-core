@@ -30,8 +30,6 @@ pub(crate) struct PageTx {
     pub vout: Vec<PageOut>,
     #[serde(default)]
     pub weight: u64,
-    #[serde(default)]
-    pub fee: u64,
     pub status: TxStatus,
 }
 
@@ -183,7 +181,7 @@ mod tests {
         assert_eq!(ours.to_tx().compute_txid(), ours.txid);
         assert_eq!(ours.vin[0].witness.len(), 3);
         assert_eq!(ours.prevouts().count(), 1);
-        assert_eq!((ours.fee, ours.weight), (141, 437));
+        assert_eq!(ours.weight, 437);
         assert_eq!(ours.status.block_height, Some(7));
     }
 
