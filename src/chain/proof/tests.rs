@@ -1719,6 +1719,21 @@ mod servers {
             .await
             .unwrap_err();
         assert!(refused.contains("do not chain"), "{refused}");
+
+        // The same for the tip a sent transaction is followed against.
+        let txid = Txid::from_byte_array([0x5a; 32]);
+        let Err(standing) =
+            crate::chain::esplora::tx_standing(&esplora(&server), Network::Mainnet, &txid).await
+        else {
+            panic!("a tip no one mined was taken");
+        };
+        assert!(standing.contains("do not chain"), "{standing}");
+        let server = mainnet_mempool(10).await;
+        let standing =
+            crate::chain::esplora::tx_standing(&esplora(&server), Network::Mainnet, &txid)
+                .await
+                .unwrap();
+        assert_eq!(standing.tip_height, 963_647);
     }
 
     /// A script in hex.

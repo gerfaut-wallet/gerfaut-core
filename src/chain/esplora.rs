@@ -1460,7 +1460,9 @@ pub(crate) async fn tx_standing(
     network: Network,
     txid: &Txid,
 ) -> Result<TxStanding, Fault> {
-    let tip_height = client.height().await?;
+    // Proven as a sync proves it: a height alone would make the
+    // transaction as deep as the server cared to say.
+    let tip_height = sync::proven_tip(client, network).await?;
     let found = client.knows_tx(txid).await?;
     if !found {
         return Ok(TxStanding {
