@@ -553,7 +553,7 @@ pub(crate) fn out_of_budget(error: &serde_json::Value) -> bool {
 /// deadline of its sync, which relegates nothing, and the next sync
 /// would start over. Past them, a refusal for want of memory is the
 /// answer at once: the sync moves to the next server, and this one is
-/// relegated for it ([`crate::chain::is_outage`]).
+/// relegated for it ([`crate::chain::FaultKind::Outage`]).
 pub(crate) const PAUSES: u32 = 3;
 
 std::thread_local! {
