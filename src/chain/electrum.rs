@@ -29,8 +29,8 @@ use electrum_client::raw_client::RawClient;
 use electrum_client::socks::Socks5Stream;
 use electrum_client::{self, ElectrumApi, Param};
 
-use super::Failure;
 use super::tls::{self, ConnectError, Verdict};
+use super::{Failure, Fault};
 
 pub(crate) mod address;
 pub(crate) mod rpc;
@@ -429,7 +429,7 @@ fn negotiate(raw: &Connection, timeout: Duration) -> Result<(), ConnectError> {
         ],
     )
     .map(|_| ())
-    .map_err(|e| ConnectError::Io(describe(&e, timeout)))
+    .map_err(|e| ConnectError::from(describe(&e, timeout)))
 }
 
 /// Runs `operation` against `target` on a thread of its own, and waits
@@ -440,8 +440,8 @@ async fn run<T: Send + 'static>(
     target: &Target,
     proxy: Option<&str>,
     deadline: Duration,
-    operation: impl FnOnce(&Connection) -> Result<T, String> + Send + 'static,
-) -> Result<T, String> {
+    operation: impl FnOnce(&Connection) -> Result<T, Fault> + Send + 'static,
+) -> Result<T, Fault> {
     let cancel = Arc::new(Cancel::default());
     let _abort = AbortOnDrop(cancel.clone());
     let (done, outcome) = tokio::sync::oneshot::channel();
@@ -452,15 +452,18 @@ async fn run<T: Send + 'static>(
         .spawn(move || {
             PAUSES_LEFT.set(PAUSES);
             let result = connect(&target, proxy.as_deref(), &cancel)
-                .map_err(|e| e.to_string())
+                .map_err(Fault::from)
                 .and_then(|raw| operation(&raw));
             let _ = done.send(result);
         })
-        .map_err(|e| format!("could not start the connection: {e}"))?;
+        .map_err(|e| Fault::other(format!("could not start the connection: {e}")))?;
     match tokio::time::timeout(deadline, outcome).await {
         Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("the connection ended unexpectedly".to_owned()),
-        Err(_) => Err(format!("no answer within {} s", deadline.as_secs())),
+        Ok(Err(_)) => Err(Fault::other("the connection ended unexpectedly")),
+        Err(_) => Err(Fault::other(format!(
+            "no answer within {} s",
+            deadline.as_secs()
+        ))),
     }
 }
 
@@ -513,7 +516,7 @@ pub(crate) async fn sync(
     plan: super::Plan,
     proxy: Option<&str>,
     deadline: Duration,
-) -> Result<super::Synced, String> {
+) -> Result<super::Synced, Fault> {
     let fail = failed(target);
     run(target, proxy, deadline, move |client| {
         sync::run(client, plan).map_err(fail)
@@ -550,7 +553,7 @@ pub(crate) fn out_of_budget(error: &serde_json::Value) -> bool {
 /// deadline of its sync, which relegates nothing, and the next sync
 /// would start over. Past them, a refusal for want of memory is the
 /// answer at once: the sync moves to the next server, and this one is
-/// relegated for it ([`crate::chain::is_outage`]).
+/// relegated for it ([`crate::chain::FaultKind::Outage`]).
 pub(crate) const PAUSES: u32 = 3;
 
 std::thread_local! {
@@ -623,36 +626,59 @@ fn timeout_for(target: &Target) -> Duration {
     }
 }
 
-/// The error of a call to `target`, as a sentence.
-fn failed(target: &Target) -> impl Fn(electrum_client::Error) -> String + use<> {
+/// The error of a call to `target`, as a sentence, of its kind.
+fn failed(target: &Target) -> impl Fn(electrum_client::Error) -> Fault + use<> {
     let timeout = timeout_for(target);
     move |error| describe(&error, timeout)
 }
 
-/// The error as a sentence a person can act on. The crate reports every
-/// failed call as "made one or multiple attempts, all errored" over a
-/// bulleted list, and an I/O failure in the operating system's words,
-/// error number included.
-fn describe(error: &electrum_client::Error, timeout: Duration) -> String {
+/// The error as a sentence a person can act on, of the kind its variant
+/// tells. The crate reports every failed call as "made one or multiple
+/// attempts, all errored" over a bulleted list, and an I/O failure in the
+/// operating system's words, error number included.
+///
+/// A refusal is in the server's words, and those choose nothing: it is
+/// an outage only when the server said, by its code, that it is out of
+/// memory for its answers ([`out_of_budget`]). A failure the core raised
+/// inside a call travels as the [`Fault`] it is ([`raised`]).
+fn describe(error: &electrum_client::Error, timeout: Duration) -> Fault {
     use electrum_client::Error;
     match error {
         // The client is left at its default of one attempt, so the list
         // holds the one failure; the last entry is the freshest anyway.
         Error::AllAttemptsErrored(errors) => match errors.last() {
             Some(inner) => describe(inner, timeout),
-            None => "request failed".to_owned(),
+            None => Fault::other("request failed"),
         },
         Error::IOError(io) => describe_io(io, timeout),
         Error::SharedIOError(io) => describe_io(io, timeout),
-        Error::Protocol(value) => format!("the server refused the request: {}", words(value)),
-        Error::Message(text) => text.clone(),
-        Error::InvalidDNSNameError(host) => format!("{host} is not a valid TLS host name"),
-        Error::CouldNotCreateConnection(_) => "TLS handshake failed".to_owned(),
-        Error::JSON(_) | Error::Hex(_) | Error::Bitcoin(_) | Error::InvalidResponse(_) => {
-            "unexpected response".to_owned()
+        Error::Protocol(value) => {
+            let refused = format!("the server refused the request: {}", words(value));
+            if out_of_budget(value) {
+                Fault::outage(refused)
+            } else {
+                Fault::other(refused)
+            }
         }
-        _ => "request failed".to_owned(),
+        Error::Message(text) => Fault::other(text.clone()),
+        Error::InvalidDNSNameError(host) => {
+            Fault::other(format!("{host} is not a valid TLS host name"))
+        }
+        Error::CouldNotCreateConnection(_) => Fault::outage("TLS handshake failed"),
+        Error::JSON(_) | Error::Hex(_) | Error::Bitcoin(_) | Error::InvalidResponse(_) => {
+            Fault::other("unexpected response")
+        }
+        _ => Fault::other("request failed"),
     }
+}
+
+/// A failure the core raises inside a call of the client of BDK, whose
+/// errors are the crate's own: carried inside an I/O error, as the
+/// [`Fault`] it is, and taken out again by [`describe`]. A server's
+/// answer never reaches one: it arrives as the crate's
+/// [`electrum_client::Error::Protocol`].
+pub(crate) fn raised(fault: Fault) -> electrum_client::Error {
+    electrum_client::Error::IOError(std::io::Error::other(fault))
 }
 
 /// The message of a JSON-RPC error, as a screen may show it: see
@@ -665,25 +691,35 @@ pub(crate) fn words(error: &serde_json::Value) -> String {
     crate::chain::server_words(&message)
 }
 
-fn describe_io(error: &std::io::Error, timeout: Duration) -> String {
+/// An I/O failure, of the kind the error has: a time limit, a connection
+/// that would not open or was cut, a name that does not resolve, are
+/// outages. A name that does not resolve has no kind of its own: the
+/// words of this device's system tell it, never a server's.
+fn describe_io(error: &std::io::Error, timeout: Duration) -> Fault {
     use std::io::ErrorKind;
+    if let Some(fault) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<Fault>())
+    {
+        return fault.clone();
+    }
     match error.kind() {
         // A socket read timeout is `WouldBlock` on Unix and `TimedOut`
         // on Windows.
         ErrorKind::TimedOut | ErrorKind::WouldBlock => {
-            format!("timed out after {} s", timeout.as_secs())
+            Fault::outage(format!("timed out after {} s", timeout.as_secs()))
         }
         ErrorKind::ConnectionRefused
         | ErrorKind::HostUnreachable
         | ErrorKind::NetworkUnreachable
-        | ErrorKind::NetworkDown => "could not connect".to_owned(),
+        | ErrorKind::NetworkDown => Fault::outage("could not connect"),
         ErrorKind::ConnectionReset
         | ErrorKind::ConnectionAborted
         | ErrorKind::BrokenPipe
         | ErrorKind::UnexpectedEof
-        | ErrorKind::NotConnected => "the connection was closed".to_owned(),
+        | ErrorKind::NotConnected => Fault::outage("the connection was closed"),
         // What [`Guarded`] says of a line too long: its own words.
-        ErrorKind::InvalidData => error.to_string(),
+        ErrorKind::InvalidData => Fault::other(error.to_string()),
         _ => {
             // Name resolution has no kind of its own, and each platform
             // words it differently.
@@ -698,9 +734,9 @@ fn describe_io(error: &std::io::Error, timeout: Duration) -> String {
             .iter()
             .any(|phrase| lower.contains(phrase))
             {
-                "host not found".to_owned()
+                Fault::outage("host not found")
             } else {
-                format!("connection failed: {text}")
+                Fault::other(format!("connection failed: {text}"))
             }
         }
     }
@@ -759,7 +795,7 @@ async fn on_one<T: Send + 'static>(
         Ok(operation(client))
     })
     .await
-    .unwrap_or_else(|text| Err(Failure::Transport(text)))
+    .unwrap_or_else(|fault| Err(Failure::Transport(fault)))
 }
 
 /// A failed call that is no broadcast, a lookup or the tip, as the
@@ -849,7 +885,7 @@ pub(crate) async fn fetch_prevouts(
         Ok((facts, None))
     })
     .await;
-    answered.unwrap_or_else(|text| (Vec::new(), Some(Failure::Transport(text))))
+    answered.unwrap_or_else(|fault| (Vec::new(), Some(Failure::Transport(fault))))
 }
 
 /// One coin, on a connection already open: see [`fetch_prevouts`].
@@ -975,12 +1011,13 @@ pub(crate) async fn tx_standing(
     txid: Txid,
     scripts: Vec<ScriptBuf>,
     proxy: Option<&str>,
-) -> Result<(bool, Option<u32>, u32), String> {
+) -> Result<(bool, Option<u32>, u32), Fault> {
     let fail = failed(target);
     run(target, proxy, call_deadline(target), move |client| {
-        let tip = patiently(|| client.block_headers_subscribe())
-            .map_err(&fail)?
-            .height as u32;
+        let announced = patiently(|| client.block_headers_subscribe()).map_err(&fail)?;
+        let height = u32::try_from(announced.height)
+            .map_err(|_| Fault::other(crate::chain::IMPOSSIBLE_TIP))?;
+        let tip = crate::chain::checked_tip(network, height, &announced.header)?;
         let mut refused = None;
         for script in &scripts {
             // A server short of memory is asked again first: the next
@@ -1004,7 +1041,7 @@ pub(crate) async fn tx_standing(
                 Some(_) => (true, None, tip),
             });
         }
-        Err(refused.map_or_else(|| "the transaction creates nothing".to_owned(), fail))
+        Err(refused.map_or_else(|| Fault::other("the transaction creates nothing"), fail))
     })
     .await
 }
@@ -1019,14 +1056,14 @@ fn proven_on(
     txid: Txid,
     height: u32,
     tip: u32,
-    fail: &impl Fn(electrum_client::Error) -> String,
-) -> Result<bool, String> {
+    fail: &impl Fn(electrum_client::Error) -> Fault,
+) -> Result<bool, Fault> {
     use crate::chain::proof::{
-        FALSE_PROOF, Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
-        check_confirmation, recheck,
+        Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, check_confirmation,
+        recheck,
     };
     match above_the_tip(height, tip) {
-        Some(Proof::False) => return Err(FALSE_PROOF.to_owned()),
+        Some(Proof::False) => return Err(Fault::false_proof()),
         Some(_) => return Ok(false),
         None => {}
     }
@@ -1044,7 +1081,7 @@ fn proven_on(
     match proof {
         Proof::Holds => {}
         Proof::Unsure => return Ok(false),
-        Proof::False | Proof::Elsewhere => return Err(FALSE_PROOF.to_owned()),
+        Proof::False | Proof::Elsewhere => return Err(Fault::false_proof()),
     }
     // A block of an early period of the chain, whose header costs little
     // to forge, holds only once chained to the checkpoint that ends its
@@ -1055,14 +1092,13 @@ fn proven_on(
         let Some(headers) = sync::headers_from(client, from, count).map_err(fail)? else {
             continue;
         };
-        let hashes =
-            chain_to_checkpoint(network, from, &headers).ok_or_else(|| FALSE_PROOF.to_owned())?;
+        let hashes = chain_to_checkpoint(network, from, &headers).ok_or_else(Fault::false_proof)?;
         read.insert(from, hashes);
     }
     match chained(network, height, hash, &read) {
         Proof::Holds => Ok(true),
         Proof::Unsure => Ok(false),
-        Proof::False | Proof::Elsewhere => Err(FALSE_PROOF.to_owned()),
+        Proof::False | Proof::Elsewhere => Err(Fault::false_proof()),
     }
 }
 
@@ -1324,12 +1360,12 @@ mod tests {
         assert_eq!((calls, waits), (1, PAUSES));
     }
 
-    /// A connection that fails, in the words this client puts it in, is an
-    /// outage, and so is a server out of memory twice in a row; another
-    /// refusal is not.
+    /// A connection that fails is an outage, told by the kind of its error,
+    /// and so is a server out of memory twice in a row; another refusal is
+    /// not, whatever its words. A failure the core raised inside a call
+    /// comes out as the fault it is.
     #[test]
     fn connections_that_fail_are_outages() {
-        use crate::chain::is_outage;
         use std::io::{Error, ErrorKind};
         for kind in [
             ErrorKind::TimedOut,
@@ -1339,24 +1375,39 @@ mod tests {
             ErrorKind::UnexpectedEof,
         ] {
             let detail = describe_io(&Error::from(kind), TIMEOUT);
-            assert!(is_outage(&detail), "{kind:?}: {detail}");
+            assert!(detail.is_outage(), "{kind:?}: {detail}");
         }
         let unknown = describe_io(
             &Error::other("failed to lookup address information"),
             TIMEOUT,
         );
         assert_eq!(unknown, "host not found");
-        assert!(is_outage(&unknown));
+        assert!(unknown.is_outage());
         // The words of this device's system, a firewall that says no:
         // nothing tells that it is the server.
         let local = describe_io(&Error::other("no route"), TIMEOUT);
         assert_eq!(local, "connection failed: no route");
-        assert!(!is_outage(&local));
-        assert!(is_outage(&describe(&out_of_memory(), TIMEOUT)));
-        let refused = electrum_client::Error::Protocol(serde_json::json!({
-            "code": 1, "message": "Too many history entries",
-        }));
-        assert!(!is_outage(&describe(&refused, TIMEOUT)));
+        assert!(!local.is_outage());
+        assert!(describe(&out_of_memory(), TIMEOUT).is_outage());
+        for words in [
+            "Too many history entries",
+            "request timed out",
+            "could not connect",
+            crate::chain::proof::FALSE_PROOF,
+        ] {
+            let refused = describe(
+                &electrum_client::Error::Protocol(serde_json::json!({
+                    "code": 1, "message": words,
+                })),
+                TIMEOUT,
+            );
+            assert_eq!(refused.kind(), crate::chain::FaultKind::Other, "{refused}");
+        }
+        let raised = describe(&raised(Fault::false_proof()), TIMEOUT);
+        assert!(raised.is_false_proof(), "{raised}");
+        assert_eq!(raised, crate::chain::proof::FALSE_PROOF);
+        let message = electrum_client::Error::Message(crate::chain::proof::FALSE_PROOF.to_owned());
+        assert!(!describe(&message, TIMEOUT).is_false_proof());
     }
 
     /// A sync whose server turns transactions down for want of memory,
@@ -1492,11 +1543,16 @@ mod tests {
         let target = Target::new(url, None);
         let started = tokio::time::Instant::now();
         let call = run(&target, None, deadline, |client| {
-            client.block_headers_subscribe().map_err(|e| e.to_string())
+            client
+                .block_headers_subscribe()
+                .map_err(|e| describe(&e, TIMEOUT))
         });
         let (outcome, heard) = tokio::join!(call, asked);
         let heard = heard.expect("the server never saw the request");
-        assert_eq!(outcome.err().as_deref(), Some("no answer within 2 s"));
+        assert_eq!(
+            outcome.err().as_ref().map(Fault::detail),
+            Some("no answer within 2 s")
+        );
         let waited = started.elapsed();
         assert!(
             waited >= deadline && waited <= deadline + Duration::from_millis(1),
@@ -1571,7 +1627,11 @@ mod tests {
                 &Target::new(url, None),
                 None,
                 Duration::from_secs(3600),
-                |client| client.block_headers_subscribe().map_err(|e| e.to_string()),
+                |client| {
+                    client
+                        .block_headers_subscribe()
+                        .map_err(|e| describe(&e, TIMEOUT))
+                },
             )
             .await;
         });
@@ -1592,7 +1652,7 @@ mod tests {
         let server = crate::testkit::FakeElectrum::start().await;
         let target = Target::new(format!("tcp://{}", server.address), None);
         run(&target, None, Duration::from_secs(10), |client| {
-            client.ping().map_err(|e| e.to_string())
+            client.ping().map_err(|e| describe(&e, TIMEOUT))
         })
         .await
         .unwrap();
@@ -1620,7 +1680,7 @@ mod tests {
         let target = Target::new(format!("tcp://{ONION}:50001"), None);
         let proxy = format!("user:pass@{address}");
         run(&target, Some(&proxy), Duration::from_secs(10), |client| {
-            client.ping().map_err(|e| e.to_string())
+            client.ping().map_err(|e| describe(&e, TIMEOUT))
         })
         .await
         .unwrap();
@@ -1842,6 +1902,7 @@ mod tests {
         }));
         let shown = describe(&written, TIMEOUT);
         let words = shown
+            .detail()
             .strip_prefix("the server refused the request: ")
             .unwrap();
         assert!(words.starts_with("history too longsee xx"), "{words}");

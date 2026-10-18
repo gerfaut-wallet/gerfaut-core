@@ -80,7 +80,7 @@ use bdk_wallet::bitcoin::{Address, ScriptBuf};
 
 use crate::chain::Endpoint;
 use crate::chain::electrum::status::Told;
-use crate::error::CoreResult;
+use crate::error::{CoreError, CoreResult, ErrorCode};
 use crate::manager::{ManagerState, Reach, WalletManager, ensure_engine, find_record};
 use crate::network::Network;
 use crate::store::TxStage;
@@ -178,10 +178,14 @@ pub enum LiveEvent {
         report: SyncReport,
     },
     /// The sync a change asked for failed; the next change, or the
-    /// next regular sync, tries again.
+    /// next regular sync, tries again. `message` is the core's words,
+    /// `kind` the code of the failure ([`crate::error::CoreError::code`]),
+    /// which a host picks its sentence on, a false proof's among them.
     SyncFailed {
         wallet_id: String,
         message: String,
+        #[serde(default = "crate::manager::sync_code")]
+        kind: ErrorCode,
     },
     NewBlock {
         height: u32,
@@ -321,7 +325,24 @@ impl Asked {
 }
 
 /// What a sync the watch ran came to: its report, or why it failed.
-type Synced = Result<SyncReport, String>;
+type Synced = Result<SyncReport, Failed>;
+
+/// Why a sync the watch ran failed: the core's words, and the code of the
+/// failure ([`CoreError::code`]).
+#[derive(Debug)]
+struct Failed {
+    message: String,
+    kind: ErrorCode,
+}
+
+impl From<CoreError> for Failed {
+    fn from(error: CoreError) -> Failed {
+        Failed {
+            message: error.to_string(),
+            kind: error.code(),
+        }
+    }
+}
 
 /// Pushed changes the syncs found nothing behind, in a row, by wallet.
 ///
@@ -963,7 +984,13 @@ impl WalletManager {
                 Some(done) = syncs.join_next_with_id() => {
                     let (task, outcome) = match done {
                         Ok((task, outcome)) => (task, outcome),
-                        Err(error) => (error.id(), Err("the sync stopped unexpectedly".to_owned())),
+                        Err(error) => (
+                            error.id(),
+                            Err(Failed {
+                                message: "the sync stopped unexpectedly".to_owned(),
+                                kind: ErrorCode::Internal,
+                            }),
+                        ),
                     };
                     let Some((wallet_id, asked)) = wallet_of.remove(&task) else {
                         continue;
@@ -1049,12 +1076,13 @@ impl WalletManager {
                 }
                 deliver(events, LiveEvent::WalletSynced { report }, halted).await
             }
-            Err(message) => {
+            Err(Failed { message, kind }) => {
                 deliver(
                     events,
                     LiveEvent::SyncFailed {
                         wallet_id: wallet_id.to_owned(),
                         message,
+                        kind,
                     },
                     halted,
                 )
@@ -1264,7 +1292,7 @@ impl WalletManager {
                 // The wallet no longer holds what they were foretold
                 // from: their scripts are read.
                 Ok(None) => {}
-                Err(error) => return Err(error.to_string()),
+                Err(error) => return Err(error.into()),
             }
         }
         let reach = asked.reach();
@@ -1296,8 +1324,6 @@ impl WalletManager {
             tokio::time::sleep(delay).await;
             (outcome, serving) = sync().await;
         }
-        outcome
-            .map(|(report, _)| report)
-            .map_err(|error| error.to_string())
+        outcome.map(|(report, _)| report).map_err(Failed::from)
     }
 }

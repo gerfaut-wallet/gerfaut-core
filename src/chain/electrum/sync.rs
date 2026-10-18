@@ -33,12 +33,11 @@ use electrum_client::{self, ElectrumApi, GetHistoryRes};
 
 use super::status::{Check, Entry, Told, Verdict};
 use crate::chain::proof::{
-    FALSE_PROOF, Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
-    check_confirmation, recheck,
+    Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, check_confirmation, recheck,
 };
 use crate::chain::{
-    ANOTHER_NETWORK, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX, has_proof_of_work,
-    height_limit,
+    ANOTHER_NETWORK, Fault, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX,
+    has_proof_of_work, height_limit,
 };
 use crate::network::Network;
 
@@ -517,7 +516,7 @@ impl Pass<'_> {
     /// Proves the confirmations the wallet does not hold: the header of
     /// each block, then the merkle branch of each transaction in it,
     /// each held to [`check_confirmation`]. A proof that does not hold
-    /// refuses the server ([`FALSE_PROOF`]): it named a confirmation it
+    /// refuses the server ([`crate::chain::proof::FALSE_PROOF`]): it named a confirmation it
     /// cannot back, and the next server is asked instead of this one
     /// being believed on anything else. One that is unsure leaves the
     /// transaction unconfirmed, as seen in the mempool now: among them, a
@@ -534,7 +533,7 @@ impl Pass<'_> {
         network: Network,
         chain: &mut Chain,
     ) -> Result<(), Error> {
-        let false_proof = || Error::Message(FALSE_PROOF.to_owned());
+        let false_proof = || super::raised(Fault::false_proof());
         let mut to_prove = std::mem::take(&mut self.to_prove);
         // A long sync may have seen blocks come in since the tip was
         // read: the tip is read again before anything is refused for it.
@@ -706,7 +705,7 @@ fn branches(
     let asked = batch.iter().map(|(txid, height)| (*txid, *height as usize));
     match client.batch_transaction_get_merkle(asked) {
         Ok(proofs) if proofs.len() == batch.len() => Ok(proofs.into_iter().map(Some).collect()),
-        Ok(_) => Err(Error::Message(FALSE_PROOF.to_owned())),
+        Ok(_) => Err(super::raised(Fault::false_proof())),
         Err(error) if refused(&error) => batch
             .iter()
             .map(

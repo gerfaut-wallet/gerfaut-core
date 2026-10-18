@@ -1212,7 +1212,7 @@ async fn open(
     let (tls, host, port) = parse(&target.url).map_err(Unopened::unreachable)?;
     let stream = net::open(&host, port, target.security(tls), proxy, budget)
         .await
-        .map_err(Unopened::unreachable)?;
+        .map_err(|fault| Unopened::unreachable(fault.to_string()))?;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = LineReader::new(reader, MAX_LINE);
     let hello = json!({

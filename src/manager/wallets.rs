@@ -48,15 +48,7 @@ impl WalletManager {
     ) -> CoreResult<WalletMeta> {
         let result: CoreResult<WalletMeta> = async {
             if !parsed.networks.contains(&network) {
-                return Err(CoreError::NetworkMismatch {
-                    expected: network.to_string(),
-                    found: parsed
-                        .networks
-                        .iter()
-                        .map(|n| n.to_string())
-                        .collect::<Vec<_>>()
-                        .join("/"),
-                });
+                return Err(super::network_mismatch(network, &parsed.networks));
             }
             let name = name.trim();
             if name.is_empty() {

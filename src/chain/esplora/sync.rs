@@ -30,24 +30,32 @@
 //! its block, both from the server that listed it, as an Electrum
 //! server's are. Two requests for the first confirmation of a block, one
 //! for each other one in it; none for a confirmation the wallet holds.
+//! One in the first years of the chain is chained to its checkpoint too
+//! ([`read_chains`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use super::api::{ScriptHashStats, TxStatus};
-use bdk_wallet::bitcoin::block::Header;
+use bdk_wallet::bitcoin::block::{Header, Version};
 use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
-use bdk_wallet::bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bdk_wallet::bitcoin::{
+    BlockHash, CompactTarget, OutPoint, ScriptBuf, Transaction, TxMerkleNode, TxOut, Txid,
+};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use electrum_client::GetMerkleRes;
 use futures_util::future::try_join_all;
 
 use super::page::PageTx;
 use super::{Client, Counts, PAGE, PARALLEL_REQUESTS};
-use crate::chain::proof::{FALSE_PROOF, Proof, above_the_tip, check_confirmation, recheck};
+use crate::chain::proof::{
+    Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, check_confirmation,
+    esplora_chains, recheck,
+};
 use crate::chain::{
-    Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX, height_limit,
+    Fault, Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX,
+    has_proof_of_work, height_limit,
 };
 use crate::network::Network;
 /// Pages read of one script at most: 10,000 confirmed transactions. A
@@ -58,14 +66,48 @@ const MAX_PAGES: usize = 400;
 /// Latest blocks kept of what a server lists: the ten Esplora lists.
 const LATEST: usize = 10;
 
-/// The part of a block summary that is read.
+/// Blocks Esplora lists a request, down from the height asked
+/// (`/blocks/:height`): ten on Blockstream's electrs and on mempool's,
+/// whose limit an operator may lower.
+const BLOCKS_PER_REQUEST: u32 = 10;
+
+/// Requests one proving of confirmations may spend chaining them to
+/// their checkpoints ([`crate::chain::proof::esplora_chains`]): two
+/// periods at worst, four on average, about what the first sync of a
+/// wallet of a few dozen addresses costs. A confirmation whose period
+/// does not fit is left unconfirmed, and the next sync goes on, the
+/// periods chained being kept for the session.
+const CHAIN_REQUESTS_MAX: u32 = 404;
+
+/// A block as Esplora sums it up: its height, and every field of its
+/// header, which make its hash.
 #[derive(serde::Deserialize)]
 struct Block {
     id: BlockHash,
     height: u32,
+    version: u32,
+    timestamp: u32,
+    bits: u32,
+    nonce: u32,
+    merkle_root: TxMerkleNode,
     /// `None` for the genesis block alone.
     #[serde(default)]
     previousblockhash: Option<BlockHash>,
+}
+
+impl Block {
+    /// The header the summary spells out. Its hash is the block's only
+    /// if the summary told the truth: [`Block::id`] is a claim.
+    fn header(&self) -> Header {
+        Header {
+            version: Version::from_consensus(self.version as i32),
+            prev_blockhash: self.previousblockhash.unwrap_or_else(BlockHash::all_zeros),
+            merkle_root: self.merkle_root,
+            time: self.timestamp,
+            bits: CompactTarget::from_consensus(self.bits),
+            nonce: self.nonce,
+        }
+    }
 }
 
 /// A transaction a history lists: where it stands, and, when the wallet
@@ -79,7 +121,7 @@ struct Listed {
 
 /// A page as the engine keeps it: see [`Listed`]. What it keeps counts
 /// against what the sync may keep.
-fn listed(client: &Client, page: Vec<PageTx>, held: &Held) -> Result<Vec<Listed>, String> {
+fn listed(client: &Client, page: Vec<PageTx>, held: &Held) -> Result<Vec<Listed>, Fault> {
     page.into_iter()
         .map(|tx| {
             let whole = if held.txs.contains_key(&tx.txid) {
@@ -89,10 +131,9 @@ fn listed(client: &Client, page: Vec<PageTx>, held: &Held) -> Result<Vec<Listed>
                 // The txid commits to the transaction: one that does not
                 // hash to it is not the one listed.
                 if whole.compute_txid() != tx.txid {
-                    return Err(
-                        "the server answered with another transaction than the one it listed"
-                            .to_owned(),
-                    );
+                    return Err(Fault::other(
+                        "the server answered with another transaction than the one it listed",
+                    ));
                 }
                 let prevouts: Vec<(OutPoint, TxOut)> = tx.prevouts().collect();
                 let spent: usize = prevouts
@@ -123,7 +164,7 @@ struct Read {
 }
 
 /// Runs a plan against one instance.
-pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, String> {
+pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
     let Plan {
         network,
         tip,
@@ -139,7 +180,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, String> {
     // Before any history, and so never past it: the tip of the answer
     // is what the wallet counts itself synced up to.
     let limit = height_limit(network, start_time);
-    let latest = latest_blocks(client, limit).await?;
+    let latest = latest_blocks(client, network, limit).await?;
     let server_tip = latest.keys().next_back().copied().unwrap_or_default();
     // The wallet's blocks far above the server's tip, or past any height
     // a chain can have reached, came from a server that made them up:
@@ -216,6 +257,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, String> {
     }
 
     let mut update = found.update;
+    check_spent(&held, &update)?;
     prove(client, network, server_tip, &held, start_time, &mut update).await?;
     let chain = meeting.chain(client, &latest, &update.anchors).await?;
     Ok(Synced {
@@ -251,7 +293,7 @@ async fn read_script(
     held: &Held,
     reading: Reading,
     agreed_up_to: u32,
-) -> Result<Read, String> {
+) -> Result<Read, Fault> {
     let stats: ScriptHashStats = client.get_json(&script_path(script)).await?;
     let used = stats.chain_stats.tx_count > 0 || stats.mempool_stats.tx_count > 0;
     let facts = held.scripts.get(script).cloned().unwrap_or_default();
@@ -293,7 +335,7 @@ async fn read_scanned(
     script: &ScriptBuf,
     held: &Held,
     agreed_up_to: u32,
-) -> Result<Read, String> {
+) -> Result<Read, Fault> {
     if held.scripts.contains_key(script) {
         return read_script(client, script, held, Reading::Complete, agreed_up_to).await;
     }
@@ -311,7 +353,7 @@ async fn read_pages_down_to(
     script: &ScriptBuf,
     held: &Held,
     known: Option<(&ScriptFacts, &ScriptHashStats)>,
-) -> Result<(Read, usize, bool), String> {
+) -> Result<(Read, usize, bool), Fault> {
     let base = format!("{}/txs", script_path(script));
     let mut txs: Vec<Listed> = Vec::new();
     let mut after: Option<Txid> = None;
@@ -319,10 +361,10 @@ async fn read_pages_down_to(
     let mut whole = false;
     for pages in 1.. {
         if pages > MAX_PAGES {
-            return Err(format!(
+            return Err(Fault::other(format!(
                 "the server lists more than {} transactions for one address",
                 MAX_PAGES * PAGE
-            ));
+            )));
         }
         let path = match after {
             Some(txid) => format!("{base}/chain/{txid}"),
@@ -422,6 +464,49 @@ fn enough(txs: &[Listed], facts: &ScriptFacts, held: &Held, stats: &ScriptHashSt
     covered as u64 >= u64::from(stats.chain_stats.tx_count)
 }
 
+/// Refuses a server that says a coin a new transaction spends is other
+/// than what the transaction that pays it pays, when the wallet holds
+/// that transaction or this sync read it ([`COIN_NOT_PAID`]): those
+/// hash to their txids, the coins Esplora attaches to each input do
+/// not. A coin of the wallet's is one of them once the history of its
+/// script is read, as long as the server lists there the transaction
+/// that paid it: what a transaction spends of the wallet, and so what it
+/// sends, is then the transaction's word and not the server's. A server
+/// that leaves that transaction out of the history, its counters
+/// lowered to match, still has its word taken for the coin, which moves
+/// what the transaction shows sent, never the balance, made of the
+/// wallet's own outputs. The coins of others whose transaction neither
+/// holds are the server's word still, as they are for a watched
+/// address: they make the fee shown, and the facts read of an input.
+/// Reading each of their transactions would prove them: a request for
+/// each payer's transaction, a third more requests for the first sync of
+/// a wallet of twenty addresses paid twice each (122 requests, measured
+/// against a server of the tests), 42 per cent more for one of a hundred
+/// addresses paid five times each (1,202), as much again for each other
+/// coin a payer spends, and every byte of those transactions, for
+/// figures that do not move the balance.
+fn check_spent(held: &Held, update: &TxUpdate<ConfirmationBlockTime>) -> Result<(), Fault> {
+    let read: HashMap<Txid, &Transaction> = update
+        .txs
+        .iter()
+        .map(|tx| (tx.compute_txid(), tx.as_ref()))
+        .collect();
+    for (outpoint, said) in &update.txouts {
+        let paying = held
+            .txs
+            .get(&outpoint.txid)
+            .map(|tx| tx.as_ref())
+            .or_else(|| read.get(&outpoint.txid).copied());
+        let Some(paying) = paying else {
+            continue;
+        };
+        if paying.output.get(outpoint.vout as usize) != Some(said) {
+            return Err(Fault::coin_not_paid());
+        }
+    }
+    Ok(())
+}
+
 /// The update being put together.
 struct Found {
     start_time: u64,
@@ -441,7 +526,7 @@ impl Found {
     /// Takes what was read of one script: where each transaction stands,
     /// the ones the wallet lacks with the coins they spend, and what left
     /// the mempool.
-    fn take(&mut self, read: Read) -> Result<(), String> {
+    fn take(&mut self, read: Read) -> Result<(), Fault> {
         for tx in read.txs {
             let txid = tx.txid;
             if !self.taken.insert(txid) {
@@ -489,7 +574,7 @@ async fn prove(
     held: &Held,
     start_time: u64,
     update: &mut TxUpdate<ConfirmationBlockTime>,
-) -> Result<(), String> {
+) -> Result<(), Fault> {
     let new: Vec<(ConfirmationBlockTime, Txid)> = update
         .anchors
         .iter()
@@ -532,24 +617,25 @@ async fn prove(
 /// ([`check_confirmation`]). Gives, for each, the time of its block once
 /// proven, `None` when the proof is unsure, or when the server has no
 /// branch or no header for it, as when a block came in since it listed
-/// it. A proof that does not hold refuses the server ([`FALSE_PROOF`]),
+/// it. A proof that does not hold refuses the server ([`crate::chain::proof::FALSE_PROOF`]),
 /// and so does a header that is not the block named. A sound branch into
 /// another block has the block at its height read again ([`recheck`]):
 /// one that replaced the block named leaves the confirmation unsure. One
 /// above `tip`, the tip the server gave before, is weighed by
 /// [`above_the_tip`] without a request.
 ///
-/// What Esplora cannot prove: it sends no run of headers, short of one
-/// request a block, so no block is chained to its checkpoint as over
-/// Electrum. A confirmation stands on its header's work alone, and one
-/// claimed in an early period of the chain costs what a header of that
-/// period costs to forge, little (see [`crate::chain::proof`]).
+/// A confirmation in one of the first periods of the chain, whose
+/// header costs next to nothing to forge, is chained to the checkpoint
+/// that ends its period ([`read_chains`]); one later on stands on its
+/// header's work, as Esplora sends headers ten at a time and chaining
+/// them all would cost more requests than the rest of the sync (see
+/// [`crate::chain::proof`]).
 pub(crate) async fn prove_confirmations(
     client: &Client,
     network: Network,
     tip: u32,
     claimed: &[(Txid, BlockId)],
-) -> Result<Vec<Option<u64>>, String> {
+) -> Result<Vec<Option<u64>>, Fault> {
     let too_high = |tip: u32| {
         claimed
             .iter()
@@ -558,14 +644,19 @@ pub(crate) async fn prove_confirmations(
     // A long sync may have seen blocks come in since the tip was read:
     // the tip is read again before anything is refused for it.
     let mut tip = tip;
+    // Proven as the first one was: a height alone would let a server
+    // raise the bound it is held to.
     if too_high(tip) {
-        let again = client.height().await?;
-        if again <= height_limit(network, crate::now_secs()) {
-            tip = tip.max(again);
+        match proven_tip(client, network).await {
+            Ok(again) => tip = tip.max(again),
+            Err(fault) if fault.is_outage() => return Err(fault),
+            // A tip that does not hold either is no excuse for the
+            // confirmation above the first one: it is refused for that.
+            Err(_) => {}
         }
     }
     if too_high(tip) {
-        return Err(FALSE_PROOF.to_owned());
+        return Err(Fault::false_proof());
     }
     let below: Vec<(Txid, BlockId)> = claimed
         .iter()
@@ -592,7 +683,7 @@ async fn prove_below_the_tip(
     client: &Client,
     network: Network,
     claimed: &[(Txid, BlockId)],
-) -> Result<Vec<Option<u64>>, String> {
+) -> Result<Vec<Option<u64>>, Fault> {
     let mut blocks: Vec<BlockHash> = claimed.iter().map(|(_, block)| block.hash).collect();
     blocks.sort_unstable();
     blocks.dedup();
@@ -606,6 +697,9 @@ async fn prove_below_the_tip(
         }
     }
     let mut times = Vec::with_capacity(claimed.len());
+    // The confirmations proven in a period whose header costs little to
+    // forge: where each sits in `times`, its height and its block.
+    let mut early: Vec<(usize, u32, BlockHash)> = Vec::new();
     for chunk in claimed.chunks(PARALLEL_REQUESTS) {
         let branches = try_join_all(chunk.iter().map(|(txid, _)| async move {
             let path = format!("/tx/{txid}/merkle-proof");
@@ -628,18 +722,138 @@ async fn prove_below_the_tip(
                 _ => Proof::Unsure,
             };
             match proof {
-                Proof::Holds => times.push(Some(u64::from(headers[&block.hash].time))),
+                Proof::Holds => {
+                    if esplora_chains(network, block.height) {
+                        early.push((times.len(), block.height, block.hash));
+                    }
+                    times.push(Some(u64::from(headers[&block.hash].time)));
+                }
                 Proof::Unsure => times.push(None),
-                Proof::False | Proof::Elsewhere => return Err(FALSE_PROOF.to_owned()),
+                Proof::False | Proof::Elsewhere => return Err(Fault::false_proof()),
+            }
+        }
+    }
+    if !early.is_empty() {
+        let blocks: Vec<(u32, BlockHash)> = early
+            .iter()
+            .map(|(_, height, hash)| (*height, *hash))
+            .collect();
+        let read = read_chains(client, network, &blocks).await?;
+        for (at, height, hash) in early {
+            match chained(network, height, hash, &read) {
+                Proof::Holds => {}
+                Proof::Unsure => times[at] = None,
+                Proof::False | Proof::Elsewhere => return Err(Fault::false_proof()),
             }
         }
     }
     Ok(times)
 }
 
+/// The chains to their checkpoints that `blocks`, proven at their
+/// heights in periods Esplora chains, need and this session has not
+/// read: by the height each starts at, as [`chained`] takes them. Each
+/// is read down from the end of its period, as many requests as
+/// [`CHAIN_REQUESTS_MAX`] leaves, the periods that do not fit left out:
+/// their confirmations are unsure, as are those of a chain a request
+/// failed in. A chain that does not end at its checkpoint refuses the
+/// server ([`crate::chain::proof::FALSE_PROOF`]).
+async fn read_chains(
+    client: &Client,
+    network: Network,
+    blocks: &[(u32, BlockHash)],
+) -> Result<HashMap<u32, Vec<BlockHash>>, Fault> {
+    let mut budget = CHAIN_REQUESTS_MAX;
+    let mut read = HashMap::new();
+    for (from, count) in chains_to_read(network, blocks) {
+        let cost = count.div_ceil(BLOCKS_PER_REQUEST);
+        if cost > budget {
+            continue;
+        }
+        let headers = match read_down_to(client, from, count, &mut budget).await {
+            Ok(Some(headers)) => headers,
+            Ok(None) => continue,
+            // A chain the server did not finish sending, down, rate
+            // limited or turning a request away, proves nothing either
+            // way: its confirmations, and those of the periods after it,
+            // stay unsure, and the sync goes on. Failing the sync instead
+            // would fail every sync of an old wallet on a server that
+            // limits these reads, and send them all to the next server.
+            Err(_) => break,
+        };
+        let hashes = chain_to_checkpoint(network, from, &headers).ok_or_else(Fault::false_proof)?;
+        read.insert(from, hashes);
+    }
+    Ok(read)
+}
+
+/// The `count` headers from `from` up, read down from the highest of
+/// them, [`PARALLEL_REQUESTS`] requests at a time, each asking for the
+/// [`BLOCKS_PER_REQUEST`] blocks below the one before it and taken from
+/// `budget`; a server that lists fewer a request is asked again for the
+/// highest block still missing. `None` when the budget runs out first,
+/// or when the server does not list the highest block missing, as one
+/// that is lying may: a chain not read proves nothing either way.
+async fn read_down_to(
+    client: &Client,
+    from: u32,
+    count: u32,
+    budget: &mut u32,
+) -> Result<Option<Vec<Header>>, Fault> {
+    let end = from + count - 1;
+    let mut headers: BTreeMap<u32, Header> = BTreeMap::new();
+    // The highest height still missing.
+    let mut next = end;
+    loop {
+        let asked: Vec<u32> = (0..PARALLEL_REQUESTS as u32)
+            .map_while(|step| {
+                next.checked_sub(step * BLOCKS_PER_REQUEST)
+                    .filter(|height| *height >= from)
+            })
+            .take(*budget as usize)
+            .collect();
+        if asked.is_empty() {
+            return Ok(None);
+        }
+        *budget -= asked.len() as u32;
+        let lists = try_join_all(asked.iter().map(|height| async move {
+            client
+                .get_json_opt::<Vec<Block>>(&format!("/blocks/{height}"))
+                .await
+        }))
+        .await?;
+        for (height, listed) in asked.iter().zip(lists) {
+            let Some(listed) = listed else {
+                return Ok(None);
+            };
+            for block in &listed {
+                if (from..=*height).contains(&block.height) {
+                    headers
+                        .entry(block.height)
+                        .or_insert_with(|| block.header());
+                }
+            }
+        }
+        if !headers.contains_key(&next) {
+            return Ok(None);
+        }
+        match (from..next)
+            .rev()
+            .find(|height| !headers.contains_key(height))
+        {
+            Some(missing) => next = missing,
+            None => break,
+        }
+    }
+    let headers: Option<Vec<Header>> = (from..=end)
+        .map(|height| headers.get(&height).copied())
+        .collect();
+    Ok(headers)
+}
+
 /// The header of the block `hash`, which must hash to it; `None` when
 /// the server has no such block, one a reorganisation left behind.
-async fn block_header(client: &Client, hash: BlockHash) -> Result<Option<Header>, String> {
+async fn block_header(client: &Client, hash: BlockHash) -> Result<Option<Header>, Fault> {
     let Some(text) = client
         .fetch(&format!("/block/{hash}/header"), 1 << 10)
         .await?
@@ -651,12 +865,12 @@ async fn block_header(client: &Client, hash: BlockHash) -> Result<Option<Header>
         .and_then(|text| deserialize_hex::<Header>(text.trim()).ok())
         .filter(|header| header.block_hash() == hash)
         .map(Some)
-        .ok_or_else(|| FALSE_PROOF.to_owned())
+        .ok_or_else(Fault::false_proof)
 }
 
 /// The header of the block the server has at `height` now; `None` when
 /// it has none there.
-async fn block_at_height(client: &Client, height: u32) -> Result<Option<Header>, String> {
+async fn block_at_height(client: &Client, height: u32) -> Result<Option<Header>, Fault> {
     let Some(text) = client
         .fetch(&format!("/block-height/{height}"), 1 << 10)
         .await?
@@ -666,37 +880,70 @@ async fn block_at_height(client: &Client, height: u32) -> Result<Option<Header>,
     let hash: BlockHash = std::str::from_utf8(&text)
         .ok()
         .and_then(|text| text.trim().parse().ok())
-        .ok_or_else(|| "unexpected response".to_owned())?;
+        .ok_or_else(|| Fault::other("unexpected response"))?;
     block_header(client, hash).await
 }
 
 /// The latest blocks, by height: ten on the instances there are,
 /// checked ([`checked_latest`]).
-async fn latest_blocks(client: &Client, limit: u32) -> Result<BTreeMap<u32, BlockHash>, String> {
-    checked_latest(client.get_json("/blocks").await?, limit)
+async fn latest_blocks(
+    client: &Client,
+    network: Network,
+    limit: u32,
+) -> Result<BTreeMap<u32, BlockHash>, Fault> {
+    checked_latest(network, client.get_json("/blocks").await?, limit)
 }
+
+/// The server's tip, proven as a descriptor wallet's sync proves it
+/// ([`checked_latest`]): what a watched address counts its
+/// confirmations from. One request, the one that read the height alone.
+pub(crate) async fn proven_tip(client: &Client, network: Network) -> Result<u32, Fault> {
+    let limit = height_limit(network, crate::now_secs());
+    let latest = latest_blocks(client, network, limit).await?;
+    latest
+        .keys()
+        .next_back()
+        .copied()
+        .ok_or_else(|| Fault::other("unexpected response"))
+}
+
+/// What a server whose latest blocks do not make a chain, with the
+/// work of their heights, is refused with.
+const UNCHAINED: &str = "the server's latest blocks do not chain";
 
 /// The latest blocks a server listed, checked, as they go into the
 /// wallet's chain: the highest [`LATEST`] kept, one for each height down
-/// from the tip, each the parent of the one above it, and the tip no
-/// higher than `limit`, the most a chain can have reached
-/// ([`height_limit`]). A server that lists blocks that do not chain is
-/// refused, and so is one past the limit.
-fn checked_latest(mut blocks: Vec<Block>, limit: u32) -> Result<BTreeMap<u32, BlockHash>, String> {
+/// from the tip, each the parent of the one above it, each with the
+/// work `network` asks for at its height ([`has_proof_of_work`]), the
+/// hash a summary names the hash of the header it spells out, and the
+/// tip no higher than `limit`, the most a chain can have reached
+/// ([`height_limit`]). A server that lists blocks that do not chain, or
+/// a tip no one mined, is refused, and so is one past the limit: a tip
+/// made up costs what mining a block of its height costs, as over
+/// Electrum.
+fn checked_latest(
+    network: Network,
+    mut blocks: Vec<Block>,
+    limit: u32,
+) -> Result<BTreeMap<u32, BlockHash>, Fault> {
     blocks.sort_by_key(|block| std::cmp::Reverse(block.height));
     blocks.truncate(LATEST);
     let tip = blocks
         .first()
-        .ok_or_else(|| "unexpected response".to_owned())?;
+        .ok_or_else(|| Fault::other("unexpected response"))?;
     if tip.height > limit {
-        return Err(IMPOSSIBLE_TIP.to_owned());
+        return Err(Fault::other(IMPOSSIBLE_TIP));
     }
     let chained = blocks.windows(2).all(|pair| {
         pair[1].height.checked_add(1) == Some(pair[0].height)
             && pair[0].previousblockhash == Some(pair[1].id)
     });
-    if !chained {
-        return Err("the server's latest blocks do not chain".to_owned());
+    let worked = blocks.iter().all(|block| {
+        let header = block.header();
+        header.block_hash() == block.id && has_proof_of_work(network, block.height, &header)
+    });
+    if !chained || !worked {
+        return Err(Fault::other(UNCHAINED));
     }
     Ok(blocks
         .into_iter()
@@ -710,7 +957,7 @@ async fn block_at(
     client: &Client,
     latest: &BTreeMap<u32, BlockHash>,
     height: u32,
-) -> Result<Option<BlockHash>, String> {
+) -> Result<Option<BlockHash>, Fault> {
     if let Some(hash) = latest.get(&height) {
         return Ok(Some(*hash));
     }
@@ -726,7 +973,7 @@ async fn block_at(
         .ok()
         .and_then(|text| text.trim().parse().ok())
         .map(Some)
-        .ok_or_else(|| "unexpected response".to_owned())
+        .ok_or_else(|| Fault::other("unexpected response"))
 }
 
 /// Where the wallet's chain and the server's meet: the last block both
@@ -753,7 +1000,7 @@ impl Meeting {
         network: Network,
         latest: &BTreeMap<u32, BlockHash>,
         local_tip: &CheckPoint,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Fault> {
         let mut conflicts = Vec::new();
         for local in local_tip.iter() {
             let Some(remote) = block_at(client, latest, local.height()).await? else {
@@ -779,7 +1026,7 @@ impl Meeting {
                 hash: remote,
             });
         }
-        Err("the server's chain never meets the wallet's".to_owned())
+        Err(Fault::other("the server's chain never meets the wallet's"))
     }
 
     /// The wallet's chain as the server sees it: from the meeting point,
@@ -793,7 +1040,7 @@ impl Meeting {
         client: &Client,
         latest: &BTreeMap<u32, BlockHash>,
         anchors: &BTreeSet<(ConfirmationBlockTime, Txid)>,
-    ) -> Result<CheckPoint, String> {
+    ) -> Result<CheckPoint, Fault> {
         let meeting = self.height;
         let mut tip = match self.ahead {
             Some(local) => local,
@@ -817,7 +1064,7 @@ impl Meeting {
             // genesis block, or blocks both agreed on.
             if height <= meeting {
                 if tip.get(height).is_some_and(|held| held.hash() != hash) {
-                    return Err("the server's chain contradicts itself".to_owned());
+                    return Err(Fault::other("the server's chain contradicts itself"));
                 }
                 if tip.get(height).is_some() {
                     continue;
@@ -874,48 +1121,71 @@ mod tests {
         assert_eq!(tip.get(0).unwrap().hash(), hash(0));
     }
 
+    /// A block summed up as Esplora sums it up, from its header.
+    fn summary(height: u32, header: &Header) -> Block {
+        Block {
+            id: header.block_hash(),
+            height,
+            version: header.version.to_consensus() as u32,
+            timestamp: header.time,
+            bits: header.bits.to_consensus(),
+            nonce: header.nonce,
+            merkle_root: header.merkle_root,
+            previousblockhash: (height > 0).then_some(header.prev_blockhash),
+        }
+    }
+
     /// The latest blocks go into the wallet's chain only as a chain: the
     /// highest ten, one per height, each the parent of the one above it,
-    /// under a tip a chain can have reached.
+    /// each the block its header makes, under a tip a chain can have
+    /// reached.
     #[test]
     fn the_latest_blocks_must_chain() {
-        let hash = |height: u32| {
-            let mut bytes = [0u8; 32];
-            bytes[..4].copy_from_slice(&height.to_le_bytes());
-            BlockHash::from_byte_array(bytes)
-        };
-        let block = |height: u32| Block {
-            id: hash(height),
-            height,
-            previousblockhash: height.checked_sub(1).map(hash),
-        };
+        let mut headers: Vec<Header> = Vec::new();
+        for height in 0..=100u32 {
+            headers.push(Header {
+                version: Version::TWO,
+                prev_blockhash: headers
+                    .last()
+                    .map_or_else(BlockHash::all_zeros, Header::block_hash),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: height,
+                bits: CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            });
+        }
+        let block = |height: u32| summary(height, &headers[height as usize]);
         let latest = |range: std::ops::RangeInclusive<u32>| range.rev().map(block).collect();
-        let read = checked_latest(latest(91..=100), 1_000).unwrap();
+        let checked =
+            |blocks: Vec<Block>, limit: u32| checked_latest(Network::Signet, blocks, limit);
+        let read = checked(latest(91..=100), 1_000).unwrap();
         assert_eq!(
             read.keys().copied().collect::<Vec<_>>(),
             (91..=100).collect::<Vec<_>>()
         );
+        assert_eq!(read[&100], headers[100].block_hash());
         // More than ten: the highest ten are read, in any order given.
         let mut many: Vec<Block> = latest(0..=100);
         many.reverse();
-        assert_eq!(checked_latest(many, 1_000).unwrap(), read);
+        assert_eq!(checked(many, 1_000).unwrap(), read);
         // A tip past what a chain can have reached.
-        assert_eq!(
-            checked_latest(latest(91..=100), 99).unwrap_err(),
-            IMPOSSIBLE_TIP
-        );
+        assert_eq!(checked(latest(91..=100), 99).unwrap_err(), IMPOSSIBLE_TIP);
         // A gap, a block twice, a parent that is not the block below.
         let mut gap: Vec<Block> = latest(91..=100);
         gap.remove(3);
-        assert!(checked_latest(gap, 1_000).is_err());
+        assert!(checked(gap, 1_000).is_err());
         let mut twice: Vec<Block> = latest(91..=100);
         twice.push(block(95));
-        assert!(checked_latest(twice, 1_000).is_err());
+        assert!(checked(twice, 1_000).is_err());
         let mut forged: Vec<Block> = latest(91..=100);
-        forged[0].previousblockhash = Some(hash(7));
-        assert!(checked_latest(forged, 1_000).is_err());
+        forged[0].previousblockhash = Some(headers[7].block_hash());
+        assert!(checked(forged, 1_000).is_err());
+        // A summary whose fields make another block than the one named.
+        let mut renamed: Vec<Block> = latest(91..=100);
+        renamed[0].nonce ^= 1;
+        assert_eq!(checked(renamed, 1_000).unwrap_err(), UNCHAINED);
         // A lone tip of four billion, once refused for its height alone.
-        assert!(checked_latest(vec![block(4_000_000_000)], 1_000).is_err());
-        assert!(checked_latest(Vec::new(), 1_000).is_err());
+        assert!(checked(vec![summary(4_000_000_000, &headers[0])], 1_000).is_err());
+        assert!(checked(Vec::new(), 1_000).is_err());
     }
 }

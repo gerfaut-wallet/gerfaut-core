@@ -18,8 +18,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-use crate::chain::tls;
 use crate::chain::tor::socks::{NO_AUTH, VERSION};
+use crate::chain::{Fault, tls};
 
 /// Anything a session can read from and write to.
 pub(crate) trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -42,20 +42,22 @@ pub(crate) enum Security<'a> {
 /// Opens a connection to `host:port`. `proxy` is the Tor SOCKS proxy
 /// the caller resolved, `user:password@host:port` or `host:port`, and
 /// is what the connection goes through when given. The whole opening,
-/// TLS included, gets `budget`.
+/// TLS included, gets `budget`. A connection that cannot be opened, its
+/// TLS or its time, is an outage of the server, unless it fails on the
+/// way through Tor: that is this device's.
 pub(crate) async fn open(
     host: &str,
     port: u16,
     security: Security<'_>,
     proxy: Option<&str>,
     budget: Duration,
-) -> Result<BoxStream, String> {
+) -> Result<BoxStream, Fault> {
     let onion = crate::chain::is_onion_host(host);
     // Checked here again, below whatever the caller decided: the one
     // place a name turns into a connection is the one place an onion
     // without a route must stop.
     if onion && proxy.is_none() {
-        return Err(crate::chain::tor::no_route(host));
+        return Err(crate::chain::tor::no_route(host).into());
     }
     let opening = async {
         let socket = match proxy {
@@ -67,30 +69,33 @@ pub(crate) async fn open(
         let _ = socket.set_nodelay(true);
         let config = match security {
             Security::Plain => return Ok(Box::new(socket) as BoxStream),
-            Security::Public => tls::public_config().map_err(|e| e.to_string())?,
-            Security::Electrum { .. } if onion => tls::onion_config().map_err(|e| e.to_string())?,
+            Security::Public => tls::public_config()?,
+            Security::Electrum { .. } if onion => tls::onion_config()?,
             Security::Electrum { pin } => {
-                let handshake = tls::Handshake::new(pin).map_err(|e| e.to_string())?;
-                let name = tls::server_name(host).map_err(|e| e.to_string())?;
+                let handshake = tls::Handshake::new(pin)?;
+                let name = tls::server_name(host)?;
                 return match TlsConnector::from(handshake.config.clone())
                     .connect(name, socket)
                     .await
                 {
                     Ok(stream) => Ok(Box::new(stream) as BoxStream),
-                    Err(error) => Err(handshake.refusal(&error).to_string()),
+                    Err(error) => Err(handshake.refusal(&error).into()),
                 };
             }
         };
-        let name = tls::server_name(host).map_err(|e| e.to_string())?;
+        let name = tls::server_name(host)?;
         TlsConnector::from(config)
             .connect(name, socket)
             .await
             .map(|stream| Box::new(stream) as BoxStream)
-            .map_err(|e| format!("TLS handshake failed: {e}"))
+            .map_err(|e| Fault::outage(format!("TLS handshake failed: {e}")))
     };
     match tokio::time::timeout(budget, opening).await {
         Ok(result) => result,
-        Err(_) => Err(format!("could not connect within {} s", budget.as_secs())),
+        Err(_) => Err(Fault::outage(format!(
+            "could not connect within {} s",
+            budget.as_secs()
+        ))),
     }
 }
 
@@ -174,14 +179,17 @@ async fn through_socks(proxy: &str, host: &str, port: u16) -> Result<TcpStream, 
     Ok(socket)
 }
 
-fn describe_io(error: &std::io::Error) -> String {
+/// A socket that would not open, in words, and of its kind: the server
+/// refused it, could not be reached, or did not answer in time, and its
+/// name does not resolve, are outages; the rest is this device's word.
+fn describe_io(error: &std::io::Error) -> Fault {
     use std::io::ErrorKind;
     match error.kind() {
         ErrorKind::ConnectionRefused
         | ErrorKind::HostUnreachable
         | ErrorKind::NetworkUnreachable
-        | ErrorKind::NetworkDown => "could not connect".to_owned(),
-        ErrorKind::TimedOut => "timed out".to_owned(),
+        | ErrorKind::NetworkDown => Fault::outage("could not connect"),
+        ErrorKind::TimedOut => Fault::outage("timed out"),
         _ => {
             let lower = error.to_string().to_ascii_lowercase();
             if [
@@ -193,9 +201,9 @@ fn describe_io(error: &std::io::Error) -> String {
             .iter()
             .any(|phrase| lower.contains(phrase))
             {
-                "host not found".to_owned()
+                Fault::outage("host not found")
             } else {
-                format!("connection failed: {error}")
+                Fault::other(format!("connection failed: {error}"))
             }
         }
     }
