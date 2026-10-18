@@ -186,11 +186,18 @@ impl WalletManager {
             // the restore as it is.
             let asked_by_index = choices.indexes.is_some();
             let mut refused = Vec::new();
+            // The wallets whose building failed: a later copy of one, which
+            // the plan counted as restored with it, is built in turn, and
+            // refused the same, never counted as watched.
+            let mut unbuilt: Vec<(Network, &WalletKind)> = Vec::new();
             for (index, fate) in plan.wallets {
                 let wallet = &payload.wallets[index];
                 let name = wallet.name.trim();
+                let copy_of_unbuilt = unbuilt
+                    .iter()
+                    .any(|(network, kind)| *network == wallet.network && **kind == wallet.kind);
                 let built = match fate {
-                    Fate::Watched => {
+                    Fate::Watched if !copy_of_unbuilt => {
                         skipped += 1;
                         continue;
                     }
@@ -199,7 +206,7 @@ impl WalletManager {
                     // reads it; building it can still fail on what only
                     // a derivation meets, and is then refused all the
                     // same, never half-restored.
-                    Fate::Restored => {
+                    Fate::Watched | Fate::Restored => {
                         let mut meta = fresh_meta(
                             name,
                             wallet.network,
@@ -209,7 +216,11 @@ impl WalletManager {
                         );
                         meta.labels = wallet.labels.clone();
                         meta.live_pinned = wallet.live_pinned;
-                        build_record(meta)
+                        let built = build_record(meta);
+                        if built.is_err() {
+                            unbuilt.push((wallet.network, &wallet.kind));
+                        }
+                        built
                     }
                 };
                 match built {
