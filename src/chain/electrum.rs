@@ -1189,7 +1189,8 @@ mod tests {
     }
 
     /// A keychain is walked as many scripts at a time as the gap, within
-    /// bounds: with nothing on it, the gap of twenty is one batch.
+    /// bounds, and never past it: with nothing on it, the gap of twenty
+    /// is one batch, and a gap of three a batch of three.
     #[tokio::test]
     async fn a_keychain_is_walked_a_gap_at_a_time() {
         use bdk_wallet::KeychainKind;
@@ -1197,7 +1198,7 @@ mod tests {
         use bdk_wallet::chain::{BlockId, CheckPoint};
 
         use crate::testkit::FakeElectrum;
-        for (stop_gap, batch) in [(20, 20), (3, 10), (500, 50)] {
+        for (stop_gap, batch) in [(20, 20), (3, 3), (500, 50)] {
             let server = FakeElectrum::start().await;
             server.state.lock().unwrap().hold = Some((usize::MAX, Duration::from_millis(20)));
             let genesis = genesis_block(bdk_wallet::bitcoin::Network::Signet).block_hash();
@@ -1233,10 +1234,95 @@ mod tests {
                 .iter()
                 .filter(|method| *method == "blockchain.scripthash.get_history")
                 .count();
-            assert!(
-                read < stop_gap as usize + batch,
-                "gap {stop_gap}: {read} read"
+            assert_eq!(read, stop_gap as usize, "gap {stop_gap}");
+        }
+    }
+
+    /// The server hears of the gap past the last address used, and of no
+    /// address further: the last batch of a walk is cut to the unused
+    /// addresses that complete the gap. A used address at the head of a
+    /// batch costs a batch of one.
+    #[tokio::test]
+    async fn a_keychain_walk_shows_the_server_the_gap_and_no_more() {
+        use bdk_wallet::KeychainKind;
+        use bdk_wallet::bitcoin::constants::genesis_block;
+        use bdk_wallet::chain::{BlockId, CheckPoint};
+
+        use crate::testkit::{FakeElectrum, nowhere, script, scripthash, transaction};
+        fn walked(i: u32) -> String {
+            format!("0014{i:04x}{}", "cd".repeat(18))
+        }
+        // The addresses used, the gap, and the addresses the server hears
+        // of: before the cut, 60 for the second, 40 for the third.
+        let cases: [(&[u32], u32, u32); 6] = [
+            (&[], 20, 20),
+            (&[0, 20], 20, 41),
+            (&[5], 20, 26),
+            (&[19], 20, 40),
+            (&[], 3, 3),
+            (&[2], 3, 6),
+        ];
+        for (used, stop_gap, heard) in cases {
+            let server = FakeElectrum::start().await;
+            for &index in used {
+                let parent = transaction(&[nowhere(1, index)], &[(&script(9), 2_000)]);
+                let payment = transaction(
+                    &[OutPoint::new(parent.compute_txid(), 0)],
+                    &[(&walked(index), 1_000)],
+                );
+                server.add_tx(&parent);
+                server.add_tx(&payment);
+                server.set_history(&walked(index), &[(payment.compute_txid(), 0)]);
+            }
+            let genesis = genesis_block(bdk_wallet::bitcoin::Network::Signet).block_hash();
+            let spks = (0u32..).map(|i| (i, ScriptBuf::from_hex(&walked(i)).unwrap()));
+            let plan = crate::chain::Plan {
+                network: crate::network::Network::Signet,
+                tip: CheckPoint::new(BlockId {
+                    height: 0,
+                    hash: genesis,
+                }),
+                start_time: 0,
+                scripts: Vec::new(),
+                scans: vec![crate::chain::Scan {
+                    keychain: KeychainKind::External,
+                    spks: Box::new(spks),
+                }],
+                stop_gap,
+                reading: crate::chain::Reading::Complete,
+                held: crate::chain::Held::default(),
+                told: None,
+            };
+            let target = Target::new(format!("tcp://{}", server.address), None);
+            let synced = sync(&target, plan, None, Duration::from_secs(60))
+                .await
+                .unwrap();
+            assert_eq!(
+                synced
+                    .update
+                    .last_active_indices
+                    .get(&KeychainKind::External),
+                used.last(),
+                "{used:?}"
             );
+            let index_of: std::collections::HashMap<String, u32> =
+                (0..1000).map(|i| (scripthash(&walked(i)), i)).collect();
+            let asked: Vec<u32> = server
+                .state
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .filter(|(method, _)| method == "blockchain.scripthash.get_history")
+                .map(|(_, hash)| index_of[hash])
+                .collect();
+            assert_eq!(
+                asked,
+                (0..heard).collect::<Vec<_>>(),
+                "{used:?}, gap {stop_gap}"
+            );
+            let last_used = used.last().map_or(0, |last| last + 1);
+            assert_eq!(heard - last_used, stop_gap, "{used:?}");
         }
     }
 
