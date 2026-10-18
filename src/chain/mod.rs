@@ -158,6 +158,31 @@ pub(crate) const TIP_LAG_MAX: u32 = 144;
 /// have reached is refused with.
 pub(crate) const IMPOSSIBLE_TIP: &str = "the server claims a block height no chain has reached";
 
+/// What a server whose tip is a header without the work of its height is
+/// refused with.
+pub(crate) const UNWORKED_TIP: &str = "the server's tip is a header no one mined";
+
+/// The tip a server announced over Electrum, `height` and its `header`,
+/// checked as the sync of a descriptor wallet checks it: no higher than
+/// any chain of `network` can have reached ([`height_limit`]), and with
+/// the work `network` asks for at that height ([`has_proof_of_work`]).
+/// Without them, a server makes a sent transaction or a watched address
+/// as deep in the chain as it cares to say. No request: the header comes
+/// with the height.
+pub(crate) fn checked_tip(
+    network: Network,
+    height: u32,
+    header: &bdk_wallet::bitcoin::block::Header,
+) -> Result<u32, Fault> {
+    if height > height_limit(network, crate::now_secs()) {
+        return Err(Fault::other(IMPOSSIBLE_TIP));
+    }
+    if !has_proof_of_work(network, height, header) {
+        return Err(Fault::other(UNWORKED_TIP));
+    }
+    Ok(height)
+}
+
 /// What a transaction does to an address, from what it pays it and what
 /// it spends of it, as a server tells both: past what a signed number
 /// holds, which no coin comes near and a server may still claim, it
@@ -1858,6 +1883,25 @@ mod tests {
             .unwrap();
         manager.sync_wallet(&wallet.id).await.unwrap();
         (manager, wallet.id)
+    }
+
+    /// An Electrum tip is held to the work of its height, with no request
+    /// more: the genesis header is a tip at height 0, and no tip at all
+    /// a few hundred thousand blocks on.
+    #[test]
+    fn an_electrum_tip_carries_the_work_of_its_height() {
+        let genesis =
+            bdk_wallet::bitcoin::constants::genesis_block(Network::Mainnet.to_bitcoin()).header;
+        assert_eq!(checked_tip(Network::Mainnet, 0, &genesis), Ok(0));
+        assert_eq!(
+            checked_tip(Network::Mainnet, 900_000, &genesis).unwrap_err(),
+            UNWORKED_TIP
+        );
+        assert_eq!(
+            checked_tip(Network::Mainnet, 4_000_000_000, &genesis).unwrap_err(),
+            IMPOSSIBLE_TIP
+        );
+        assert_eq!(checked_tip(Network::Signet, 900_000, &genesis), Ok(900_000));
     }
 
     /// A tip of four billion, from either kind of server, is refused,

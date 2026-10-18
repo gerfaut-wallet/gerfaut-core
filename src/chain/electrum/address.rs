@@ -43,7 +43,7 @@ use crate::chain::proof::{
     Proof, ProvenCoin, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
     check_confirmation, proven_coin, recheck, remember_coin,
 };
-use crate::chain::{Fault, IMPOSSIBLE_TIP, KEEP_MAX, Kept, height_limit};
+use crate::chain::{Fault, KEEP_MAX, Kept};
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
 use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
@@ -62,6 +62,7 @@ const MAX_HEADERS: usize = 2_000;
 #[derive(Deserialize)]
 struct Tip {
     height: u32,
+    hex: String,
 }
 
 /// One line of a history: height 0 or -1 is the mempool.
@@ -759,15 +760,15 @@ async fn headers_from(
 }
 
 /// The server's tip, refused past any height a chain of `network` can
-/// have reached ([`height_limit`]).
+/// have reached, or in a header without the work of its height
+/// ([`crate::chain::checked_tip`]).
 async fn read_tip(connection: &mut Connection, network: Network) -> Result<u32, Fault> {
     let tip: Tip = connection
         .call("blockchain.headers.subscribe", json!([]))
         .await?;
-    if tip.height > height_limit(network, crate::now_secs()) {
-        return Err(Fault::other(IMPOSSIBLE_TIP));
-    }
-    Ok(tip.height)
+    let header: Header =
+        deserialize_hex(&tip.hex).map_err(|_| Fault::other("unexpected response"))?;
+    crate::chain::checked_tip(network, tip.height, &header)
 }
 
 /// The header at `height`, read again; `None` when the server refuses it.

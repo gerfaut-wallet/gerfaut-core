@@ -1014,9 +1014,10 @@ pub(crate) async fn tx_standing(
 ) -> Result<(bool, Option<u32>, u32), Fault> {
     let fail = failed(target);
     run(target, proxy, call_deadline(target), move |client| {
-        let tip = patiently(|| client.block_headers_subscribe())
-            .map_err(&fail)?
-            .height as u32;
+        let announced = patiently(|| client.block_headers_subscribe()).map_err(&fail)?;
+        let height = u32::try_from(announced.height)
+            .map_err(|_| Fault::other(crate::chain::IMPOSSIBLE_TIP))?;
+        let tip = crate::chain::checked_tip(network, height, &announced.header)?;
         let mut refused = None;
         for script in &scripts {
             // A server short of memory is asked again first: the next
