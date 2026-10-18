@@ -1676,25 +1676,30 @@ mod servers {
 
     /// A chain the server fails to send, a request refused halfway, is
     /// no proof either way: the confirmation is left unconfirmed and the
-    /// sync goes on, where the refusal used to fail it whole. Asked again
-    /// once the server answers, it confirms.
+    /// sync goes on, where the refusal used to fail it whole. Once the
+    /// server sends the whole chain, it is read again and judged: here,
+    /// the genesis header claimed at height 1,000, a false proof.
     #[tokio::test]
     async fn an_early_esplora_chain_cut_short_is_unsure() {
-        let coinbase: Transaction = deserialize_hex(EARLY_COINBASE).unwrap();
-        let server = mainnet_mempool(4).await;
+        let genesis = bdk_wallet::bitcoin::constants::genesis_block(Network::Mainnet.to_bitcoin());
+        let server = mainnet_mempool(10).await;
         {
             let mut state = server.state.lock().unwrap();
-            for (at, hex) in (2_006..).zip(EARLY) {
-                state.served.insert(at, header(hex));
-            }
-            state.address_txs = vec![listed_coinbase(&coinbase, 2_010, header(EARLY[4]).time)];
-            state.blocks_refused.insert(2_011);
+            state.served.insert(1_000, genesis.header);
+            state.address_txs = vec![listed_coinbase(
+                &genesis.txdata[0],
+                1_000,
+                genesis.header.time,
+            )];
+            state.blocks_refused.insert(1_505);
         }
         let state = esplora_address(&server, Network::Mainnet).await.unwrap();
         assert_eq!(state.txs[0].height, None);
         server.state.lock().unwrap().blocks_refused.clear();
-        let state = esplora_address(&server, Network::Mainnet).await.unwrap();
-        assert_eq!(state.txs[0].height, Some(2_010));
+        let refused = esplora_address(&server, Network::Mainnet)
+            .await
+            .unwrap_err();
+        assert!(refused.is_false_proof(), "{refused}");
     }
 
     /// A confirmation whose chain does not fit in what a sync may spend
