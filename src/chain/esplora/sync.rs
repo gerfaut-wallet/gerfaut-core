@@ -756,7 +756,7 @@ async fn prove_below_the_tip(
 /// is read down from the end of its period, as many requests as
 /// [`CHAIN_REQUESTS_MAX`] leaves, the periods that do not fit left out:
 /// their confirmations are unsure, as are those of a chain a request
-/// failed in. A chain that does not end at its checkpoint refuses the
+/// was turned down in; a server down halfway fails the sync. A chain that does not end at its checkpoint refuses the
 /// server ([`crate::chain::proof::FALSE_PROOF`]).
 async fn read_chains(
     client: &Client,
@@ -773,9 +773,12 @@ async fn read_chains(
         let headers = match read_down_to(client, from, count, &mut budget).await {
             Ok(Some(headers)) => headers,
             Ok(None) => continue,
-            // A chain the server did not finish sending proves nothing
-            // either way: its confirmations, and those of the periods
-            // after it, stay unsure, and the sync goes on without them.
+            // A server down or rate-limited halfway fails the sync, as
+            // any other request would: it is relegated, and the next
+            // server reads the chain. Turned down otherwise, the chain
+            // proves nothing either way: its confirmations, and those of
+            // the periods after it, stay unsure, and the sync goes on.
+            Err(fault) if fault.is_outage() => return Err(fault),
             Err(_) => break,
         };
         let hashes = chain_to_checkpoint(network, from, &headers).ok_or_else(Fault::false_proof)?;
