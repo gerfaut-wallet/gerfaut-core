@@ -305,7 +305,10 @@ enum Fate {
 /// backup, read without building any engine: each wallet is checked the
 /// way an import checks one ([`check_restorable`]) and against the
 /// wallets restored before it, so two copies of a wallet in one backup
-/// come back as one.
+/// come back as one. What it cannot see is what only building the engine
+/// meets, a refusal no wallet is known to raise: the import refuses such
+/// a wallet, and its later copies with it, where the preview had them
+/// restored once and skipped.
 fn plan_restore(
     vault: &VaultPayload,
     payload: &BackupPayload,
