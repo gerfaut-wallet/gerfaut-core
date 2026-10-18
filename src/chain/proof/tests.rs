@@ -1604,7 +1604,10 @@ mod servers {
         let refused = esplora_address(&server, Network::Mainnet)
             .await
             .unwrap_err();
-        assert!(refused.contains(FALSE_PROOF), "{refused}");
+        assert!(
+            refused.is_false_proof() && refused.contains(FALSE_PROOF),
+            "{refused}"
+        );
         // From 2,015 down to 1,000: 102 requests of ten.
         assert_eq!(asked(&server, "/blocks/"), 102);
 
@@ -1612,7 +1615,11 @@ mod servers {
         let listed = early(&server);
         list(&server, vec![listed]);
         let refused = esplora_sync(&server, address_plan(Network::Mainnet, Held::default())).await;
-        assert!(refusal(refused).contains(FALSE_PROOF));
+        let refused = refusal(refused);
+        assert!(
+            refused.is_false_proof() && refused.contains(FALSE_PROOF),
+            "{refused}"
+        );
     }
 
     /// The real block 2,010 and the nine around it, the last of them the
@@ -1850,7 +1857,11 @@ mod servers {
             list(&server, vec![lie.clone(), parent.clone()]);
             let refused =
                 esplora_sync(&server, address_plan(Network::Signet, Held::default())).await;
-            assert!(refusal(refused).contains(COIN_NOT_PAID));
+            let refused = refusal(refused);
+            assert!(
+                refused.is_false_proof() && refused.contains(COIN_NOT_PAID),
+                "{refused}"
+            );
             // The transaction that pays it held, not read again.
             list(&server, vec![lie]);
             let plan = address_plan(
@@ -1860,7 +1871,11 @@ mod servers {
                     ..Held::default()
                 },
             );
-            assert!(refusal(esplora_sync(&server, plan).await).contains(COIN_NOT_PAID));
+            let refused = refusal(esplora_sync(&server, plan).await);
+            assert!(
+                refused.is_false_proof() && refused.contains(COIN_NOT_PAID),
+                "{refused}"
+            );
         }
     }
 
@@ -1888,7 +1903,10 @@ mod servers {
         ] {
             server.state.lock().unwrap().address_txs = vec![lie.clone(), parent.clone()];
             let refused = esplora_address(&server, Network::Signet).await.unwrap_err();
-            assert!(refused.contains(COIN_NOT_PAID), "{refused}");
+            assert!(
+                refused.is_false_proof() && refused.contains(COIN_NOT_PAID),
+                "{refused}"
+            );
             server.state.lock().unwrap().address_txs = vec![lie];
             let refused = crate::chain::esplora::fetch_address_state(
                 &esplora(&server),
@@ -1898,7 +1916,10 @@ mod servers {
             )
             .await
             .unwrap_err();
-            assert!(refused.contains(COIN_NOT_PAID), "{refused}");
+            assert!(
+                refused.is_false_proof() && refused.contains(COIN_NOT_PAID),
+                "{refused}"
+            );
         }
     }
 
