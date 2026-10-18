@@ -61,8 +61,10 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 /// Onion endpoints get more room. The connect budget is spent around
 /// the SOCKS handshake, and behind that handshake Tor builds a circuit
 /// to the onion service, which regularly takes half a minute: a slow
-/// circuit must not read as a dead host. The circuit then carries less
-/// than a plain connection, so the whole request gets two minutes.
+/// circuit must not read as a dead host. The built-in Tor spends this
+/// minute on two attempts, the second beside the first after thirty
+/// seconds (`chain::tor::attempts`). The circuit then carries less than
+/// a plain connection, so the whole request gets two minutes.
 const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const TOR_TIMEOUT: Duration = Duration::from_secs(120);
 

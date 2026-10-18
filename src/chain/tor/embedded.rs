@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arti_client::config::TorClientConfigBuilder;
-use arti_client::{TorClient, TorClientConfig};
+use arti_client::{DataStream, TorClient, TorClientConfig};
 use futures_util::StreamExt;
 use tokio::sync::OnceCell;
 use tor_rtcompat::tokio::TokioRustlsRuntime;
 
-use super::{Progress, socks, update};
+use super::{Progress, attempts, socks, update};
 use crate::error::{CoreError, CoreResult};
 
 /// How long a bootstrap may take. A first run downloads the network
@@ -118,10 +118,12 @@ async fn bootstrap(data_dir: &Path) -> CoreResult<Embedded> {
         .await
         .map_err(|error| tor(format!("cannot listen on loopback for Tor: {error}")))?;
     let connect = {
-        let client = client.clone();
+        let streams = Arc::new(Streams {
+            current: std::sync::Mutex::new(client.clone()),
+        });
         move |host: String, port: u16| {
-            let client = client.clone();
-            async move { client.connect((host, port)).await.map_err(io::Error::other) }
+            let streams = streams.clone();
+            async move { streams.connect(host, port).await }
         }
     };
     // Fresh for every start: nothing outside this process ever holds
@@ -135,6 +137,75 @@ async fn bootstrap(data_dir: &Path) -> CoreResult<Embedded> {
         },
         _client: client,
     })
+}
+
+type Client = Arc<TorClient<TokioRustlsRuntime>>;
+
+/// The client the streams of the proxy go out on: the one bootstrapped,
+/// until the second attempt at an onion connection connects through a
+/// client of its own ([`attempts`]). That client then takes its place:
+/// its circuit to the service is the one known to answer, where the
+/// streams of the first would still join the attempt that hangs. Every
+/// stream shares one isolation either way, as before any second
+/// attempt.
+struct Streams {
+    current: std::sync::Mutex<Client>,
+}
+
+impl Streams {
+    fn current(&self) -> Client {
+        self.current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// The client of a second attempt beside one made through `first`:
+    /// the one another stream put in its place meanwhile, if one did,
+    /// else one of a new isolation.
+    fn successor(&self, first: &Client) -> Client {
+        let current = self.current();
+        if Arc::ptr_eq(&current, first) {
+            first.isolated_client()
+        } else {
+            current
+        }
+    }
+
+    /// `used` in the place of `first`, unless another stream replaced
+    /// `first` already; nothing when `used` is `first`.
+    fn adopt(&self, first: &Client, used: &Client) {
+        let mut current = self
+            .current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Arc::ptr_eq(&current, first) {
+            *current = used.clone();
+        }
+    }
+
+    /// The upstream side of a `CONNECT`: a host in the clear in one
+    /// attempt, an onion service in two ([`attempts::two`]).
+    async fn connect(&self, host: String, port: u16) -> io::Result<DataStream> {
+        let first = self.current();
+        if !crate::chain::is_onion_host(&host) {
+            return first.connect((host, port)).await.map_err(io::Error::other);
+        }
+        let through = |client: Client, host: String| async move {
+            match client.connect((host, port)).await {
+                Ok(stream) => Ok((stream, client)),
+                Err(error) => Err(io::Error::other(error)),
+            }
+        };
+        let (stream, used) = attempts::two(
+            through(first.clone(), host.clone()),
+            || through(self.successor(&first), host),
+            attempts::TRY,
+        )
+        .await?;
+        self.adopt(&first, &used);
+        Ok(stream)
+    }
 }
 
 fn config(data_dir: &Path) -> CoreResult<TorClientConfig> {
