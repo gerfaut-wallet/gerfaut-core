@@ -1282,13 +1282,28 @@ fn wallet() -> Vec<Fixture> {
         ),
         fixture(
             "SyncFailure",
-            vec![(
-                "unreachable",
-                SyncFailure {
-                    wallet_id: COLD.to_owned(),
-                    message: "sync failed via electrum.example.org: connection refused".to_owned(),
-                },
-            )],
+            vec![
+                (
+                    "unreachable",
+                    SyncFailure {
+                        wallet_id: COLD.to_owned(),
+                        message: "sync failed via electrum.example.org: connection refused"
+                            .to_owned(),
+                        kind: ErrorCode::Sync,
+                    },
+                ),
+                (
+                    "false_proof",
+                    SyncFailure {
+                        wallet_id: COLD.to_owned(),
+                        message: format!(
+                            "sync failed via electrum.example.org: electrum.example.org: {}",
+                            crate::chain::proof::FALSE_PROOF
+                        ),
+                        kind: ErrorCode::FalseProof,
+                    },
+                ),
+            ],
         ),
         fixture(
             "SyncAllReport",
@@ -1300,6 +1315,7 @@ fn wallet() -> Vec<Fixture> {
                         wallet_id: COLD.to_owned(),
                         message: "sync failed via electrum.example.org: connection refused"
                             .to_owned(),
+                        kind: ErrorCode::Sync,
                     }],
                 },
             )],
@@ -2579,6 +2595,18 @@ fn live() -> Vec<Fixture> {
             LiveEvent::SyncFailed {
                 wallet_id: COLD.to_owned(),
                 message: "sync failed via electrum.example.org: connection refused".to_owned(),
+                kind: ErrorCode::Sync,
+            },
+        ),
+        (
+            "sync_failed_false_proof",
+            LiveEvent::SyncFailed {
+                wallet_id: COLD.to_owned(),
+                message: format!(
+                    "sync failed via electrum.example.org: electrum.example.org: {}",
+                    crate::chain::proof::FALSE_PROOF
+                ),
+                kind: ErrorCode::FalseProof,
             },
         ),
         ("new_block", LiveEvent::NewBlock { height: TIP + 1 }),

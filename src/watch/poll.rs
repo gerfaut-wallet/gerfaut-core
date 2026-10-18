@@ -173,7 +173,7 @@ impl Poller {
             (ROUND_BUDGET, 1)
         };
         Ok(Poller {
-            client: Arc::new(esplora::client(base, proxy)?),
+            client: Arc::new(esplora::client(base, proxy).map_err(|fault| fault.to_string())?),
             budget,
             at_once,
         })
@@ -236,7 +236,10 @@ impl Plan {
             .map(move |(hex, script)| {
                 let client = client.clone();
                 async move {
-                    let stats = client.scripthash_stats(&script).await?;
+                    let stats = client
+                        .scripthash_stats(&script)
+                        .await
+                        .map_err(|fault| fault.to_string())?;
                     Ok::<_, String>((hex, Fingerprint::of(&stats)))
                 }
             })
@@ -263,7 +266,11 @@ pub(super) async fn same_network(
     let client = poller.client.clone();
     let network = hub.config.network;
     let checked = hub
-        .during(async move { esplora::check_network(&client, network).await })
+        .during(async move {
+            esplora::check_network(&client, network)
+                .await
+                .map_err(|fault| fault.to_string())
+        })
         .await?;
     if let Some(pause) = poller.take_rate_limit() {
         hub.pace(endpoint).limited(pause, Instant::now());
@@ -346,11 +353,15 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         let plan = poller.plan(&hub.watched, &mut hub.turns, 0, HOT);
         let known_tip = tip.clone();
         let round = async move {
-            let hash = client.tip_hash().await?.to_string();
+            let hash = client
+                .tip_hash()
+                .await
+                .map_err(|fault| fault.to_string())?
+                .to_string();
             let height = if known_tip.as_deref() == Some(hash.as_str()) {
                 None
             } else {
-                Some(client.height().await?)
+                Some(client.height().await.map_err(|fault| fault.to_string())?)
             };
             Ok::<_, String>((hash, height, plan.check().await?))
         };

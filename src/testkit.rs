@@ -914,6 +914,13 @@ pub(crate) struct MempoolState {
     /// are still served, while the chain and the branches are the new
     /// block's.
     pub stale: HashMap<u32, bdk_wallet::bitcoin::block::Header>,
+    /// Blocks the latest listed hold (`/blocks`), ten when `None`.
+    pub latest_listed: Option<u32>,
+    /// Blocks a listing down from a height holds (`/blocks/:height`),
+    /// ten when `None`, as Esplora lists them.
+    pub blocks_listed: Option<u32>,
+    /// Heights a listing down from which is refused with a 400.
+    pub blocks_refused: std::collections::HashSet<u32>,
 }
 
 /// The headers of the chain the fake mempool serves, by height: see
@@ -1092,6 +1099,28 @@ impl MempoolState {
         page.into_iter()
             .map(|tx| self.as_listed(chain_headers, tx))
             .collect()
+    }
+
+    /// The `listed` blocks down from `height`, as Esplora sums them up,
+    /// the genesis block last.
+    fn blocks_down_from(&self, chain: &Headers, height: u32, listed: u32) -> Value {
+        let blocks = (height.saturating_sub(listed - 1)..=height)
+            .rev()
+            .map(|height| {
+                let header = self.header_in(chain, height);
+                json!({
+                    "id": header.block_hash().to_string(),
+                    "height": height,
+                    "version": header.version.to_consensus() as u32,
+                    "timestamp": header.time,
+                    "bits": header.bits.to_consensus(),
+                    "nonce": header.nonce,
+                    "merkle_root": header.merkle_root.to_string(),
+                    "previousblockhash": (height > 0).then(|| header.prev_blockhash.to_string()),
+                })
+            })
+            .collect();
+        Value::Array(blocks)
     }
 
     /// The id of the block at `height` in the chain the REST side
@@ -1292,19 +1321,28 @@ impl FakeMempool {
             } else if path.ends_with("/blocks/tip/height") {
                 ("200 OK", state.tip.to_string())
             } else if path.ends_with("/blocks") {
-                let tip = state.tip;
-                let blocks: Vec<Value> = (tip.saturating_sub(9)..=tip)
-                    .rev()
-                    .map(|height| {
-                        let header = state.header_in(&chain, height);
-                        json!({
-                            "id": header.block_hash().to_string(),
-                            "height": height,
-                            "previousblockhash": (height > 0).then(|| header.prev_blockhash.to_string()),
-                        })
-                    })
-                    .collect();
-                ("200 OK", Value::Array(blocks).to_string())
+                let listed = state.latest_listed.unwrap_or(10);
+                (
+                    "200 OK",
+                    state
+                        .blocks_down_from(&chain, state.tip, listed)
+                        .to_string(),
+                )
+            } else if let Some(height) = path
+                .rsplit_once("/blocks/")
+                .and_then(|(_, height)| height.parse::<u32>().ok())
+            {
+                if state.blocks_refused.contains(&height) {
+                    ("400 Bad Request", "Invalid request".to_owned())
+                } else if height <= state.tip {
+                    let listed = state.blocks_listed.unwrap_or(10);
+                    (
+                        "200 OK",
+                        state.blocks_down_from(&chain, height, listed).to_string(),
+                    )
+                } else {
+                    ("404 Not Found", "Block not found".to_owned())
+                }
             } else if let Some(height) = path
                 .rsplit_once("/block-height/")
                 .and_then(|(_, height)| height.parse::<u32>().ok())

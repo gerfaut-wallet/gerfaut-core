@@ -24,6 +24,7 @@ use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use super::{
     CLIENT_NAME, MAX_LINE, MAX_READ, PROTOCOL, TIMEOUT, TOR_TIMEOUT, Target, parse, too_long, words,
 };
+use crate::chain::Fault;
 use crate::chain::net::{self, BoxStream, LineReader, LineTooLong};
 
 /// Requests awaiting their answer at any time: as many as the live
@@ -39,33 +40,62 @@ const MAX_STRAY: usize = 1_000;
 /// Why a call came back without its result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CallError {
-    /// The server answered with an error: its words, kept short.
-    Refused(String),
+    /// The server answered with an error: its words, kept short, and
+    /// whether it turned the request down for want of memory
+    /// ([`super::out_of_budget`]), which is an outage of the server
+    /// whatever was asked.
+    Refused { words: String, busy: bool },
     /// The server turned the request down for want of memory, in these
-    /// words ([`super::out_of_budget`]): it is asked again once, a moment
-    /// later, before a caller hears of it as a refusal.
+    /// words: it is asked again once, a moment later, before a caller
+    /// hears of it as a refusal.
     Busy(String),
     /// The answer was longer than a line may be.
     TooLong,
     /// The connection failed, or the answer was not the protocol.
-    Failed(String),
+    Failed(Fault),
+}
+
+impl CallError {
+    /// A refusal in the server's words.
+    pub(crate) fn refused(words: impl Into<String>) -> CallError {
+        CallError::Refused {
+            words: words.into(),
+            busy: false,
+        }
+    }
+
+    /// What a caller hears of a refusal for want of memory.
+    fn busy(words: String) -> CallError {
+        CallError::Refused { words, busy: true }
+    }
 }
 
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CallError::Refused(words) | CallError::Busy(words) => {
+            CallError::Refused { words, .. } | CallError::Busy(words) => {
                 write!(f, "the server refused the request: {words}")
             }
             CallError::TooLong => f.write_str(&too_long(MAX_LINE)),
-            CallError::Failed(detail) => f.write_str(detail),
+            CallError::Failed(fault) => write!(f, "{fault}"),
         }
     }
 }
 
-impl From<CallError> for String {
-    fn from(error: CallError) -> String {
-        error.to_string()
+/// A refusal for want of memory is an outage, and a failed connection
+/// is what it was found to be; any other refusal, whatever its words,
+/// is not.
+impl From<CallError> for Fault {
+    fn from(error: CallError) -> Fault {
+        match &error {
+            CallError::Refused { busy: true, .. } | CallError::Busy(_) => {
+                Fault::outage(error.to_string())
+            }
+            CallError::Refused { busy: false, .. } | CallError::TooLong => {
+                Fault::other(error.to_string())
+            }
+            CallError::Failed(fault) => fault.clone(),
+        }
     }
 }
 
@@ -109,7 +139,7 @@ impl Connection {
     /// Connects to `target` and agrees on the protocol. `proxy` is the
     /// Tor proxy the caller resolved; only an onion host goes through
     /// it, and an onion host without one is refused before any socket.
-    pub(crate) async fn open(target: &Target, proxy: Option<&str>) -> Result<Self, String> {
+    pub(crate) async fn open(target: &Target, proxy: Option<&str>) -> Result<Self, Fault> {
         let (tls, host, port) = parse(&target.url)?;
         let onion = super::is_onion(target, &host);
         let timeout = if onion { TOR_TIMEOUT } else { TIMEOUT };
@@ -143,7 +173,7 @@ impl Connection {
             Ok(())
         })
         .await?;
-        answer.unwrap_or_else(|| Err(CallError::Failed("no answer".to_owned())))
+        answer.unwrap_or_else(|| Err(CallError::Failed(Fault::other("no answer"))))
     }
 
     /// The same method for each of `params`, a window at a time. Each
@@ -171,7 +201,7 @@ impl Connection {
                     busy.push(index);
                     Ok(())
                 }
-                Err(CallError::Busy(words)) => each(index, Err(CallError::Refused(words))),
+                Err(CallError::Busy(words)) => each(index, Err(CallError::busy(words))),
                 result => each(index, result),
             },
         )
@@ -184,7 +214,7 @@ impl Connection {
         busy.sort_unstable();
         let again = busy.into_iter().map(|index| (index, &params[index]));
         self.round(method, again, |index, result| match result {
-            Err(CallError::Busy(words)) => each(index, Err(CallError::Refused(words))),
+            Err(CallError::Busy(words)) => each(index, Err(CallError::busy(words))),
             result => each(index, result),
         })
         .await
@@ -227,7 +257,7 @@ impl Connection {
             params,
         };
         let mut line = serde_json::to_string(&request)
-            .map_err(|_| CallError::Failed("the request could not be written".to_owned()))?;
+            .map_err(|_| CallError::Failed(Fault::other("the request could not be written")))?;
         line.push('\n');
         let write = async {
             self.writer.write_all(line.as_bytes()).await?;
@@ -235,10 +265,14 @@ impl Connection {
         };
         match tokio::time::timeout(self.timeout, write).await {
             Ok(Ok(())) => Ok(id),
-            Ok(Err(error)) => Err(CallError::Failed(format!(
+            Ok(Err(error)) => Err(CallError::Failed(Fault::outage(format!(
                 "the connection was closed: {error}"
+            )))),
+            // A server that takes no more of what it is sent is as
+            // down as one that sends nothing back.
+            Err(_) => Err(CallError::Failed(Fault::outage(
+                "the server stopped reading",
             ))),
-            Err(_) => Err(CallError::Failed("the server stopped reading".to_owned())),
         }
     }
 
@@ -252,30 +286,32 @@ impl Connection {
         for _ in 0..MAX_STRAY {
             let line = match tokio::time::timeout(self.timeout, self.reader.next_line()).await {
                 Err(_) => {
-                    return Err(CallError::Failed(format!(
+                    return Err(CallError::Failed(Fault::outage(format!(
                         "timed out after {} s",
                         self.timeout.as_secs()
-                    )));
+                    ))));
                 }
                 Ok(Err(error)) if LineTooLong::is(&error) => {
                     return Err(CallError::TooLong);
                 }
                 Ok(Err(error)) => {
-                    return Err(CallError::Failed(format!(
+                    return Err(CallError::Failed(Fault::outage(format!(
                         "the connection was closed: {error}"
-                    )));
+                    ))));
                 }
                 Ok(Ok(None)) => {
-                    return Err(CallError::Failed("the connection was closed".to_owned()));
+                    return Err(CallError::Failed(Fault::outage(
+                        "the connection was closed",
+                    )));
                 }
                 Ok(Ok(Some(line))) => line,
             };
             self.read = self.read.saturating_add(line.len());
             if self.read > self.read_max {
-                return Err(CallError::Failed(format!(
+                return Err(CallError::Failed(Fault::other(format!(
                     "the server sent more than {} MiB on one connection",
                     self.read_max >> 20
-                )));
+                ))));
             }
             let Ok(envelope) = serde_json::from_slice::<Envelope<'_>>(&line) else {
                 continue;
@@ -287,16 +323,16 @@ impl Connection {
                 if super::out_of_budget(&error) {
                     return Ok((id, Err(CallError::Busy(words(&error)))));
                 }
-                return Ok((id, Err(CallError::Refused(words(&error)))));
+                return Ok((id, Err(CallError::refused(words(&error)))));
             }
             let text = envelope.result.map_or("null", RawValue::get);
             let result = serde_json::from_str::<T>(text)
-                .map_err(|_| CallError::Failed("unexpected response".to_owned()));
+                .map_err(|_| CallError::Failed(Fault::other("unexpected response")));
             return Ok((id, result));
         }
-        Err(CallError::Failed(
-            "the server sends answers to nothing it was asked".to_owned(),
-        ))
+        Err(CallError::Failed(Fault::other(
+            "the server sends answers to nothing it was asked",
+        )))
     }
 }
 
@@ -405,7 +441,10 @@ mod tests {
         assert_eq!(read, [true, true, true]);
         assert_eq!(
             history.unwrap_err(),
-            CallError::Refused("response budget exhausted, retry later".to_owned())
+            CallError::Refused {
+                words: "response budget exhausted, retry later".to_owned(),
+                busy: true,
+            }
         );
         let asked = server.state.lock().unwrap().asked.clone();
         let count = |method: &str| asked.iter().filter(|asked| *asked == method).count();
@@ -433,9 +472,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(Fault::from(refused.clone()).is_outage());
         assert_eq!(
             refused,
-            CallError::Refused("response budget exhausted, retry later".to_owned())
+            CallError::Refused {
+                words: "response budget exhausted, retry later".to_owned(),
+                busy: true,
+            }
         );
     }
 }

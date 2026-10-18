@@ -194,10 +194,15 @@ async fn duplicates_and_network_mismatch_are_refused() {
         manager.add_wallet("Two", &parsed, Network::Signet).await,
         Err(CoreError::DuplicateWallet(_))
     ));
-    assert!(matches!(
-        manager.add_wallet("Three", &parsed, Network::Mainnet).await,
-        Err(CoreError::NetworkMismatch { .. })
-    ));
+    let mismatch = manager
+        .add_wallet("Three", &parsed, Network::Mainnet)
+        .await
+        .unwrap_err();
+    assert!(matches!(mismatch, CoreError::NetworkMismatch { .. }));
+    assert_eq!(
+        mismatch.to_string(),
+        "network mismatch: input is for signet, testnet4 or regtest, expected mainnet"
+    );
 }
 
 #[tokio::test]

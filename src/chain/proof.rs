@@ -24,13 +24,28 @@
 //! one request unless a server sends fewer at a time, must follow one
 //! another up to the hash the checkpoints give for that block
 //! ([`chain_to_checkpoint`]). The periods
-//! read are kept for the session. Esplora has no way to send a run of
-//! headers short of one request per block: over Esplora, a confirmation
-//! is taken on its header's work alone, and one claimed in an early
-//! period costs what forging a header of that period costs. Past the last
-//! checkpoint, there is no hash to chain to either way, and the work of a
-//! recent block is the price of a forged confirmation, as it is for any
-//! wallet that reads headers.
+//! read are kept for the session, whichever kind of server they were
+//! read from.
+//!
+//! Esplora sends ten headers a request (`/blocks/:height`, ten blocks
+//! down from that height, every field of their headers), so a period
+//! costs up to 202 requests to chain, 101 on average, where Electrum
+//! sends it in one. Chaining every period Electrum chains would cost an
+//! old wallet ten times its first sync, and get the IP banned on
+//! blockstream.info. Over Esplora, only the periods whose forged header
+//! costs less than [`ESPLORA_CHAIN_BELOW_DIFFICULTY`] are chained, the
+//! first five years of the chain, 404 requests at most each time a sync
+//! proves its confirmations ([`esplora_chains`]); one past that budget
+//! is left unconfirmed, never refused. A confirmation from 2014 on
+//! stands on its header's work, about ten dollars of it then and up
+//! from there. Past the last checkpoint, there is no hash to chain to
+//! either way, and the work of a recent block is the price of a forged
+//! confirmation, as it is for any wallet that reads headers.
+//!
+//! The chain is read down from the end of the period, to the checkpoint
+//! that follows the block. The one before it proves nothing: a forger
+//! builds on the real block that ends the previous period as easily as
+//! on any other.
 //!
 //! The table is written again before each release, from the checkpoints
 //! of the latest Electrum release:
@@ -82,28 +97,15 @@ mod tests;
 
 /// What a server whose proof of a confirmation does not hold is refused
 /// with: a header without the work of its height, or a branch that does
-/// not lead to its root.
+/// not lead to its root. Raised as a [`crate::chain::Fault`] of its own
+/// kind ([`crate::chain::Fault::false_proof`]), which is what a sync's
+/// code is decided on: the same words in a server's refusal are none.
 pub(crate) const FALSE_PROOF: &str = "the server sent a false proof of a confirmation";
 
 /// What a server that lists a coin its own transaction does not pay is
-/// refused with.
+/// refused with, under the same kind
+/// ([`crate::chain::Fault::coin_not_paid`]).
 pub(crate) const COIN_NOT_PAID: &str = "the server listed a coin its transaction does not pay";
-
-/// Whether a server was refused, in `detail`, for a proof that does not
-/// hold: [`FALSE_PROOF`] or [`COIN_NOT_PAID`], said by the core. The same
-/// words in a server's own refusal, which a sync quotes after
-/// "refused the request", do not count: a server does not choose the
-/// code it is refused with.
-pub(crate) fn is_false_proof(detail: &str) -> bool {
-    [FALSE_PROOF, COIN_NOT_PAID].iter().any(|said| {
-        detail.match_indices(said).any(|(at, _)| {
-            !detail[..at]
-                .trim_end()
-                .trim_end_matches(':')
-                .ends_with("refused the request")
-        })
-    })
-}
 
 /// Blocks between two retargets.
 const RETARGET_PERIOD: u32 = 2_016;
@@ -383,6 +385,12 @@ const CHAIN_BELOW_DIFFICULTY: u128 = 400_000_000_000_000;
 /// than mainnet, in a period past the checkpoints, or in a period whose
 /// work proves enough.
 pub(crate) fn checkpoint_for(network: Network, height: u32) -> Option<(u32, BlockHash)> {
+    checkpoint_below(network, height, CHAIN_BELOW_DIFFICULTY)
+}
+
+/// The checkpoint at the end of the period of `height`, when the
+/// difficulty of that period is under `difficulty`.
+fn checkpoint_below(network: Network, height: u32, difficulty: u128) -> Option<(u32, BlockHash)> {
     if network != Network::Mainnet {
         return None;
     }
@@ -390,8 +398,34 @@ pub(crate) fn checkpoint_for(network: Network, height: u32) -> Option<(u32, Bloc
     let end = targets::MAINNET_ENDS.get(period)?.parse().ok()?;
     let bits = CompactTarget::from_consensus(targets::MAINNET_BITS[period]);
     let params = Params::new(network.to_bitcoin());
-    (Target::from_compact(bits).difficulty(&params) < CHAIN_BELOW_DIFFICULTY)
+    (Target::from_compact(bits).difficulty(&params) < difficulty)
         .then_some(((period as u32 + 1) * RETARGET_PERIOD - 1, end))
+}
+
+/// The difficulty under which a confirmation read over Esplora is
+/// chained to its checkpoint: 2^32, the first 145 periods, blocks up to
+/// 292,319 (March 2014).
+///
+/// Under it, a forged header costs fewer than 2^64 hashes, about $11 at
+/// the price of [`CHAIN_BELOW_DIFFICULTY`], and nothing at all in the
+/// first periods, which a CPU mines in minutes. Above it, the chain would
+/// cost too much: Esplora sends ten headers a request, so a period takes
+/// 101 requests on average and 202 at most, once per wallet, as a
+/// confirmation the wallet holds is not proven again. A wallet in use
+/// since 2014, a payment or two a month, touches a hundred periods or
+/// more, some 10,000 requests to chain, where its whole first sync costs
+/// about 1,200 (a hundred addresses, five hundred confirmations,
+/// measured against a server of the tests); blockstream.info bans an IP
+/// well before that. Under the bound, a descriptor wallet seldom pays
+/// anything, wallets that export an extended public key being few before
+/// 2014; an address watched since the early years does, a few hundred
+/// requests, once.
+const ESPLORA_CHAIN_BELOW_DIFFICULTY: u128 = 1 << 32;
+
+/// Whether a confirmation at `height`, read over Esplora, is to be
+/// chained to its checkpoint ([`ESPLORA_CHAIN_BELOW_DIFFICULTY`]).
+pub(crate) fn esplora_chains(network: Network, height: u32) -> bool {
+    checkpoint_below(network, height, ESPLORA_CHAIN_BELOW_DIFFICULTY).is_some()
 }
 
 /// The hashes of the blocks from `from` to the end of its period, read

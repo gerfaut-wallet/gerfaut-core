@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::{self, Endpoint};
-use crate::error::{CoreError, CoreResult};
+use crate::error::{CoreError, CoreResult, ErrorCode};
 use crate::network::Network;
 use crate::now_secs;
 use crate::wallet::meta::{CachedTotals, SyncStamp, WalletKind, WalletMeta};
@@ -32,7 +32,30 @@ pub struct SyncAllReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncFailure {
     pub wallet_id: String,
+    /// The core's words, for logs and for a failure an app has no
+    /// sentence of its own for.
     pub message: String,
+    /// The code of the failure, the one [`CoreError::code`] gives: what
+    /// an app picks its sentence on, a false proof's among them. A
+    /// failure written before it had one reads as [`ErrorCode::Sync`].
+    #[serde(default = "sync_code")]
+    pub kind: ErrorCode,
+}
+
+impl SyncFailure {
+    /// The failure of the sync of `wallet_id`, in its words and by its code.
+    pub fn of(wallet_id: impl Into<String>, error: &CoreError) -> Self {
+        SyncFailure {
+            wallet_id: wallet_id.into(),
+            message: error.to_string(),
+            kind: error.code(),
+        }
+    }
+}
+
+/// The code of a failure that came without one.
+pub(crate) fn sync_code() -> ErrorCode {
+    ErrorCode::Sync
 }
 
 /// How long routine syncs may go on reading only the counters of the
@@ -374,7 +397,7 @@ impl WalletManager {
             }
         }
 
-        Err(sync_failure(endpoints, attempts.said))
+        Err(sync_failure(endpoints, attempts))
     }
 
     async fn sync_address_wallet(
@@ -430,7 +453,7 @@ impl WalletManager {
                 }
             }
         }
-        Err(sync_failure(endpoints, attempts.said))
+        Err(sync_failure(endpoints, attempts))
     }
 
     /// Fetches an older round of history for a watched address and
@@ -500,7 +523,7 @@ impl WalletManager {
                 }
             }
         }
-        Err(sync_failure(&endpoints, attempts.said))
+        Err(sync_failure(&endpoints, attempts))
     }
 
     /// The servers a sync of the wallet of `meta` tries, in order.
@@ -576,10 +599,7 @@ impl WalletManager {
         for meta in metas {
             match self.sync_wallet(&meta.id).await {
                 Ok(sync) => report.reports.push(sync),
-                Err(error) => report.failures.push(SyncFailure {
-                    wallet_id: meta.id,
-                    message: error.to_string(),
-                }),
+                Err(error) => report.failures.push(SyncFailure::of(meta.id, &error)),
             }
         }
         report
@@ -783,22 +803,30 @@ fn sync_order(
     endpoints
 }
 
-/// What the servers a sync tried before one answered said, and those of
-/// them that were down.
+/// What the servers a sync tried before one answered said, and what
+/// their failures were. Decided on the kind each failure carries
+/// ([`chain::FaultKind`]), set where the core wrote its words: never on
+/// the words, those of a server least of all.
 #[derive(Default)]
-struct Attempts<'a> {
+pub(super) struct Attempts<'a> {
     /// Each server's words, for the error the sync fails with.
     said: Vec<String>,
-    /// The ones relegated if a later one answers ([`chain::is_outage`]).
+    /// The ones relegated if a later one answers: those that were down
+    /// ([`chain::FaultKind::Outage`]).
     down: Vec<&'a Endpoint>,
+    /// Whether one of them sent a proof that does not hold
+    /// ([`chain::FaultKind::FalseProof`]).
+    false_proof: bool,
 }
 
 impl<'a> Attempts<'a> {
-    fn failed(&mut self, endpoint: &'a Endpoint, detail: &str) {
-        if chain::is_outage(detail) {
-            self.down.push(endpoint);
+    pub(super) fn failed(&mut self, endpoint: &'a Endpoint, fault: &chain::Fault) {
+        match fault.kind() {
+            chain::FaultKind::Outage => self.down.push(endpoint),
+            chain::FaultKind::FalseProof => self.false_proof = true,
+            chain::FaultKind::Other => {}
         }
-        self.said.push(format!("{}: {detail}", endpoint.label()));
+        self.said.push(format!("{}: {fault}", endpoint.label()));
     }
 }
 
@@ -815,7 +843,7 @@ const RELEGATION_MAX: Duration = Duration::from_secs(60 * 60);
 /// again, up to [`RELEGATION_MAX`], and no longer once it answers. An
 /// hour past its last relegation, it starts over from the first.
 ///
-/// Only an outage counts ([`chain::is_outage`]): a refusal of one
+/// Only an outage counts ([`chain::FaultKind::Outage`]): a refusal of one
 /// request, a history too long for that server, says nothing of the
 /// next wallet, and relegating the server for it would send that wallet
 /// to the others. When every server fails, the request is at fault, and
@@ -890,24 +918,23 @@ fn relegation_for(before: u32) -> Duration {
 /// One error covering every endpoint tried, so the user sees each
 /// backend's outcome instead of only the last one. When one of them was
 /// refused for a proof that does not hold, the error says so by its code
-/// ([`CoreError::FalseProof`]).
-pub(super) fn sync_failure(endpoints: &[Endpoint], attempts: Vec<String>) -> CoreError {
+/// ([`CoreError::FalseProof`]): a failure the core marked so, never words
+/// that read like it ([`chain::FaultKind::FalseProof`]).
+pub(super) fn sync_failure(endpoints: &[Endpoint], attempts: Attempts<'_>) -> CoreError {
     let backend = config_label(endpoints);
-    if attempts
-        .iter()
-        .any(|attempt| chain::proof::is_false_proof(attempt))
-    {
+    let said = attempts.said;
+    if attempts.false_proof {
         return CoreError::FalseProof {
             backend,
-            detail: attempts.join("; "),
+            detail: said.join("; "),
         };
     }
     CoreError::Sync {
         backend,
-        detail: if attempts.is_empty() {
+        detail: if said.is_empty() {
             "no backend available".to_owned()
         } else {
-            attempts.join("; ")
+            said.join("; ")
         },
     }
 }
