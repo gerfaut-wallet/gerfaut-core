@@ -366,11 +366,19 @@ pub(crate) fn check_material(kind: &WalletKind, network: Network) -> CoreResult<
                 let networks =
                     crate::input::descriptor_networks(descriptor).map_err(as_descriptor_error)?;
                 if !networks.contains(&network) {
-                    return Err(CoreError::NetworkMismatch {
-                        expected: network.to_string(),
-                        found: "descriptor".to_owned(),
-                    });
+                    return Err(network_mismatch(network, &networks));
                 }
+                // What the engine checks of each descriptor before it
+                // derives anything, so that a material this passes is
+                // one the engine takes.
+                if descriptor.is_multipath() {
+                    return Err(CoreError::Descriptor(
+                        "a stored descriptor cannot hold both branches in one".to_owned(),
+                    ));
+                }
+                descriptor
+                    .sanity_check()
+                    .map_err(|e| CoreError::Descriptor(e.to_string()))?;
             }
             Ok(())
         }
@@ -378,17 +386,38 @@ pub(crate) fn check_material(kind: &WalletKind, network: Network) -> CoreResult<
     }
 }
 
-/// Refuses an address that is not one of `network`.
+/// Refuses an address that is not one of `network`, naming the networks
+/// it is one of.
 fn check_address(address: &str, network: Network) -> CoreResult<()> {
-    address
+    let address = address
         .parse::<bdk_wallet::bitcoin::Address<_>>()
-        .ok()
-        .and_then(|a| a.require_network(network.to_bitcoin()).ok())
-        .map(|_| ())
-        .ok_or_else(|| CoreError::NetworkMismatch {
-            expected: network.to_string(),
-            found: "address".to_owned(),
-        })
+        .map_err(|e| CoreError::InvalidInput {
+            kind: "address",
+            detail: e.to_string(),
+        })?;
+    if address.is_valid_for_network(network.to_bitcoin()) {
+        return Ok(());
+    }
+    let networks: Vec<Network> = Network::ALL
+        .into_iter()
+        .filter(|candidate| address.is_valid_for_network(candidate.to_bitcoin()))
+        .collect();
+    Err(network_mismatch(network, &networks))
+}
+
+/// The refusal of material for `expected` that is for `found`, the
+/// networks it was read as, named the way a person reads them.
+pub(crate) fn network_mismatch(expected: Network, found: &[Network]) -> CoreError {
+    let names: Vec<&str> = found.iter().map(|network| network.as_str()).collect();
+    let found = match names.split_last() {
+        None => "no network Gerfaut knows".to_owned(),
+        Some((last, [])) => (*last).to_owned(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+    };
+    CoreError::NetworkMismatch {
+        expected: expected.to_string(),
+        found,
+    }
 }
 
 /// Loads the BDK engine for a wallet from its stored change set, caching

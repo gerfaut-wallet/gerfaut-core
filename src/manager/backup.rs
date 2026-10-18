@@ -7,11 +7,12 @@ use crate::backup::{
     self, BACKUP_VERSION, BackupBackendPreview, BackupBundle, BackupOptions, BackupPayload,
     BackupPreview, BackupWallet, BackupWalletPreview, ImportChoices, ImportReport, RefusedWallet,
 };
-use crate::chain;
+use crate::chain::{self, BackendConfig};
 use crate::error::{CoreError, CoreResult};
 use crate::input::RecognizedKind;
+use crate::network::Network;
 use crate::now_secs;
-use crate::store::WalletRecord;
+use crate::store::{Settings, VaultPayload, WalletRecord};
 use crate::wallet::meta::WalletKind;
 
 use super::{WalletManager, build_record, check_material, find_record, find_watched, fresh_meta};
@@ -82,54 +83,40 @@ impl WalletManager {
     /// Reads a backup without touching the vault: what it holds, which
     /// of its wallets this vault already watches, and what its settings
     /// would put in place, spelled out so "apply node settings" is an
-    /// answer to a question the screen actually asked.
+    /// answer to a question the screen actually asked. All of it is read
+    /// off [`plan_restore`], the plan [`Self::import_backup`] carries out:
+    /// what the preview promises is what a restore of every wallet does.
     pub async fn preview_backup(&self, source: &str, password: &str) -> CoreResult<BackupPreview> {
         let payload = backup::open(&backup::decode_source(source)?, password)?;
         let state = self.state.lock().await;
+        let plan = plan_restore(&state.payload, &payload, 0..payload.wallets.len());
         Ok(BackupPreview {
             created_at: payload.created_at,
             has_settings: payload.has_settings(),
-            // The backends a restore would put in place: the same
-            // reading as the import, so an address it would drop is not
-            // promised here.
-            backends: payload
+            backends: plan
                 .backends
                 .iter()
-                .flatten()
-                .filter_map(|(network, config)| {
-                    let config = config.clone().canonical().ok()?;
-                    Some(BackupBackendPreview {
-                        network: *network,
-                        backend: config.label(*network),
-                    })
+                .map(|(network, config)| BackupBackendPreview {
+                    network: *network,
+                    backend: config.label(*network),
                 })
                 .collect(),
-            // The hosts a restore would pin: the same reading as the
-            // import, so the list shows what would land and nothing
-            // that would be dropped on the way.
-            electrum_hosts: restorable_certs(&payload).into_keys().collect(),
-            wallets: payload
+            electrum_hosts: plan.certs.into_keys().collect(),
+            wallets: plan
                 .wallets
-                .iter()
-                .enumerate()
-                .map(|(index, wallet)| {
-                    let already_watched =
-                        find_watched(&state.payload, wallet.network, &wallet.kind).is_some();
-                    // What a restore checks of each wallet it takes, so
-                    // the screen can leave out, and say why, one it would
-                    // refuse. One already watched is skipped before that:
-                    // a single state, the one that happens.
-                    let refused = (!already_watched)
-                        .then(|| check_restorable(wallet).err())
-                        .flatten()
-                        .map(|error| error.to_string());
+                .into_iter()
+                .map(|(index, fate)| {
+                    let wallet = &payload.wallets[index];
                     BackupWalletPreview {
                         index: index as u32,
                         name: wallet.name.clone(),
                         network: wallet.network,
                         kind: wallet.kind.clone(),
-                        already_watched,
-                        refused,
+                        already_watched: matches!(fate, Fate::Watched),
+                        refused: match fate {
+                            Fate::Refused(error) => Some(error.to_string()),
+                            Fate::Watched | Fate::Restored => None,
+                        },
                     }
                 })
                 .collect(),
@@ -141,14 +128,16 @@ impl WalletManager {
     /// labels; a wallet already watched is skipped, never duplicated or
     /// overwritten. The settings the backup carries are applied only
     /// when asked: backends replace the ones present for the same
-    /// networks, the certificates accepted for the servers those
-    /// backends name are added but never replaced (a fingerprint that
+    /// networks, the certificates accepted for the servers in service
+    /// afterwards are added but never replaced (a fingerprint that
     /// changed is exactly what pinning refuses to switch in silence),
-    /// the gap limit is bounded like [`Self::set_gap_limit`]. A wallet
-    /// whose material does not hold together, a change descriptor of
-    /// another wallet among it, fails the restore, named, and the vault
-    /// is left as it was: the preview marks such a wallet
-    /// ([`BackupWalletPreview::refused`]) so it is never asked for.
+    /// the gap limit is bounded like [`Self::set_gap_limit`]. What is
+    /// restored and what is pinned is decided by [`plan_restore`], the
+    /// plan the preview shows. A wallet whose material does not hold
+    /// together, a change descriptor of another wallet among it, fails
+    /// the restore, named, and the vault is left as it was: the preview
+    /// marks such a wallet ([`BackupWalletPreview::refused`]) so it is
+    /// never asked for.
     pub async fn import_backup(
         &self,
         source: &str,
@@ -184,6 +173,8 @@ impl WalletManager {
                 None => state.payload.settings.gap_limit,
             };
 
+            let plan = plan_restore(&state.payload, &payload, chosen.iter().copied());
+
             // Everything that can fail happens before the vault changes: a
             // descriptor the engine refuses leaves nothing half-restored.
             let mut pending: Vec<(WalletRecord, Option<bdk_wallet::Wallet>)> = Vec::new();
@@ -195,29 +186,32 @@ impl WalletManager {
             // the restore as it is.
             let asked_by_index = choices.indexes.is_some();
             let mut refused = Vec::new();
-            for index in chosen {
+            for (index, fate) in plan.wallets {
                 let wallet = &payload.wallets[index];
-                let watched = find_watched(&state.payload, wallet.network, &wallet.kind).is_some()
-                    || pending.iter().any(|(record, _)| {
-                        record.meta.network == wallet.network && record.meta.kind == wallet.kind
-                    });
-                if watched {
-                    skipped += 1;
-                    continue;
-                }
                 let name = wallet.name.trim();
-                let built = check_name(name).and_then(|()| {
-                    let mut meta = fresh_meta(
-                        name,
-                        wallet.network,
-                        wallet.kind.clone(),
-                        recognized_kind(&wallet.kind),
-                        gap_limit,
-                    );
-                    meta.labels = wallet.labels.clone();
-                    meta.live_pinned = wallet.live_pinned;
-                    build_record(meta)
-                });
+                let built = match fate {
+                    Fate::Watched => {
+                        skipped += 1;
+                        continue;
+                    }
+                    Fate::Refused(error) => Err(error),
+                    // The plan checked the material the way the engine
+                    // reads it; building it can still fail on what only
+                    // a derivation meets, and is then refused all the
+                    // same, never half-restored.
+                    Fate::Restored => {
+                        let mut meta = fresh_meta(
+                            name,
+                            wallet.network,
+                            wallet.kind.clone(),
+                            recognized_kind(&wallet.kind),
+                            gap_limit,
+                        );
+                        meta.labels = wallet.labels.clone();
+                        meta.live_pinned = wallet.live_pinned;
+                        build_record(meta)
+                    }
+                };
                 match built {
                     Ok(record) => pending.push(record),
                     Err(error) if !asked_by_index && is_refusal(&error) => {
@@ -239,20 +233,9 @@ impl WalletManager {
             state.commit(|next| {
                 if settings_applied {
                     let settings = &mut next.settings;
-                    if let Some(backends) = &payload.backends {
-                        // Stored the way the settings screen stores them: a
-                        // backup from a vault older than that form, or one
-                        // written by hand, must not put in place an address
-                        // the screen would have refused. One that cannot be
-                        // read is left out, and the backend of that network
-                        // stays as it was.
-                        settings.backends.extend(backends.iter().filter_map(
-                            |(network, config)| Some((*network, config.clone().canonical().ok()?)),
-                        ));
-                    }
-                    for (host, fingerprint) in restorable_certs(&payload) {
-                        settings.electrum_certs.entry(host).or_insert(fingerprint);
-                    }
+                    settings.backends.extend(plan.backends);
+                    // The plan pins no host the vault pins already.
+                    settings.electrum_certs.extend(plan.certs);
                     settings.gap_limit = gap_limit;
                 }
                 for (record, engine) in pending {
@@ -278,54 +261,160 @@ impl WalletManager {
     }
 }
 
-/// The certificates a restore pins, by host, as an acceptance made by
-/// hand stores them. Only those of an Electrum server the settings can
-/// reach without anyone typing it: one a backend of the same backup
-/// names, among those the restore applies (the same reading, through
-/// [`BackendConfig::canonical`]), or one of the public servers of the
-/// catalogue that sign their own certificate, which a person picks from
-/// a list, on a network the backup leaves on its default as on any
-/// other. A pin is a decision about such a server; one for a host
-/// nothing names would wait in the vault, unseen, for the day that host
-/// is typed in, and take its certificate as accepted. Each one also
-/// passes the check of the acceptance dialog: a backup must not pin
-/// what the dialog would have refused, nor a fingerprint shaped so that
-/// no real certificate can ever match it and the host becomes
-/// permanently unreachable.
-fn restorable_certs(payload: &BackupPayload) -> BTreeMap<String, String> {
-    let applied = payload
+/// What a restore of `payload` does to the vault `vault`, decided in one
+/// place: [`WalletManager::preview_backup`] shows it and
+/// [`WalletManager::import_backup`] carries it out, so the preview never
+/// promises what the restore would not do. The settings are those a
+/// restore puts in place when they are applied.
+struct RestorePlan {
+    /// What becomes of each wallet considered, by its index in the
+    /// backup, in the order of the backup.
+    wallets: Vec<(usize, Fate)>,
+    /// The backends the settings put in place, by network, in the form
+    /// the settings screen stores them; those of the other networks stay
+    /// as they are.
+    backends: BTreeMap<Network, BackendConfig>,
+    /// The certificates the settings pin, by host; never one the vault
+    /// pins already. See [`restorable_certs`].
+    certs: BTreeMap<String, String>,
+}
+
+/// What a restore does with one wallet of the backup.
+enum Fate {
+    /// The vault watches the same material on the same network already,
+    /// or a wallet of the backup before it is restored with it: skipped.
+    Watched,
+    /// Its name or its material is refused, for this reason.
+    Refused(CoreError),
+    /// Restored as a new wallet.
+    Restored,
+}
+
+/// The plan of a restore of the wallets `chosen`, by index into the
+/// backup, read without building any engine: each wallet is checked the
+/// way an import checks one ([`check_restorable`]) and against the
+/// wallets restored before it, so two copies of a wallet in one backup
+/// come back as one.
+fn plan_restore(
+    vault: &VaultPayload,
+    payload: &BackupPayload,
+    chosen: impl IntoIterator<Item = usize>,
+) -> RestorePlan {
+    let mut restored: Vec<&BackupWallet> = Vec::new();
+    let wallets = chosen
+        .into_iter()
+        .map(|index| {
+            let wallet = &payload.wallets[index];
+            let watched = find_watched(vault, wallet.network, &wallet.kind).is_some()
+                || restored.iter().any(|earlier| {
+                    earlier.network == wallet.network && earlier.kind == wallet.kind
+                });
+            let fate = if watched {
+                Fate::Watched
+            } else {
+                match check_restorable(wallet) {
+                    Ok(()) => {
+                        restored.push(wallet);
+                        Fate::Restored
+                    }
+                    Err(error) => Fate::Refused(error),
+                }
+            };
+            (index, fate)
+        })
+        .collect();
+    // Stored the way the settings screen stores them: a backup from a
+    // vault older than that form, or one written by hand, must not put in
+    // place an address the screen would have refused. One that cannot be
+    // read is left out, and the backend of that network stays as it was.
+    let backends: BTreeMap<Network, BackendConfig> = payload
         .backends
         .iter()
         .flatten()
         .filter_map(|(network, config)| Some((*network, config.clone().canonical().ok()?)))
+        .collect();
+    let certs = restorable_certs(&vault.settings, &backends, payload);
+    RestorePlan {
+        wallets,
+        backends,
+        certs,
+    }
+}
+
+/// The certificates a restore pins, by host, as an acceptance made by
+/// hand stores them. Only those of an Electrum server the settings reach
+/// without anyone typing it: one a backend in service after the restore
+/// names, the backup's (`backends`) for the networks it replaces and the
+/// vault's for the others, or one of the public servers of the catalogue
+/// that sign their own certificate, which a person picks from a list. A
+/// pin is a decision about such a server; one for a host nothing names
+/// would wait in the vault, unseen, for the day that host is typed in,
+/// and take its certificate as accepted. Each one also passes the check
+/// of the acceptance dialog: a backup must not pin what the dialog would
+/// have refused, nor a fingerprint shaped so that no real certificate
+/// can ever match it and the host becomes permanently unreachable.
+///
+/// Two entries of the backup that name the same host under two
+/// spellings pin it once when they agree, and not at all when they do
+/// not: the restore has no way to tell which one the person accepted,
+/// and the acceptance dialog asks again at the first connection. A host
+/// the vault pins already keeps its own pin and is left out, never
+/// replaced in silence.
+///
+/// A pin stands in for the check by an authority: one restored for the
+/// vault's own server, whose certificate an authority signs, makes that
+/// server answer to the backup's fingerprint instead. It is named in the
+/// preview and taken only with the settings, which may as well replace
+/// that server outright; checking the authority first would take a
+/// connection the preview does not make.
+fn restorable_certs(
+    vault: &Settings,
+    backends: &BTreeMap<Network, BackendConfig>,
+    payload: &BackupPayload,
+) -> BTreeMap<String, String> {
+    let mut in_service = vault.backends.clone();
+    in_service.extend(backends.clone());
+    let served = in_service
+        .iter()
         .filter_map(|(network, config)| {
-            chain::endpoints(&config, network, &chain::TrustedCerts::new()).ok()
+            chain::endpoints(config, *network, &chain::TrustedCerts::new()).ok()
         })
         .flatten()
         .filter_map(|endpoint| match endpoint {
             chain::Endpoint::Electrum(target) => Some(target.url.to_string()),
             chain::Endpoint::Esplora(_) => None,
         });
-    let catalogue = crate::network::Network::ALL
+    let catalogue = Network::ALL
         .into_iter()
         .flat_map(chain::public::public_servers)
         .filter(|server| {
             server.self_signed && server.protocol == chain::public::ServerProtocol::Electrum
         })
         .map(|server| server.url);
-    let named: HashSet<String> = applied
+    let named: HashSet<String> = served
         .chain(catalogue)
         .map(|url| chain::electrum::certificate_key(&url))
         .collect();
-    payload
-        .electrum_certs
-        .iter()
-        .flatten()
-        .map(|(host, fingerprint)| (chain::electrum::certificate_key(host), fingerprint))
-        .filter(|(host, fingerprint)| {
-            named.contains(host) && chain::tls::is_fingerprint(fingerprint)
-        })
-        .map(|(host, fingerprint)| (host, fingerprint.to_ascii_uppercase()))
+    // Each host with the one fingerprint its entries agree on, or none.
+    let mut agreed: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (host, fingerprint) in payload.electrum_certs.iter().flatten() {
+        if !chain::tls::is_fingerprint(fingerprint) {
+            continue;
+        }
+        let fingerprint = fingerprint.to_ascii_uppercase();
+        agreed
+            .entry(chain::electrum::certificate_key(host))
+            .and_modify(|seen| {
+                if seen.as_deref() != Some(fingerprint.as_str()) {
+                    *seen = None;
+                }
+            })
+            .or_insert(Some(fingerprint));
+    }
+    agreed
+        .into_iter()
+        .filter_map(|(host, fingerprint)| Some((host, fingerprint?)))
+        .filter(|(host, _)| named.contains(host) && !vault.electrum_certs.contains_key(host))
         .collect()
 }
 
@@ -380,7 +469,8 @@ fn check_name(name: &str) -> CoreResult<()> {
 }
 
 /// What a restore refuses a wallet of the backup for, read without
-/// building its engine: its name, then its material.
+/// building its engine: its name, then its material, as
+/// [`check_material`] reads it the way the engine would.
 fn check_restorable(wallet: &BackupWallet) -> CoreResult<()> {
     check_name(&wallet.name)?;
     check_material(&wallet.kind, wallet.network)
