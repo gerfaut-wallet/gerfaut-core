@@ -10,9 +10,16 @@
 //! second attempt through a client of an isolation of its own, which
 //! arti starts from nothing, with a rendezvous point of its own. The
 //! first goes on meanwhile, and whichever connects first is used.
+//!
+//! [`Routes`] keeps, for each onion service, the client its streams go
+//! through: the one that last connected to it, so that later streams go
+//! where the service answered rather than back to a rendezvous that
+//! hangs.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// How long an attempt runs alone, and how long both then get: the
@@ -75,6 +82,113 @@ where
                 ),
             )
         })),
+    }
+}
+
+/// A Tor client as [`Routes`] handles it: one of a new isolation can be
+/// made from it, and two handles tell whether they are the same client.
+pub(super) trait Isolate: Clone {
+    fn isolated(&self) -> Self;
+    fn same(&self, other: &Self) -> bool;
+}
+
+/// The client each onion service is reached through, by host. A service
+/// starts on the client the routes were made with. A second attempt
+/// that connects puts its client in that place for that service alone;
+/// so does a new isolation, when neither attempt connected. The streams
+/// to one service that wait on the same client share one second
+/// client, so that they build one new way to the service rather than
+/// one each. One entry per onion host the process reached: a few.
+pub(super) struct Routes<C> {
+    base: C,
+    hosts: Mutex<HashMap<String, Route<C>>>,
+}
+
+struct Route<C> {
+    current: C,
+    next: Option<C>,
+}
+
+impl<C: Isolate> Routes<C> {
+    pub(super) fn new(base: C) -> Self {
+        Routes {
+            base,
+            hosts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn hosts(&self) -> std::sync::MutexGuard<'_, HashMap<String, Route<C>>> {
+        self.hosts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The client a stream to `host` goes through first.
+    fn first(&self, host: &str) -> C {
+        self.hosts()
+            .get(host)
+            .map_or_else(|| self.base.clone(), |route| route.current.clone())
+    }
+
+    /// The client of a second attempt beside one made through `first`:
+    /// the one another stream put in its place meanwhile, if one did,
+    /// else the one the second attempts beside `first` share.
+    fn second(&self, host: &str, first: &C) -> C {
+        let mut hosts = self.hosts();
+        let route = hosts.entry(host.to_owned()).or_insert_with(|| Route {
+            current: self.base.clone(),
+            next: None,
+        });
+        if !route.current.same(first) {
+            return route.current.clone();
+        }
+        route.next.get_or_insert_with(|| first.isolated()).clone()
+    }
+
+    /// After a second attempt beside `first`, unless another stream
+    /// moved the service on already: the client that connected, or one
+    /// of a new isolation when none did, in the place of `first`. The
+    /// next stream then never waits again on what hung.
+    fn settle(&self, host: &str, first: &C, used: Option<&C>) {
+        let mut hosts = self.hosts();
+        let route = hosts.entry(host.to_owned()).or_insert_with(|| Route {
+            current: self.base.clone(),
+            next: None,
+        });
+        if route.current.same(first) {
+            route.current = used.map_or_else(|| first.isolated(), C::clone);
+            route.next = None;
+        }
+    }
+
+    /// A stream to the onion service `host`, in two attempts
+    /// ([`two`]) opened by `open`, each through its client.
+    pub(super) async fn connect<S, F, O>(&self, host: String, port: u16, open: O) -> io::Result<S>
+    where
+        O: Fn(C, String, u16) -> F,
+        F: Future<Output = io::Result<S>>,
+    {
+        let key = host.trim_end_matches('.').to_ascii_lowercase();
+        let first = self.first(&key);
+        let seconded = std::sync::atomic::AtomicBool::new(false);
+        let through = |client: C, host: String| {
+            let opened = open(client.clone(), host, port);
+            async move { opened.await.map(|stream| (stream, client)) }
+        };
+        let connected = two(
+            through(first.clone(), host.clone()),
+            || {
+                seconded.store(true, std::sync::atomic::Ordering::Relaxed);
+                through(self.second(&key, &first), host)
+            },
+            TRY,
+        )
+        .await;
+        if seconded.load(std::sync::atomic::Ordering::Relaxed) {
+            let used = connected.as_ref().ok().map(|(_, used)| used);
+            self.settle(&key, &first, used);
+        }
+        connected.map(|(stream, _)| stream)
     }
 }
 
@@ -243,5 +357,130 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(begun.elapsed(), Duration::from_secs(60));
         assert!(started.load(Ordering::SeqCst));
+    }
+
+    /// A client of the tests: its number, and the count of clients made.
+    #[derive(Clone)]
+    struct Fake {
+        id: usize,
+        made: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Isolate for Fake {
+        fn isolated(&self) -> Self {
+            Fake {
+                id: self.made.fetch_add(1, Ordering::SeqCst) + 1,
+                made: self.made.clone(),
+            }
+        }
+
+        fn same(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    fn routes() -> Routes<Fake> {
+        Routes::new(Fake {
+            id: 0,
+            made: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
+    /// What a client does with a host: connects or fails after a while,
+    /// or never answers (`None`).
+    type Behaviour = fn(usize, &str) -> Option<(Duration, bool)>;
+
+    /// A stream to `host`: the number of the client it went through.
+    async fn stream(routes: &Routes<Fake>, host: &str, behave: Behaviour) -> io::Result<usize> {
+        routes
+            .connect(host.to_owned(), 80, |client: Fake, host, _| {
+                let outcome = behave(client.id, &host);
+                async move {
+                    match outcome {
+                        Some((after, true)) => {
+                            tokio::time::sleep(after).await;
+                            Ok(client.id)
+                        }
+                        Some((after, false)) => {
+                            tokio::time::sleep(after).await;
+                            Err(io::Error::other(format!("refused by {}", client.id)))
+                        }
+                        None => std::future::pending().await,
+                    }
+                }
+            })
+            .await
+    }
+
+    /// The bootstrapped client hangs on the service, any other answers.
+    fn first_hangs(id: usize, _: &str) -> Option<(Duration, bool)> {
+        (id != 0).then_some((Duration::from_secs(5), true))
+    }
+
+    /// Streams that wait together on a hung service share one second
+    /// client, and the streams after them go straight through it; the
+    /// other services stay where they were.
+    #[tokio::test(start_paused = true)]
+    async fn streams_that_hang_together_share_one_second_route() {
+        let routes = routes();
+        let host = "x.onion";
+        let (a, b, c, d) = tokio::join!(
+            stream(&routes, host, first_hangs),
+            stream(&routes, host, first_hangs),
+            stream(&routes, host, first_hangs),
+            stream(&routes, host, first_hangs),
+        );
+        assert_eq!([a.unwrap(), b.unwrap(), c.unwrap(), d.unwrap()], [1; 4]);
+        assert_eq!(routes.base.made.load(Ordering::SeqCst), 1);
+
+        let begun = tokio::time::Instant::now();
+        assert_eq!(stream(&routes, "X.ONION.", first_hangs).await.unwrap(), 1);
+        assert_eq!(begun.elapsed(), Duration::from_secs(5));
+
+        let answers = |_: usize, _: &str| Some((Duration::from_secs(1), true));
+        assert_eq!(stream(&routes, "y.onion", answers).await.unwrap(), 0);
+        assert_eq!(routes.base.made.load(Ordering::SeqCst), 1);
+    }
+
+    /// Neither attempt connected: the next stream starts on a client of
+    /// a new isolation, rather than wait again on what hung.
+    #[tokio::test(start_paused = true)]
+    async fn a_service_silent_twice_is_tried_next_on_a_new_route() {
+        let routes = routes();
+        let silent = |_: usize, _: &str| None;
+        let error = stream(&routes, "x.onion", silent).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let answers_third =
+            |id: usize, _: &str| (id == 2).then_some((Duration::from_secs(1), true));
+        let begun = tokio::time::Instant::now();
+        assert_eq!(stream(&routes, "x.onion", answers_third).await.unwrap(), 2);
+        assert_eq!(begun.elapsed(), Duration::from_secs(1));
+    }
+
+    /// A service that refuses at once leaves its route as it was, and
+    /// no client is made for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_quick_refusal_moves_nothing() {
+        let routes = routes();
+        let refuses = |_: usize, _: &str| Some((Duration::from_secs(2), false));
+        let error = stream(&routes, "x.onion", refuses).await.unwrap_err();
+        assert_eq!(error.to_string(), "refused by 0");
+        assert_eq!(routes.base.made.load(Ordering::SeqCst), 0);
+        assert_eq!(routes.first("x.onion").id, 0);
+    }
+
+    /// The first attempt winning after the second started keeps the
+    /// service on it, and the next hang gets a second client of its own
+    /// rather than the one left behind.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_first_keeps_its_route() {
+        let routes = routes();
+        let late = |id: usize, _: &str| match id {
+            0 => Some((Duration::from_secs(35), true)),
+            _ => None,
+        };
+        assert_eq!(stream(&routes, "x.onion", late).await.unwrap(), 0);
+        assert_eq!(routes.first("x.onion").id, 0);
+        assert_eq!(stream(&routes, "x.onion", first_hangs).await.unwrap(), 2);
     }
 }

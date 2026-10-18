@@ -41,8 +41,8 @@ use crate::chain::{
 };
 use crate::network::Network;
 
-/// The fewest requests per batch while walking a keychain: see
-/// [`walk_batch`].
+/// The fewest requests per batch while walking a keychain, before the
+/// cut to what completes the gap: see [`walk_batch`].
 const BATCH: usize = 10;
 /// Requests per batch for a list known in full: the scripts revealed,
 /// and the headers and proofs they call for. ElectrumX, from 1.18 on,
