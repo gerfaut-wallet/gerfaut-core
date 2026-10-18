@@ -1674,6 +1674,29 @@ mod servers {
         assert_eq!(asked(&server, "/blocks/"), 2);
     }
 
+    /// A chain the server fails to send, a request refused halfway, is
+    /// no proof either way: the confirmation is left unconfirmed and the
+    /// sync goes on, where the refusal used to fail it whole. Asked again
+    /// once the server answers, it confirms.
+    #[tokio::test]
+    async fn an_early_esplora_chain_cut_short_is_unsure() {
+        let coinbase: Transaction = deserialize_hex(EARLY_COINBASE).unwrap();
+        let server = mainnet_mempool(4).await;
+        {
+            let mut state = server.state.lock().unwrap();
+            for (at, hex) in (2_006..).zip(EARLY) {
+                state.served.insert(at, header(hex));
+            }
+            state.address_txs = vec![listed_coinbase(&coinbase, 2_010, header(EARLY[4]).time)];
+            state.blocks_refused.insert(2_011);
+        }
+        let state = esplora_address(&server, Network::Mainnet).await.unwrap();
+        assert_eq!(state.txs[0].height, None);
+        server.state.lock().unwrap().blocks_refused.clear();
+        let state = esplora_address(&server, Network::Mainnet).await.unwrap();
+        assert_eq!(state.txs[0].height, Some(2_010));
+    }
+
     /// A confirmation whose chain does not fit in what a sync may spend
     /// on chains is left unconfirmed, never taken for a false proof: the
     /// genesis header at height 10, from a server that lists one block a

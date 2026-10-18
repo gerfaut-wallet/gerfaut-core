@@ -749,8 +749,9 @@ async fn prove_below_the_tip(
 /// read: by the height each starts at, as [`chained`] takes them. Each
 /// is read down from the end of its period, as many requests as
 /// [`CHAIN_REQUESTS_MAX`] leaves, the periods that do not fit left out:
-/// their confirmations are unsure. A chain that does not end at its
-/// checkpoint refuses the server ([`FALSE_PROOF`]).
+/// their confirmations are unsure, as are those of a chain a request
+/// failed in. A chain that does not end at its checkpoint refuses the
+/// server ([`crate::chain::proof::FALSE_PROOF`]).
 async fn read_chains(
     client: &Client,
     network: Network,
@@ -763,8 +764,13 @@ async fn read_chains(
         if cost > budget {
             continue;
         }
-        let Some(headers) = read_down_to(client, from, count, &mut budget).await? else {
-            continue;
+        let headers = match read_down_to(client, from, count, &mut budget).await {
+            Ok(Some(headers)) => headers,
+            Ok(None) => continue,
+            // A chain the server did not finish sending proves nothing
+            // either way: its confirmations, and those of the periods
+            // after it, stay unsure, and the sync goes on without them.
+            Err(_) => break,
         };
         let hashes = chain_to_checkpoint(network, from, &headers).ok_or_else(Fault::false_proof)?;
         read.insert(from, hashes);
@@ -773,10 +779,12 @@ async fn read_chains(
 }
 
 /// The `count` headers from `from` up, read down from the highest of
-/// them ten at a time, each request taken from `budget`. `None` when
-/// the budget runs out first, or when the server stops listing blocks,
-/// as one whose limit is lower, or one that is lying, may: a chain not
-/// read proves nothing either way.
+/// them, [`PARALLEL_REQUESTS`] requests at a time, each asking for the
+/// [`BLOCKS_PER_REQUEST`] blocks below the one before it and taken from
+/// `budget`; a server that lists fewer a request is asked again for the
+/// highest block still missing. `None` when the budget runs out first,
+/// or when the server does not list the highest block missing, as one
+/// that is lying may: a chain not read proves nothing either way.
 async fn read_down_to(
     client: &Client,
     from: u32,
@@ -785,32 +793,47 @@ async fn read_down_to(
 ) -> Result<Option<Vec<Header>>, Fault> {
     let end = from + count - 1;
     let mut headers: BTreeMap<u32, Header> = BTreeMap::new();
+    // The highest height still missing.
     let mut next = end;
     loop {
-        if *budget == 0 {
+        let asked: Vec<u32> = (0..PARALLEL_REQUESTS as u32)
+            .map_while(|step| {
+                next.checked_sub(step * BLOCKS_PER_REQUEST)
+                    .filter(|height| *height >= from)
+            })
+            .take(*budget as usize)
+            .collect();
+        if asked.is_empty() {
             return Ok(None);
         }
-        *budget -= 1;
-        let Some(listed) = client
-            .get_json_opt::<Vec<Block>>(&format!("/blocks/{next}"))
-            .await?
-        else {
-            return Ok(None);
-        };
-        let lowest = listed
-            .iter()
-            .map(|block| block.height)
-            .filter(|height| (from..=next).contains(height))
-            .min();
-        for block in &listed {
-            if (from..=next).contains(&block.height) {
-                headers.insert(block.height, block.header());
+        *budget -= asked.len() as u32;
+        let lists = try_join_all(asked.iter().map(|height| async move {
+            client
+                .get_json_opt::<Vec<Block>>(&format!("/blocks/{height}"))
+                .await
+        }))
+        .await?;
+        for (height, listed) in asked.iter().zip(lists) {
+            let Some(listed) = listed else {
+                return Ok(None);
+            };
+            for block in &listed {
+                if (from..=*height).contains(&block.height) {
+                    headers
+                        .entry(block.height)
+                        .or_insert_with(|| block.header());
+                }
             }
         }
-        match lowest {
-            Some(lowest) if lowest <= from => break,
-            Some(lowest) => next = lowest - 1,
-            None => return Ok(None),
+        if !headers.contains_key(&next) {
+            return Ok(None);
+        }
+        match (from..next)
+            .rev()
+            .find(|height| !headers.contains_key(height))
+        {
+            Some(missing) => next = missing,
+            None => break,
         }
     }
     let headers: Option<Vec<Header>> = (from..=end)

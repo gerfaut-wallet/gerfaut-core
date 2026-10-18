@@ -919,6 +919,8 @@ pub(crate) struct MempoolState {
     /// Blocks a listing down from a height holds (`/blocks/:height`),
     /// ten when `None`, as Esplora lists them.
     pub blocks_listed: Option<u32>,
+    /// Heights a listing down from which is refused with a 400.
+    pub blocks_refused: std::collections::HashSet<u32>,
 }
 
 /// The headers of the chain the fake mempool serves, by height: see
@@ -1330,7 +1332,9 @@ impl FakeMempool {
                 .rsplit_once("/blocks/")
                 .and_then(|(_, height)| height.parse::<u32>().ok())
             {
-                if height <= state.tip {
+                if state.blocks_refused.contains(&height) {
+                    ("400 Bad Request", "Invalid request".to_owned())
+                } else if height <= state.tip {
                     let listed = state.blocks_listed.unwrap_or(10);
                     (
                         "200 OK",
