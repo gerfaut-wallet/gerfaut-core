@@ -20,7 +20,7 @@ use crate::now_secs;
 use crate::wallet::meta::WalletKind;
 use crate::wallet::views;
 
-use super::sync::sync_failure;
+use super::sync::{Attempts, sync_failure};
 use super::{WalletManager, ensure_engine, find_record};
 
 impl WalletManager {
@@ -329,7 +329,7 @@ impl WalletManager {
                     return Ok(report);
                 }
                 Err(Failure::Transport(detail)) => {
-                    refusals.push((endpoint.label(), detail.clone()));
+                    refusals.push((endpoint.label(), detail.to_string()));
                     failures.push((endpoint, Failure::Transport(detail)));
                 }
                 Err(Failure::Refused(detail)) => {
@@ -365,15 +365,15 @@ impl WalletManager {
 
     /// `answered` answered after each of `failed` went down: those are
     /// relegated, for the syncs as for what is sent. Only an outage of the
-    /// server itself counts ([`chain::is_outage`]): a node's verdict, a
+    /// server itself counts ([`chain::FaultKind::Outage`]): a node's verdict, a
     /// page a server would not serve, a route through Tor that failed,
     /// relegate nothing.
     fn note_send(&self, answered: &chain::Endpoint, failed: &[(&chain::Endpoint, Failure)]) {
         let down: Vec<&chain::Endpoint> = failed
             .iter()
-            .filter(|(_, failure)| {
-                matches!(failure, Failure::Transport(detail) if chain::is_outage(detail))
-            })
+            .filter(
+                |(_, failure)| matches!(failure, Failure::Transport(fault) if fault.is_outage()),
+            )
             .map(|(endpoint, _)| *endpoint)
             .collect();
         self.answered_after(answered, &down);
@@ -478,7 +478,7 @@ impl WalletManager {
         let (config, certs) = self.state.lock().await.chain_setup(network);
         let endpoints = self.send_endpoints(network, &config, &certs, Purpose::Broadcast)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
-        let mut attempts: Vec<String> = Vec::new();
+        let mut attempts = Attempts::default();
         let mut failures: Vec<(&chain::Endpoint, Failure)> = Vec::new();
         for endpoint in &endpoints {
             match chain::tx_standing(endpoint, network, txid, scripts.clone(), proxy.as_deref())
@@ -500,9 +500,9 @@ impl WalletManager {
                         at: now_secs(),
                     });
                 }
-                Err(detail) => {
-                    attempts.push(format!("{}: {detail}", endpoint.label()));
-                    failures.push((endpoint, Failure::Transport(detail)));
+                Err(fault) => {
+                    attempts.failed(endpoint, &fault);
+                    failures.push((endpoint, Failure::Transport(fault)));
                 }
             }
         }

@@ -50,12 +50,12 @@ use futures_util::future::try_join_all;
 use super::page::PageTx;
 use super::{Client, Counts, PAGE, PARALLEL_REQUESTS};
 use crate::chain::proof::{
-    COIN_NOT_PAID, FALSE_PROOF, Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
-    check_confirmation, esplora_chains, recheck,
+    Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, check_confirmation,
+    esplora_chains, recheck,
 };
 use crate::chain::{
-    Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX, has_proof_of_work,
-    height_limit,
+    Fault, Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX,
+    has_proof_of_work, height_limit,
 };
 use crate::network::Network;
 /// Pages read of one script at most: 10,000 confirmed transactions. A
@@ -121,7 +121,7 @@ struct Listed {
 
 /// A page as the engine keeps it: see [`Listed`]. What it keeps counts
 /// against what the sync may keep.
-fn listed(client: &Client, page: Vec<PageTx>, held: &Held) -> Result<Vec<Listed>, String> {
+fn listed(client: &Client, page: Vec<PageTx>, held: &Held) -> Result<Vec<Listed>, Fault> {
     page.into_iter()
         .map(|tx| {
             let whole = if held.txs.contains_key(&tx.txid) {
@@ -131,10 +131,9 @@ fn listed(client: &Client, page: Vec<PageTx>, held: &Held) -> Result<Vec<Listed>
                 // The txid commits to the transaction: one that does not
                 // hash to it is not the one listed.
                 if whole.compute_txid() != tx.txid {
-                    return Err(
-                        "the server answered with another transaction than the one it listed"
-                            .to_owned(),
-                    );
+                    return Err(Fault::other(
+                        "the server answered with another transaction than the one it listed",
+                    ));
                 }
                 let prevouts: Vec<(OutPoint, TxOut)> = tx.prevouts().collect();
                 let spent: usize = prevouts
@@ -165,7 +164,7 @@ struct Read {
 }
 
 /// Runs a plan against one instance.
-pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, String> {
+pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
     let Plan {
         network,
         tip,
@@ -294,7 +293,7 @@ async fn read_script(
     held: &Held,
     reading: Reading,
     agreed_up_to: u32,
-) -> Result<Read, String> {
+) -> Result<Read, Fault> {
     let stats: ScriptHashStats = client.get_json(&script_path(script)).await?;
     let used = stats.chain_stats.tx_count > 0 || stats.mempool_stats.tx_count > 0;
     let facts = held.scripts.get(script).cloned().unwrap_or_default();
@@ -336,7 +335,7 @@ async fn read_scanned(
     script: &ScriptBuf,
     held: &Held,
     agreed_up_to: u32,
-) -> Result<Read, String> {
+) -> Result<Read, Fault> {
     if held.scripts.contains_key(script) {
         return read_script(client, script, held, Reading::Complete, agreed_up_to).await;
     }
@@ -354,7 +353,7 @@ async fn read_pages_down_to(
     script: &ScriptBuf,
     held: &Held,
     known: Option<(&ScriptFacts, &ScriptHashStats)>,
-) -> Result<(Read, usize, bool), String> {
+) -> Result<(Read, usize, bool), Fault> {
     let base = format!("{}/txs", script_path(script));
     let mut txs: Vec<Listed> = Vec::new();
     let mut after: Option<Txid> = None;
@@ -362,10 +361,10 @@ async fn read_pages_down_to(
     let mut whole = false;
     for pages in 1.. {
         if pages > MAX_PAGES {
-            return Err(format!(
+            return Err(Fault::other(format!(
                 "the server lists more than {} transactions for one address",
                 MAX_PAGES * PAGE
-            ));
+            )));
         }
         let path = match after {
             Some(txid) => format!("{base}/chain/{txid}"),
@@ -486,7 +485,7 @@ fn enough(txs: &[Listed], facts: &ScriptFacts, held: &Held, stats: &ScriptHashSt
 /// addresses paid five times each (1,202), as much again for each other
 /// coin a payer spends, and every byte of those transactions, for
 /// figures that do not move the balance.
-fn check_spent(held: &Held, update: &TxUpdate<ConfirmationBlockTime>) -> Result<(), String> {
+fn check_spent(held: &Held, update: &TxUpdate<ConfirmationBlockTime>) -> Result<(), Fault> {
     let read: HashMap<Txid, &Transaction> = update
         .txs
         .iter()
@@ -502,7 +501,7 @@ fn check_spent(held: &Held, update: &TxUpdate<ConfirmationBlockTime>) -> Result<
             continue;
         };
         if paying.output.get(outpoint.vout as usize) != Some(said) {
-            return Err(COIN_NOT_PAID.to_owned());
+            return Err(Fault::coin_not_paid());
         }
     }
     Ok(())
@@ -527,7 +526,7 @@ impl Found {
     /// Takes what was read of one script: where each transaction stands,
     /// the ones the wallet lacks with the coins they spend, and what left
     /// the mempool.
-    fn take(&mut self, read: Read) -> Result<(), String> {
+    fn take(&mut self, read: Read) -> Result<(), Fault> {
         for tx in read.txs {
             let txid = tx.txid;
             if !self.taken.insert(txid) {
@@ -575,7 +574,7 @@ async fn prove(
     held: &Held,
     start_time: u64,
     update: &mut TxUpdate<ConfirmationBlockTime>,
-) -> Result<(), String> {
+) -> Result<(), Fault> {
     let new: Vec<(ConfirmationBlockTime, Txid)> = update
         .anchors
         .iter()
@@ -618,7 +617,7 @@ async fn prove(
 /// ([`check_confirmation`]). Gives, for each, the time of its block once
 /// proven, `None` when the proof is unsure, or when the server has no
 /// branch or no header for it, as when a block came in since it listed
-/// it. A proof that does not hold refuses the server ([`FALSE_PROOF`]),
+/// it. A proof that does not hold refuses the server ([`crate::chain::proof::FALSE_PROOF`]),
 /// and so does a header that is not the block named. A sound branch into
 /// another block has the block at its height read again ([`recheck`]):
 /// one that replaced the block named leaves the confirmation unsure. One
@@ -636,7 +635,7 @@ pub(crate) async fn prove_confirmations(
     network: Network,
     tip: u32,
     claimed: &[(Txid, BlockId)],
-) -> Result<Vec<Option<u64>>, String> {
+) -> Result<Vec<Option<u64>>, Fault> {
     let too_high = |tip: u32| {
         claimed
             .iter()
@@ -651,7 +650,7 @@ pub(crate) async fn prove_confirmations(
         tip = tip.max(proven_tip(client, network).await?);
     }
     if too_high(tip) {
-        return Err(FALSE_PROOF.to_owned());
+        return Err(Fault::false_proof());
     }
     let below: Vec<(Txid, BlockId)> = claimed
         .iter()
@@ -678,7 +677,7 @@ async fn prove_below_the_tip(
     client: &Client,
     network: Network,
     claimed: &[(Txid, BlockId)],
-) -> Result<Vec<Option<u64>>, String> {
+) -> Result<Vec<Option<u64>>, Fault> {
     let mut blocks: Vec<BlockHash> = claimed.iter().map(|(_, block)| block.hash).collect();
     blocks.sort_unstable();
     blocks.dedup();
@@ -724,7 +723,7 @@ async fn prove_below_the_tip(
                     times.push(Some(u64::from(headers[&block.hash].time)));
                 }
                 Proof::Unsure => times.push(None),
-                Proof::False | Proof::Elsewhere => return Err(FALSE_PROOF.to_owned()),
+                Proof::False | Proof::Elsewhere => return Err(Fault::false_proof()),
             }
         }
     }
@@ -738,7 +737,7 @@ async fn prove_below_the_tip(
             match chained(network, height, hash, &read) {
                 Proof::Holds => {}
                 Proof::Unsure => times[at] = None,
-                Proof::False | Proof::Elsewhere => return Err(FALSE_PROOF.to_owned()),
+                Proof::False | Proof::Elsewhere => return Err(Fault::false_proof()),
             }
         }
     }
@@ -756,7 +755,7 @@ async fn read_chains(
     client: &Client,
     network: Network,
     blocks: &[(u32, BlockHash)],
-) -> Result<HashMap<u32, Vec<BlockHash>>, String> {
+) -> Result<HashMap<u32, Vec<BlockHash>>, Fault> {
     let mut budget = CHAIN_REQUESTS_MAX;
     let mut read = HashMap::new();
     for (from, count) in chains_to_read(network, blocks) {
@@ -767,8 +766,7 @@ async fn read_chains(
         let Some(headers) = read_down_to(client, from, count, &mut budget).await? else {
             continue;
         };
-        let hashes =
-            chain_to_checkpoint(network, from, &headers).ok_or_else(|| FALSE_PROOF.to_owned())?;
+        let hashes = chain_to_checkpoint(network, from, &headers).ok_or_else(Fault::false_proof)?;
         read.insert(from, hashes);
     }
     Ok(read)
@@ -784,7 +782,7 @@ async fn read_down_to(
     from: u32,
     count: u32,
     budget: &mut u32,
-) -> Result<Option<Vec<Header>>, String> {
+) -> Result<Option<Vec<Header>>, Fault> {
     let end = from + count - 1;
     let mut headers: BTreeMap<u32, Header> = BTreeMap::new();
     let mut next = end;
@@ -823,7 +821,7 @@ async fn read_down_to(
 
 /// The header of the block `hash`, which must hash to it; `None` when
 /// the server has no such block, one a reorganisation left behind.
-async fn block_header(client: &Client, hash: BlockHash) -> Result<Option<Header>, String> {
+async fn block_header(client: &Client, hash: BlockHash) -> Result<Option<Header>, Fault> {
     let Some(text) = client
         .fetch(&format!("/block/{hash}/header"), 1 << 10)
         .await?
@@ -835,12 +833,12 @@ async fn block_header(client: &Client, hash: BlockHash) -> Result<Option<Header>
         .and_then(|text| deserialize_hex::<Header>(text.trim()).ok())
         .filter(|header| header.block_hash() == hash)
         .map(Some)
-        .ok_or_else(|| FALSE_PROOF.to_owned())
+        .ok_or_else(Fault::false_proof)
 }
 
 /// The header of the block the server has at `height` now; `None` when
 /// it has none there.
-async fn block_at_height(client: &Client, height: u32) -> Result<Option<Header>, String> {
+async fn block_at_height(client: &Client, height: u32) -> Result<Option<Header>, Fault> {
     let Some(text) = client
         .fetch(&format!("/block-height/{height}"), 1 << 10)
         .await?
@@ -850,7 +848,7 @@ async fn block_at_height(client: &Client, height: u32) -> Result<Option<Header>,
     let hash: BlockHash = std::str::from_utf8(&text)
         .ok()
         .and_then(|text| text.trim().parse().ok())
-        .ok_or_else(|| "unexpected response".to_owned())?;
+        .ok_or_else(|| Fault::other("unexpected response"))?;
     block_header(client, hash).await
 }
 
@@ -860,21 +858,21 @@ async fn latest_blocks(
     client: &Client,
     network: Network,
     limit: u32,
-) -> Result<BTreeMap<u32, BlockHash>, String> {
+) -> Result<BTreeMap<u32, BlockHash>, Fault> {
     checked_latest(network, client.get_json("/blocks").await?, limit)
 }
 
 /// The server's tip, proven as a descriptor wallet's sync proves it
 /// ([`checked_latest`]): what a watched address counts its
 /// confirmations from. One request, the one that read the height alone.
-pub(crate) async fn proven_tip(client: &Client, network: Network) -> Result<u32, String> {
+pub(crate) async fn proven_tip(client: &Client, network: Network) -> Result<u32, Fault> {
     let limit = height_limit(network, crate::now_secs());
     let latest = latest_blocks(client, network, limit).await?;
     latest
         .keys()
         .next_back()
         .copied()
-        .ok_or_else(|| "unexpected response".to_owned())
+        .ok_or_else(|| Fault::other("unexpected response"))
 }
 
 /// What a server whose latest blocks do not make a chain, with the
@@ -895,14 +893,14 @@ fn checked_latest(
     network: Network,
     mut blocks: Vec<Block>,
     limit: u32,
-) -> Result<BTreeMap<u32, BlockHash>, String> {
+) -> Result<BTreeMap<u32, BlockHash>, Fault> {
     blocks.sort_by_key(|block| std::cmp::Reverse(block.height));
     blocks.truncate(LATEST);
     let tip = blocks
         .first()
-        .ok_or_else(|| "unexpected response".to_owned())?;
+        .ok_or_else(|| Fault::other("unexpected response"))?;
     if tip.height > limit {
-        return Err(IMPOSSIBLE_TIP.to_owned());
+        return Err(Fault::other(IMPOSSIBLE_TIP));
     }
     let chained = blocks.windows(2).all(|pair| {
         pair[1].height.checked_add(1) == Some(pair[0].height)
@@ -913,7 +911,7 @@ fn checked_latest(
         header.block_hash() == block.id && has_proof_of_work(network, block.height, &header)
     });
     if !chained || !worked {
-        return Err(UNCHAINED.to_owned());
+        return Err(Fault::other(UNCHAINED));
     }
     Ok(blocks
         .into_iter()
@@ -927,7 +925,7 @@ async fn block_at(
     client: &Client,
     latest: &BTreeMap<u32, BlockHash>,
     height: u32,
-) -> Result<Option<BlockHash>, String> {
+) -> Result<Option<BlockHash>, Fault> {
     if let Some(hash) = latest.get(&height) {
         return Ok(Some(*hash));
     }
@@ -943,7 +941,7 @@ async fn block_at(
         .ok()
         .and_then(|text| text.trim().parse().ok())
         .map(Some)
-        .ok_or_else(|| "unexpected response".to_owned())
+        .ok_or_else(|| Fault::other("unexpected response"))
 }
 
 /// Where the wallet's chain and the server's meet: the last block both
@@ -970,7 +968,7 @@ impl Meeting {
         network: Network,
         latest: &BTreeMap<u32, BlockHash>,
         local_tip: &CheckPoint,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Fault> {
         let mut conflicts = Vec::new();
         for local in local_tip.iter() {
             let Some(remote) = block_at(client, latest, local.height()).await? else {
@@ -996,7 +994,7 @@ impl Meeting {
                 hash: remote,
             });
         }
-        Err("the server's chain never meets the wallet's".to_owned())
+        Err(Fault::other("the server's chain never meets the wallet's"))
     }
 
     /// The wallet's chain as the server sees it: from the meeting point,
@@ -1010,7 +1008,7 @@ impl Meeting {
         client: &Client,
         latest: &BTreeMap<u32, BlockHash>,
         anchors: &BTreeSet<(ConfirmationBlockTime, Txid)>,
-    ) -> Result<CheckPoint, String> {
+    ) -> Result<CheckPoint, Fault> {
         let meeting = self.height;
         let mut tip = match self.ahead {
             Some(local) => local,
@@ -1034,7 +1032,7 @@ impl Meeting {
             // genesis block, or blocks both agreed on.
             if height <= meeting {
                 if tip.get(height).is_some_and(|held| held.hash() != hash) {
-                    return Err("the server's chain contradicts itself".to_owned());
+                    return Err(Fault::other("the server's chain contradicts itself"));
                 }
                 if tip.get(height).is_some() {
                     continue;

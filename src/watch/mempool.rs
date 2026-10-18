@@ -111,7 +111,7 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
             };
             let stream = net::open(&host, port, security, proxy.as_deref(), budget)
                 .await
-                .map_err(Exit::Unreachable)?;
+                .map_err(|fault| Exit::Unreachable(fault.to_string()))?;
             let mut request = url
                 .as_str()
                 .into_client_request()

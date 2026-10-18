@@ -614,22 +614,6 @@ fn a_confirmation_above_the_tip_is_weighed() {
     assert_eq!(above_the_tip(u32::MAX, u32::MAX - 1), Some(Proof::Unsure));
 }
 
-/// A false proof is the core's word: the same words in a server's own
-/// refusal do not make the error one.
-#[test]
-fn a_server_does_not_choose_the_false_proof_code() {
-    assert!(is_false_proof(&format!(
-        "electrum.example.org: {FALSE_PROOF}"
-    )));
-    assert!(is_false_proof(&format!(
-        "a: could not connect; b: {COIN_NOT_PAID}"
-    )));
-    assert!(!is_false_proof(&format!(
-        "electrum.example.org: the server refused the request: {FALSE_PROOF}"
-    )));
-    assert!(!is_false_proof("electrum.example.org: could not connect"));
-}
-
 /// The two halves of a transaction of 64 bytes, as they are hashed: the
 /// first one read as a txid, the second as its sibling.
 pub(super) fn halves_of_64_bytes(first: [u8; 32]) -> (Txid, [u8; 32], Transaction) {
@@ -800,7 +784,10 @@ mod servers {
         }
     }
 
-    async fn electrum_sync(server: &FakeElectrum, network: Network) -> Result<Synced, String> {
+    async fn electrum_sync(
+        server: &FakeElectrum,
+        network: Network,
+    ) -> Result<Synced, crate::chain::Fault> {
         let target = Target::new(format!("tcp://{}", server.address), None);
         crate::chain::electrum::sync(&target, plan(network), None, Duration::from_secs(30)).await
     }
@@ -817,7 +804,7 @@ mod servers {
     }
 
     /// The error of a sync that was to fail.
-    fn refusal(synced: Result<Synced, String>) -> String {
+    fn refusal(synced: Result<Synced, crate::chain::Fault>) -> crate::chain::Fault {
         match synced {
             Ok(synced) => panic!("confirmed {:?}", anchored(&synced)),
             Err(refused) => refused,
@@ -909,7 +896,7 @@ mod servers {
             .branches
             .insert(txid, (vec!["ab".repeat(32)], 0));
         let refused = refusal(electrum_sync(&server, Network::Signet).await);
-        assert!(refused.contains(FALSE_PROOF), "{refused}");
+        assert!(refused.is_false_proof(), "{refused}");
 
         // Through a transaction of 64 bytes whose first half is the txid.
         let server = signet().await;
@@ -946,7 +933,7 @@ mod servers {
             .branches
             .insert(txid, (vec![shown(raw)], 1));
         let refused = refusal(electrum_sync(&server, Network::Signet).await);
-        assert!(refused.contains(FALSE_PROOF), "{refused}");
+        assert!(refused.is_false_proof(), "{refused}");
 
         // Alone in its block, at a position past it.
         let server = signet().await;
@@ -958,7 +945,7 @@ mod servers {
             .branches
             .insert(payment.compute_txid(), (Vec::new(), 3));
         let refused = refusal(electrum_sync(&server, Network::Signet).await);
-        assert!(refused.contains(FALSE_PROOF), "{refused}");
+        assert!(refused.is_false_proof(), "{refused}");
     }
 
     /// A block that replaced the one first read, between the header and
@@ -1051,7 +1038,7 @@ mod servers {
             let payment = pay(&server, height, |_| true);
             let synced = electrum_sync(&server, Network::Signet).await;
             match (synced, refused) {
-                (Err(error), true) => assert!(error.contains(FALSE_PROOF), "{error}"),
+                (Err(error), true) => assert!(error.is_false_proof(), "{error}"),
                 (Ok(synced), false) => {
                     assert_eq!(anchored(&synced), []);
                     let txid = payment.compute_txid();
@@ -1079,7 +1066,7 @@ mod servers {
         let refused = address_state(&server, SIGNET_ADDRESS, Network::Signet)
             .await
             .unwrap_err();
-        assert!(refused.contains(FALSE_PROOF), "{refused}");
+        assert!(refused.is_false_proof(), "{refused}");
         // A tip no chain has reached.
         let server = signet().await;
         server.state.lock().unwrap().height = 4_000_000_000;
@@ -1113,14 +1100,14 @@ mod servers {
         let server = early().await;
         server.set_history(&ours(), &[(coinbase.compute_txid(), 1_000)]);
         let refused = refusal(electrum_sync(&server, Network::Mainnet).await);
-        assert!(refused.contains(FALSE_PROOF), "{refused}");
+        assert!(refused.is_false_proof(), "{refused}");
 
         let server = early().await;
         server.set_history(ADDRESS_SCRIPT, &[(coinbase.compute_txid(), 1_000)]);
         let refused = address_state(&server, MAINNET_ADDRESS, Network::Mainnet)
             .await
             .unwrap_err();
-        assert!(refused.contains(FALSE_PROOF), "{refused}");
+        assert!(refused.is_false_proof(), "{refused}");
     }
 
     /// On mainnet, a real transaction of the last checkpoint's block is
@@ -1169,7 +1156,7 @@ mod servers {
             assert!(!forged.target().is_met_by(forged.block_hash()));
             let refused = refusal(electrum_sync(&server, Network::Mainnet).await);
             assert!(
-                refused.contains(FALSE_PROOF) || refused.contains("do not chain"),
+                refused.is_false_proof() || refused.contains("do not chain"),
                 "{height}: {refused}"
             );
         }
@@ -1184,7 +1171,7 @@ mod servers {
         server: &FakeElectrum,
         address: &str,
         network: Network,
-    ) -> Result<crate::wallet::AddressWatchState, String> {
+    ) -> Result<crate::wallet::AddressWatchState, crate::chain::Fault> {
         let target = Target::new(format!("tcp://{}", server.address), None);
         crate::chain::electrum::address::fetch_state(&target, address, network, None, &[], None)
             .await
@@ -1226,7 +1213,7 @@ mod servers {
         let refused = address_state(&server, SIGNET_ADDRESS, Network::Signet)
             .await
             .unwrap_err();
-        assert!(refused.contains(FALSE_PROOF), "{refused}");
+        assert!(refused.is_false_proof(), "{refused}");
     }
 
     /// A watched address: a block that replaced the one first read, and a
@@ -1289,6 +1276,13 @@ mod servers {
             "{refused}"
         );
         assert!(refused.to_string().contains(FALSE_PROOF), "{refused}");
+        // A sync of every wallet says it by the same code.
+        let all = manager.sync_all(None).await;
+        assert!(all.reports.is_empty());
+        let failed = &all.failures[0];
+        assert_eq!(failed.wallet_id, wallet.id);
+        assert_eq!(failed.kind, crate::error::ErrorCode::FalseProof);
+        assert!(failed.message.contains(FALSE_PROOF), "{}", failed.message);
     }
 
     /// On mainnet, a real confirmation of the last checkpoint's block is
@@ -1329,7 +1323,7 @@ mod servers {
         let refused = address_state(&server, MAINNET_ADDRESS, Network::Mainnet)
             .await
             .unwrap_err();
-        assert!(refused.contains(FALSE_PROOF), "{refused}");
+        assert!(refused.is_false_proof(), "{refused}");
     }
 
     /// A coin is confirmed when its transaction is, in the round: the
@@ -1377,7 +1371,10 @@ mod servers {
             let refused = address_state(&server, SIGNET_ADDRESS, Network::Signet)
                 .await
                 .unwrap_err();
-            assert!(refused.contains("does not pay"), "{vout}: {refused}");
+            assert!(
+                refused.is_false_proof() && refused.contains("does not pay"),
+                "{vout}: {refused}"
+            );
         }
     }
 
@@ -1422,7 +1419,7 @@ mod servers {
             .insert(FakeMempool::rest_key(ADDRESS_SCRIPT), payments);
     }
 
-    async fn esplora_sync(server: &FakeMempool, plan: Plan) -> Result<Synced, String> {
+    async fn esplora_sync(server: &FakeMempool, plan: Plan) -> Result<Synced, crate::chain::Fault> {
         crate::chain::esplora::sync::run(&esplora(server), plan).await
     }
 
@@ -1463,7 +1460,7 @@ mod servers {
             .branches
             .insert(txid.to_string(), (vec!["ab".repeat(32)], 0));
         let refused = esplora_sync(&server, address_plan(Network::Signet, Held::default())).await;
-        assert!(refusal(refused).contains(FALSE_PROOF));
+        assert!(refusal(refused).is_false_proof());
     }
 
     /// A block the server listed and has no header for, as after a
@@ -1533,8 +1530,8 @@ mod servers {
             server.state.lock().unwrap().address_txs = vec![payment];
             let state = esplora_address(&server, Network::Signet).await;
             if refused {
-                assert!(refusal(synced).contains(FALSE_PROOF));
-                assert!(state.unwrap_err().contains(FALSE_PROOF));
+                assert!(refusal(synced).is_false_proof());
+                assert!(state.unwrap_err().is_false_proof());
             } else {
                 assert!(synced.unwrap().update.tx_update.anchors.is_empty());
                 assert_eq!(state.unwrap().txs[0].height, None);
@@ -1729,7 +1726,7 @@ mod servers {
         let server = mainnet_mempool(10).await;
         list(&server, vec![esplora_payment(0x32, 0x42, 50_000, true)]);
         let refused = esplora_sync(&server, address_plan(Network::Mainnet, Held::default())).await;
-        assert!(refusal(refused).contains(FALSE_PROOF));
+        assert!(refusal(refused).is_false_proof());
     }
 
     /// A confirmation the wallet holds in the same block is not proven
@@ -1915,7 +1912,7 @@ mod servers {
     async fn esplora_address(
         server: &FakeMempool,
         network: Network,
-    ) -> Result<crate::wallet::AddressWatchState, String> {
+    ) -> Result<crate::wallet::AddressWatchState, crate::chain::Fault> {
         let address = if network == Network::Mainnet {
             MAINNET_ADDRESS
         } else {
@@ -1950,7 +1947,7 @@ mod servers {
         let refused = esplora_address(&server, Network::Mainnet)
             .await
             .unwrap_err();
-        assert!(refused.contains(FALSE_PROOF), "{refused}");
+        assert!(refused.is_false_proof(), "{refused}");
     }
 
     /// The coins of an address over Esplora are read as over Electrum.
@@ -1984,7 +1981,10 @@ mod servers {
 
         server.state.lock().unwrap().utxos = vec![coin(&txid, 0, 60_000)];
         let refused = esplora_address(&server, Network::Signet).await.unwrap_err();
-        assert!(refused.contains("does not pay"), "{refused}");
+        assert!(
+            refused.is_false_proof() && refused.contains("does not pay"),
+            "{refused}"
+        );
     }
 
     /// A coin past the round over Esplora counts as confirmed once its
@@ -2060,7 +2060,10 @@ mod servers {
         let refused = read(vec![coin(5_000_000, 500)], Vec::new())
             .await
             .unwrap_err();
-        assert!(refused.contains("does not pay"), "{refused}");
+        assert!(
+            refused.is_false_proof() && refused.contains("does not pay"),
+            "{refused}"
+        );
         // Higher than the round's oldest confirmation: unconfirmed.
         let coins = read(vec![coin(50_000, 530)], Vec::new()).await.unwrap();
         assert_eq!(coins[0].height, None);

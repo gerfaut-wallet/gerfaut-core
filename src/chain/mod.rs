@@ -8,6 +8,7 @@
 pub mod connect;
 pub(crate) mod electrum;
 pub(crate) mod esplora;
+mod fault;
 pub(crate) mod net;
 pub(crate) mod proof;
 pub mod public;
@@ -24,6 +25,8 @@ use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bdk_wallet::chain::{CheckPoint, ConfirmationBlockTime};
 use serde::{Deserialize, Serialize};
 use url::{Host, ParseError, Url};
+
+pub(crate) use fault::{Fault, FaultKind};
 
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
@@ -182,44 +185,6 @@ pub(crate) fn server_words(text: &str) -> String {
         short.push('\u{2026}');
     }
     short
-}
-
-/// The words of a failed request that say the server is down, or asks
-/// for less, whatever was asked: the connection could not be opened or
-/// was cut, the connection or one request timed out, its certificate
-/// would not do, or the server answered HTTP 429 or a 5xx. Each is this
-/// crate's own wording, and each is pinned by a test on the function
-/// that writes it. The deadline of a whole sync is not one: how long a
-/// sync takes depends on the wallet as much as on the server. Nor is
-/// what this device says: a Tor that is starting or missing, or the
-/// words of its system, a firewall for instance ("connection failed").
-const OUTAGES: [&str; 8] = [
-    "could not connect",
-    "timed out",
-    "the connection was closed",
-    "host not found",
-    "TLS handshake failed",
-    "the server's certificate",
-    "HTTP 429",
-    "HTTP 5",
-];
-
-/// Whether a request failed because of the server, not because of what
-/// was asked: see [`OUTAGES`]. A refusal in the server's own words, a
-/// history too long for it or a page it would not serve, is about one
-/// request or one wallet, whatever those words say, unless they are the
-/// ones of a server out of memory for its answers.
-pub(crate) fn is_outage(detail: &str) -> bool {
-    if detail.contains("through Tor") {
-        return false;
-    }
-    if ["the server refused", "the server will not send"]
-        .iter()
-        .any(|refused| detail.contains(refused))
-    {
-        return detail.contains("budget exhausted");
-    }
-    OUTAGES.iter().any(|outage| detail.contains(outage))
 }
 
 /// What every HTTP client of the core is built from: one that takes no
@@ -557,11 +522,16 @@ fn scan_deadline(endpoint: &Endpoint) -> Duration {
 /// `work`, given up once `deadline` has passed.
 async fn within<T>(
     deadline: Duration,
-    work: impl Future<Output = Result<T, String>>,
-) -> Result<T, String> {
+    work: impl Future<Output = Result<T, Fault>>,
+) -> Result<T, Fault> {
     tokio::time::timeout(deadline, work)
         .await
-        .unwrap_or_else(|_| Err(format!("no answer within {} s", deadline.as_secs())))
+        .unwrap_or_else(|_| {
+            Err(Fault::other(format!(
+                "no answer within {} s",
+                deadline.as_secs()
+            )))
+        })
 }
 
 /// What a sync of a descriptor wallet reads, and what the wallet
@@ -750,8 +720,9 @@ pub(crate) fn check_amounts(update: &bdk_wallet::Update, held_sats: u64) -> Resu
 
 /// Runs one sync attempt against one endpoint, within the deadline of
 /// a scan, and refuses an answer whose amounts no chain can carry (see
-/// [`check_amounts`]). The error is a plain string: the caller owns
-/// retry logic and error wrapping. Dropping the future abandons the
+/// [`check_amounts`]). The error is the server's failure, its words and
+/// their kind ([`Fault`]): the caller owns retry logic and error
+/// wrapping. Dropping the future abandons the
 /// attempt, an Electrum connection included.
 ///
 /// `proxy`, here and below, is the Tor SOCKS proxy the caller resolved
@@ -760,7 +731,7 @@ pub(crate) async fn sync_engine(
     endpoint: &Endpoint,
     plan: Plan,
     proxy: Option<&str>,
-) -> Result<Synced, String> {
+) -> Result<Synced, Fault> {
     let deadline = scan_deadline(endpoint);
     let held_sats = plan.held.sats;
     let synced = match endpoint {
@@ -788,7 +759,7 @@ pub(crate) async fn fetch_address_state(
     proxy: Option<&str>,
     held: &[crate::wallet::AddressTx],
     told: Option<&electrum::status::Told>,
-) -> Result<Option<AddressWatchState>, String> {
+) -> Result<Option<AddressWatchState>, Fault> {
     match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client_for_run(url, proxy)?;
@@ -819,8 +790,9 @@ pub(crate) enum Failure {
     /// server error, a rate limit, a server short of memory twice, a
     /// proxy's page, an answer that is not the protocol, a request the
     /// server turned away. Nothing was said about the transaction, and
-    /// the next endpoint may be asked.
-    Transport(String),
+    /// the next endpoint may be asked. Its kind says whether the server
+    /// itself is down ([`FaultKind::Outage`]).
+    Transport(Fault),
     /// The node itself turned the transaction down, in these words: a
     /// verdict recognised as bitcoind's ([`node_verdict`]). That is the
     /// answer: another operator's node would say the same, and seeing
@@ -1013,9 +985,9 @@ pub(crate) async fn broadcast(
         Ok(answered) if answered == txid => Ok(()),
         // No verdict of the node's: a server that says it took another
         // transaction has not said it took this one.
-        Ok(answered) => Err(Failure::Transport(format!(
+        Ok(answered) => Err(Failure::Transport(Fault::other(format!(
             "the server answered with the txid {answered}, not {txid}"
-        ))),
+        )))),
         // The node says it holds it already. The same server is asked for
         // it: handed over, it is the transaction; not there, the server's
         // index may not have caught up with its node, whose word stands.
@@ -1024,9 +996,9 @@ pub(crate) async fn broadcast(
         Err(Failure::Refused(words)) if already_known(&words) => {
             match fetch_tx(endpoint, txid, proxy).await {
                 Ok(Some(held)) if held.compute_txid() == txid => Ok(()),
-                Ok(Some(_)) => Err(Failure::Transport(format!(
+                Ok(Some(_)) => Err(Failure::Transport(Fault::other(format!(
                     "the server handed over another transaction as {txid}"
-                ))),
+                )))),
                 Ok(None) => Ok(()),
                 Err(failure) => Err(failure),
             }
@@ -1104,11 +1076,11 @@ pub(crate) async fn inspect_certificate(
 /// for its txid. The txid commits to every output, so a transaction
 /// that does not hash to it is the server's invention, refused rather
 /// than read for the value and the fee the preview shows.
-pub(crate) fn output_at(tx: &Transaction, outpoint: OutPoint) -> Result<Option<TxOut>, String> {
+pub(crate) fn output_at(tx: &Transaction, outpoint: OutPoint) -> Result<Option<TxOut>, Fault> {
     if tx.compute_txid() != outpoint.txid {
-        return Err(
-            "the server answered with another transaction than the one asked for".to_owned(),
-        );
+        return Err(Fault::other(
+            "the server answered with another transaction than the one asked for",
+        ));
     }
     Ok(tx.output.get(outpoint.vout as usize).cloned())
 }
@@ -1215,7 +1187,7 @@ pub(crate) async fn tx_standing(
     txid: Txid,
     scripts: Vec<ScriptBuf>,
     proxy: Option<&str>,
-) -> Result<TxStanding, String> {
+) -> Result<TxStanding, Fault> {
     match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client(url, proxy)?;
@@ -1248,7 +1220,7 @@ pub(crate) async fn fetch_address_history(
     network: Network,
     from: &str,
     proxy: Option<&str>,
-) -> Result<esplora::HistoryRound, String> {
+) -> Result<esplora::HistoryRound, Fault> {
     match endpoint {
         Endpoint::Esplora(url) => {
             let client = esplora::client_for_run(url, proxy)?;
@@ -1782,35 +1754,55 @@ mod tests {
     }
 
     /// A server down, or asking for less, is an outage; a refusal of what
-    /// was asked is not, whatever words the server put in it, unless they
-    /// say it is out of memory for its answers. Nor is a server that lies.
+    /// was asked is not, whatever words the server put in it, unless it
+    /// turned the request down for want of memory. Nor is a server that
+    /// lies, nor what the core says of an answer it would not take.
     #[test]
     fn an_outage_is_told_from_a_refused_request() {
+        use electrum::rpc::CallError;
         let changed = tls::ConnectError::Certificate(tls::Verdict::Changed {
             stored: "AA".to_owned(),
             presented: "BB".to_owned(),
         });
-        assert!(is_outage(&changed.to_string()), "{changed}");
-        assert!(is_outage(
-            "the server refused the history of this address: response budget exhausted, retry later"
-        ));
-        for refused in [
+        assert!(Fault::from(changed.clone()).is_outage(), "{changed}");
+        let busy = Fault::from(CallError::Refused {
+            words: "response budget exhausted, retry later".to_owned(),
+            busy: true,
+        });
+        assert!(busy.is_outage(), "{busy}");
+        // The words of a refusal choose nothing, those of an outage or of
+        // a false proof included.
+        for words in [
+            "history too large",
+            "request timed out",
+            "could not connect",
+            "HTTP 503: server error",
+            "response budget exhausted, retry later",
+            proof::FALSE_PROOF,
+            proof::COIN_NOT_PAID,
+        ] {
+            let refused = Fault::from(CallError::refused(words));
+            assert_eq!(refused.kind(), FaultKind::Other, "{refused}");
+        }
+        for said in [
             "no answer within 600 s",
             "the connection ended unexpectedly",
             "request failed",
-            "the server refused the request: history too large",
-            "the server refused the request: request timed out",
-            "the server will not send the history of this address, too long for it \
-             (could not connect); an Esplora backend can read it",
-            "HTTP 400: bad request",
-            "HTTP 404: not found",
             "unexpected response",
             ANOTHER_NETWORK,
             IMPOSSIBLE_TIP,
             "the history of this address changed since the last sync; sync the wallet and try again",
         ] {
-            assert!(!is_outage(refused), "{refused}");
+            assert_eq!(
+                Fault::from(said.to_owned()).kind(),
+                FaultKind::Other,
+                "{said}"
+            );
         }
+        assert!(Fault::false_proof().is_false_proof());
+        assert!(Fault::coin_not_paid().is_false_proof());
+        assert_eq!(Fault::false_proof(), proof::FALSE_PROOF);
+        assert_eq!(Fault::coin_not_paid(), proof::COIN_NOT_PAID);
     }
 
     /// The highest tip a chain can have is far past the real one, with

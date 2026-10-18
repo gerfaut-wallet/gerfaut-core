@@ -56,7 +56,7 @@ mod sync;
 mod updates;
 mod wallets;
 
-pub(crate) use sync::{Reach, complete_lately};
+pub(crate) use sync::{Reach, complete_lately, sync_code};
 pub use sync::{SyncAllReport, SyncFailure};
 
 /// Vault file name inside the data directory.

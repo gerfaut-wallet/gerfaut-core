@@ -42,7 +42,14 @@
   "sync_failed": {
     "type": "sync_failed",
     "wallet_id": "a7d40b19-5c3e-4f82-b6a1-2e9c8d7f0b54",
-    "message": "sync failed via electrum.example.org: connection refused"
+    "message": "sync failed via electrum.example.org: connection refused",
+    "kind": "sync"
+  },
+  "sync_failed_false_proof": {
+    "type": "sync_failed",
+    "wallet_id": "a7d40b19-5c3e-4f82-b6a1-2e9c8d7f0b54",
+    "message": "sync failed via electrum.example.org: electrum.example.org: the server sent a false proof of a confirmation",
+    "kind": "false_proof"
   },
   "new_block": {"type": "new_block", "height": 800001},
   "status": {
