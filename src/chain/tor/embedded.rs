@@ -118,9 +118,7 @@ async fn bootstrap(data_dir: &Path) -> CoreResult<Embedded> {
         .await
         .map_err(|error| tor(format!("cannot listen on loopback for Tor: {error}")))?;
     let connect = {
-        let streams = Arc::new(Streams {
-            current: std::sync::Mutex::new(client.clone()),
-        });
+        let streams = Arc::new(Streams::new(client.clone()));
         move |host: String, port: u16| {
             let streams = streams.clone();
             async move { streams.connect(host, port).await }
@@ -141,70 +139,112 @@ async fn bootstrap(data_dir: &Path) -> CoreResult<Embedded> {
 
 type Client = Arc<TorClient<TokioRustlsRuntime>>;
 
-/// The client the streams of the proxy go out on: the one bootstrapped,
-/// until the second attempt at an onion connection connects through a
-/// client of its own ([`attempts`]). That client then takes its place:
-/// its circuit to the service is the one known to answer, where the
-/// streams of the first would still join the attempt that hangs. Every
-/// stream shares one isolation either way, as before any second
-/// attempt.
+/// The clients the streams of the proxy go out on. A host in the clear
+/// always goes through the one bootstrapped. An onion service goes
+/// through it too, until the second attempt at an onion connection
+/// connects through a client of its own ([`attempts`]): that client then
+/// takes its place for the onion services, its circuit to the service
+/// being the one known to answer, where the streams of the first would
+/// still join the attempt that hangs.
 struct Streams {
-    current: std::sync::Mutex<Client>,
+    bootstrapped: Client,
+    onion: std::sync::Mutex<Onion>,
+}
+
+/// The client of the onion streams, and the one their second attempts
+/// share while it hangs.
+struct Onion {
+    current: Client,
+    next: Option<Client>,
 }
 
 impl Streams {
-    fn current(&self) -> Client {
-        self.current
+    fn new(client: Client) -> Self {
+        Streams {
+            onion: std::sync::Mutex::new(Onion {
+                current: client.clone(),
+                next: None,
+            }),
+            bootstrapped: client,
+        }
+    }
+
+    fn onion(&self) -> std::sync::MutexGuard<'_, Onion> {
+        self.onion
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
     }
 
     /// The client of a second attempt beside one made through `first`:
     /// the one another stream put in its place meanwhile, if one did,
-    /// else one of a new isolation.
+    /// else one of a new isolation, the same for every stream that waits
+    /// on `first`, so that they all build one new way to the service
+    /// rather than one each.
     fn successor(&self, first: &Client) -> Client {
-        let current = self.current();
-        if Arc::ptr_eq(&current, first) {
-            first.isolated_client()
-        } else {
-            current
+        let mut onion = self.onion();
+        if !Arc::ptr_eq(&onion.current, first) {
+            return onion.current.clone();
         }
+        onion
+            .next
+            .get_or_insert_with(|| first.isolated_client())
+            .clone()
     }
 
     /// `used` in the place of `first`, unless another stream replaced
     /// `first` already; nothing when `used` is `first`.
     fn adopt(&self, first: &Client, used: &Client) {
-        let mut current = self
-            .current
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if Arc::ptr_eq(&current, first) {
-            *current = used.clone();
+        let mut onion = self.onion();
+        if Arc::ptr_eq(&onion.current, first) && !Arc::ptr_eq(used, first) {
+            onion.current = used.clone();
+            onion.next = None;
+        }
+    }
+
+    /// Forgets the client of the second attempts beside `first`, once
+    /// neither connected: the next stream that waits on `first` tries
+    /// one of a new isolation, rather than join what arti may still be
+    /// trying behind the one that failed.
+    fn give_up(&self, first: &Client) {
+        let mut onion = self.onion();
+        if Arc::ptr_eq(&onion.current, first) {
+            onion.next = None;
         }
     }
 
     /// The upstream side of a `CONNECT`: a host in the clear in one
     /// attempt, an onion service in two ([`attempts::two`]).
     async fn connect(&self, host: String, port: u16) -> io::Result<DataStream> {
-        let first = self.current();
         if !crate::chain::is_onion_host(&host) {
-            return first.connect((host, port)).await.map_err(io::Error::other);
+            return self
+                .bootstrapped
+                .connect((host, port))
+                .await
+                .map_err(io::Error::other);
         }
+        let first = self.onion().current.clone();
         let through = |client: Client, host: String| async move {
             match client.connect((host, port)).await {
                 Ok(stream) => Ok((stream, client)),
                 Err(error) => Err(io::Error::other(error)),
             }
         };
-        let (stream, used) = attempts::two(
+        let connected = attempts::two(
             through(first.clone(), host.clone()),
             || through(self.successor(&first), host),
             attempts::TRY,
         )
-        .await?;
-        self.adopt(&first, &used);
-        Ok(stream)
+        .await;
+        match connected {
+            Ok((stream, used)) => {
+                self.adopt(&first, &used);
+                Ok(stream)
+            }
+            Err(error) => {
+                self.give_up(&first);
+                Err(error)
+            }
+        }
     }
 }
 

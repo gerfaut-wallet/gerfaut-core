@@ -187,12 +187,11 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
 /// Requests per batch while walking a keychain: as many as the gap, so
 /// that a walk that finds nothing past the last address used reads that
 /// gap in one batch, as ElectrumX, which waits a second at the end of
-/// each, would have it; never fewer than [`BATCH`] nor more than
-/// [`LIST_BATCH`]. And never more than the `missing` unused addresses
-/// that would complete the gap: every script asked for is an address
-/// the server learns before it is used, and the gap is how many the
-/// user lets it learn past the last one used. A used address at the
-/// head of a batch costs one batch more.
+/// each, would have it, within [`BATCH`] and [`LIST_BATCH`]. Then cut to
+/// the `missing` unused addresses that would complete the gap: every
+/// script asked for is an address the server learns before it is used,
+/// and the gap is how many the user lets it learn past the last one
+/// used. A used address at the head of a batch costs one batch more.
 fn walk_batch(stop_gap: u32, missing: usize) -> usize {
     usize::try_from(stop_gap)
         .unwrap_or(usize::MAX)

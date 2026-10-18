@@ -22,8 +22,9 @@ pub(super) const TRY: Duration = Duration::from_secs(30);
 
 /// Connects with `first`, given `try_for`; past it, with `second()` as
 /// well, and both get `try_for` more. The stream of whichever connects
-/// first. When one fails, the other is waited for, and when both fail,
-/// the error is the one that came last. A failure of `first` within
+/// first. When one fails, the other is waited for; when neither
+/// connects, the error is the last failure, or a timeout when both were
+/// silent. A failure of `first` within
 /// `try_for` is returned as it is: arti has already tried the
 /// rendezvous points it would try, and the service is down or gone.
 pub(super) async fn two<S, F, G>(
@@ -40,29 +41,41 @@ where
         return connected;
     }
     let mut second = std::pin::pin!(second());
+    let mut failed = None;
     let both = async {
-        tokio::select! {
-            connected = first.as_mut() => match connected {
-                Ok(stream) => Ok(stream),
-                Err(_) => second.as_mut().await,
-            },
-            connected = second.as_mut() => match connected {
-                Ok(stream) => Ok(stream),
-                Err(_) => first.as_mut().await,
-            },
+        let (mut first_done, mut second_done) = (false, false);
+        while !(first_done && second_done) {
+            let outcome = tokio::select! {
+                connected = first.as_mut(), if !first_done => {
+                    first_done = true;
+                    connected
+                }
+                connected = second.as_mut(), if !second_done => {
+                    second_done = true;
+                    connected
+                }
+            };
+            match outcome {
+                Ok(stream) => return Some(stream),
+                Err(error) => failed = Some(error),
+            }
         }
+        None
     };
-    tokio::time::timeout(try_for, both)
-        .await
-        .unwrap_or_else(|_| {
-            Err(io::Error::new(
+    let connected = tokio::time::timeout(try_for, both).await;
+    match connected {
+        Ok(Some(stream)) => Ok(stream),
+        // A failure is worth more than the silence of the other attempt.
+        _ => Err(failed.unwrap_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
                     "the onion service did not answer within {} s",
                     (try_for * 2).as_secs()
                 ),
-            ))
-        })
+            )
+        })),
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +209,22 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.to_string(), "second failed");
+    }
+
+    /// A failure is told, rather than the silence of the other attempt.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_beside_a_silent_attempt_is_told() {
+        let started = Arc::new(AtomicBool::new(false));
+        let begun = tokio::time::Instant::now();
+        let error = two(
+            attempt(Duration::from_secs(40), Err("descriptor not found")),
+            second(&started, Duration::from_secs(300), Ok("late")),
+            TRY_FOR,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "descriptor not found");
+        assert_eq!(begun.elapsed(), Duration::from_secs(60));
     }
 
     /// Neither attempt in time: the connection fails at the minute, when
