@@ -32,8 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      # The releases newer than the fork that were read and do not carry
-      # the fix, separated by spaces.
+      # The releases that were read and do not carry the fix, the one the
+      # fork patches among them, separated by spaces.
       REVIEWED: 0.5.0
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
