@@ -41,8 +41,8 @@ use crate::chain::{
 };
 use crate::network::Network;
 
-/// The fewest requests per batch while walking a keychain: see
-/// [`walk_batch`].
+/// The fewest requests per batch while walking a keychain, before the
+/// cut to what completes the gap: see [`walk_batch`].
 const BATCH: usize = 10;
 /// Requests per batch for a list known in full: the scripts revealed,
 /// and the headers and proofs they call for. ElectrumX, from 1.18 on,
@@ -113,10 +113,14 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
     }
 
     let mut last_active = BTreeMap::new();
+    let gap = (stop_gap as usize).max(1);
     for Scan { keychain, mut spks } in scans {
         let mut unused = 0usize;
         'scan: loop {
-            let batch: Vec<(u32, ScriptBuf)> = spks.by_ref().take(walk_batch(stop_gap)).collect();
+            let batch: Vec<(u32, ScriptBuf)> = spks
+                .by_ref()
+                .take(walk_batch(stop_gap, gap - unused))
+                .collect();
             if batch.is_empty() {
                 break;
             }
@@ -136,7 +140,7 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
                 };
                 if history.is_empty() {
                     unused = unused.saturating_add(1);
-                    if unused >= (stop_gap as usize).max(1) {
+                    if unused >= gap {
                         break 'scan;
                     }
                 } else {
@@ -183,15 +187,16 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
 /// Requests per batch while walking a keychain: as many as the gap, so
 /// that a walk that finds nothing past the last address used reads that
 /// gap in one batch, as ElectrumX, which waits a second at the end of
-/// each, would have it; never fewer than [`BATCH`] nor more than
-/// [`LIST_BATCH`]. The walk stops within a batch past the gap: every
+/// each, would have it, within [`BATCH`] and [`LIST_BATCH`]. Then cut to
+/// the `missing` unused addresses that would complete the gap: every
 /// script asked for is an address the server learns before it is used,
-/// and the gap is how many the user lets it learn, so it learns at most
-/// twice that many.
-fn walk_batch(stop_gap: u32) -> usize {
+/// and the gap is how many the user lets it learn past the last one
+/// used. A used address at the head of a batch costs one batch more.
+fn walk_batch(stop_gap: u32, missing: usize) -> usize {
     usize::try_from(stop_gap)
         .unwrap_or(usize::MAX)
         .clamp(BATCH, LIST_BATCH)
+        .min(missing)
 }
 
 /// The history of `script` the server listed, when the sync reads it:

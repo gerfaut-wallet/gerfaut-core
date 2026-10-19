@@ -13,6 +13,9 @@
 //! credentials drawn for the process: loopback is shared by every app on
 //! Android, and this proxy carries this wallet's traffic only.
 
+// Built and tested in every configuration, like `socks`.
+#[cfg_attr(not(feature = "embedded-tor"), allow(dead_code))]
+mod attempts;
 #[cfg(feature = "embedded-tor")]
 mod embedded;
 // Only the embedded client runs the server; it is built and tested in

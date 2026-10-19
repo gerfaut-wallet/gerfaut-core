@@ -210,10 +210,17 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
     }
 
     let mut last_active = BTreeMap::new();
+    // Never more requests at a time than the unused addresses that would
+    // complete the gap: the server learns of no more than the gap past
+    // the last address used.
+    let gap = (stop_gap as usize).max(1);
     for Scan { keychain, mut spks } in scans {
         let mut unused = 0usize;
         loop {
-            let batch: Vec<(u32, ScriptBuf)> = spks.by_ref().take(PARALLEL_REQUESTS).collect();
+            let batch: Vec<(u32, ScriptBuf)> = spks
+                .by_ref()
+                .take(PARALLEL_REQUESTS.min(gap - unused))
+                .collect();
             if batch.is_empty() {
                 break;
             }
@@ -231,7 +238,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
                 }
                 found.take(read)?;
             }
-            if unused >= (stop_gap as usize).max(1) {
+            if unused >= gap {
                 break;
             }
         }
@@ -1187,5 +1194,59 @@ mod tests {
         // A lone tip of four billion, once refused for its height alone.
         assert!(checked(vec![summary(4_000_000_000, &headers[0])], 1_000).is_err());
         assert!(checked(Vec::new(), 1_000).is_err());
+    }
+
+    /// A keychain with nothing on it is walked to the gap and no further,
+    /// whatever the gap: the last requests at a time are cut to what
+    /// completes it, where four went out every time.
+    #[tokio::test]
+    async fn an_empty_keychain_shows_the_server_the_gap_and_no_more() {
+        use crate::testkit::FakeMempool;
+        fn walked(i: u32) -> String {
+            format!("0014{i:04x}{}", "cd".repeat(18))
+        }
+        for stop_gap in [20, 18, 2, 1] {
+            let server = FakeMempool::start(false, 0).await;
+            let client =
+                super::super::client_for_run(&format!("http://{}/api", server.address), None)
+                    .unwrap();
+            let genesis =
+                bdk_wallet::bitcoin::constants::genesis_block(bdk_wallet::bitcoin::Network::Signet)
+                    .block_hash();
+            let spks = (0u32..).map(|i| (i, ScriptBuf::from_hex(&walked(i)).unwrap()));
+            let plan = Plan {
+                network: Network::Signet,
+                tip: CheckPoint::new(BlockId {
+                    height: 0,
+                    hash: genesis,
+                }),
+                start_time: 0,
+                scripts: Vec::new(),
+                scans: vec![crate::chain::Scan {
+                    keychain: bdk_wallet::KeychainKind::External,
+                    spks: Box::new(spks),
+                }],
+                stop_gap,
+                reading: Reading::Complete,
+                held: Held::default(),
+                told: None,
+            };
+            run(&client, plan).await.unwrap();
+            let index_of: HashMap<String, u32> = (0..100)
+                .map(|i| (FakeMempool::rest_key(&walked(i)), i))
+                .collect();
+            let mut heard: Vec<u32> = server
+                .state
+                .lock()
+                .unwrap()
+                .paths
+                .iter()
+                .filter_map(|path| path.split_once("/scripthash/"))
+                .map(|(_, rest)| index_of[rest.split('/').next().unwrap()])
+                .collect();
+            heard.sort_unstable();
+            heard.dedup();
+            assert_eq!(heard, (0..stop_gap).collect::<Vec<_>>(), "gap {stop_gap}");
+        }
     }
 }

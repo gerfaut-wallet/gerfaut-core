@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arti_client::config::TorClientConfigBuilder;
-use arti_client::{TorClient, TorClientConfig};
+use arti_client::{DataStream, TorClient, TorClientConfig};
 use futures_util::StreamExt;
 use tokio::sync::OnceCell;
 use tor_rtcompat::tokio::TokioRustlsRuntime;
 
-use super::{Progress, socks, update};
+use super::{Progress, attempts, socks, update};
 use crate::error::{CoreError, CoreResult};
 
 /// How long a bootstrap may take. A first run downloads the network
@@ -118,10 +118,10 @@ async fn bootstrap(data_dir: &Path) -> CoreResult<Embedded> {
         .await
         .map_err(|error| tor(format!("cannot listen on loopback for Tor: {error}")))?;
     let connect = {
-        let client = client.clone();
+        let streams = Arc::new(Streams::new(client.clone()));
         move |host: String, port: u16| {
-            let client = client.clone();
-            async move { client.connect((host, port)).await.map_err(io::Error::other) }
+            let streams = streams.clone();
+            async move { streams.connect(host, port).await }
         }
     };
     // Fresh for every start: nothing outside this process ever holds
@@ -135,6 +135,51 @@ async fn bootstrap(data_dir: &Path) -> CoreResult<Embedded> {
         },
         _client: client,
     })
+}
+
+type Client = Arc<TorClient<TokioRustlsRuntime>>;
+
+impl attempts::Isolate for Client {
+    fn isolated(&self) -> Self {
+        self.isolated_client()
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(self, other)
+    }
+}
+
+/// The clients the streams of the proxy go out on: a host in the clear
+/// through the one bootstrapped, in one attempt; an onion service in two
+/// ([`attempts`]), through the client that last reached it.
+struct Streams {
+    bootstrapped: Client,
+    onion: attempts::Routes<Client>,
+}
+
+impl Streams {
+    fn new(client: Client) -> Self {
+        Streams {
+            onion: attempts::Routes::new(client.clone()),
+            bootstrapped: client,
+        }
+    }
+
+    /// The upstream side of a `CONNECT`.
+    async fn connect(&self, host: String, port: u16) -> io::Result<DataStream> {
+        if !crate::chain::is_onion_host(&host) {
+            return self
+                .bootstrapped
+                .connect((host, port))
+                .await
+                .map_err(io::Error::other);
+        }
+        self.onion
+            .connect(host, port, |client: Client, host, port| async move {
+                client.connect((host, port)).await.map_err(io::Error::other)
+            })
+            .await
+    }
 }
 
 fn config(data_dir: &Path) -> CoreResult<TorClientConfig> {
