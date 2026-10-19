@@ -9,7 +9,8 @@ the [patch.crates-io] section: the fork keeps the version of the release
 it patches, never one of its own. A release counts when it is not yanked,
 not a pre-release, newer than the fork, and missing from REVIEWED, the
 space-separated releases already read and found without the fix. A list
-rather than a ceiling: a fixed 0.4.x published after 0.5.0 still counts.
+rather than a ceiling, so that each release is read once, whatever its
+number.
 
 Any failure, including a fork that is no longer in Cargo.lock, exits
 non-zero, so that the scheduled run reports it instead of going quiet.
