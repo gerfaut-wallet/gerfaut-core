@@ -64,11 +64,11 @@ thiserror = "2"
 # the version the tree already pulls in, so nothing new is compiled.
 log = "0.4"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 # With `zeroize`, Argon2 wipes its own working hashes too, the one
 # that stands for the password among them.
-argon2 = { version = "0.5", features = ["zeroize"] }
-rand = "0.9"
+argon2 = { version = "0.6", features = ["zeroize"] }
+rand = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 # The exclusive lock on the vault: flock on Unix and Android, LockFileEx
 # on Windows. The standard library's own `File::try_lock` answers

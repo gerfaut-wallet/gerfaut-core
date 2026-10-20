@@ -18,7 +18,7 @@
 use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use rand::RngCore;
+use rand::Rng;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::VaultError;
@@ -133,10 +133,10 @@ pub fn seal_with(magic: &[u8; 8], plaintext: &[u8], key: &VaultKey) -> Result<Ve
     header.extend_from_slice(&nonce);
 
     let derived = key.derive(kdf, &salt)?;
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived[..]));
+    let cipher = XChaCha20Poly1305::new(<&Key>::from(&*derived));
     let ciphertext = cipher
         .encrypt(
-            XNonce::from_slice(&nonce),
+            <&XNonce>::from(&nonce),
             Payload {
                 msg: plaintext,
                 aad: &header,
@@ -185,7 +185,7 @@ pub fn unseal_with(magic: &[u8; 8], file: &[u8], key: &VaultKey) -> Result<Vec<u
     let ciphertext = &file[HEADER_LEN..];
 
     let derived = key.derive(kdf, salt)?;
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived[..]));
+    let cipher = XChaCha20Poly1305::new(<&Key>::from(&*derived));
     let payload = Payload {
         msg: ciphertext,
         // Version 1 sealed without associated data.
@@ -195,8 +195,9 @@ pub fn unseal_with(magic: &[u8; 8], file: &[u8], key: &VaultKey) -> Result<Vec<u
             &file[..HEADER_LEN]
         },
     };
+    let nonce = <&XNonce>::try_from(nonce).map_err(|_| VaultError::NotAVault)?;
     cipher
-        .decrypt(XNonce::from_slice(nonce), payload)
+        .decrypt(nonce, payload)
         .map_err(|_| VaultError::WrongKeyOrCorrupted)
 }
 
@@ -266,9 +267,9 @@ mod tests {
         rand::rng().fill_bytes(&mut salt);
         rand::rng().fill_bytes(&mut nonce);
         let derived = key.derive(KDF_RAW, &salt).unwrap();
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived[..]));
+        let cipher = XChaCha20Poly1305::new(<&Key>::from(&*derived));
         let ciphertext = cipher
-            .encrypt(XNonce::from_slice(&nonce), b"legacy payload".as_slice())
+            .encrypt(<&XNonce>::from(&nonce), b"legacy payload".as_slice())
             .unwrap();
         let mut file = Vec::new();
         file.extend_from_slice(MAGIC);
@@ -295,10 +296,10 @@ mod tests {
         header.extend_from_slice(&salt);
         header.extend_from_slice(&nonce);
         let derived = key.derive(kdf, &salt).unwrap();
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived[..]));
+        let cipher = XChaCha20Poly1305::new(<&Key>::from(&*derived));
         let ciphertext = cipher
             .encrypt(
-                XNonce::from_slice(&nonce),
+                <&XNonce>::from(&nonce),
                 Payload {
                     msg: plaintext,
                     aad: &header,
