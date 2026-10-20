@@ -107,6 +107,14 @@ pub(crate) const FALSE_PROOF: &str = "the server sent a false proof of a confirm
 /// ([`crate::chain::Fault::coin_not_paid`]).
 pub(crate) const COIN_NOT_PAID: &str = "the server listed a coin its transaction does not pay";
 
+/// What a server whose chain takes a confirmation the wallet proved out
+/// of the wallet's chain, without proving the blocks it puts in its
+/// place, is refused with, under the same kind
+/// ([`crate::chain::Fault::unproven_reorganisation`]): see
+/// [`chains_up_to`].
+pub(crate) const UNPROVEN_REORGANISATION: &str =
+    "the server's chain takes back a proven confirmation without proof";
+
 /// Blocks between two retargets.
 const RETARGET_PERIOD: u32 = 2_016;
 
@@ -426,6 +434,30 @@ const ESPLORA_CHAIN_BELOW_DIFFICULTY: u128 = 1 << 32;
 /// chained to its checkpoint ([`ESPLORA_CHAIN_BELOW_DIFFICULTY`]).
 pub(crate) fn esplora_chains(network: Network, height: u32) -> bool {
     checkpoint_below(network, height, ESPLORA_CHAIN_BELOW_DIFFICULTY).is_some()
+}
+
+/// Whether `headers`, the server's from `from` up, prove the blocks it
+/// puts there in place of the wallet's: each the parent of the next,
+/// each with the work `network` asks for at its height
+/// ([`has_proof_of_work`]), the last one the block `top`, one of the
+/// latest blocks the server sent, checked already. A reorganisation
+/// that takes back a confirmation the wallet proved is taken on this
+/// proof alone, below the latest blocks: the server's word for the hash
+/// of a block there costs nothing, where a chain of blocks up to its
+/// tip costs the work of every one of them.
+pub(crate) fn chains_up_to(
+    network: Network,
+    from: u32,
+    headers: &[Header],
+    top: BlockHash,
+) -> bool {
+    headers
+        .windows(2)
+        .all(|pair| pair[1].prev_blockhash == pair[0].block_hash())
+        && headers.last().is_some_and(|last| last.block_hash() == top)
+        && (from..)
+            .zip(headers)
+            .all(|(height, header)| has_proof_of_work(network, height, header))
 }
 
 /// The hashes of the blocks from `from` to the end of its period, read

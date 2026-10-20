@@ -391,12 +391,13 @@ pub(crate) fn electrum_histories(
         .enumerate()
         .map(|(index, script)| (script.as_script(), index))
         .collect();
-    let unconfirmed: std::collections::HashSet<Txid> = standing(wallet)
+    let unconfirmed: std::collections::HashSet<Txid> = wallet
+        .transactions()
         .filter(|wtx| !wtx.chain_position.is_confirmed())
         .map(|wtx| wtx.tx_node.txid)
         .collect();
     let mut histories: Vec<Vec<(Txid, i32)>> = vec![Vec::new(); scripts.len()];
-    for wtx in standing(wallet) {
+    for wtx in wallet.transactions() {
         let tx = &wtx.tx_node.tx;
         let height = match wtx.chain_position {
             ChainPosition::Confirmed { anchor, .. } => {
@@ -515,7 +516,7 @@ pub(crate) fn script_facts(
         .map(|(index, script)| (script.as_script(), index))
         .collect();
     let mut facts = vec![crate::chain::ScriptFacts::default(); scripts.len()];
-    for wtx in standing(wallet) {
+    for wtx in wallet.transactions() {
         let txid = wtx.tx_node.txid;
         let confirmed = wtx.chain_position.is_confirmed();
         // What the transaction does to each script it touches: coins
@@ -562,7 +563,10 @@ pub(crate) fn script_facts(
 /// A block that confirms them moves these and no other.
 pub(crate) fn pending_scripts(wallet: &bdk_wallet::Wallet) -> Vec<bdk_wallet::bitcoin::ScriptBuf> {
     let mut scripts = std::collections::BTreeSet::new();
-    for wtx in standing(wallet).filter(|wtx| !wtx.chain_position.is_confirmed()) {
+    for wtx in wallet
+        .transactions()
+        .filter(|wtx| !wtx.chain_position.is_confirmed())
+    {
         scripts.extend(touched(wallet, &wtx.tx_node.tx));
     }
     scripts.into_iter().collect()
@@ -662,38 +666,9 @@ fn mempool_page_full(watch: &AddressWatchState) -> bool {
 /// Whether the wallet holds a transaction still waiting for a block, one
 /// a server still has.
 pub(crate) fn has_pending(wallet: &bdk_wallet::Wallet) -> bool {
-    standing(wallet).any(|wtx| !wtx.chain_position.is_confirmed())
-}
-
-/// The transactions of the wallet a server may still list: all of them
-/// but the ones [`vanished`].
-pub(crate) fn standing(
-    wallet: &bdk_wallet::Wallet,
-) -> impl Iterator<Item = bdk_wallet::WalletTx<'_>> {
-    wallet.transactions().filter(|wtx| !vanished(wallet, wtx))
-}
-
-/// A payment the wallet still shows as waiting for a block only because
-/// a block once confirmed it: a reorganisation took that block out, a
-/// conflicting spend took its place, and a sync has seen it gone from
-/// the server since it was last seen there. The wallet engine keeps
-/// such a transaction, whatever a server says, as long as nothing it
-/// holds conflicts with it; the spend that replaced it pays none of the
-/// wallet's scripts.
-///
-/// The syncs and the watch leave it out of what they expect a server to
-/// list, the way it left the server: a sync does not read a whole
-/// history again looking for it, and a watch that starts does not sync
-/// its script again because the server's status leaves it out. Should a
-/// server list it again, a reorganisation undoing the first one, it is
-/// news on its script like any transaction the wallet lacks.
-fn vanished(wallet: &bdk_wallet::Wallet, wtx: &bdk_wallet::WalletTx<'_>) -> bool {
-    !wtx.chain_position.is_confirmed()
-        && !wtx.tx_node.anchors.is_empty()
-        && wallet
-            .tx_graph()
-            .get_last_evicted(wtx.tx_node.txid)
-            .is_some_and(|evicted| wtx.tx_node.last_seen.is_none_or(|seen| evicted >= seen))
+    wallet
+        .transactions()
+        .any(|wtx| !wtx.chain_position.is_confirmed())
 }
 
 /// What a sync of a descriptor wallet moved, against what the engine
@@ -1663,11 +1638,10 @@ mod tests {
     }
 
     /// A payment confirmed, then taken out of the chain by a
-    /// reorganisation that mines a conflicting spend in its place: the
-    /// wallet engine keeps showing it as waiting for a block, whatever a
-    /// server says. Once a sync has seen it gone from the server, the
-    /// syncs and the watch stop expecting it there; listed again, it is
-    /// expected again.
+    /// reorganisation that mines a conflicting spend in its place. Once a
+    /// sync has seen it gone from the server, the wallet engine no longer
+    /// shows it, and the syncs and the watch stop expecting it there;
+    /// listed again, it is shown and expected again.
     #[test]
     fn a_payment_a_reorganisation_took_is_not_expected_of_a_server() {
         use bdk_wallet::bitcoin::BlockHash;
@@ -1687,6 +1661,7 @@ mod tests {
             &[(ours.to_hex_string().as_str(), 50_000)],
         );
         let txid = payment.compute_txid();
+        let listed = payment.clone();
         let genesis = engine.latest_checkpoint();
         let block = |byte: u8| BlockId {
             height: 10,
@@ -1717,11 +1692,9 @@ mod tests {
             })
             .unwrap();
         engine.apply_evicted_txs([(txid, 1_800_000_000)]);
-        // The engine still shows it, waiting for a block.
-        let shown: Vec<_> = engine.transactions().collect();
-        assert_eq!(shown.len(), 1);
-        assert!(!shown[0].chain_position.is_confirmed());
-        // Nothing expects it of a server any more.
+        // The engine shows it no more, and nothing expects it of a
+        // server.
+        assert_eq!(engine.transactions().count(), 0);
         let facts = script_facts(&engine, std::slice::from_ref(&ours));
         assert!(facts[0].expected.is_empty());
         assert_eq!(facts[0].counts, crate::chain::esplora::Counts::default());
@@ -1733,10 +1706,10 @@ mod tests {
         );
 
         // Listed by a server again, it is expected again.
-        engine.apply_unconfirmed_txs([(
-            engine.get_tx(txid).unwrap().tx_node.tx.as_ref().clone(),
-            1_800_000_100,
-        )]);
+        engine.apply_unconfirmed_txs([(listed, 1_800_000_100)]);
+        let shown: Vec<_> = engine.transactions().collect();
+        assert_eq!(shown.len(), 1);
+        assert!(!shown[0].chain_position.is_confirmed());
         let facts = script_facts(&engine, std::slice::from_ref(&ours));
         assert!(facts[0].expected.contains(&txid));
         assert!(has_pending(&engine));

@@ -154,6 +154,27 @@ pub(crate) fn is_genesis_of(network: Network, hash: bdk_wallet::bitcoin::BlockHa
 /// height held was never a real one.
 pub(crate) const TIP_LAG_MAX: u32 = 144;
 
+/// What a server is refused with when it is behind a block of the
+/// wallet that holds a confirmation, and its answer would take that
+/// block out ([`drops_a_confirmation`]).
+pub(crate) const BEHIND: &str = "the server is behind a confirmation the wallet holds";
+
+/// Whether a server whose tip is `server_tip`, more than [`TIP_LAG_MAX`]
+/// below the wallet's, would have the wallet drop a block holding one of
+/// its confirmations, at the heights in `confirmed`. On mainnet such a
+/// block carries the work of its height, and none at a height a chain
+/// can have reached (`limit`) was made up: the server lags, or hides
+/// it, and is refused rather than followed. Where work proves nothing,
+/// the blocks go, as any a server made up.
+pub(crate) fn drops_a_confirmation(
+    network: Network,
+    mut confirmed: impl Iterator<Item = u32>,
+    server_tip: u32,
+    limit: u32,
+) -> bool {
+    network == Network::Mainnet && confirmed.any(|height| height > server_tip && height <= limit)
+}
+
 /// What a server whose tip is higher than any chain of its network can
 /// have reached is refused with.
 pub(crate) const IMPOSSIBLE_TIP: &str = "the server claims a block height no chain has reached";
@@ -220,8 +241,24 @@ pub(crate) fn server_words(text: &str) -> String {
 /// every Esplora sync would leave the machine by a route the person
 /// never chose, and the choice of Tor in the settings would not be the
 /// whole story of where they go.
+///
+/// Its TLS is the core's own: ring, and the public authorities of
+/// `webpki-roots`, the ones an Electrum server is checked against.
+/// Left to itself, reqwest asks the operating system which authorities
+/// to trust, which on Android needs the app to hand it a Java context
+/// first, and panics when no crypto provider was installed before it.
+/// Should the configuration fail to build, the client trusts no
+/// authority at all: every HTTPS request fails, none goes out unchecked.
 pub(crate) fn http_client() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().no_proxy()
+    let builder = reqwest::Client::builder().no_proxy();
+    match tls::public_config() {
+        Ok(config) => {
+            let mut config = (*config).clone();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            builder.tls_backend_preconfigured(config)
+        }
+        Err(_) => builder.tls_certs_only(Vec::new()),
+    }
 }
 
 /// Whether a client sends its requests through a proxy of any kind.
@@ -1805,6 +1842,7 @@ mod tests {
             "response budget exhausted, retry later",
             proof::FALSE_PROOF,
             proof::COIN_NOT_PAID,
+            proof::UNPROVEN_REORGANISATION,
         ] {
             let refused = Fault::from(CallError::refused(words));
             assert_eq!(refused.kind(), FaultKind::Other, "{refused}");
@@ -1826,8 +1864,13 @@ mod tests {
         }
         assert!(Fault::false_proof().is_false_proof());
         assert!(Fault::coin_not_paid().is_false_proof());
+        assert!(Fault::unproven_reorganisation().is_false_proof());
         assert_eq!(Fault::false_proof(), proof::FALSE_PROOF);
         assert_eq!(Fault::coin_not_paid(), proof::COIN_NOT_PAID);
+        assert_eq!(
+            Fault::unproven_reorganisation(),
+            proof::UNPROVEN_REORGANISATION
+        );
     }
 
     /// The highest tip a chain can have is far past the real one, with
@@ -1968,6 +2011,110 @@ mod tests {
                 honest
             );
         }
+    }
+
+    /// A payment confirmed in block 80 of a signet server at 100, then
+    /// a chain at 110 that has the payment nowhere. A server whose block
+    /// 80 does not chain up to its latest blocks is refused, and the
+    /// payment stays confirmed; one whose chain does takes it out, a
+    /// reorganisation like any other.
+    #[tokio::test]
+    async fn a_confirmation_is_taken_back_on_proof_alone() {
+        use crate::testkit::{FakeElectrum, nowhere, script, transaction};
+        const WALLET: &str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)";
+        for forged in [true, false] {
+            let server = FakeElectrum::start().await;
+            let dir = tempfile::tempdir().unwrap();
+            let manager =
+                crate::WalletManager::open(dir.path(), crate::store::VaultKey::Raw([7; 32]))
+                    .unwrap();
+            manager
+                .set_backend(Network::Signet, server.backend())
+                .await
+                .unwrap();
+            let parsed = crate::input::parse_input(WALLET).unwrap();
+            let wallet = manager
+                .add_wallet("Watched", &parsed, Network::Signet)
+                .await
+                .unwrap()
+                .id;
+            let address = &manager.receive_addresses(&wallet, 0).await.unwrap()[0].address;
+            let ours = address
+                .parse::<bdk_wallet::bitcoin::Address<_>>()
+                .unwrap()
+                .assume_checked()
+                .script_pubkey()
+                .to_hex_string();
+            let parent = transaction(&[nowhere(1, 0)], &[(&script(9), 60_000)]);
+            let payment = transaction(
+                &[OutPoint::new(parent.compute_txid(), 0)],
+                &[(&ours, 50_000)],
+            );
+            server.add_tx(&parent);
+            server.add_tx(&payment);
+            server.set_history(&ours, &[(payment.compute_txid(), 80)]);
+            manager.sync_wallet(&wallet).await.unwrap();
+            let confirmations = |snapshot: crate::wallet::snapshot::WalletSnapshot| {
+                snapshot
+                    .txs
+                    .iter()
+                    .map(|tx| tx.confirmations)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                confirmations(manager.wallet_snapshot(&wallet).await.unwrap()),
+                [21]
+            );
+
+            // The payment mined nowhere: every block from 80 up changes.
+            {
+                let mut state = server.state.lock().unwrap();
+                state.histories.clear();
+                state.height = 110;
+                if forged {
+                    let mut header = state.header_of(80);
+                    header.nonce = 7;
+                    state.served.insert(80, header);
+                }
+            }
+            let synced = manager.sync_wallet(&wallet).await;
+            let snapshot = manager.wallet_snapshot(&wallet).await.unwrap();
+            if forged {
+                let refused = synced.unwrap_err();
+                assert_eq!(
+                    refused.code(),
+                    crate::error::ErrorCode::FalseProof,
+                    "{refused}"
+                );
+                assert!(
+                    refused.to_string().contains(proof::UNPROVEN_REORGANISATION),
+                    "{refused}"
+                );
+                assert_eq!(confirmations(snapshot), [21]);
+            } else {
+                assert_eq!(synced.unwrap().tip_height, 110);
+                assert_eq!(confirmations(snapshot), Vec::<u32>::new());
+            }
+        }
+    }
+
+    /// Blocks far above a server's tip are dropped unless one holds a
+    /// confirmation proven with the work of mainnet, at a height a chain
+    /// can have reached.
+    #[test]
+    fn a_server_far_behind_drops_no_confirmation_on_mainnet() {
+        let confirmed = [500_u32, 900_000];
+        let drops =
+            |network, tip| drops_a_confirmation(network, confirmed.into_iter(), tip, 950_000);
+        assert!(drops(Network::Mainnet, 899_000));
+        assert!(!drops(Network::Mainnet, 900_000));
+        assert!(!drops(Network::Signet, 899_000));
+        assert!(!drops_a_confirmation(
+            Network::Mainnet,
+            [4_000_000_000].into_iter(),
+            899_000,
+            950_000
+        ));
     }
 
     /// A previous transaction is read only if it is the one asked for:

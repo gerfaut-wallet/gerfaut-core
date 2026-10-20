@@ -20,16 +20,19 @@ default = []
 embedded-tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:tor-config"]
 
 [dependencies]
-bdk_wallet = "3.1"
+bdk_wallet = "3.2"
 # The blocking Electrum client a descriptor sync speaks through, over a
 # stream the core opens itself: the version and features `bdk_electrum`
 # brought, when it was kept only to reach this.
 electrum-client = { version = "0.25", default-features = false, features = ["proxy", "rustls-ring"] }
+# `rustls-no-provider`: every client gets the core's own TLS, ring and
+# the authorities of `webpki-roots` (`chain::http_client`); `rustls`
+# would add aws-lc-rs as reqwest's default provider, for nothing.
 # `gzip`: Esplora answers are JSON, and compressed they are about a
 # quarter of the size. The client asks for it and decompresses on its
 # own; what reads a body whole still caps it where it did. `socks`: an
 # onion host is reached through the Tor proxy.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "socks"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "gzip", "socks"] }
 # Reads a server address the way the HTTP client will, so the Tor check
 # and the connection never mean two different hosts; the version
 # reqwest already pulls in, so nothing new is compiled.
@@ -64,11 +67,11 @@ thiserror = "2"
 # the version the tree already pulls in, so nothing new is compiled.
 log = "0.4"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 # With `zeroize`, Argon2 wipes its own working hashes too, the one
 # that stands for the password among them.
-argon2 = { version = "0.5", features = ["zeroize"] }
-rand = "0.9"
+argon2 = { version = "0.6", features = ["zeroize"] }
+rand = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 # The exclusive lock on the vault: flock on Unix and Android, LockFileEx
 # on Windows. The standard library's own `File::try_lock` answers

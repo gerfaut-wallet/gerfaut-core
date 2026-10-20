@@ -27,8 +27,11 @@ pub(crate) enum FaultKind {
     Outage,
     /// The server sent a proof that does not hold: a confirmation its
     /// header or its branch does not back
-    /// ([`crate::chain::proof::FALSE_PROOF`]), or a coin its own
-    /// transaction does not pay ([`crate::chain::proof::COIN_NOT_PAID`]).
+    /// ([`crate::chain::proof::FALSE_PROOF`]), a coin its own
+    /// transaction does not pay ([`crate::chain::proof::COIN_NOT_PAID`]),
+    /// or a chain that takes back a confirmation the wallet proved
+    /// without proving its own blocks
+    /// ([`crate::chain::proof::UNPROVEN_REORGANISATION`]).
     /// What makes a sync fail under [`crate::error::ErrorCode::FalseProof`].
     FalseProof,
     /// Anything else: a refusal of what was asked, in the server's words
@@ -74,6 +77,14 @@ impl Fault {
         Fault {
             kind: FaultKind::FalseProof,
             detail: crate::chain::proof::COIN_NOT_PAID.to_owned(),
+        }
+    }
+
+    /// A chain that takes back a proven confirmation without proof.
+    pub(crate) fn unproven_reorganisation() -> Fault {
+        Fault {
+            kind: FaultKind::FalseProof,
+            detail: crate::chain::proof::UNPROVEN_REORGANISATION.to_owned(),
         }
     }
 

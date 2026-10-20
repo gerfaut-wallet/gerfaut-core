@@ -23,7 +23,7 @@
 //!   leaves out a transaction the wallet holds there, is set aside
 //!   unread ([`super::status`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use bdk_wallet::bitcoin::block::Header;
@@ -32,12 +32,13 @@ use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use electrum_client::{self, ElectrumApi, GetHistoryRes};
 
 use super::status::{Check, Entry, Told, Verdict};
+use crate::chain::proof::chains_up_to;
 use crate::chain::proof::{
     Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, check_confirmation, recheck,
 };
 use crate::chain::{
-    ANOTHER_NETWORK, Fault, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX,
-    has_proof_of_work, height_limit,
+    ANOTHER_NETWORK, BEHIND, Fault, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX,
+    drops_a_confirmation, has_proof_of_work, height_limit,
 };
 use crate::network::Network;
 
@@ -86,7 +87,12 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
         ..
     } = plan;
     let told = told.as_ref();
-    let mut chain = Chain::read(client, &tip, network, start_time)?;
+    let confirmed: BTreeSet<u32> = held
+        .anchors
+        .values()
+        .map(|anchor| anchor.block_id.height)
+        .collect();
+    let mut chain = Chain::read(client, &tip, network, start_time, &confirmed)?;
     let mut pass = Pass {
         held: &held,
         start_time,
@@ -264,12 +270,18 @@ impl Chain {
     /// blocks under it are checked ([`checked_suffix`]). The wallet's
     /// own blocks are read the same way: those far above the server's
     /// tip, or past that height, came from a server that made them up.
-    /// They are left out of the walk, and dropped.
+    /// They are left out of the walk, and dropped, unless one of them
+    /// holds a confirmation ([`drops_a_confirmation`]).
+    ///
+    /// A block of the wallet that holds a confirmation, in `confirmed`,
+    /// and that the server replaces below its latest blocks, is replaced
+    /// on proof alone ([`prove_below_the_latest`]).
     fn read(
         client: &impl ElectrumApi,
         local: &CheckPoint,
         network: Network,
         now: u64,
+        confirmed: &BTreeSet<u32>,
     ) -> Result<Self, Error> {
         let limit = height_limit(network, now);
         let notification = client.block_headers_subscribe()?;
@@ -279,6 +291,9 @@ impl Chain {
             .ok_or_else(|| Error::Message(IMPOSSIBLE_TIP.to_owned()))?;
         let (local, dropped) =
             if local.height() > height.saturating_add(TIP_LAG_MAX) || local.height() > limit {
+                if drops_a_confirmation(network, confirmed.iter().copied(), height, limit) {
+                    return Err(Error::Message(BEHIND.to_owned()));
+                }
                 let kept = local
                     .iter()
                     .find(|checkpoint| checkpoint.height() <= height)
@@ -347,6 +362,18 @@ impl Chain {
         let agreement = agreement.ok_or_else(|| {
             Error::Message("the server's chain never meets the wallet's".to_owned())
         })?;
+        // Every block of the wallet above the agreement is one the server
+        // replaces; the lowest of those below the latest blocks that
+        // holds a confirmation.
+        let replaced = local
+            .iter()
+            .map(|checkpoint| checkpoint.height())
+            .take_while(|at| *at > agreement.height())
+            .filter(|at| *at < start && confirmed.contains(at))
+            .last();
+        if let Some(from) = replaced {
+            prove_below_the_latest(client, network, from, start, &hashes)?;
+        }
         let tip = agreement
             .clone()
             .extend(
@@ -430,6 +457,36 @@ fn checked_suffix(
     Err(Error::Message(
         "the server's latest blocks do not chain".to_owned(),
     ))
+}
+
+/// Proves the server's blocks from `from` up to `start`, the first of
+/// its latest blocks, checked already: a reorganisation that takes back
+/// a confirmation the wallet proved at `from` ([`chains_up_to`]). The
+/// hashes read on the way down must be those of the chain. Refused as
+/// [`Fault::unproven_reorganisation`] otherwise, the server's refusal
+/// to send the headers included.
+fn prove_below_the_latest(
+    client: &impl ElectrumApi,
+    network: Network,
+    from: u32,
+    start: u32,
+    hashes: &BTreeMap<u32, BlockHash>,
+) -> Result<(), Error> {
+    let unproven = || super::raised(Fault::unproven_reorganisation());
+    let top = *hashes.get(&start).ok_or_else(unproven)?;
+    let headers = headers_from(client, from, start - from + 1)?.ok_or_else(unproven)?;
+    if headers.len() as u32 != start - from + 1 || !chains_up_to(network, from, &headers, top) {
+        return Err(unproven());
+    }
+    let agrees = (from..).zip(&headers).all(|(at, header)| {
+        hashes
+            .get(&at)
+            .is_none_or(|read| *read == header.block_hash())
+    });
+    if !agrees {
+        return Err(unproven());
+    }
+    Ok(())
 }
 
 /// Refuses a server of another network, once its chain and the
