@@ -26,7 +26,7 @@ use bdk_wallet::chain::{CheckPoint, ConfirmationBlockTime};
 use serde::{Deserialize, Serialize};
 use url::{Host, ParseError, Url};
 
-pub(crate) use fault::{Fault, FaultKind};
+pub(crate) use fault::{Fault, FaultKind, IoOutage};
 
 use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
