@@ -20,7 +20,7 @@ default = []
 embedded-tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:tor-config"]
 
 [dependencies]
-bdk_wallet = "3.1"
+bdk_wallet = "3.2"
 # The blocking Electrum client a descriptor sync speaks through, over a
 # stream the core opens itself: the version and features `bdk_electrum`
 # brought, when it was kept only to reach this.
