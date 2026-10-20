@@ -50,12 +50,12 @@ use futures_util::future::try_join_all;
 use super::page::PageTx;
 use super::{Client, Counts, PAGE, PARALLEL_REQUESTS};
 use crate::chain::proof::{
-    Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, check_confirmation,
-    esplora_chains, recheck,
+    Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, chains_up_to,
+    check_confirmation, esplora_chains, recheck,
 };
 use crate::chain::{
-    Fault, Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX,
-    has_proof_of_work, height_limit,
+    BEHIND, Fault, Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX,
+    drops_a_confirmation, has_proof_of_work, height_limit,
 };
 use crate::network::Network;
 /// Pages read of one script at most: 10,000 confirmed transactions. A
@@ -184,9 +184,18 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
     let server_tip = latest.keys().next_back().copied().unwrap_or_default();
     // The wallet's blocks far above the server's tip, or past any height
     // a chain can have reached, came from a server that made them up:
-    // left out of the walk, and dropped (see [`Synced::drop_above`]).
+    // left out of the walk, and dropped (see [`Synced::drop_above`]),
+    // unless one of them holds a confirmation ([`drops_a_confirmation`]).
+    let confirmed: BTreeSet<u32> = held
+        .anchors
+        .values()
+        .map(|anchor| anchor.block_id.height)
+        .collect();
     let (tip, dropped) =
         if tip.height() > server_tip.saturating_add(TIP_LAG_MAX) || tip.height() > limit {
+            if drops_a_confirmation(network, confirmed.iter().copied(), server_tip, limit) {
+                return Err(Fault::other(BEHIND));
+            }
             let kept = tip
                 .iter()
                 .find(|checkpoint| checkpoint.height() <= server_tip)
@@ -196,6 +205,17 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
             (tip, None)
         };
     let meeting = Meeting::find(client, network, &latest, &tip).await?;
+    // A server behind the wallet that disagrees with it below its tip
+    // has an update built without the wallet's blocks above that tip,
+    // which the engine of BDK then takes out: a confirmation there is
+    // one the server has no block to prove.
+    if dropped.is_none()
+        && meeting.ahead.is_none()
+        && confirmed.iter().any(|height| *height > server_tip)
+    {
+        return Err(Fault::other(BEHIND));
+    }
+    meeting.prove(client, network, &latest, &confirmed).await?;
     let mut found = Found::new(start_time);
 
     let mut covered: HashSet<ScriptBuf> = scripts.iter().cloned().collect();
@@ -1036,6 +1056,50 @@ impl Meeting {
         Err(Fault::other("the server's chain never meets the wallet's"))
     }
 
+    /// Proves the server's blocks that replace one of the wallet's
+    /// holding a confirmation, in `confirmed`, below the latest blocks:
+    /// the chain from the lowest of them up to the first of the latest
+    /// ([`chains_up_to`]), read within [`CHAIN_REQUESTS_MAX`], and the
+    /// hashes the server gave for the wallet's blocks on the way down are
+    /// those of that chain. Refused as
+    /// [`Fault::unproven_reorganisation`] otherwise, a chain the server
+    /// does not send in full included.
+    async fn prove(
+        &self,
+        client: &Client,
+        network: Network,
+        latest: &BTreeMap<u32, BlockHash>,
+        confirmed: &BTreeSet<u32>,
+    ) -> Result<(), Fault> {
+        let Some((&start, &top)) = latest.first_key_value() else {
+            return Ok(());
+        };
+        let Some(from) = self
+            .conflicts
+            .iter()
+            .map(|conflict| conflict.height)
+            .filter(|at| *at < start && confirmed.contains(at))
+            .min()
+        else {
+            return Ok(());
+        };
+        let mut budget = CHAIN_REQUESTS_MAX;
+        let headers = read_down_to(client, from, start - from + 1, &mut budget)
+            .await?
+            .ok_or_else(Fault::unproven_reorganisation)?;
+        let agrees = self.conflicts.iter().all(|conflict| {
+            conflict
+                .height
+                .checked_sub(from)
+                .and_then(|index| headers.get(index as usize))
+                .is_none_or(|header| header.block_hash() == conflict.hash)
+        });
+        if !chains_up_to(network, from, &headers, top) || !agrees {
+            return Err(Fault::unproven_reorganisation());
+        }
+        Ok(())
+    }
+
     /// The wallet's chain as the server sees it: from the meeting point,
     /// the server's blocks where the wallet's differ, one per height a
     /// transaction confirmed at, and the latest ones. The engine of BDK
@@ -1085,6 +1149,7 @@ impl Meeting {
 
 #[cfg(test)]
 mod tests {
+    use crate::chain::proof::UNPROVEN_REORGANISATION;
     use bdk_wallet::bitcoin::hashes::Hash;
 
     use super::*;
@@ -1126,6 +1191,51 @@ mod tests {
             .unwrap();
         assert_eq!(tip.height(), 2);
         assert_eq!(tip.get(0).unwrap().hash(), hash(0));
+    }
+
+    /// A block of the wallet holding a confirmation, which the server
+    /// replaces below its latest blocks, is replaced only by a block of
+    /// the chain the server sends up to them; one that holds none is
+    /// replaced with no request.
+    #[tokio::test]
+    async fn a_confirmation_is_taken_back_on_proof_alone() {
+        let server = crate::testkit::FakeMempool::start(false, 0).await;
+        server.state.lock().unwrap().tip = 500;
+        let client =
+            super::super::client_for_run(&format!("http://{}/api", server.address), None).unwrap();
+        let latest = latest_blocks(&client, Network::Signet, u32::MAX)
+            .await
+            .unwrap();
+        let real = crate::testkit::FakeMempool::header_at_height(&server.state.lock().unwrap(), 80)
+            .block_hash();
+        let meeting = |hash: BlockHash| Meeting {
+            agreement: CheckPoint::new(BlockId {
+                height: 0,
+                hash: BlockHash::from_byte_array([0; 32]),
+            }),
+            height: 0,
+            conflicts: vec![BlockId { height: 80, hash }],
+            ahead: None,
+        };
+        let confirmed = BTreeSet::from([80]);
+
+        meeting(real)
+            .prove(&client, Network::Signet, &latest, &confirmed)
+            .await
+            .unwrap();
+        let refused = meeting(BlockHash::from_byte_array([7; 32]))
+            .prove(&client, Network::Signet, &latest, &confirmed)
+            .await
+            .unwrap_err();
+        assert!(refused.is_false_proof(), "{refused}");
+        assert!(refused.contains(UNPROVEN_REORGANISATION), "{refused}");
+
+        let asked = server.state.lock().unwrap().paths.len();
+        meeting(BlockHash::from_byte_array([7; 32]))
+            .prove(&client, Network::Signet, &latest, &BTreeSet::new())
+            .await
+            .unwrap();
+        assert_eq!(server.state.lock().unwrap().paths.len(), asked);
     }
 
     /// A block summed up as Esplora sums it up, from its header.

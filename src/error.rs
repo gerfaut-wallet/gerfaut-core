@@ -59,8 +59,10 @@ pub enum ErrorCode {
     /// A chain backend failed during a sync.
     Sync,
     /// A server answered a sync with a proof that does not hold: a
-    /// confirmation its block's header and branch do not back, or a coin
-    /// its own transaction does not pay. It lies, or is broken: another
+    /// confirmation its block's header and branch do not back, a coin
+    /// its own transaction does not pay, or a chain that takes back a
+    /// confirmation without the blocks that would prove it. It lies, or
+    /// is broken: another
     /// server, or one's own node, is the way out.
     FalseProof,
     /// The network refused a transaction, or no backend took it.

@@ -1433,6 +1433,61 @@ mod servers {
             .count()
     }
 
+    /// An Esplora server at 600 behind a wallet whose block 605 holds a
+    /// confirmation: one that agrees with the wallet below its tip
+    /// leaves the wallet's chain as it is, one that disagrees there, and
+    /// would have it lose block 605, is refused.
+    #[tokio::test]
+    async fn an_esplora_server_behind_a_confirmation_keeps_it() {
+        use bdk_wallet::chain::ConfirmationBlockTime;
+        let server = mempool(Network::Signet).await;
+        list(&server, Vec::new());
+        let real = FakeMempool::header_at_height(&server.state.lock().unwrap(), 480).block_hash();
+        let genesis = bdk_wallet::bitcoin::constants::genesis_block(Network::Signet.to_bitcoin());
+        let confirmed = BlockId {
+            height: 605,
+            hash: BlockHash::from_byte_array([5; 32]),
+        };
+        for (at_480, refused) in [(real, false), (BlockHash::from_byte_array([4; 32]), true)] {
+            let tip = CheckPoint::new(BlockId {
+                height: 0,
+                hash: genesis.block_hash(),
+            })
+            .extend([
+                BlockId {
+                    height: 480,
+                    hash: at_480,
+                },
+                confirmed,
+            ])
+            .unwrap();
+            let mut held = Held::default();
+            held.anchors.insert(
+                Txid::from_byte_array([6; 32]),
+                ConfirmationBlockTime {
+                    block_id: confirmed,
+                    confirmation_time: 1_700_000_000,
+                },
+            );
+            let plan = Plan {
+                tip,
+                ..address_plan(Network::Signet, held)
+            };
+            let synced = esplora_sync(&server, plan).await;
+            if refused {
+                let refused = refusal(synced);
+                assert!(refused.contains(crate::chain::BEHIND), "{refused}");
+            } else {
+                let synced = synced.unwrap();
+                let chain = synced.update.chain.unwrap();
+                assert_eq!(
+                    chain.get(605).map(|block| block.hash()),
+                    Some(confirmed.hash)
+                );
+            }
+        }
+    }
+
     /// An Esplora server proves a confirmation with the branch of its
     /// block and the block's header: taken, at the time of the header. A
     /// branch that leads elsewhere refuses the server, where the status
