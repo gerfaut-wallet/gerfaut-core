@@ -13,7 +13,7 @@
   },
   "too_many_parts": {
     "kind": "too_many_parts",
-    "message": "invalid qr: this QR code announces 5001 parts, more than Gerfaut reads"
+    "message": "This QR code announces 5001 parts, more than Gerfaut reads."
   },
   "network_mismatch": {
     "kind": "network_mismatch",
