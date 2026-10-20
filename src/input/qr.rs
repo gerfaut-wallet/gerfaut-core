@@ -314,20 +314,9 @@ pub const MAX_SCAN_BYTES: usize = 16 << 20;
 /// one, which is what both screens do on a refusal. Bounded in number
 /// ([`MAX_OPEN_SCANS`]) and in the frames each takes: frames past
 /// [`MAX_FRAME_LEN`] are refused, and a scan past [`MAX_SCAN_BYTES`] or
-/// past its frame bound ([`scan_frame_limit`]) too.
-///
-/// Left unbounded by bytes: the fountain decoder of the `ur` crate
-/// keeps, for each mixed part it takes, the list of the fragments mixed
-/// in it, twice, 16 bytes a fragment. An honest scan of a 5,000-part
-/// code holds some 550 a part, about 40 MB at worst; a code drawn so
-/// that every part mixes thousands of fragments holds up to 700 MB at
-/// the frame bound, shown frame after frame for twenty minutes. The
-/// list handed whole to [`assemble`] at each frame reached the same
-/// peak. Counting it would take the degree of each part before the
-/// decoder does, which the crate only gives through `minicbor`, one
-/// more dependency, and a sampler call that underflows on a part
-/// numbered 0: left for a release after 0.1.0, or for a part bound
-/// smaller than the 5,000 parts a UR may announce.
+/// past its frame bound ([`scan_frame_limit`]) too. The fountain
+/// decoder keeps more than the frames, the fragments mixed in each
+/// part: bounded by [`MAX_UR_MIX`].
 #[derive(Default)]
 pub struct QrScans {
     open: std::sync::Mutex<OpenScans>,
@@ -457,9 +446,60 @@ fn ur_header(frame: &str) -> CoreResult<(String, Option<u32>)> {
 /// scanned after it.
 const MAX_UR_PARTS: u32 = 5_000;
 
-/// True when a multi-part frame announces a count the decoder can take.
-fn ur_part_count_is_sane(frame: &str) -> bool {
-    matches!(ur_header(frame), Ok((_, Some(total))) if (1..=MAX_UR_PARTS).contains(&total))
+/// Most fragments a mixed part of a UR may combine and still go to the
+/// decoder. The decoder keeps the list of the fragments mixed in every
+/// part it takes, twice, 16 bytes a fragment, until the scan ends: a
+/// code drawn so that each part mixes thousands of the 5,000 fragments
+/// it may announce grew the desktop app by 650 MB at the frame bound.
+/// Under this bound the lists hold 20 MB at most, [`MAX_SCAN_FRAMES`]
+/// parts of 128 fragments.
+///
+/// Nothing honest is lost. A part that mixes many fragments resolves
+/// one only once all its others are known, and the simpler parts have
+/// done that by then: in 80 simulated scans of 100 to 5,000 parts, by a
+/// camera that misses a fifth to three quarters of the frames, every
+/// scan but one came together on the same frame with these parts set
+/// aside as with them, and that one 2.5 % later.
+const MAX_UR_MIX: usize = 128;
+
+/// The fountain part of a multi-part UR frame, in CBOR, read before the
+/// decoder takes it.
+struct UrPart {
+    cbor: Vec<u8>,
+}
+
+/// The fountain part of a multi-part UR frame; none for a frame the
+/// decoder would turn away for its numbers: no count or one past
+/// [`MAX_UR_PARTS`], a part numbered 0, a count other than its
+/// header's. The crate draws the fragments of a part from those two
+/// numbers without a check: 0 underflows, and a count of 0 panics.
+fn ur_part(frame: &str) -> Option<UrPart> {
+    let (_, Some(total)) = ur_header(frame).ok()? else {
+        return None;
+    };
+    if !(1..=MAX_UR_PARTS).contains(&total) {
+        return None;
+    }
+    let (ur::ur::Kind::MultiPart, cbor) = ur::ur::decode(frame).ok()? else {
+        return None;
+    };
+    let mut fields = minicbor::Decoder::new(&cbor);
+    if fields.array().ok()? != Some(5) {
+        return None;
+    }
+    let sequence = fields.u32().ok()?;
+    let count = fields.u32().ok()?;
+    (sequence > 0 && count == total).then_some(UrPart { cbor })
+}
+
+impl UrPart {
+    /// The fragments the part mixes, drawn as the decoder draws them: a
+    /// few milliseconds for a part of a 5,000-part code, which the
+    /// decoder used to pay for every frame anyway.
+    fn mixes(&self) -> usize {
+        minicbor::decode::<ur::fountain::Part>(&self.cbor)
+            .map_or(usize::MAX, |part| part.indexes().len())
+    }
 }
 
 /// A multi-part UR on its way: the fountain decoder, fed one frame at
@@ -470,6 +510,9 @@ struct UrFold {
     /// The parts the first frame announced.
     total: u32,
     decoder: ur::ur::Decoder,
+    /// The fragments named by the parts handed to the decoder, repeats
+    /// counted: what its lists hold, at most.
+    mixed: usize,
 }
 
 impl UrFold {
@@ -502,6 +545,7 @@ impl UrFold {
             ur_type,
             total,
             decoder: ur::ur::Decoder::default(),
+            mixed: 0,
         };
         match fold.take(first) {
             Some(outcome) => Fold::Settled(outcome),
@@ -512,10 +556,14 @@ impl UrFold {
     /// Takes one frame; the answer once the fountain comes together.
     fn take(&mut self, frame: &str) -> Option<CoreResult<QrProgress>> {
         // Frames of another type or a damaged one do not abort the scan:
-        // the camera will see them again. One announcing an impossible
-        // count never reaches the decoder.
-        if ur_part_count_is_sane(frame) {
-            let _ = self.decoder.receive(frame);
+        // the camera will see them again. One the decoder would turn away
+        // for its numbers never reaches it, nor does a part that mixes
+        // more than MAX_UR_MIX fragments.
+        if let Some(part) = ur_part(frame) {
+            let mixes = part.mixes();
+            if mixes <= MAX_UR_MIX && self.decoder.receive(frame).is_ok() {
+                self.mixed += mixes;
+            }
         }
         self.decoder.complete().then(|| self.finish())
     }
@@ -2037,5 +2085,138 @@ mod tests {
         for id in &opened[2..] {
             assert!(scans.push(*id, &frames[0]).is_ok());
         }
+    }
+
+    /// A multi-part UR frame of `ur_type` whose header says `header`
+    /// and whose fountain part says `seq` of `count`: one byte of data,
+    /// a message of `count` bytes, `checksum` for its CRC.
+    fn fountain_frame(
+        ur_type: &str,
+        header: (u32, u32),
+        seq: u32,
+        count: u32,
+        checksum: u32,
+    ) -> String {
+        let part = Value::Array(vec![
+            Value::Integer(seq.into()),
+            Value::Integer(count.into()),
+            Value::Integer(count.into()),
+            Value::Integer(checksum.into()),
+            Value::Bytes(vec![0]),
+        ]);
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&part, &mut cbor).unwrap();
+        let words = ur::bytewords::encode(&cbor, ur::bytewords::Style::Minimal);
+        format!("ur:{ur_type}/{}-{}/{words}", header.0, header.1)
+    }
+
+    /// The fragments the decoder of a scan was handed, at most what its
+    /// lists hold.
+    fn mixed(scan: &QrScan) -> usize {
+        match &scan.fold {
+            Fold::Ur(ur) => ur.mixed,
+            _ => panic!("not a UR on its way"),
+        }
+    }
+
+    /// A code drawn to fill the decoder: as many distinct parts as a
+    /// scan takes, 10,000 for a 5,000-part code, half of them drawn to mix
+    /// more fragments than any honest part needs. Those never reach the
+    /// decoder, and what the others leave in its lists stays under
+    /// MAX_UR_MIX a frame: 20 MB at most, where the parts of thousands
+    /// of fragments held 650 MB.
+    #[test]
+    fn a_code_drawn_to_fill_the_decoder_stays_within_its_bound() {
+        let frame =
+            |seq: u32| fountain_frame("bytes", (seq, MAX_UR_PARTS), seq, MAX_UR_PARTS, 0xdead_beef);
+        let half = MAX_SCAN_FRAMES / 2;
+        let mut scan = QrScan::new();
+        let (mut wide, mut narrow, mut kept) = (0, 0, 0);
+        let mut seq = MAX_UR_PARTS;
+        while wide + narrow < MAX_SCAN_FRAMES {
+            seq += 1;
+            let frame = frame(seq);
+            let mixes = ur_part(&frame).unwrap().mixes();
+            if mixes > MAX_UR_MIX {
+                if wide == half {
+                    continue;
+                }
+                wide += 1;
+            } else {
+                if narrow == half {
+                    continue;
+                }
+                narrow += 1;
+                kept += mixes;
+            }
+            assert!(!scan.push(&frame).unwrap().complete);
+        }
+        assert_eq!(scan.frames(), MAX_SCAN_FRAMES);
+        assert_eq!(mixed(&scan), kept);
+        assert!(kept <= MAX_SCAN_FRAMES * MAX_UR_MIX);
+        // One frame more and the scan is over, its lists let go.
+        assert!(matches!(
+            scan.push(&frame(seq + 1)),
+            Err(CoreError::TooManyFrames(10_001))
+        ));
+        assert!(matches!(scan.fold, Fold::Over));
+    }
+
+    /// A camera that misses two frames in three needs the mixed parts
+    /// of a fountain code to read it, and still reads it with the parts
+    /// that mix too many fragments set aside.
+    #[test]
+    fn a_camera_missing_frames_reads_a_long_code_without_the_widest_parts() {
+        let text: String = (0..4_000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&Value::Bytes(text.clone().into_bytes()), &mut cbor).unwrap();
+        let mut encoder = ur::ur::Encoder::new(&cbor, 10, "bytes").unwrap();
+        let total = encoder.fragment_count() as u32;
+        assert!(total > 400);
+        let mut scan = QrScan::new();
+        let mut draw = Draw(0x0bad_cafe);
+        let mut set_aside = 0;
+        let progress = loop {
+            let frame = encoder.next_part().unwrap();
+            if draw.below(3) != 0 {
+                continue;
+            }
+            if ur_part(&frame).unwrap().mixes() > MAX_UR_MIX {
+                set_aside += 1;
+            }
+            let progress = scan.push(&frame).unwrap();
+            if progress.complete {
+                break progress;
+            }
+        };
+        assert!(set_aside > 0);
+        assert!(scan.frames() < scan_frame_limit(total));
+        assert_eq!(progress.text.as_deref(), Some(text.as_str()));
+    }
+
+    /// A part numbered 0, or whose count is none, past the bound or not
+    /// its header's, never reaches the crate's draw, which would
+    /// underflow or panic on it; the scan goes on.
+    #[test]
+    fn a_part_numbered_zero_or_miscounted_is_set_aside() {
+        for (seq, count) in [(0, 10), (1, 0), (1, 11), (11, MAX_UR_PARTS + 1)] {
+            let frame = fountain_frame("bytes", (1, 10), seq, count, 7);
+            assert!(ur_part(&frame).is_none(), "{seq} of {count}");
+        }
+        assert!(ur_part(&fountain_frame("bytes", (1, 10), 1, 10, 7)).is_some());
+        let mut scan = QrScan::new();
+        let first = scan
+            .push(&fountain_frame("bytes", (1, 10), 1, 10, 7))
+            .unwrap();
+        assert_eq!(first.received, 1);
+        for (seq, count) in [(0, 10), (2, 0), (2, 11)] {
+            let progress = scan
+                .push(&fountain_frame("bytes", (2, 10), seq, count, 7))
+                .unwrap();
+            assert_eq!(progress.received, 1);
+        }
+        assert_eq!(mixed(&scan), 1);
     }
 }

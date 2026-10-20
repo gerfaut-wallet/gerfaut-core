@@ -84,6 +84,10 @@ fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 subtle = "2"
 uuid = { version = "1", features = ["v4"] }
 ur = "0.5"
+# Reads the fountain part of a UR frame (`ur::fountain::Part`) before
+# the decoder takes it. The version `ur` already pulls in, so nothing
+# new is compiled.
+minicbor = "2"
 ciborium = "0.2"
 flate2 = "1"
 data-encoding = "2"
