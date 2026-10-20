@@ -1551,6 +1551,15 @@ mod tests {
                 "{refused}"
             );
         }
+        // An origin that puts the key at depth 255: the code opens, and
+        // the descriptor it holds is refused in words, never a panic.
+        let deep = hdkey_with(6, origin_from(index(84), hardened.clone(), 255, fp));
+        let text = assemble(&[encode_ur("crypto-output", &tag(TAG_WPKH, deep))])
+            .unwrap()
+            .text
+            .unwrap();
+        let error = crate::input::parse_input(&text).unwrap_err().to_string();
+        assert!(error.contains("at depth 255"), "{error}");
         // The same origin, well formed, still opens.
         let key = hdkey_with(6, origin_from(index(84), hardened, 3, fp));
         let text = assemble(&[encode_ur("crypto-output", &tag(TAG_WPKH, key))])

@@ -504,7 +504,57 @@ pub(crate) fn read_descriptor(text: &str) -> CoreResult<Descriptor<DescriptorPub
              origin, as in `[fingerprint/84'/0'/0']xpub…/0/*`"
         )));
     }
+    if let Some((depth, steps)) = too_deep(&descriptor) {
+        let written = match steps {
+            1 => "the step written after it goes".to_owned(),
+            steps => format!("the {steps} steps written after it go"),
+        };
+        return Err(invalid(format!(
+            "an extended public key at depth {depth} cannot derive its addresses: {written} \
+             past depth {MAX_KEY_DEPTH}, the deepest a BIP32 key can be"
+        )));
+    }
     Ok(descriptor)
+}
+
+/// The deepest an extended key can be, BIP32 writing its depth on one
+/// byte.
+const MAX_KEY_DEPTH: u32 = u8::MAX as u32;
+
+/// The depth of an extended key in the descriptor that would derive
+/// past [`MAX_KEY_DEPTH`], and the steps that take it there: those
+/// written after it, plus one for a wildcard. Such a key has no address
+/// to give, and miniscript panics when asked for one; refused here, it
+/// never reaches a derivation, whether it was typed, scanned or read
+/// from a backup.
+fn too_deep(descriptor: &Descriptor<DescriptorPublicKey>) -> Option<(u32, u32)> {
+    let mut found = None;
+    descriptor.for_any_key(|key| {
+        let (depth, longest, wildcard) = match key {
+            DescriptorPublicKey::Single(_) => return false,
+            DescriptorPublicKey::XPub(xkey) => {
+                (xkey.xkey.depth, xkey.derivation_path.len(), xkey.wildcard)
+            }
+            DescriptorPublicKey::MultiXPub(xkey) => (
+                xkey.xkey.depth,
+                xkey.derivation_paths
+                    .paths()
+                    .iter()
+                    .map(|path| path.len())
+                    .max()
+                    .unwrap_or(0),
+                xkey.wildcard,
+            ),
+        };
+        let steps = u32::try_from(longest)
+            .unwrap_or(u32::MAX)
+            .saturating_add(u32::from(wildcard != Wildcard::None));
+        if u32::from(depth).saturating_add(steps) > MAX_KEY_DEPTH {
+            found = Some((u32::from(depth), steps));
+        }
+        found.is_some()
+    });
+    found
 }
 
 /// The deepest the parentheses and braces of `text` nest, counted on
@@ -2023,6 +2073,64 @@ mod tests {
                 "{external} / {internal}"
             );
         }
+    }
+
+    /// `TPUB` re-encoded at another depth: a key a forged export or QR
+    /// code could carry.
+    fn at_depth(depth: u8) -> String {
+        let mut data = base58::decode_check(TPUB).unwrap();
+        data[4] = depth;
+        base58::encode_check(&data)
+    }
+
+    /// An extended key too deep to derive its addresses is refused at
+    /// reading, in words, whatever form carries it; before, miniscript
+    /// panicked on its first address. One step short of the limit is a
+    /// key like any other.
+    #[test]
+    fn a_key_too_deep_to_derive_is_refused_not_a_panic() {
+        let deep = at_depth(255);
+        let almost = at_depth(254);
+        for input in [
+            deep.clone(),
+            format!("wpkh({deep}/0/*)"),
+            format!("wpkh({deep}/*)"),
+            format!("wpkh({almost}/0/*)"),
+            format!("wpkh({deep}/<0;1>/*)"),
+            format!("wpkh([d34db33f/84h/1h/0h]{deep}/0/*)"),
+            format!("wsh(sortedmulti(1,{TPUB}/0/*,{deep}/0/*))"),
+            format!("tr({deep}/0/*)"),
+            format!("wpkh({deep}/0/*)\nwpkh({deep}/1/*)"),
+        ] {
+            let error = parse_input(&input).unwrap_err().to_string();
+            assert!(
+                error.contains("past depth 255, the deepest a BIP32 key can be"),
+                "{input}: {error}"
+            );
+        }
+        // A lone key whose path, edited, would go past the limit.
+        let edited = ImportOptions {
+            derivation: Some(DerivationChoice {
+                receive: "0/0/0/0/*".to_owned(),
+                change: Some("1/*".to_owned()),
+                origin: None,
+            }),
+            ..ImportOptions::default()
+        };
+        let error = parse_input_with_options(&at_depth(251), &edited).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid descriptor: an extended public key at depth 251 cannot derive its \
+             addresses: the 5 steps written after it go past depth 255, the deepest a BIP32 \
+             key can be"
+        );
+        let one = parse_input(&format!("wpkh({deep}/*)"))
+            .unwrap_err()
+            .to_string();
+        assert!(one.contains("the step written after it goes past"), "{one}");
+        // At the limit, not past it.
+        assert!(parse_input(&format!("wpkh({almost}/*)")).is_ok());
+        assert!(parse_input(&format!("wpkh({deep})")).is_ok());
     }
 
     /// A multisig that names one key twice is refused at reading, as

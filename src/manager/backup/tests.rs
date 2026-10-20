@@ -1110,6 +1110,47 @@ async fn the_preview_refuses_a_pair_the_engine_finds_the_same() {
     );
 }
 
+/// A backup holding a key too deep to derive its addresses, written by
+/// hand: the preview refuses it in words and the restore leaves it out,
+/// where building its engine used to panic.
+#[tokio::test]
+async fn a_backup_key_too_deep_is_refused_not_a_panic() {
+    let mut data = bdk_wallet::bitcoin::base58::decode_check(TPUB).unwrap();
+    data[4] = 255;
+    let deep = bdk_wallet::bitcoin::base58::encode_check(&data);
+    let mut wallet = signet_wallet("Too deep", 0);
+    wallet.kind = WalletKind::Descriptors {
+        external: format!("wpkh({deep}/0/*)"),
+        internal: Some(format!("wpkh({deep}/1/*)")),
+        script: crate::input::ScriptKind::Segwit,
+    };
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: vec![wallet, signet_wallet("Fine", 3)],
+        backends: None,
+        electrum_certs: None,
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    let reason = preview.wallets[0].refused.clone().unwrap_or_default();
+    assert!(reason.contains("at depth 255"), "{reason}");
+    assert_eq!(preview.wallets[1].refused, None);
+    let report = manager
+        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+        .await
+        .unwrap();
+    assert_eq!(report.added.len(), 1);
+    assert_eq!(report.refused.len(), 1);
+    assert!(report.refused[0].reason.contains("at depth 255"));
+}
+
 /// What a change that is the receive address at index 1 is refused with.
 const RECEIVE_ADDRESS: &str = "descriptor error: the change descriptor is the receive address at \
                                index 1; change needs a path of its own";
