@@ -223,6 +223,16 @@ fn create_engine(
 ) -> CoreResult<bdk_wallet::Wallet> {
     // The engine is given what was read, never the text again.
     let (external, internal) = read_pair(external, internal)?;
+    // A bare script has no address, and the engine panics the first
+    // time one is asked of it: refused here, on the path reading,
+    // adding and restoring a wallet all take.
+    if external.desc_type() == bdk_wallet::miniscript::descriptor::DescriptorType::Bare {
+        return Err(CoreError::Descriptor(
+            "a bare descriptor has no address, so it cannot be watched; Gerfaut watches pkh, \
+             wpkh, sh, wsh and tr descriptors"
+                .to_owned(),
+        ));
+    }
     let params = match internal {
         Some(internal) => bdk_wallet::Wallet::create(external, internal),
         None => bdk_wallet::Wallet::create_single(external),

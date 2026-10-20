@@ -2133,6 +2133,25 @@ mod tests {
         assert!(parse_input(&format!("wpkh({deep})")).is_ok());
     }
 
+    /// A bare descriptor has no address: it is refused at reading,
+    /// where it used to be added and then crash the receive screen.
+    /// Wrapped, the same script is a wallet like any other.
+    #[test]
+    fn a_bare_descriptor_is_refused_at_reading() {
+        for input in [
+            format!("pk({TPUB}/0/*)"),
+            format!("multi(1,{TPUB}/0/*,{TPUB}/1/*)"),
+            format!("pk({TPUB}/0/*)\npk({TPUB}/1/*)"),
+        ] {
+            let error = parse_input(&input).unwrap_err().to_string();
+            assert!(
+                error.contains("a bare descriptor has no address"),
+                "{input}: {error}"
+            );
+        }
+        assert!(parse_input(&format!("sh(pk({TPUB}/0/*))")).is_ok());
+    }
+
     /// A multisig that names one key twice is refused at reading, as
     /// the engine refuses it, not after "Add wallet".
     #[test]
