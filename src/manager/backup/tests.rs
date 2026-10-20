@@ -998,6 +998,121 @@ async fn a_backup_wallet_without_a_name_is_left_out() {
     assert_eq!(report.refused[0].name, "Wallet 1 of the backup");
 }
 
+/// A pair whose change branch derives the receive branch's addresses
+/// under another spelling, a key origin added, the keys of a
+/// `sortedmulti` in another order, or the first receive address alone,
+/// reads as one wallet on two branches, and only the engine refuses it,
+/// on the first address of each. The preview refuses it as the restore
+/// does, a later copy of it with it, in the same words: nothing the
+/// person confirms is refused after.
+#[tokio::test]
+async fn the_preview_refuses_a_pair_the_engine_finds_the_same() {
+    let pair = |name: &str, external: String, internal: String| {
+        let mut wallet = signet_wallet(name, 0);
+        let script = if external.starts_with("wsh(") {
+            crate::input::ScriptKind::WitnessScript
+        } else {
+            crate::input::ScriptKind::Segwit
+        };
+        wallet.kind = WalletKind::Descriptors {
+            external,
+            internal: Some(internal),
+            script,
+        };
+        wallet
+    };
+    let origin = pair(
+        "Origin added",
+        format!("wpkh({TPUB}/0/*)"),
+        format!("wpkh([d34db33f/84h/1h/0h]{TPUB}/0/*)"),
+    );
+    let mut copy = origin.clone();
+    copy.name = "Copy".to_owned();
+    let payload = BackupPayload {
+        version: BACKUP_VERSION,
+        created_at: 1_756_000_000,
+        wallets: vec![
+            origin,
+            pair(
+                "Keys swapped",
+                format!("wsh(sortedmulti(1,{TPUB}/0/*,{TPUB}/1/*))"),
+                format!("wsh(sortedmulti(1,{TPUB}/1/*,{TPUB}/0/*))"),
+            ),
+            pair(
+                "First address",
+                format!("wpkh({TPUB}/0/*)"),
+                format!("wpkh({TPUB}/0/0)"),
+            ),
+            signet_wallet("Fine", 3),
+            copy,
+        ],
+        backends: None,
+        electrum_certs: None,
+        gap_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let text = data_encoding::BASE64.encode(&backup::seal(&payload, BACKUP_PASSWORD).unwrap());
+    let preview = manager
+        .preview_backup(&text, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+    let reasons: Vec<Option<String>> = preview.wallets.iter().map(|w| w.refused.clone()).collect();
+    let same = Some(SAME_ADDRESSES.to_owned());
+    assert_eq!(
+        reasons,
+        vec![same.clone(), same.clone(), same.clone(), None, same.clone()]
+    );
+    assert!(preview.wallets.iter().all(|w| !w.already_watched));
+
+    // Asked for by index beside a fine one, it fails the restore, named,
+    // and nothing is restored: what was asked for is not done in part.
+    let asked = ImportChoices {
+        indexes: Some(vec![0, 3]),
+        apply_settings: false,
+    };
+    let error = manager
+        .import_backup(&text, BACKUP_PASSWORD, &asked)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("descriptor error: \"Origin added\" cannot be restored"),
+        "{error}"
+    );
+    assert!(manager.list_wallets(None).await.is_empty());
+
+    // Every wallet: the four are left out in those words, the fine one
+    // restored.
+    let report = manager
+        .import_backup(&text, BACKUP_PASSWORD, &ImportChoices::default())
+        .await
+        .unwrap();
+    assert_eq!(report.added.len(), 1);
+    assert_eq!(report.added[0].name, "Fine");
+    assert_eq!(report.skipped, 0);
+    let left_out: Vec<_> = report
+        .refused
+        .iter()
+        .map(|r| (r.index, r.reason.clone()))
+        .collect();
+    let reason = SAME_ADDRESSES.to_owned();
+    assert_eq!(
+        left_out,
+        vec![
+            (0, reason.clone()),
+            (1, reason.clone()),
+            (2, reason.clone()),
+            (4, reason)
+        ]
+    );
+}
+
+/// What a pair the engine finds the same is refused with.
+const SAME_ADDRESSES: &str = "descriptor error: the two descriptors begin with the same \
+                              address; change needs a path of its own";
+
 /// Only what is wrong with a wallet's own name or material leaves it
 /// out of a restore of every wallet; anything else, an error of the
 /// core or of the disk, fails the restore as it is.

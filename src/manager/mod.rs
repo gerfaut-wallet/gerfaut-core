@@ -230,7 +230,19 @@ fn create_engine(
     params
         .network(network.to_bitcoin())
         .create_wallet_no_persist()
-        .map_err(|e| CoreError::Descriptor(e.to_string()))
+        .map_err(|e| match e {
+            // The engine tells a branch by its first address: two that
+            // share it, written apart by a key origin or by the order of
+            // a `sortedmulti`, are one branch to it.
+            bdk_wallet::descriptor::DescriptorError::ExternalAndInternalAreTheSame => {
+                CoreError::Descriptor(
+                    "the two descriptors begin with the same address; change needs a path of \
+                     its own"
+                        .to_owned(),
+                )
+            }
+            other => CoreError::Descriptor(other.to_string()),
+        })
 }
 
 /// Reads the descriptors of a wallet as they reach the engine: from the
@@ -319,7 +331,17 @@ fn fresh_meta(
 /// single address is re-checked against its network as a defense in
 /// depth, whatever validated it upstream.
 fn build_record(meta: WalletMeta) -> CoreResult<(WalletRecord, Option<bdk_wallet::Wallet>)> {
-    let mut engine = engine_for(&meta.kind, meta.network)?;
+    let engine = engine_for(&meta.kind, meta.network)?;
+    record_with(meta, engine)
+}
+
+/// The stored record of a new identity whose engine [`engine_for`]
+/// built already, from the same material on the same network: what a
+/// restore keeps of the engine its plan built.
+fn record_with(
+    meta: WalletMeta,
+    mut engine: Option<bdk_wallet::Wallet>,
+) -> CoreResult<(WalletRecord, Option<bdk_wallet::Wallet>)> {
     let changeset = match &mut engine {
         Some(engine) => Some(engine.take_staged().ok_or_else(|| {
             CoreError::Internal("new wallet produced no initial change set".to_owned())
@@ -351,11 +373,11 @@ fn engine_for(kind: &WalletKind, network: Network) -> CoreResult<Option<bdk_wall
     }
 }
 
-/// What [`engine_for`] would refuse about this material on `network`,
-/// without building the engine, which derives addresses ahead: the
-/// descriptors held to public keys and to one wallet on two branches,
-/// the keys and the address to the network. Cheap enough for a backup's
-/// preview to ask of every wallet.
+/// What is refused about this material on `network`, in words that name
+/// it, before any engine is built: the descriptors held to public keys
+/// and to one wallet on two branches, the keys and the address to the
+/// network. Not the last word: [`engine_for`] checks its own way after
+/// it, and a restore builds the engine in its plan, preview included.
 pub(crate) fn check_material(kind: &WalletKind, network: Network) -> CoreResult<()> {
     match kind {
         WalletKind::Descriptors {
@@ -368,9 +390,8 @@ pub(crate) fn check_material(kind: &WalletKind, network: Network) -> CoreResult<
                 if !networks.contains(&network) {
                     return Err(network_mismatch(network, &networks));
                 }
-                // What the engine checks of each descriptor before it
-                // derives anything, so that a material this passes is
-                // one the engine takes.
+                // What the engine checks of each descriptor too, said
+                // here in the core's words rather than in its own.
                 if descriptor.is_multipath() {
                     return Err(CoreError::Descriptor(
                         "a stored descriptor cannot hold both branches in one".to_owned(),
