@@ -220,8 +220,24 @@ pub(crate) fn server_words(text: &str) -> String {
 /// every Esplora sync would leave the machine by a route the person
 /// never chose, and the choice of Tor in the settings would not be the
 /// whole story of where they go.
+///
+/// Its TLS is the core's own: ring, and the public authorities of
+/// `webpki-roots`, the ones an Electrum server is checked against.
+/// Left to itself, reqwest asks the operating system which authorities
+/// to trust, which on Android needs the app to hand it a Java context
+/// first, and panics when no crypto provider was installed before it.
+/// Should the configuration fail to build, the client trusts no
+/// authority at all: every HTTPS request fails, none goes out unchecked.
 pub(crate) fn http_client() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().no_proxy()
+    let builder = reqwest::Client::builder().no_proxy();
+    match tls::public_config() {
+        Ok(config) => {
+            let mut config = (*config).clone();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            builder.tls_backend_preconfigured(config)
+        }
+        Err(_) => builder.tls_certs_only(Vec::new()),
+    }
 }
 
 /// Whether a client sends its requests through a proxy of any kind.
