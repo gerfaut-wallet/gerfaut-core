@@ -1,9 +1,9 @@
 //! Which TLS backend actually serves.
 //!
-//! Two are compiled in: `electrum-client`'s `rustls` feature turns on
-//! `rustls/default`, which brings `aws-lc-rs` along even under
-//! `use-rustls-ring`. `rustls` then has no single obvious default, and
-//! the first caller to install one decides for the whole process, so
+//! `rustls` can carry two backends at once, and then has no single
+//! obvious default: the first caller to install one decides for the
+//! whole process. Only ring is compiled in today, but a dependency that
+//! brings `aws-lc-rs` back must not change which serves, so
 //! `WalletManager::open` installs ring before anything can open a
 //! socket.
 //!

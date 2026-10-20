@@ -664,7 +664,6 @@ fn describe(error: &electrum_client::Error, timeout: Duration) -> Fault {
         Error::InvalidDNSNameError(host) => {
             Fault::other(format!("{host} is not a valid TLS host name"))
         }
-        Error::CouldNotCreateConnection(_) => Fault::outage("TLS handshake failed"),
         Error::JSON(_) | Error::Hex(_) | Error::Bitcoin(_) | Error::InvalidResponse(_) => {
             Fault::other("unexpected response")
         }
