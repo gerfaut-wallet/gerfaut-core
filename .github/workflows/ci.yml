@@ -47,7 +47,7 @@ jobs:
         run: cargo clippy --all-targets --features embedded-tor -- -D warnings
 
   # The code behind #[cfg(windows)], which no Linux job compiles: the
-  # desktop ships it. ring, secp256k1-sys and aws-lc-sys compile C for
+  # desktop ships it. ring and secp256k1-sys compile C for
   # the target, so a check from Linux would need a MinGW toolchain;
   # this runs on Windows itself, for the MSVC target the desktop builds.
   windows:

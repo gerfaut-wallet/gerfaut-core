@@ -40,7 +40,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # reqwest already pulls in, so nothing new is compiled.
 url = "2.5.8"
 # Direct, so Electrum connections can carry their own certificate
-# verifier; the same version and provider `electrum-client` pulls in.
+# verifier; the version and provider reqwest and tokio-rustls pull in.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
 # The live watcher holds one connection open and waits on it, which the
