@@ -999,12 +999,12 @@ async fn a_backup_wallet_without_a_name_is_left_out() {
 }
 
 /// A pair whose change branch derives the receive branch's addresses
-/// under another spelling, a key origin added, the keys of a
-/// `sortedmulti` in another order, or the first receive address alone,
-/// reads as one wallet on two branches, and only the engine refuses it,
-/// on the first address of each. The preview refuses it as the restore
-/// does, a later copy of it with it, in the same words: nothing the
-/// person confirms is refused after.
+/// under another spelling, a key origin added or the keys of a
+/// `sortedmulti` in another order, reads as one wallet on two branches,
+/// and only the engine refuses it, on the first address of each; a
+/// change that is one receive address is refused before it. The preview
+/// refuses each as the restore does, a later copy with it, in the same
+/// words: nothing the person confirms is refused after.
 #[tokio::test]
 async fn the_preview_refuses_a_pair_the_engine_finds_the_same() {
     let pair = |name: &str, external: String, internal: String| {
@@ -1039,9 +1039,9 @@ async fn the_preview_refuses_a_pair_the_engine_finds_the_same() {
                 format!("wsh(sortedmulti(1,{TPUB}/1/*,{TPUB}/0/*))"),
             ),
             pair(
-                "First address",
+                "Receive address",
                 format!("wpkh({TPUB}/0/*)"),
-                format!("wpkh({TPUB}/0/0)"),
+                format!("wpkh({TPUB}/0/1)"),
             ),
             signet_wallet("Fine", 3),
             copy,
@@ -1059,9 +1059,10 @@ async fn the_preview_refuses_a_pair_the_engine_finds_the_same() {
         .unwrap();
     let reasons: Vec<Option<String>> = preview.wallets.iter().map(|w| w.refused.clone()).collect();
     let same = Some(SAME_ADDRESSES.to_owned());
+    let fixed = Some(RECEIVE_ADDRESS.to_owned());
     assert_eq!(
         reasons,
-        vec![same.clone(), same.clone(), same.clone(), None, same.clone()]
+        vec![same.clone(), same.clone(), fixed, None, same.clone()]
     );
     assert!(preview.wallets.iter().all(|w| !w.already_watched));
 
@@ -1103,11 +1104,15 @@ async fn the_preview_refuses_a_pair_the_engine_finds_the_same() {
         vec![
             (0, reason.clone()),
             (1, reason.clone()),
-            (2, reason.clone()),
+            (2, RECEIVE_ADDRESS.to_owned()),
             (4, reason)
         ]
     );
 }
+
+/// What a change that is the receive address at index 1 is refused with.
+const RECEIVE_ADDRESS: &str = "descriptor error: the change descriptor is the receive address at \
+                               index 1; change needs a path of its own";
 
 /// What a pair the engine finds the same is refused with.
 const SAME_ADDRESSES: &str = "descriptor error: the two descriptors begin with the same \

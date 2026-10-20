@@ -852,6 +852,18 @@ fn pair_holds(
     if external.to_string() == internal.to_string() {
         return refuse("the two descriptors are the same; change needs a path of its own");
     }
+    let named = |what: &str, index: u32| {
+        Err(CoreError::InvalidInput {
+            kind: "descriptor",
+            detail: format!("{what} at index {index}; change needs a path of its own"),
+        })
+    };
+    if let Some(index) = address_of(external, internal) {
+        return named("the change descriptor is the receive address", index);
+    }
+    if let Some(index) = address_of(internal, external) {
+        return named("the receive descriptor is the change address", index);
+    }
     if external.desc_type() != internal.desc_type() {
         return refuse("the change descriptor is not of the receive descriptor's script type");
     }
@@ -887,6 +899,54 @@ fn pair_holds(
             }
         }
     }
+}
+
+/// The index of the address of `ranged` that `fixed` is, when it is
+/// one: a descriptor without a wildcard, beside one with it, that gives
+/// the same script as the ranged one at an index its own keys name, the
+/// last step of an extended key's path or of a single key's origin.
+/// Paired as receive and change, every payment's change would land on a
+/// receive address. Read on the keys alone, it refuses no wallet it does
+/// not prove; a key written another way (a bare key without an origin,
+/// a child key with its steps in the origin) goes unseen here, and the
+/// check of the keys' material refuses the latter as another wallet.
+fn address_of(
+    ranged: &Descriptor<DescriptorPublicKey>,
+    fixed: &Descriptor<DescriptorPublicKey>,
+) -> Option<u32> {
+    use bdk_wallet::bitcoin::bip32::ChildNumber;
+    // Deriving a hardened step panics in miniscript; reading refuses
+    // them before, and this holds without it.
+    if !ranged.has_wildcard()
+        || fixed.has_wildcard()
+        || hardened_derivation(ranged).is_some()
+        || hardened_derivation(fixed).is_some()
+    {
+        return None;
+    }
+    let script = fixed.at_derivation_index(0).ok()?.script_pubkey();
+    let mut named = Vec::new();
+    fixed.for_each_key(|key| {
+        let last = match key {
+            DescriptorPublicKey::XPub(xkey) => xkey.derivation_path.into_iter().last(),
+            DescriptorPublicKey::Single(single) => single
+                .origin
+                .as_ref()
+                .and_then(|(_, path)| path.into_iter().last()),
+            DescriptorPublicKey::MultiXPub(_) => None,
+        };
+        if let Some(ChildNumber::Normal { index }) = last
+            && !named.contains(index)
+        {
+            named.push(*index);
+        }
+        true
+    });
+    named.into_iter().find(|index| {
+        ranged
+            .at_derivation_index(*index)
+            .is_ok_and(|address| address.script_pubkey() == script)
+    })
 }
 
 // --- extended keys -----------------------------------------------------
@@ -1963,6 +2023,62 @@ mod tests {
                 "{external} / {internal}"
             );
         }
+    }
+
+    /// A change descriptor that is one receive address, named by the
+    /// last step of its key's path or of its origin, is refused: every
+    /// change would land there. A fixed change address that is no
+    /// receive address is left alone, as is a pair of ranged branches.
+    #[test]
+    fn a_change_that_is_a_receive_address_is_refused() {
+        let receive = format!("wpkh({TPUB}/0/*)");
+        let refused = |internal: &str| {
+            parse_input(&format!("{receive}\n{internal}"))
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            refused(&format!("wpkh({TPUB}/0/1)")),
+            "invalid descriptor: the change descriptor is the receive address at index 1; \
+             change needs a path of its own"
+        );
+        assert!(refused(&format!("wpkh({TPUB}/0/0)")).contains("at index 0"));
+        // A fixed change address of the same key elsewhere: no proof.
+        let other = format!("{receive}\nwpkh({TPUB}/1/0)");
+        assert_eq!(
+            parse_input(&other).unwrap().kind,
+            RecognizedKind::DescriptorPair
+        );
+        // And a backup holding such a pair is refused alike.
+        let stored = |internal: &str| {
+            check_stored_pair(&receive.parse().unwrap(), &internal.parse().unwrap())
+        };
+        assert!(stored(&format!("wpkh({TPUB}/0/7)")).is_err());
+        assert!(stored(&format!("wpkh({TPUB}/1/*)")).is_ok());
+        // The other way round: a fixed receive address that the change
+        // branch derives at the index it names.
+        let reversed = parse_input(&format!("wpkh({TPUB}/1/3)\nwpkh({TPUB}/1/*)"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            reversed,
+            "invalid descriptor: the receive descriptor is the change address at index 3; \
+             change needs a path of its own"
+        );
+        // The same address as a bare key, its origin naming the step,
+        // which reading refuses already for its network.
+        let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::verification_only();
+        let fifth = receive
+            .parse::<Descriptor<DescriptorPublicKey>>()
+            .unwrap()
+            .at_derivation_index(5)
+            .unwrap()
+            .derived_descriptor(&secp)
+            .unwrap()
+            .to_string();
+        let key = &fifth[fifth.find('(').unwrap() + 1..fifth.find(')').unwrap()];
+        let bare = stored(&format!("wpkh([d34db33f/84h/1h/0h/0/5]{key})")).unwrap_err();
+        assert!(bare.to_string().contains("at index 5"), "{bare}");
     }
 
     /// The change descriptor of a pair is held to the receive one: the
