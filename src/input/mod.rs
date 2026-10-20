@@ -1001,7 +1001,7 @@ fn canonical_branch(path: &str, which: &str) -> CoreResult<String> {
                     "has `*` before the end; it can only be the last step".to_owned(),
                 ));
             }
-            let (index, hardened) = parse_step(step).map_err(&refuse)?;
+            let (index, hardened) = parse_step(step).map_err(refuse)?;
             if hardened {
                 return Err(refuse(format!(
                     "has a hardened step{}: an extended public key cannot derive hardened \
@@ -1073,7 +1073,7 @@ fn canonical_origin(origin: &str, source: OriginSource) -> CoreResult<String> {
                 "cannot contain a wildcard; `*` belongs to the receive and change paths".to_owned(),
             ));
         }
-        let (index, hardened) = parse_step(step).map_err(&refuse)?;
+        let (index, hardened) = parse_step(step).map_err(refuse)?;
         canonical.push('/');
         canonical.push_str(&index.to_string());
         if hardened {
