@@ -361,7 +361,7 @@ fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
             return Err(CoreError::InvalidInput {
                 kind: "qr",
                 detail: format!(
-                    "This is part 1 of a {total}-part QR code. Scan it with the camera instead."
+                    "This is one part of a {total}-part QR code. Scan it with the camera instead."
                 ),
             });
         };

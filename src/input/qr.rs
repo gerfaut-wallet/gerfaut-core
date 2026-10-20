@@ -64,9 +64,12 @@ fn qr_error(detail: impl Into<String>) -> CoreError {
     }
 }
 
-/// What a refused code is to be replaced by, whichever screen scanned
-/// it: the wallet import, or the broadcast page.
-const SHOW_INSTEAD: &str = "Show the wallet export or the signed transaction instead.";
+/// What a refused code is to be replaced by. The same scanner serves
+/// the wallet import, the broadcast page, the backup restore and the
+/// server settings: the sentence names the two codes people bring most
+/// and leaves the screen to say which.
+const SHOW_INSTEAD: &str =
+    "Show the code this screen asks for instead, such as a wallet export or a signed transaction.";
 
 /// A code of a kind Gerfaut does not read, named by `what`.
 fn not_read(what: &str) -> CoreError {
@@ -123,7 +126,7 @@ fn is_ur(frame: &str) -> bool {
 pub(crate) fn opened_once(text: String) -> CoreResult<String> {
     if is_envelope(&text) {
         return Err(qr_error(
-            "This QR code holds another QR code, which no wallet makes. Show the wallet export itself.",
+            "This QR code holds another QR code, which no wallet makes.",
         ));
     }
     Ok(text)
@@ -2449,7 +2452,8 @@ mod tests {
             (
                 &unknown,
                 "This QR code holds an executable file, which Gerfaut does not read. \
-                 Show the wallet export or the signed transaction instead.",
+                 Show the code this screen asks for instead, such as a wallet export or a \
+                 signed transaction.",
             ),
             (
                 &encoded,
@@ -2459,7 +2463,8 @@ mod tests {
             (
                 &seed,
                 "This QR code holds a crypto-seed record, which Gerfaut does not read. \
-                 Show the wallet export or the signed transaction instead.",
+                 Show the code this screen asks for instead, such as a wallet export or a \
+                 signed transaction.",
             ),
         ] {
             for frame in frames {
@@ -2606,7 +2611,7 @@ mod tests {
         );
         assert_eq!(
             crate::input::parse_input(&a[0]).unwrap_err().to_string(),
-            "This is part 1 of a 3-part QR code. Scan it with the camera instead."
+            "This is one part of a 3-part QR code. Scan it with the camera instead."
         );
         let scans = QrScans::default();
         assert_eq!(
