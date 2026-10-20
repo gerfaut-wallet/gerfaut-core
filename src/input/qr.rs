@@ -180,6 +180,9 @@ enum Fold {
     /// UR, a first frame refused, a fountain come together, two BBQr
     /// codes met at once.
     Settled(CoreResult<QrProgress>),
+    /// A UR that came together into a message Gerfaut does not take,
+    /// and which code it is: settled too.
+    Refused(CoreResult<QrProgress>, UrCode),
     /// A multi-part UR on its way.
     Ur(UrFold),
     /// A BBQr on its way, or complete and still watched for the parts
@@ -224,12 +227,21 @@ impl QrScan {
             return;
         }
         let settled = match &mut self.fold {
-            Fold::Ur(ur) => ur.take(frame),
-            Fold::Bbqr(bbqr) => bbqr.take(frame),
-            Fold::Empty | Fold::Settled(_) | Fold::Over => None,
+            Fold::Ur(ur) => ur.take(frame).map(|outcome| ur.settle(outcome)),
+            Fold::Bbqr(bbqr) => bbqr.take(frame).map(Fold::Settled),
+            Fold::Empty | Fold::Settled(_) | Fold::Refused(..) | Fold::Over => None,
         };
-        if let Some(outcome) = settled {
-            self.fold = Fold::Settled(outcome);
+        if let Some(fold) = settled {
+            self.fold = fold;
+        }
+    }
+
+    /// The UR this scan refused whole once it came together. None for
+    /// any other refusal.
+    fn refused_code(&self) -> Option<UrCode> {
+        match &self.fold {
+            Fold::Refused(_, code) => Some(code.clone()),
+            _ => None,
         }
     }
 
@@ -242,7 +254,7 @@ impl QrScan {
             return Err(CoreError::TooManyFrames(self.frames as u32));
         }
         match &self.fold {
-            Fold::Settled(outcome) => replay(outcome),
+            Fold::Settled(outcome) | Fold::Refused(outcome, _) => replay(outcome),
             Fold::Ur(ur) => Ok(ur.partial()),
             Fold::Bbqr(bbqr) => bbqr.progress(),
             // Both are ruled out by the counts above.
@@ -288,6 +300,22 @@ fn replay(outcome: &CoreResult<QrProgress>) -> CoreResult<QrProgress> {
     }
 }
 
+/// What every part of one multi-part UR carries: its type, the count
+/// of its fragments and the CRC-32 of its message.
+#[derive(Clone, PartialEq, Eq)]
+struct UrCode {
+    ur_type: String,
+    count: u32,
+    checksum: u32,
+}
+
+impl UrCode {
+    /// True when `frame` is a part of this code.
+    fn holds(&self, frame: &str) -> bool {
+        ur_part(frame.trim()).is_some_and(|part| part.code() == *self)
+    }
+}
+
 // --- Scans held by an app ----------------------------------------------
 
 /// Most scans an app holds open at once. A screen opens one when its
@@ -317,10 +345,28 @@ pub const MAX_SCAN_BYTES: usize = 16 << 20;
 /// past its frame bound ([`scan_frame_limit`]) too. The fountain
 /// decoder keeps more than the frames, the fragments mixed in each
 /// part: bounded by [`MAX_UR_MIX`].
+///
+/// A code Gerfaut does not take is refused at its first frame when its
+/// header says so (a UR or BBQr of a type it does not read), and each
+/// of its frames again on a fresh scan, so the screens keep the reason
+/// up and bar each frame. A UR whose message, once it came together,
+/// Gerfaut does not take (a private key, a script it does not read) is
+/// remembered by its type, count and checksum: a wallet shows its code
+/// in a loop, and the next pass would start a collection that ends in
+/// the same refusal, the reason gone from the screen meanwhile. Its
+/// frames are refused on sight instead, by the same answer, by any scan
+/// not yet started: one on its way to another code passes over them as
+/// over any frame of another code. The last [`MAX_REFUSED_CODES`] are
+/// kept. A BBQr refused once together is not: its parts carry no
+/// checksum, and a part misread or of another code with the same
+/// header would get the refusal tied to the parts of the right one.
 #[derive(Default)]
 pub struct QrScans {
     open: std::sync::Mutex<OpenScans>,
 }
+
+/// Most URs refused whole that [`QrScans`] remembers.
+pub const MAX_REFUSED_CODES: usize = 4;
 
 #[derive(Default)]
 struct OpenScans {
@@ -328,6 +374,14 @@ struct OpenScans {
     last: u32,
     /// Open scans, oldest first.
     scans: std::collections::VecDeque<(u32, std::sync::Arc<std::sync::Mutex<HeldScan>>)>,
+    /// URs refused whole, oldest first.
+    refused: std::collections::VecDeque<std::sync::Arc<RefusedCode>>,
+}
+
+/// A UR refused whole, and the refusal its frames get.
+struct RefusedCode {
+    code: UrCode,
+    answer: CoreResult<QrProgress>,
 }
 
 /// One scan an app holds, and the bytes of frames it took.
@@ -372,15 +426,20 @@ impl QrScans {
     }
 
     /// Gives one frame to an open scan: where it stands, as [`assemble`]
-    /// says of every frame it took. A scan that answers with its text or
-    /// a refusal starts again empty.
+    /// says of every frame it took, but for a frame of a UR refused whole
+    /// on a scan not yet started, which gets that refusal again. A scan
+    /// that answers with its text or a refusal starts again empty.
     pub fn push(&self, id: u32, frame: &str) -> CoreResult<QrProgress> {
-        let scan = held(&self.open)
-            .scans
-            .iter()
-            .find(|(open, _)| *open == id)
-            .map(|(_, scan)| scan.clone())
-            .ok_or_else(|| qr_error("this scan was closed: open the scanner again"))?;
+        let (scan, refused) = {
+            let open = held(&self.open);
+            let scan = open
+                .scans
+                .iter()
+                .find(|(open, _)| *open == id)
+                .map(|(_, scan)| scan.clone())
+                .ok_or_else(|| qr_error("this scan was closed: open the scanner again"))?;
+            (scan, open.refused.iter().cloned().collect::<Vec<_>>())
+        };
         let mut scan = match scan.lock() {
             Ok(scan) => scan,
             // A frame that panicked the decoder left it halfway: the
@@ -392,9 +451,38 @@ impl QrScans {
                 scan
             }
         };
-        let outcome = scan.push(frame);
+        // A frame of a UR refused whole gets its refusal again, read no
+        // further than its fountain part, unless the scan is on its way to
+        // another code. One longer than any QR code holds is left to the
+        // scan, which refuses it.
+        let known = refused.iter().find(|refused| {
+            scan.scan.frames() == 0
+                && frame.trim().len() <= MAX_FRAME_LEN
+                && refused.code.holds(frame)
+        });
+        let outcome = match known {
+            Some(refused) => replay(&refused.answer),
+            None => scan.push(frame),
+        };
+        let newly_refused = match (&outcome, known) {
+            (Err(_), None) => scan.scan.refused_code(),
+            _ => None,
+        };
         if !matches!(&outcome, Ok(progress) if !progress.complete) {
             *scan = HeldScan::default();
+        }
+        drop(scan);
+        if let Some(code) = newly_refused {
+            let mut open = held(&self.open);
+            // Once each: a code refused again moves to the newest.
+            open.refused.retain(|refused| refused.code != code);
+            while open.refused.len() >= MAX_REFUSED_CODES {
+                open.refused.pop_front();
+            }
+            open.refused.push_back(std::sync::Arc::new(RefusedCode {
+                code,
+                answer: replay(&outcome),
+            }));
         }
         outcome
     }
@@ -462,9 +550,16 @@ const MAX_UR_PARTS: u32 = 5_000;
 /// aside as with them, and that one 2.5 % later.
 const MAX_UR_MIX: usize = 128;
 
-/// The fountain part of a multi-part UR frame, in CBOR, read before the
-/// decoder takes it.
+/// What a multi-part UR frame says of itself, read as far as the scan
+/// needs before the decoder takes it.
 struct UrPart {
+    /// The type, in lower case.
+    ur_type: String,
+    /// The fragments of the message and its CRC-32, the same on every
+    /// part of one code.
+    count: u32,
+    checksum: u32,
+    /// The fountain part, in CBOR.
     cbor: Vec<u8>,
 }
 
@@ -474,7 +569,7 @@ struct UrPart {
 /// header's. The crate draws the fragments of a part from those two
 /// numbers without a check: 0 underflows, and a count of 0 panics.
 fn ur_part(frame: &str) -> Option<UrPart> {
-    let (_, Some(total)) = ur_header(frame).ok()? else {
+    let (ur_type, Some(total)) = ur_header(frame).ok()? else {
         return None;
     };
     if !(1..=MAX_UR_PARTS).contains(&total) {
@@ -489,7 +584,14 @@ fn ur_part(frame: &str) -> Option<UrPart> {
     }
     let sequence = fields.u32().ok()?;
     let count = fields.u32().ok()?;
-    (sequence > 0 && count == total).then_some(UrPart { cbor })
+    let _length = fields.u32().ok()?;
+    let checksum = fields.u32().ok()?;
+    (sequence > 0 && count == total).then_some(UrPart {
+        ur_type,
+        count,
+        checksum,
+        cbor,
+    })
 }
 
 impl UrPart {
@@ -499,6 +601,14 @@ impl UrPart {
     fn mixes(&self) -> usize {
         minicbor::decode::<ur::fountain::Part>(&self.cbor)
             .map_or(usize::MAX, |part| part.indexes().len())
+    }
+
+    fn code(&self) -> UrCode {
+        UrCode {
+            ur_type: self.ur_type.clone(),
+            count: self.count,
+            checksum: self.checksum,
+        }
     }
 }
 
@@ -510,6 +620,9 @@ struct UrFold {
     /// The parts the first frame announced.
     total: u32,
     decoder: ur::ur::Decoder,
+    /// The code of the first part the decoder took: every other part it
+    /// takes belongs to the same one.
+    code: Option<UrCode>,
     /// The fragments named by the parts handed to the decoder, repeats
     /// counted: what its lists hold, at most.
     mixed: usize,
@@ -533,6 +646,11 @@ impl UrFold {
             Some(total) if total > MAX_UR_PARTS => {
                 return Fold::Settled(Err(CoreError::TooManyParts(total)));
             }
+            // A type no part of which Gerfaut reads: said at once, rather
+            // than once every part has come.
+            Some(_) if !UR_TYPES.contains(&ur_type.as_str()) => {
+                return Fold::Settled(Err(unsupported_ur_type(&ur_type)));
+            }
             Some(total) => total,
             None => {
                 let outcome = ur::ur::decode(first)
@@ -545,10 +663,11 @@ impl UrFold {
             ur_type,
             total,
             decoder: ur::ur::Decoder::default(),
+            code: None,
             mixed: 0,
         };
         match fold.take(first) {
-            Some(outcome) => Fold::Settled(outcome),
+            Some(outcome) => fold.settle(outcome),
             None => Fold::Ur(fold),
         }
     }
@@ -563,9 +682,22 @@ impl UrFold {
             let mixes = part.mixes();
             if mixes <= MAX_UR_MIX && self.decoder.receive(frame).is_ok() {
                 self.mixed += mixes;
+                self.code.get_or_insert_with(|| part.code());
             }
         }
         self.decoder.complete().then(|| self.finish())
+    }
+
+    /// The fold once the fountain came together: a message whose
+    /// checksum holds and that Gerfaut refuses is that code's, and says
+    /// which. One whose checksum fails may be parts of another code.
+    fn settle(&self, outcome: CoreResult<QrProgress>) -> Fold {
+        match (&outcome, &self.code) {
+            (Err(_), Some(code)) if matches!(self.decoder.message(), Ok(Some(_))) => {
+                Fold::Refused(outcome, code.clone())
+            }
+            _ => Fold::Settled(outcome),
+        }
     }
 
     /// The parts resolved so far, nothing decoded yet.
@@ -618,6 +750,19 @@ fn ur_progress(
     })
 }
 
+/// The UR types Gerfaut reads, those [`ur_message_to_text`] opens.
+const UR_TYPES: [&str; 5] = [
+    "bytes",
+    "crypto-output",
+    "crypto-hdkey",
+    "crypto-psbt",
+    "psbt",
+];
+
+fn unsupported_ur_type(ur_type: &str) -> CoreError {
+    qr_error(format!("unsupported UR type `{ur_type}`"))
+}
+
 /// Turns the CBOR payload of a UR into classifier text, noting in
 /// `warnings` what it had to assume.
 fn ur_message_to_text(
@@ -666,7 +811,7 @@ fn ur_message_to_text(
             };
             Ok(data_encoding::BASE64.encode(&raw))
         }
-        other => Err(qr_error(format!("unsupported UR type `{other}`"))),
+        other => Err(unsupported_ur_type(other)),
     }
 }
 
@@ -1034,6 +1179,20 @@ impl BbqrFold {
             Ok((header, _)) => header,
             Err(e) => return Fold::Settled(Err(e)),
         };
+        // A type or an encoding Gerfaut does not read: said at once,
+        // rather than once every part has come.
+        if !matches!(header.file_type, 'U' | 'J' | 'P' | 'T') {
+            return Fold::Settled(Err(qr_error(format!(
+                "unsupported BBQr file type `{}`",
+                header.file_type
+            ))));
+        }
+        if !matches!(header.encoding, 'H' | '2' | 'Z') {
+            return Fold::Settled(Err(qr_error(format!(
+                "unsupported BBQr encoding `{}`",
+                header.encoding
+            ))));
+        }
         let mut fold = BbqrFold {
             encoding: header.encoding,
             file_type: header.file_type,
@@ -1096,12 +1255,6 @@ impl BbqrFold {
 
     /// The text every part together makes.
     fn decode(&self) -> CoreResult<QrProgress> {
-        if !matches!(self.file_type, 'U' | 'J' | 'P' | 'T') {
-            return Err(qr_error(format!(
-                "unsupported BBQr file type `{}`",
-                self.file_type
-            )));
-        }
         let joined: String = self.parts.iter().flatten().map(String::as_str).collect();
         let bytes = match self.encoding {
             'H' => data_encoding::HEXUPPER_PERMISSIVE
@@ -2218,5 +2371,134 @@ mod tests {
             assert_eq!(progress.received, 1);
         }
         assert_eq!(mixed(&scan), 1);
+    }
+
+    /// A code of a type Gerfaut does not read is refused at its first
+    /// frame, and each frame of it again on a fresh scan: no collection
+    /// ever starts, so the screens keep the reason up.
+    #[test]
+    fn a_code_of_a_type_gerfaut_does_not_read_is_refused_at_once() {
+        let scans = QrScans::default();
+        let unknown: Vec<String> = bbqr_frames(&format!("wpkh({TPUB}/<0;1>/*)"), 3)
+            .iter()
+            .map(|frame| frame.replacen("B$ZU", "B$ZX", 1))
+            .collect();
+        let encoded: Vec<String> = bbqr_frames(&format!("wpkh({TPUB}/<0;1>/*)"), 3)
+            .iter()
+            .map(|frame| frame.replacen("B$ZU", "B$QU", 1))
+            .collect();
+        let mut seed = ur::ur::Encoder::new(&[7; 120], 10, "crypto-seed").unwrap();
+        let seed: Vec<String> = (0..30).map(|_| seed.next_part().unwrap()).collect();
+        for (frames, words) in [
+            (&unknown, "unsupported BBQr file type `X`"),
+            (&encoded, "unsupported BBQr encoding `Q`"),
+            (&seed, "unsupported UR type `crypto-seed`"),
+        ] {
+            for frame in frames {
+                let id = scans.open();
+                let refused = scans.push(id, frame).unwrap_err().to_string();
+                assert!(refused.ends_with(words), "{refused}");
+                assert!(same(
+                    &assemble(std::slice::from_ref(frame)),
+                    &scans.push(id, frame)
+                ));
+                scans.close(id);
+            }
+        }
+    }
+
+    /// A UR whose message, once it came together, Gerfaut refuses is
+    /// refused again on sight, part after part of its fountain, by any
+    /// scan not yet started and by the same words; a scan on its way to
+    /// another code passes over its parts. The last few such codes are
+    /// kept, and no refusal that is about no one code.
+    #[test]
+    fn a_ur_refused_whole_is_refused_on_sight() {
+        let scans = QrScans::default();
+        // A descriptor with a private key in it.
+        let Value::Tag(_, key) = hdkey(None) else {
+            unreachable!()
+        };
+        let Value::Map(mut entries) = *key else {
+            unreachable!()
+        };
+        entries[0].1 = Value::Bool(true);
+        let mut private = Vec::new();
+        ciborium::into_writer(&tag(TAG_WPKH, tag(303, Value::Map(entries))), &mut private).unwrap();
+        let mut encoder = ur::ur::Encoder::new(&private, 10, "crypto-output").unwrap();
+        let id = scans.open();
+        let refused = loop {
+            match scans.push(id, &encoder.next_part().unwrap()) {
+                Ok(progress) => assert!(!progress.complete),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(refused, CoreError::PrivateMaterialRejected));
+        let fresh = scans.open();
+        for _ in 0..30 {
+            let frame = encoder.next_part().unwrap();
+            assert!(matches!(
+                scans.push(fresh, &frame),
+                Err(CoreError::PrivateMaterialRejected)
+            ));
+            assert!(matches!(
+                scans.push(id, &frame),
+                Err(CoreError::PrivateMaterialRejected)
+            ));
+        }
+        // Another code is read, the refused one in front of the camera
+        // with it.
+        let mut public = Vec::new();
+        ciborium::into_writer(&tag(TAG_WPKH, hdkey(None)), &mut public).unwrap();
+        let readable = ur_parts("crypto-output", &public, 40, 30);
+        let first = scans.push(fresh, &readable[0]).unwrap();
+        assert!(!first.complete);
+        let passed = scans.push(fresh, &encoder.next_part().unwrap()).unwrap();
+        assert_eq!(passed.received, first.received);
+        let mut done = false;
+        for frame in &readable[1..] {
+            if scans.push(fresh, frame).unwrap().complete {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+
+        // The last few are kept: the first goes once four more are.
+        for byte in 0..MAX_REFUSED_CODES as u8 {
+            let mut cbor = Vec::new();
+            ciborium::into_writer(&Value::Bytes(vec![0xff, byte, 0xfe]), &mut cbor).unwrap();
+            let mut encoder = ur::ur::Encoder::new(&cbor, 2, "bytes").unwrap();
+            let id = scans.open();
+            let refused = loop {
+                if let Err(e) = scans.push(id, &encoder.next_part().unwrap()) {
+                    break e.to_string();
+                }
+            };
+            assert!(refused.contains("not text"), "{refused}");
+            let id = scans.open();
+            assert!(scans.push(id, &encoder.next_part().unwrap()).is_err());
+        }
+        let id = scans.open();
+        assert!(scans.push(id, &encoder.next_part().unwrap()).is_ok());
+    }
+
+    /// A BBQr refused once together is not remembered: its parts carry
+    /// no checksum, and the parts of two codes with the same header, or
+    /// a part misread, would get the refusal tied to the right code.
+    #[test]
+    fn a_bbqr_refused_once_together_is_read_again() {
+        let scans = QrScans::default();
+        let a = bbqr_frames(&format!("wpkh({TPUB}/<0;1>/*)"), 3);
+        let b = bbqr_frames(&format!("pkh({TPUB}/<0;1>/*)"), 3);
+        assert_eq!(a[0][..8], b[0][..8]);
+        let id = scans.open();
+        assert!(scans.push(id, &a[0]).is_ok());
+        assert!(scans.push(id, &b[1]).is_ok());
+        assert!(scans.push(id, &a[2]).is_err());
+        let fresh = scans.open();
+        assert!(!scans.push(fresh, &a[0]).unwrap().complete);
+        assert!(!scans.push(fresh, &a[1]).unwrap().complete);
+        assert!(scans.push(fresh, &a[2]).unwrap().complete);
     }
 }
