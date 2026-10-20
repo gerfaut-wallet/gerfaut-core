@@ -2025,6 +2025,16 @@ mod tests {
         }
     }
 
+    /// A multisig that names one key twice is refused at reading, as
+    /// the engine refuses it, not after "Add wallet".
+    #[test]
+    fn a_key_repeated_in_a_multisig_is_refused_at_reading() {
+        let error = parse_input(&format!("wsh(multi(1,{TPUB}/<0;1>/*,{TPUB}/<0;1>/*))"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("repeated pubkeys"), "{error}");
+    }
+
     /// A change descriptor that is one receive address, named by the
     /// last step of its key's path or of its origin, is refused: every
     /// change would land there. A fixed change address that is no
