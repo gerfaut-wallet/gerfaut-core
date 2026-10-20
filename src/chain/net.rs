@@ -62,7 +62,7 @@ pub(crate) async fn open(
     let opening = async {
         let socket = match proxy {
             Some(proxy) => through_socks(proxy, host, port).await?,
-            None => TcpStream::connect((host, port))
+            None => super::dial::connect_async(host, port, budget)
                 .await
                 .map_err(|e| describe_io(&e))?,
         };

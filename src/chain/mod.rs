@@ -6,6 +6,7 @@
 //! (`redirects`).
 
 pub mod connect;
+mod dial;
 pub(crate) mod electrum;
 pub(crate) mod esplora;
 mod fault;
