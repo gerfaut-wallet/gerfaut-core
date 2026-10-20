@@ -1280,13 +1280,21 @@ mod tests {
 
     #[test]
     fn crypto_output_sorted_multisig() {
+        // The same key on two other branches: two cosigners to the
+        // engine, which refuses a key repeated.
+        let other = Value::Array(vec![
+            Value::Array(vec![Value::Integer(2.into()), Value::Integer(3.into())]),
+            Value::Bool(false),
+            Value::Array(vec![]),
+            Value::Bool(false),
+        ]);
         let multi = tag(
             TAG_WSH,
             tag(
                 TAG_SORTED_MULTI,
                 map(vec![
                     (1, Value::Integer(2.into())),
-                    (2, Value::Array(vec![hdkey(None), hdkey(None)])),
+                    (2, Value::Array(vec![hdkey(None), hdkey(Some(other))])),
                 ]),
             ),
         );

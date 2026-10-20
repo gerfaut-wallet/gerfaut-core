@@ -361,7 +361,10 @@ fn record_with(
 /// What a wallet of this material is watched with on `network`: the
 /// engine of a descriptor wallet, nothing for a single address, which is
 /// checked against the network instead.
-fn engine_for(kind: &WalletKind, network: Network) -> CoreResult<Option<bdk_wallet::Wallet>> {
+pub(crate) fn engine_for(
+    kind: &WalletKind,
+    network: Network,
+) -> CoreResult<Option<bdk_wallet::Wallet>> {
     match kind {
         WalletKind::Descriptors {
             external, internal, ..

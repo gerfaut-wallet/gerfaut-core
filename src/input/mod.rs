@@ -233,13 +233,51 @@ pub fn parse_input_with(input: &str, script: Option<ScriptKind>) -> CoreResult<P
 /// ignore those two.
 pub fn parse_input_with_options(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
     if bsms::is_bsms(input) {
-        return parse_bsms_record(input);
+        let parsed = parse_bsms_record(input)?;
+        engine_takes(&parsed)?;
+        return Ok(parsed);
     }
     let mut parsed = classify(input, options)?;
+    engine_takes(&parsed)?;
     if parsed.preview_address.is_none() {
         parsed.preview_address = preview_address(&parsed, options.network);
     }
     Ok(parsed)
+}
+
+/// Builds the engine a wallet of this input would be watched with, the
+/// way adding it builds it ([`crate::manager::engine_for`]), on the first
+/// network the input allows, and drops it: what only the engine refuses
+/// is refused at reading, where the person sees it, and never after they
+/// asked to add the wallet. The network does not change the verdict:
+/// the engine reads the kind of network of the keys, the same for every
+/// network the input allows.
+fn engine_takes(parsed: &ParsedInput) -> CoreResult<()> {
+    let ParsedPayload::Descriptors {
+        external,
+        internal,
+        script,
+    } = &parsed.payload
+    else {
+        return Ok(());
+    };
+    let Some(network) = parsed.networks.first() else {
+        return Ok(());
+    };
+    let kind = crate::wallet::meta::WalletKind::Descriptors {
+        external: external.clone(),
+        internal: internal.clone(),
+        script: *script,
+    };
+    crate::manager::engine_for(&kind, *network)
+        .map(|_| ())
+        .map_err(|error| match error {
+            CoreError::Descriptor(detail) => CoreError::InvalidInput {
+                kind: "descriptor",
+                detail,
+            },
+            other => other,
+        })
 }
 
 /// A BSMS record is its descriptor plus a promise: the first address the
@@ -1744,7 +1782,7 @@ mod tests {
 
         let cosigner = slip132(TPUB, UPUB_MULTI);
         let parsed = parse_input(&format!(
-            "sh(wsh(sortedmulti(1,{cosigner}/<0;1>/*,{TPUB}/<0;1>/*)))"
+            "sh(wsh(sortedmulti(1,{cosigner}/<0;1>/*,{TPUB}/<2;3>/*)))"
         ))
         .unwrap();
         assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
@@ -1899,6 +1937,32 @@ mod tests {
         let parsed = parse_input(&input).unwrap();
         assert_eq!(parsed.kind, RecognizedKind::DescriptorPair);
         assert!(parsed.warnings.is_empty());
+    }
+
+    /// A pair whose two branches begin with the same address under two
+    /// spellings, a key origin added or the keys of a `sortedmulti` in
+    /// another order, reads as one wallet on two branches; the engine
+    /// refuses it, and so does reading it, before anyone asks to add it.
+    #[test]
+    fn a_pair_the_engine_finds_the_same_is_refused_at_reading() {
+        for (external, internal) in [
+            (
+                format!("wpkh({TPUB}/0/*)"),
+                format!("wpkh([d34db33f/84h/1h/0h]{TPUB}/0/*)"),
+            ),
+            (
+                format!("wsh(sortedmulti(1,{TPUB}/0/*,{TPUB}/1/*))"),
+                format!("wsh(sortedmulti(1,{TPUB}/1/*,{TPUB}/0/*))"),
+            ),
+        ] {
+            let error = parse_input(&format!("{external}\n{internal}")).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "invalid descriptor: the two descriptors begin with the same address; change \
+                 needs a path of its own",
+                "{external} / {internal}"
+            );
+        }
     }
 
     /// The change descriptor of a pair is held to the receive one: the
