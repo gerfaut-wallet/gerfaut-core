@@ -78,10 +78,28 @@ fn not_read(what: &str) -> CoreError {
     ))
 }
 
-/// A frame that opens like an envelope and breaks off: a camera that
-/// caught a code half drawn, or a code damaged on the screen.
+/// What a frame that opens like an envelope and breaks off is told: a
+/// camera that caught a code half drawn, or a code damaged on screen.
+const DAMAGED_FRAME: &str =
+    "Part of this QR code could not be read. Hold the camera steady on the code.";
+
+/// The same, for a text pasted or opened from a file: no camera there.
+const DAMAGED_PASTE: &str = "This text starts like a QR code but is cut short or damaged. Paste it again in full, or scan the code with the camera.";
+
 fn damaged_frame() -> CoreError {
-    qr_error("Part of this QR code could not be read. Hold the camera steady on the code.")
+    qr_error(DAMAGED_FRAME)
+}
+
+/// Opens a QR envelope pasted as text, or read from a file: what
+/// [`assemble`] says of it as a single frame, but for a damaged one,
+/// which is told about the text rather than a camera.
+pub(crate) fn open_pasted(text: &str) -> CoreResult<QrProgress> {
+    assemble(&[text.to_owned()]).map_err(|e| match e {
+        CoreError::InvalidInput { kind: "qr", detail } if detail == DAMAGED_FRAME => {
+            qr_error(DAMAGED_PASTE)
+        }
+        other => other,
+    })
 }
 
 /// A UR as the person knows it: by its type, but for `bytes`, which
@@ -2618,6 +2636,25 @@ mod tests {
             scans.push(7, &a[0]).unwrap_err().to_string(),
             "This scan was closed. Open the scanner again."
         );
+        // Pasted or read from a file, a damaged envelope is told about
+        // the text: there is no camera to hold steady.
+        let pasted = "This text starts like a QR code but is cut short or damaged. \
+                      Paste it again in full, or scan the code with the camera.";
+        for text in ["ur:bytes/x-y/z", "B$ZU0000AAAA"] {
+            assert_eq!(
+                crate::input::parse_input(text).unwrap_err().to_string(),
+                pasted,
+                "{text}"
+            );
+            assert_eq!(
+                crate::broadcast::decode_transaction(text)
+                    .unwrap_err()
+                    .to_string(),
+                pasted,
+                "{text}"
+            );
+            assert_eq!(refusal(&[text.to_owned()]), damaged, "{text}");
+        }
         // The code stays the one the apps read: invalid_input.
         assert_eq!(
             assemble(&[a[0].clone(), b[0].clone()]).unwrap_err().code(),

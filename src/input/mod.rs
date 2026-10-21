@@ -356,7 +356,7 @@ fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
             total,
             warnings,
             ..
-        } = qr::assemble(&[trimmed.to_owned()])?;
+        } = qr::open_pasted(trimmed)?;
         let Some(text) = text else {
             return Err(CoreError::InvalidInput {
                 kind: "qr",
