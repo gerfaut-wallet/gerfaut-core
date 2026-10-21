@@ -54,11 +54,109 @@ pub struct QrProgress {
     pub warnings: Vec<InputWarning>,
 }
 
+/// A refusal of a QR code. The apps show its words as they are, under
+/// the code `invalid_input`: they are sentences for the person holding
+/// the camera, saying what Gerfaut saw and what to do about it.
 fn qr_error(detail: impl Into<String>) -> CoreError {
     CoreError::InvalidInput {
         kind: "qr",
         detail: detail.into(),
     }
+}
+
+/// What a refused code is to be replaced by. The same scanner serves
+/// the wallet import, the broadcast page, the backup restore and the
+/// server settings: the sentence names the two codes people bring most
+/// and leaves the screen to say which.
+const SHOW_INSTEAD: &str =
+    "Show the code this screen asks for instead, such as a wallet export or a signed transaction.";
+
+/// A code of a kind Gerfaut does not read, named by `what`.
+fn not_read(what: &str) -> CoreError {
+    qr_error(format!(
+        "This QR code holds {what}, which Gerfaut does not read. {SHOW_INSTEAD}"
+    ))
+}
+
+/// What a frame that opens like an envelope and breaks off is told: a
+/// camera that caught a code half drawn, or a code damaged on screen.
+const DAMAGED_FRAME: &str =
+    "Part of this QR code could not be read. Hold the camera steady on the code.";
+
+/// The same, for a text pasted or opened from a file: no camera there.
+const DAMAGED_PASTE: &str = "This text starts like a QR code but is cut short or damaged. Paste or open it again in full, or scan the code with the camera.";
+
+/// The kind of a refusal for a damaged frame: a sort of its own, which
+/// the paste path tells apart by kind, whatever the words say.
+pub(crate) const DAMAGED_KIND: &str = "qr frame";
+
+fn damaged_frame() -> CoreError {
+    CoreError::InvalidInput {
+        kind: DAMAGED_KIND,
+        detail: DAMAGED_FRAME.to_owned(),
+    }
+}
+
+/// Opens a QR envelope pasted as text, or read from a file: what
+/// [`assemble`] says of it as a single frame, but for a damaged one,
+/// which is told about the text rather than a camera.
+pub(crate) fn open_pasted(text: &str) -> CoreResult<QrProgress> {
+    assemble(&[text.to_owned()]).map_err(told_of_paste)
+}
+
+/// A refusal as a paste gets it: a damaged frame, known by its kind,
+/// is told about the text; anything else stays as it is.
+fn told_of_paste(error: CoreError) -> CoreError {
+    match error {
+        CoreError::InvalidInput {
+            kind: DAMAGED_KIND, ..
+        } => CoreError::InvalidInput {
+            kind: DAMAGED_KIND,
+            detail: DAMAGED_PASTE.to_owned(),
+        },
+        other => other,
+    }
+}
+
+/// The refusal of one frame of a multi-part code pasted as text, with
+/// the `total` parts it announces: which part it is, when it says, and
+/// that the whole code is scanned instead.
+pub(crate) fn pasted_part(text: &str, total: u32) -> CoreError {
+    let text = text.trim();
+    let part = if is_ur(text) {
+        text.split('/')
+            .nth(1)
+            .and_then(|indices| indices.split_once('-'))
+            .and_then(|(seq, _)| seq.parse::<u32>().ok())
+    } else {
+        bbqr_header(text).ok().map(|(header, _)| header.index + 1)
+    };
+    qr_error(match part {
+        Some(part) if (1..=total).contains(&part) => format!(
+            "This is part {part} of a {total}-part QR code. Scan the whole code with the camera instead."
+        ),
+        // A mixed part of a fountain code is no one part of it.
+        _ => format!(
+            "This is one frame of a {total}-part animated QR code. Scan the whole code with the camera instead."
+        ),
+    })
+}
+
+/// A UR as the person knows it: by its type, but for `bytes`, which
+/// says nothing to anyone.
+fn ur_code(ur_type: &str) -> String {
+    match ur_type {
+        "bytes" => "UR code".to_owned(),
+        other => format!("{other} code"),
+    }
+}
+
+/// A code whose every part came, holding what Gerfaut cannot open: a
+/// damaged export, or a form of it this version does not know.
+fn unreadable(what: &str) -> CoreError {
+    qr_error(format!(
+        "This {what} came through, but what it holds is damaged or in a form Gerfaut does not read. Export it again from the wallet."
+    ))
 }
 
 /// True when a frame is an envelope this module can open.
@@ -86,7 +184,7 @@ fn is_ur(frame: &str) -> bool {
 pub(crate) fn opened_once(text: String) -> CoreResult<String> {
     if is_envelope(&text) {
         return Err(qr_error(
-            "this QR code holds another QR code, which no wallet makes",
+            "This QR code holds another QR code, which no wallet makes.",
         ));
     }
     Ok(text)
@@ -180,6 +278,9 @@ enum Fold {
     /// UR, a first frame refused, a fountain come together, two BBQr
     /// codes met at once.
     Settled(CoreResult<QrProgress>),
+    /// A UR that came together into a message Gerfaut does not take,
+    /// and which code it is: settled too.
+    Refused(CoreResult<QrProgress>, UrCode),
     /// A multi-part UR on its way.
     Ur(UrFold),
     /// A BBQr on its way, or complete and still watched for the parts
@@ -224,29 +325,38 @@ impl QrScan {
             return;
         }
         let settled = match &mut self.fold {
-            Fold::Ur(ur) => ur.take(frame),
-            Fold::Bbqr(bbqr) => bbqr.take(frame),
-            Fold::Empty | Fold::Settled(_) | Fold::Over => None,
+            Fold::Ur(ur) => ur.take(frame).map(|outcome| ur.settle(outcome)),
+            Fold::Bbqr(bbqr) => bbqr.take(frame).map(Fold::Settled),
+            Fold::Empty | Fold::Settled(_) | Fold::Refused(..) | Fold::Over => None,
         };
-        if let Some(outcome) = settled {
-            self.fold = Fold::Settled(outcome);
+        if let Some(fold) = settled {
+            self.fold = fold;
+        }
+    }
+
+    /// The UR this scan refused whole once it came together. None for
+    /// any other refusal.
+    fn refused_code(&self) -> Option<UrCode> {
+        match &self.fold {
+            Fold::Refused(_, code) => Some(code.clone()),
+            _ => None,
         }
     }
 
     /// Where the scan stands after the frames taken so far.
     pub fn progress(&self) -> CoreResult<QrProgress> {
         if self.frames == 0 {
-            return Err(qr_error("no frame scanned yet"));
+            return Err(qr_error("No frame was scanned yet."));
         }
         if self.frames > self.limit {
             return Err(CoreError::TooManyFrames(self.frames as u32));
         }
         match &self.fold {
-            Fold::Settled(outcome) => replay(outcome),
+            Fold::Settled(outcome) | Fold::Refused(outcome, _) => replay(outcome),
             Fold::Ur(ur) => Ok(ur.partial()),
             Fold::Bbqr(bbqr) => bbqr.progress(),
             // Both are ruled out by the counts above.
-            Fold::Empty | Fold::Over => Err(qr_error("no frame scanned yet")),
+            Fold::Empty | Fold::Over => Err(qr_error("No frame was scanned yet.")),
         }
     }
 }
@@ -288,6 +398,22 @@ fn replay(outcome: &CoreResult<QrProgress>) -> CoreResult<QrProgress> {
     }
 }
 
+/// What every part of one multi-part UR carries: its type, the count
+/// of its fragments and the CRC-32 of its message.
+#[derive(Clone, PartialEq, Eq)]
+struct UrCode {
+    ur_type: String,
+    count: u32,
+    checksum: u32,
+}
+
+impl UrCode {
+    /// True when `frame` is a part of this code.
+    fn holds(&self, frame: &str) -> bool {
+        ur_part(frame.trim()).is_some_and(|part| part.code() == *self)
+    }
+}
+
 // --- Scans held by an app ----------------------------------------------
 
 /// Most scans an app holds open at once. A screen opens one when its
@@ -314,24 +440,31 @@ pub const MAX_SCAN_BYTES: usize = 16 << 20;
 /// one, which is what both screens do on a refusal. Bounded in number
 /// ([`MAX_OPEN_SCANS`]) and in the frames each takes: frames past
 /// [`MAX_FRAME_LEN`] are refused, and a scan past [`MAX_SCAN_BYTES`] or
-/// past its frame bound ([`scan_frame_limit`]) too.
+/// past its frame bound ([`scan_frame_limit`]) too. The fountain
+/// decoder keeps more than the frames, the fragments mixed in each
+/// part: bounded by [`MAX_UR_MIX`].
 ///
-/// Left unbounded by bytes: the fountain decoder of the `ur` crate
-/// keeps, for each mixed part it takes, the list of the fragments mixed
-/// in it, twice, 16 bytes a fragment. An honest scan of a 5,000-part
-/// code holds some 550 a part, about 40 MB at worst; a code drawn so
-/// that every part mixes thousands of fragments holds up to 700 MB at
-/// the frame bound, shown frame after frame for twenty minutes. The
-/// list handed whole to [`assemble`] at each frame reached the same
-/// peak. Counting it would take the degree of each part before the
-/// decoder does, which the crate only gives through `minicbor`, one
-/// more dependency, and a sampler call that underflows on a part
-/// numbered 0: left for a release after 0.1.0, or for a part bound
-/// smaller than the 5,000 parts a UR may announce.
+/// A code Gerfaut does not take is refused at its first frame when its
+/// header says so (a UR or BBQr of a type it does not read), and each
+/// of its frames again on a fresh scan, so the screens keep the reason
+/// up and bar each frame. A UR whose message, once it came together,
+/// Gerfaut does not take (a private key, a script it does not read) is
+/// remembered by its type, count and checksum: a wallet shows its code
+/// in a loop, and the next pass would start a collection that ends in
+/// the same refusal, the reason gone from the screen meanwhile. Its
+/// frames are refused on sight instead, by the same answer, by any scan
+/// not yet started: one on its way to another code passes over them as
+/// over any frame of another code. The last [`MAX_REFUSED_CODES`] are
+/// kept. A BBQr refused once together is not: its parts carry no
+/// checksum, and a part misread or of another code with the same
+/// header would get the refusal tied to the parts of the right one.
 #[derive(Default)]
 pub struct QrScans {
     open: std::sync::Mutex<OpenScans>,
 }
+
+/// Most URs refused whole that [`QrScans`] remembers.
+pub const MAX_REFUSED_CODES: usize = 4;
 
 #[derive(Default)]
 struct OpenScans {
@@ -339,6 +472,14 @@ struct OpenScans {
     last: u32,
     /// Open scans, oldest first.
     scans: std::collections::VecDeque<(u32, std::sync::Arc<std::sync::Mutex<HeldScan>>)>,
+    /// URs refused whole, oldest first.
+    refused: std::collections::VecDeque<std::sync::Arc<RefusedCode>>,
+}
+
+/// A UR refused whole, and the refusal its frames get.
+struct RefusedCode {
+    code: UrCode,
+    answer: CoreResult<QrProgress>,
 }
 
 /// One scan an app holds, and the bytes of frames it took.
@@ -352,7 +493,7 @@ impl HeldScan {
     fn push(&mut self, frame: &str) -> CoreResult<QrProgress> {
         let taken = frame.trim().len();
         if taken > MAX_FRAME_LEN {
-            return Err(qr_error("this frame is longer than any QR code holds"));
+            return Err(damaged_frame());
         }
         self.bytes += taken;
         if self.bytes > MAX_SCAN_BYTES {
@@ -383,15 +524,20 @@ impl QrScans {
     }
 
     /// Gives one frame to an open scan: where it stands, as [`assemble`]
-    /// says of every frame it took. A scan that answers with its text or
-    /// a refusal starts again empty.
+    /// says of every frame it took, but for a frame of a UR refused whole
+    /// on a scan not yet started, which gets that refusal again. A scan
+    /// that answers with its text or a refusal starts again empty.
     pub fn push(&self, id: u32, frame: &str) -> CoreResult<QrProgress> {
-        let scan = held(&self.open)
-            .scans
-            .iter()
-            .find(|(open, _)| *open == id)
-            .map(|(_, scan)| scan.clone())
-            .ok_or_else(|| qr_error("this scan was closed: open the scanner again"))?;
+        let (scan, refused) = {
+            let open = held(&self.open);
+            let scan = open
+                .scans
+                .iter()
+                .find(|(open, _)| *open == id)
+                .map(|(_, scan)| scan.clone())
+                .ok_or_else(|| qr_error("This scan was closed. Open the scanner again."))?;
+            (scan, open.refused.iter().cloned().collect::<Vec<_>>())
+        };
         let mut scan = match scan.lock() {
             Ok(scan) => scan,
             // A frame that panicked the decoder left it halfway: the
@@ -403,9 +549,38 @@ impl QrScans {
                 scan
             }
         };
-        let outcome = scan.push(frame);
+        // A frame of a UR refused whole gets its refusal again, read no
+        // further than its fountain part, unless the scan is on its way to
+        // another code. One longer than any QR code holds is left to the
+        // scan, which refuses it.
+        let known = refused.iter().find(|refused| {
+            scan.scan.frames() == 0
+                && frame.trim().len() <= MAX_FRAME_LEN
+                && refused.code.holds(frame)
+        });
+        let outcome = match known {
+            Some(refused) => replay(&refused.answer),
+            None => scan.push(frame),
+        };
+        let newly_refused = match (&outcome, known) {
+            (Err(_), None) => scan.scan.refused_code(),
+            _ => None,
+        };
         if !matches!(&outcome, Ok(progress) if !progress.complete) {
             *scan = HeldScan::default();
+        }
+        drop(scan);
+        if let Some(code) = newly_refused {
+            let mut open = held(&self.open);
+            // Once each: a code refused again moves to the newest.
+            open.refused.retain(|refused| refused.code != code);
+            while open.refused.len() >= MAX_REFUSED_CODES {
+                open.refused.pop_front();
+            }
+            open.refused.push_back(std::sync::Arc::new(RefusedCode {
+                code,
+                answer: replay(&outcome),
+            }));
         }
         outcome
     }
@@ -428,17 +603,13 @@ impl QrScans {
 /// → (type, None).
 fn ur_header(frame: &str) -> CoreResult<(String, Option<u32>)> {
     let lower = frame.to_ascii_lowercase();
-    let rest = lower
-        .strip_prefix("ur:")
-        .ok_or_else(|| qr_error("not a UR"))?;
-    let (ur_type, rest) = rest
-        .split_once('/')
-        .ok_or_else(|| qr_error("UR without a type"))?;
+    let rest = lower.strip_prefix("ur:").ok_or_else(damaged_frame)?;
+    let (ur_type, rest) = rest.split_once('/').ok_or_else(damaged_frame)?;
     let total = match rest.split_once('/') {
         Some((seq, _)) => Some(
             seq.split_once('-')
                 .and_then(|(_, total)| total.parse::<u32>().ok())
-                .ok_or_else(|| qr_error("malformed UR sequence"))?,
+                .ok_or_else(damaged_frame)?,
         ),
         None => None,
     };
@@ -457,9 +628,82 @@ fn ur_header(frame: &str) -> CoreResult<(String, Option<u32>)> {
 /// scanned after it.
 const MAX_UR_PARTS: u32 = 5_000;
 
-/// True when a multi-part frame announces a count the decoder can take.
-fn ur_part_count_is_sane(frame: &str) -> bool {
-    matches!(ur_header(frame), Ok((_, Some(total))) if (1..=MAX_UR_PARTS).contains(&total))
+/// Most fragments a mixed part of a UR may combine and still go to the
+/// decoder. The decoder keeps the list of the fragments mixed in every
+/// part it takes, twice, 16 bytes a fragment, until the scan ends: a
+/// code drawn so that each part mixes thousands of the 5,000 fragments
+/// it may announce grew the desktop app by 650 MB at the frame bound.
+/// Under this bound the lists hold 20 MB at most, [`MAX_SCAN_FRAMES`]
+/// parts of 128 fragments.
+///
+/// Nothing honest is lost. A part that mixes many fragments resolves
+/// one only once all its others are known, and the simpler parts have
+/// done that by then: in 80 simulated scans of 100 to 5,000 parts, by a
+/// camera that misses a fifth to three quarters of the frames, every
+/// scan but one came together on the same frame with these parts set
+/// aside as with them, and that one 2.5 % later.
+const MAX_UR_MIX: usize = 128;
+
+/// What a multi-part UR frame says of itself, read as far as the scan
+/// needs before the decoder takes it.
+struct UrPart {
+    /// The type, in lower case.
+    ur_type: String,
+    /// The fragments of the message and its CRC-32, the same on every
+    /// part of one code.
+    count: u32,
+    checksum: u32,
+    /// The fountain part, in CBOR.
+    cbor: Vec<u8>,
+}
+
+/// The fountain part of a multi-part UR frame; none for a frame the
+/// decoder would turn away for its numbers: no count or one past
+/// [`MAX_UR_PARTS`], a part numbered 0, a count other than its
+/// header's. The crate draws the fragments of a part from those two
+/// numbers without a check: 0 underflows, and a count of 0 panics.
+fn ur_part(frame: &str) -> Option<UrPart> {
+    let (ur_type, Some(total)) = ur_header(frame).ok()? else {
+        return None;
+    };
+    if !(1..=MAX_UR_PARTS).contains(&total) {
+        return None;
+    }
+    let (ur::ur::Kind::MultiPart, cbor) = ur::ur::decode(frame).ok()? else {
+        return None;
+    };
+    let mut fields = minicbor::Decoder::new(&cbor);
+    if fields.array().ok()? != Some(5) {
+        return None;
+    }
+    let sequence = fields.u32().ok()?;
+    let count = fields.u32().ok()?;
+    let _length = fields.u32().ok()?;
+    let checksum = fields.u32().ok()?;
+    (sequence > 0 && count == total).then_some(UrPart {
+        ur_type,
+        count,
+        checksum,
+        cbor,
+    })
+}
+
+impl UrPart {
+    /// The fragments the part mixes, drawn as the decoder draws them: a
+    /// few milliseconds for a part of a 5,000-part code, which the
+    /// decoder used to pay for every frame anyway.
+    fn mixes(&self) -> usize {
+        minicbor::decode::<ur::fountain::Part>(&self.cbor)
+            .map_or(usize::MAX, |part| part.indexes().len())
+    }
+
+    fn code(&self) -> UrCode {
+        UrCode {
+            ur_type: self.ur_type.clone(),
+            count: self.count,
+            checksum: self.checksum,
+        }
+    }
 }
 
 /// A multi-part UR on its way: the fountain decoder, fed one frame at
@@ -470,6 +714,12 @@ struct UrFold {
     /// The parts the first frame announced.
     total: u32,
     decoder: ur::ur::Decoder,
+    /// The code of the first part the decoder took: every other part it
+    /// takes belongs to the same one.
+    code: Option<UrCode>,
+    /// The fragments named by the parts handed to the decoder, repeats
+    /// counted: what its lists hold, at most.
+    mixed: usize,
 }
 
 impl UrFold {
@@ -482,18 +732,30 @@ impl UrFold {
         };
         let total = match total {
             Some(0) => {
-                return Fold::Settled(Err(qr_error(
-                    "this QR code announces an impossible number of parts",
-                )));
+                return Fold::Settled(Err(damaged_frame()));
             }
             // A code of its own: the screens say this one in their words.
             Some(total) if total > MAX_UR_PARTS => {
                 return Fold::Settled(Err(CoreError::TooManyParts(total)));
             }
+            // A type no part of which Gerfaut reads: said at once, rather
+            // than once every part has come, and named only when it is
+            // one, letters, digits and hyphens: the message shows it.
+            Some(_) if !UR_TYPES.contains(&ur_type.as_str()) => {
+                let named = !ur_type.is_empty()
+                    && ur_type
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+                return Fold::Settled(Err(if named {
+                    unsupported_ur_type(&ur_type)
+                } else {
+                    damaged_frame()
+                }));
+            }
             Some(total) => total,
             None => {
                 let outcome = ur::ur::decode(first)
-                    .map_err(|e| qr_error(format!("invalid UR: {e}")))
+                    .map_err(|_| damaged_frame())
                     .and_then(|(_, bytes)| ur_progress(&ur_type, 1, 1, Some(bytes)));
                 return Fold::Settled(outcome);
             }
@@ -502,9 +764,11 @@ impl UrFold {
             ur_type,
             total,
             decoder: ur::ur::Decoder::default(),
+            code: None,
+            mixed: 0,
         };
         match fold.take(first) {
-            Some(outcome) => Fold::Settled(outcome),
+            Some(outcome) => fold.settle(outcome),
             None => Fold::Ur(fold),
         }
     }
@@ -512,12 +776,29 @@ impl UrFold {
     /// Takes one frame; the answer once the fountain comes together.
     fn take(&mut self, frame: &str) -> Option<CoreResult<QrProgress>> {
         // Frames of another type or a damaged one do not abort the scan:
-        // the camera will see them again. One announcing an impossible
-        // count never reaches the decoder.
-        if ur_part_count_is_sane(frame) {
-            let _ = self.decoder.receive(frame);
+        // the camera will see them again. One the decoder would turn away
+        // for its numbers never reaches it, nor does a part that mixes
+        // more than MAX_UR_MIX fragments.
+        if let Some(part) = ur_part(frame) {
+            let mixes = part.mixes();
+            if mixes <= MAX_UR_MIX && self.decoder.receive(frame).is_ok() {
+                self.mixed += mixes;
+                self.code.get_or_insert_with(|| part.code());
+            }
         }
         self.decoder.complete().then(|| self.finish())
+    }
+
+    /// The fold once the fountain came together: a message whose
+    /// checksum holds and that Gerfaut refuses is that code's, and says
+    /// which. One whose checksum fails may be parts of another code.
+    fn settle(&self, outcome: CoreResult<QrProgress>) -> Fold {
+        match (&outcome, &self.code) {
+            (Err(_), Some(code)) if matches!(self.decoder.message(), Ok(Some(_))) => {
+                Fold::Refused(outcome, code.clone())
+            }
+            _ => Fold::Settled(outcome),
+        }
     }
 
     /// The parts resolved so far, nothing decoded yet.
@@ -538,13 +819,13 @@ impl UrFold {
 
     /// The message the fountain came together into, read as text.
     fn finish(&self) -> CoreResult<QrProgress> {
-        let message = self
-            .decoder
-            .message()
-            .map_err(|e| qr_error(format!("invalid UR: {e}")))?;
         // The type the parts carried, not the first frame's: that one may
         // be a damaged frame of another code, skipped above.
         let ur_type = self.decoder.ur_type().unwrap_or(&self.ur_type);
+        let message = self
+            .decoder
+            .message()
+            .map_err(|_| unreadable(&ur_code(ur_type)))?;
         ur_progress(ur_type, self.received(), self.total, message)
     }
 }
@@ -556,10 +837,19 @@ fn ur_progress(
     total: u32,
     message: Option<Vec<u8>>,
 ) -> CoreResult<QrProgress> {
+    if !UR_TYPES.contains(&ur_type) {
+        return Err(unsupported_ur_type(ur_type));
+    }
     let mut warnings = Vec::new();
+    // What the checks below name is for the code that reads the
+    // message; the person is told the code came and could not be read.
     let text = message
         .map(|bytes| ur_message_to_text(ur_type, &bytes, &mut warnings))
-        .transpose()?;
+        .transpose()
+        .map_err(|e| match e {
+            CoreError::InvalidInput { kind: "qr", .. } => unreadable(&ur_code(ur_type)),
+            other => other,
+        })?;
     Ok(QrProgress {
         format: QrFormat::Ur,
         received,
@@ -568,6 +858,19 @@ fn ur_progress(
         text,
         warnings,
     })
+}
+
+/// The UR types Gerfaut reads, those [`ur_message_to_text`] opens.
+const UR_TYPES: [&str; 5] = [
+    "bytes",
+    "crypto-output",
+    "crypto-hdkey",
+    "crypto-psbt",
+    "psbt",
+];
+
+fn unsupported_ur_type(ur_type: &str) -> CoreError {
+    not_read(&format!("a {ur_type} record"))
 }
 
 /// Turns the CBOR payload of a UR into classifier text, noting in
@@ -618,7 +921,7 @@ fn ur_message_to_text(
             };
             Ok(data_encoding::BASE64.encode(&raw))
         }
-        other => Err(qr_error(format!("unsupported UR type `{other}`"))),
+        other => Err(unsupported_ur_type(other)),
     }
 }
 
@@ -944,17 +1247,14 @@ fn bbqr_header(frame: &str) -> CoreResult<(BbqrHeader, &str)> {
     // byte offsets, and one that lands inside a character would panic:
     // anything else is refused here, before an offset is taken.
     if !frame.is_ascii() {
-        return Err(qr_error(
-            "not a BBQr frame: it carries characters outside ASCII",
-        ));
+        return Err(damaged_frame());
     }
     let bytes = frame.as_bytes();
     if !frame.starts_with("B$") || bytes.len() < 8 {
-        return Err(qr_error("not a BBQr frame"));
+        return Err(damaged_frame());
     }
-    let base36 = |s: &str| -> CoreResult<u32> {
-        u32::from_str_radix(s, 36).map_err(|_| qr_error("malformed BBQr header"))
-    };
+    let base36 =
+        |s: &str| -> CoreResult<u32> { u32::from_str_radix(s, 36).map_err(|_| damaged_frame()) };
     let header = BbqrHeader {
         encoding: bytes[2] as char,
         file_type: bytes[3] as char,
@@ -962,7 +1262,7 @@ fn bbqr_header(frame: &str) -> CoreResult<(BbqrHeader, &str)> {
         index: base36(&frame[6..8])?,
     };
     if header.total == 0 || header.index >= header.total {
-        return Err(qr_error("malformed BBQr header"));
+        return Err(damaged_frame());
     }
     Ok((header, &frame[8..]))
 }
@@ -986,6 +1286,23 @@ impl BbqrFold {
             Ok((header, _)) => header,
             Err(e) => return Fold::Settled(Err(e)),
         };
+        // A type or an encoding Gerfaut does not read: said at once,
+        // rather than once every part has come.
+        if !matches!(header.file_type, 'U' | 'J' | 'P' | 'T') {
+            // The other types of the BBQr specification, by name.
+            let what = match header.file_type {
+                'B' => "a binary file".to_owned(),
+                'C' => "CBOR data".to_owned(),
+                'X' => "an executable file".to_owned(),
+                other => format!("a file of BBQr type {other}"),
+            };
+            return Fold::Settled(Err(not_read(&what)));
+        }
+        if !matches!(header.encoding, 'H' | '2' | 'Z') {
+            return Fold::Settled(Err(qr_error(
+                "This BBQr code is encoded in a way Gerfaut does not read. Show it from the wallet as a UR or as plain text instead.",
+            )));
+        }
         let mut fold = BbqrFold {
             encoding: header.encoding,
             file_type: header.file_type,
@@ -1017,7 +1334,7 @@ impl BbqrFold {
         match &mut self.parts[header.index as usize] {
             Some(seen) if *seen != payload => {
                 return Some(Err(qr_error(
-                    "two different QR codes were scanned together: scan one at a time",
+                    "Two different QR codes were in view at once. Show one code at a time.",
                 )));
             }
             Some(_) => {}
@@ -1048,17 +1365,11 @@ impl BbqrFold {
 
     /// The text every part together makes.
     fn decode(&self) -> CoreResult<QrProgress> {
-        if !matches!(self.file_type, 'U' | 'J' | 'P' | 'T') {
-            return Err(qr_error(format!(
-                "unsupported BBQr file type `{}`",
-                self.file_type
-            )));
-        }
         let joined: String = self.parts.iter().flatten().map(String::as_str).collect();
         let bytes = match self.encoding {
             'H' => data_encoding::HEXUPPER_PERMISSIVE
                 .decode(joined.as_bytes())
-                .map_err(|_| qr_error("invalid BBQr hex payload"))?,
+                .map_err(|_| unreadable("BBQr code"))?,
             '2' => decode_base32(&joined)?,
             'Z' => {
                 let compressed = decode_base32(&joined)?;
@@ -1068,22 +1379,23 @@ impl BbqrFold {
                 flate2::read::DeflateDecoder::new(&compressed[..])
                     .take(MAX_INFLATED_LEN as u64 + 1)
                     .read_to_end(&mut text)
-                    .map_err(|e| qr_error(format!("invalid BBQr compressed payload: {e}")))?;
+                    .map_err(|_| unreadable("BBQr code"))?;
                 if text.len() > MAX_INFLATED_LEN {
                     return Err(qr_error(
-                        "this BBQr code expands to far more than any transaction or wallet",
+                        "This QR code unpacks to far more than any wallet or transaction holds, so Gerfaut stopped reading it.",
                     ));
                 }
                 text
             }
-            other => return Err(qr_error(format!("unsupported BBQr encoding `{other}`"))),
+            // Refused at the first frame already.
+            _ => return Err(unreadable("BBQr code")),
         };
         // Binary file types come out as the text form every other path
         // accepts: a PSBT as base64, a transaction as hex.
         let text = match self.file_type {
             'P' => data_encoding::BASE64.encode(&bytes),
             'T' => hex(&bytes),
-            _ => String::from_utf8(bytes).map_err(|_| qr_error("BBQr payload is not text"))?,
+            _ => String::from_utf8(bytes).map_err(|_| unreadable("BBQr code"))?,
         };
         Ok(QrProgress {
             format: QrFormat::Bbqr,
@@ -1099,7 +1411,7 @@ impl BbqrFold {
 fn decode_base32(payload: &str) -> CoreResult<Vec<u8>> {
     data_encoding::BASE32_NOPAD
         .decode(payload.trim_end_matches('=').as_bytes())
-        .map_err(|_| qr_error("invalid BBQr base32 payload"))
+        .map_err(|_| unreadable("BBQr code"))
 }
 
 #[cfg(test)]
@@ -1417,12 +1729,15 @@ mod tests {
         assert_eq!(refused.code(), crate::error::ErrorCode::TooManyParts);
         assert_eq!(
             refused.to_string(),
-            "invalid qr: this QR code announces 5001 parts, more than Gerfaut reads"
+            "This QR code announces 5001 parts, more than Gerfaut reads."
         );
         // A count of none is no count at all, not one too large.
         assert!(matches!(
             assemble(&[frame_announcing("bytes", 1, 0)]),
-            Err(CoreError::InvalidInput { kind: "qr", .. })
+            Err(CoreError::InvalidInput {
+                kind: DAMAGED_KIND,
+                ..
+            })
         ));
         let progress = assemble(&[frame_announcing("bytes", 1, MAX_UR_PARTS)]).unwrap();
         assert!(!progress.complete);
@@ -1691,7 +2006,10 @@ mod tests {
         let one = bbqr_frames(&format!("wpkh({TPUB}/<0;1>/*)"), 2);
         let other = bbqr_frames(&format!("pkh({TPUB}/<0;1>/*)"), 2);
         let refused = assemble(&[one[0].clone(), other[0].clone(), one[1].clone()]).unwrap_err();
-        assert!(refused.to_string().contains("one at a time"), "{refused}");
+        assert!(
+            refused.to_string().contains("one code at a time"),
+            "{refused}"
+        );
         let again = assemble(&[one[0].clone(), one[0].clone(), one[1].clone()]).unwrap();
         assert!(again.complete);
     }
@@ -1734,7 +2052,13 @@ mod tests {
             assert!(is_envelope(text), "{text:?}");
             let error = assemble(&[text.to_owned()]).unwrap_err();
             assert!(
-                matches!(error, CoreError::InvalidInput { kind: "qr", .. }),
+                matches!(
+                    error,
+                    CoreError::InvalidInput {
+                        kind: "qr" | DAMAGED_KIND,
+                        ..
+                    }
+                ),
                 "{text:?}: {error}"
             );
             assert!(crate::input::parse_input(text).is_err(), "{text:?}");
@@ -1774,12 +2098,12 @@ mod tests {
 
         let refused = assemble(std::slice::from_ref(&frame)).unwrap_err();
         assert!(
-            refused.to_string().contains("expands to far more"),
+            refused.to_string().contains("unpacks to far more"),
             "{refused}"
         );
         let refused = crate::broadcast::decode_transaction(&frame).unwrap_err();
         assert!(
-            refused.to_string().contains("expands to far more"),
+            refused.to_string().contains("unpacks to far more"),
             "{refused}"
         );
 
@@ -1806,7 +2130,7 @@ mod tests {
         let error = assemble(&["B$HX010000".to_owned()])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("file type"), "{error}");
+        assert!(error.contains("an executable file"), "{error}");
     }
 
     /// The same answer, error included: same variant, same words.
@@ -1991,14 +2315,20 @@ mod tests {
         // A refusal starts it again too, as both screens do.
         let other = bbqr_frames(&format!("pkh({TPUB}/<0;1>/*)"), 3);
         let refused = scans.push(id, &other[1]).unwrap_err();
-        assert!(refused.to_string().contains("one at a time"), "{refused}");
+        assert!(
+            refused.to_string().contains("one code at a time"),
+            "{refused}"
+        );
         assert_eq!(scans.push(id, &other[1]).unwrap().received, 1);
 
         // A frame longer than any QR code holds is refused.
         let long = format!("B$ZU0300{}", "A".repeat(MAX_FRAME_LEN));
         assert!(matches!(
             scans.push(id, &long),
-            Err(CoreError::InvalidInput { kind: "qr", .. })
+            Err(CoreError::InvalidInput {
+                kind: DAMAGED_KIND,
+                ..
+            })
         ));
 
         // So is a scan past its bytes, as a code larger than Gerfaut
@@ -2036,6 +2366,426 @@ mod tests {
         assert!(scans.push(opened[1], &frames[0]).is_err());
         for id in &opened[2..] {
             assert!(scans.push(*id, &frames[0]).is_ok());
+        }
+    }
+
+    /// A multi-part UR frame of `ur_type` whose header says `header`
+    /// and whose fountain part says `seq` of `count`: one byte of data,
+    /// a message of `count` bytes, `checksum` for its CRC.
+    fn fountain_frame(
+        ur_type: &str,
+        header: (u32, u32),
+        seq: u32,
+        count: u32,
+        checksum: u32,
+    ) -> String {
+        let part = Value::Array(vec![
+            Value::Integer(seq.into()),
+            Value::Integer(count.into()),
+            Value::Integer(count.into()),
+            Value::Integer(checksum.into()),
+            Value::Bytes(vec![0]),
+        ]);
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&part, &mut cbor).unwrap();
+        let words = ur::bytewords::encode(&cbor, ur::bytewords::Style::Minimal);
+        format!("ur:{ur_type}/{}-{}/{words}", header.0, header.1)
+    }
+
+    /// The fragments the decoder of a scan was handed, at most what its
+    /// lists hold.
+    fn mixed(scan: &QrScan) -> usize {
+        match &scan.fold {
+            Fold::Ur(ur) => ur.mixed,
+            _ => panic!("not a UR on its way"),
+        }
+    }
+
+    /// A code drawn to fill the decoder: as many distinct parts as a
+    /// scan takes, 10,000 for a 5,000-part code, half of them drawn to mix
+    /// more fragments than any honest part needs. Those never reach the
+    /// decoder, and what the others leave in its lists stays under
+    /// MAX_UR_MIX a frame: 20 MB at most, where the parts of thousands
+    /// of fragments held 650 MB.
+    #[test]
+    fn a_code_drawn_to_fill_the_decoder_stays_within_its_bound() {
+        let frame =
+            |seq: u32| fountain_frame("bytes", (seq, MAX_UR_PARTS), seq, MAX_UR_PARTS, 0xdead_beef);
+        let half = MAX_SCAN_FRAMES / 2;
+        let mut scan = QrScan::new();
+        let (mut wide, mut narrow, mut kept) = (0, 0, 0);
+        let mut seq = MAX_UR_PARTS;
+        while wide + narrow < MAX_SCAN_FRAMES {
+            seq += 1;
+            let frame = frame(seq);
+            let mixes = ur_part(&frame).unwrap().mixes();
+            if mixes > MAX_UR_MIX {
+                if wide == half {
+                    continue;
+                }
+                wide += 1;
+            } else {
+                if narrow == half {
+                    continue;
+                }
+                narrow += 1;
+                kept += mixes;
+            }
+            assert!(!scan.push(&frame).unwrap().complete);
+        }
+        assert_eq!(scan.frames(), MAX_SCAN_FRAMES);
+        assert_eq!(mixed(&scan), kept);
+        assert!(kept <= MAX_SCAN_FRAMES * MAX_UR_MIX);
+        // One frame more and the scan is over, its lists let go.
+        assert!(matches!(
+            scan.push(&frame(seq + 1)),
+            Err(CoreError::TooManyFrames(10_001))
+        ));
+        assert!(matches!(scan.fold, Fold::Over));
+    }
+
+    /// A camera that misses two frames in three needs the mixed parts
+    /// of a fountain code to read it, and still reads it with the parts
+    /// that mix too many fragments set aside.
+    #[test]
+    fn a_camera_missing_frames_reads_a_long_code_without_the_widest_parts() {
+        let text: String = (0..4_000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&Value::Bytes(text.clone().into_bytes()), &mut cbor).unwrap();
+        let mut encoder = ur::ur::Encoder::new(&cbor, 10, "bytes").unwrap();
+        let total = encoder.fragment_count() as u32;
+        assert!(total > 400);
+        let mut scan = QrScan::new();
+        let mut draw = Draw(0x0bad_cafe);
+        let mut set_aside = 0;
+        let progress = loop {
+            let frame = encoder.next_part().unwrap();
+            if draw.below(3) != 0 {
+                continue;
+            }
+            if ur_part(&frame).unwrap().mixes() > MAX_UR_MIX {
+                set_aside += 1;
+            }
+            let progress = scan.push(&frame).unwrap();
+            if progress.complete {
+                break progress;
+            }
+        };
+        assert!(set_aside > 0);
+        assert!(scan.frames() < scan_frame_limit(total));
+        assert_eq!(progress.text.as_deref(), Some(text.as_str()));
+    }
+
+    /// A part numbered 0, or whose count is none, past the bound or not
+    /// its header's, never reaches the crate's draw, which would
+    /// underflow or panic on it; the scan goes on.
+    #[test]
+    fn a_part_numbered_zero_or_miscounted_is_set_aside() {
+        for (seq, count) in [(0, 10), (1, 0), (1, 11), (11, MAX_UR_PARTS + 1)] {
+            let frame = fountain_frame("bytes", (1, 10), seq, count, 7);
+            assert!(ur_part(&frame).is_none(), "{seq} of {count}");
+        }
+        assert!(ur_part(&fountain_frame("bytes", (1, 10), 1, 10, 7)).is_some());
+        let mut scan = QrScan::new();
+        let first = scan
+            .push(&fountain_frame("bytes", (1, 10), 1, 10, 7))
+            .unwrap();
+        assert_eq!(first.received, 1);
+        for (seq, count) in [(0, 10), (2, 0), (2, 11)] {
+            let progress = scan
+                .push(&fountain_frame("bytes", (2, 10), seq, count, 7))
+                .unwrap();
+            assert_eq!(progress.received, 1);
+        }
+        assert_eq!(mixed(&scan), 1);
+    }
+
+    /// A code of a type Gerfaut does not read is refused at its first
+    /// frame, and each frame of it again on a fresh scan: no collection
+    /// ever starts, so the screens keep the reason up.
+    #[test]
+    fn a_code_of_a_type_gerfaut_does_not_read_is_refused_at_once() {
+        let scans = QrScans::default();
+        let unknown: Vec<String> = bbqr_frames(&format!("wpkh({TPUB}/<0;1>/*)"), 3)
+            .iter()
+            .map(|frame| frame.replacen("B$ZU", "B$ZX", 1))
+            .collect();
+        let encoded: Vec<String> = bbqr_frames(&format!("wpkh({TPUB}/<0;1>/*)"), 3)
+            .iter()
+            .map(|frame| frame.replacen("B$ZU", "B$QU", 1))
+            .collect();
+        let mut seed = ur::ur::Encoder::new(&[7; 120], 10, "crypto-seed").unwrap();
+        let seed: Vec<String> = (0..30).map(|_| seed.next_part().unwrap()).collect();
+        for (frames, words) in [
+            (
+                &unknown,
+                "This QR code holds an executable file, which Gerfaut does not read. \
+                 Show the code this screen asks for instead, such as a wallet export or a \
+                 signed transaction.",
+            ),
+            (
+                &encoded,
+                "This BBQr code is encoded in a way Gerfaut does not read. \
+                 Show it from the wallet as a UR or as plain text instead.",
+            ),
+            (
+                &seed,
+                "This QR code holds a crypto-seed record, which Gerfaut does not read. \
+                 Show the code this screen asks for instead, such as a wallet export or a \
+                 signed transaction.",
+            ),
+        ] {
+            for frame in frames {
+                let id = scans.open();
+                let refused = scans.push(id, frame).unwrap_err().to_string();
+                assert_eq!(refused, words);
+                assert!(same(
+                    &assemble(std::slice::from_ref(frame)),
+                    &scans.push(id, frame)
+                ));
+                scans.close(id);
+            }
+        }
+    }
+
+    /// A UR whose message, once it came together, Gerfaut refuses is
+    /// refused again on sight, part after part of its fountain, by any
+    /// scan not yet started and by the same words; a scan on its way to
+    /// another code passes over its parts. The last few such codes are
+    /// kept, and no refusal that is about no one code.
+    #[test]
+    fn a_ur_refused_whole_is_refused_on_sight() {
+        let scans = QrScans::default();
+        // A descriptor with a private key in it.
+        let Value::Tag(_, key) = hdkey(None) else {
+            unreachable!()
+        };
+        let Value::Map(mut entries) = *key else {
+            unreachable!()
+        };
+        entries[0].1 = Value::Bool(true);
+        let mut private = Vec::new();
+        ciborium::into_writer(&tag(TAG_WPKH, tag(303, Value::Map(entries))), &mut private).unwrap();
+        let mut encoder = ur::ur::Encoder::new(&private, 10, "crypto-output").unwrap();
+        let id = scans.open();
+        let refused = loop {
+            match scans.push(id, &encoder.next_part().unwrap()) {
+                Ok(progress) => assert!(!progress.complete),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(refused, CoreError::PrivateMaterialRejected));
+        let fresh = scans.open();
+        for _ in 0..30 {
+            let frame = encoder.next_part().unwrap();
+            assert!(matches!(
+                scans.push(fresh, &frame),
+                Err(CoreError::PrivateMaterialRejected)
+            ));
+            assert!(matches!(
+                scans.push(id, &frame),
+                Err(CoreError::PrivateMaterialRejected)
+            ));
+        }
+        // Another code is read, the refused one in front of the camera
+        // with it.
+        let mut public = Vec::new();
+        ciborium::into_writer(&tag(TAG_WPKH, hdkey(None)), &mut public).unwrap();
+        let readable = ur_parts("crypto-output", &public, 40, 30);
+        let first = scans.push(fresh, &readable[0]).unwrap();
+        assert!(!first.complete);
+        let passed = scans.push(fresh, &encoder.next_part().unwrap()).unwrap();
+        assert_eq!(passed.received, first.received);
+        let mut done = false;
+        for frame in &readable[1..] {
+            if scans.push(fresh, frame).unwrap().complete {
+                done = true;
+                break;
+            }
+        }
+        assert!(done);
+
+        // The last few are kept: the first goes once four more are.
+        for byte in 0..MAX_REFUSED_CODES as u8 {
+            let mut cbor = Vec::new();
+            ciborium::into_writer(&Value::Bytes(vec![0xff, byte, 0xfe]), &mut cbor).unwrap();
+            let mut encoder = ur::ur::Encoder::new(&cbor, 2, "bytes").unwrap();
+            let id = scans.open();
+            let refused = loop {
+                if let Err(e) = scans.push(id, &encoder.next_part().unwrap()) {
+                    break e.to_string();
+                }
+            };
+            assert!(
+                refused.starts_with("This UR code came through"),
+                "{refused}"
+            );
+            let id = scans.open();
+            assert!(scans.push(id, &encoder.next_part().unwrap()).is_err());
+        }
+        let id = scans.open();
+        assert!(scans.push(id, &encoder.next_part().unwrap()).is_ok());
+    }
+
+    /// A BBQr refused once together is not remembered: its parts carry
+    /// no checksum, and the parts of two codes with the same header, or
+    /// a part misread, would get the refusal tied to the right code.
+    #[test]
+    fn a_bbqr_refused_once_together_is_read_again() {
+        let scans = QrScans::default();
+        let a = bbqr_frames(&format!("wpkh({TPUB}/<0;1>/*)"), 3);
+        let b = bbqr_frames(&format!("pkh({TPUB}/<0;1>/*)"), 3);
+        assert_eq!(a[0][..8], b[0][..8]);
+        let id = scans.open();
+        assert!(scans.push(id, &a[0]).is_ok());
+        assert!(scans.push(id, &b[1]).is_ok());
+        assert!(scans.push(id, &a[2]).is_err());
+        let fresh = scans.open();
+        assert!(!scans.push(fresh, &a[0]).unwrap().complete);
+        assert!(!scans.push(fresh, &a[1]).unwrap().complete);
+        assert!(scans.push(fresh, &a[2]).unwrap().complete);
+    }
+    /// Every refusal a scan can show is a sentence for the person
+    /// holding the camera: what Gerfaut saw, and what to do.
+    #[test]
+    fn a_scan_refusal_says_what_was_seen_and_what_to_do() {
+        let refusal = |frames: &[String]| assemble(frames).unwrap_err().to_string();
+        let damaged = "Part of this QR code could not be read. Hold the camera steady on the code.";
+        for frame in [
+            "ur:bytes/x-y/z",
+            "UR:",
+            "ur:bytes/1-0/lpad",
+            "ur:a\u{202e}b/1-3/lpad",
+            "B$ZU0000AAAA",
+            "B$ZU0201\u{e9}",
+        ] {
+            assert_eq!(refusal(&[frame.to_owned()]), damaged, "{frame}");
+        }
+        assert_eq!(
+            refusal(&[encode_ur("crypto-output", &Value::Bytes(vec![1]))]),
+            "This crypto-output code came through, but what it holds is damaged or in a \
+             form Gerfaut does not read. Export it again from the wallet."
+        );
+        assert_eq!(
+            refusal(&["B$2U0100!!!!".to_owned()]),
+            "This BBQr code came through, but what it holds is damaged or in a form \
+             Gerfaut does not read. Export it again from the wallet."
+        );
+        let a = bbqr_frames(&format!("wpkh({TPUB}/<0;1>/*)"), 3);
+        let b = bbqr_frames(&format!("pkh({TPUB}/<0;1>/*)"), 3);
+        assert_eq!(
+            refusal(&[a[0].clone(), b[0].clone()]),
+            "Two different QR codes were in view at once. Show one code at a time."
+        );
+        assert_eq!(
+            crate::input::parse_input(&a[0]).unwrap_err().to_string(),
+            "This is part 1 of a 3-part QR code. Scan the whole code with the camera instead."
+        );
+        let scans = QrScans::default();
+        assert_eq!(
+            scans.push(7, &a[0]).unwrap_err().to_string(),
+            "This scan was closed. Open the scanner again."
+        );
+        // Pasted or read from a file, a damaged envelope is told about
+        // the text: there is no camera to hold steady.
+        let pasted = "This text starts like a QR code but is cut short or damaged. \
+                      Paste or open it again in full, or scan the code with the camera.";
+        for text in ["ur:bytes/x-y/z", "B$ZU0000AAAA"] {
+            assert_eq!(
+                crate::input::parse_input(text).unwrap_err().to_string(),
+                pasted,
+                "{text}"
+            );
+            assert_eq!(
+                crate::broadcast::decode_transaction(text)
+                    .unwrap_err()
+                    .to_string(),
+                pasted,
+                "{text}"
+            );
+            assert_eq!(refusal(&[text.to_owned()]), damaged, "{text}");
+        }
+        // The code stays the one the apps read: invalid_input.
+        assert_eq!(
+            assemble(&[a[0].clone(), b[0].clone()]).unwrap_err().code(),
+            crate::error::ErrorCode::InvalidInput
+        );
+    }
+
+    /// The paste path knows a damaged frame by its kind, not its words:
+    /// a damaged frame told otherwise is still told about the text.
+    #[test]
+    fn a_damaged_paste_is_known_by_its_kind() {
+        let reworded = CoreError::InvalidInput {
+            kind: DAMAGED_KIND,
+            detail: "Some other words, one day.".to_owned(),
+        };
+        assert_eq!(told_of_paste(reworded).to_string(), DAMAGED_PASTE);
+        // Every damaged frame comes under that kind, and nothing else.
+        assert!(matches!(
+            assemble(&["ur:bytes/x-y/z".to_owned()]),
+            Err(CoreError::InvalidInput {
+                kind: DAMAGED_KIND,
+                ..
+            })
+        ));
+        let other = qr_error("Two different QR codes were in view at once.");
+        assert_eq!(
+            told_of_paste(other).to_string(),
+            "Two different QR codes were in view at once."
+        );
+        // Under the code the apps read, a sentence as it is.
+        assert_eq!(
+            damaged_frame().code(),
+            crate::error::ErrorCode::InvalidInput
+        );
+        assert_eq!(damaged_frame().to_string(), DAMAGED_FRAME);
+    }
+
+    /// A part of an animated code pasted as text is named for what it
+    /// is, at the import as on the broadcast page.
+    #[test]
+    fn a_pasted_part_says_which_part_it_is() {
+        let bbqr = bbqr_frames(&format!("wpkh({TPUB}/<0;1>/*)"), 3);
+        let mut descriptor = Vec::new();
+        ciborium::into_writer(&tag(TAG_WPKH, hdkey(None)), &mut descriptor).unwrap();
+        let ur = ur_parts("crypto-output", &descriptor, 20, 30);
+        let total = ur[0]
+            .split('/')
+            .nth(1)
+            .unwrap()
+            .split_once('-')
+            .unwrap()
+            .1
+            .to_owned();
+        let named = |part: &str, of: &str| {
+            format!(
+                "This is part {part} of a {of}-part QR code. Scan the whole code with the camera instead."
+            )
+        };
+        for (text, words) in [
+            (&bbqr[1], named("2", "3")),
+            (&bbqr[2], named("3", "3")),
+            (&ur[1], named("2", &total)),
+            (
+                &ur[25],
+                format!(
+                    "This is one frame of a {total}-part animated QR code. Scan the whole code with the camera instead."
+                ),
+            ),
+        ] {
+            assert_eq!(
+                crate::input::parse_input(text).unwrap_err().to_string(),
+                words
+            );
+            assert_eq!(
+                crate::broadcast::decode_transaction(text)
+                    .unwrap_err()
+                    .to_string(),
+                words
+            );
         }
     }
 }

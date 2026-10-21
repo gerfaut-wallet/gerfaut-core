@@ -152,13 +152,16 @@ pub enum CoreError {
 
     /// The input is a recognized format but invalid in itself
     /// (bad checksum, malformed derivation path, ...).
-    #[error("invalid {kind}: {detail}")]
+    ///
+    /// A QR code refused (`kind` "qr", or "qr frame" for a damaged frame)
+    /// reads as its detail alone: a sentence the apps show as it is.
+    #[error("{}", invalid_input(kind, detail))]
     InvalidInput { kind: &'static str, detail: String },
 
     /// A multi-part UR announces more parts than the 5,000 Gerfaut
     /// reads, the count it gives. Refused on the count alone, before
     /// any part is decoded.
-    #[error("invalid qr: this QR code announces {0} parts, more than Gerfaut reads")]
+    #[error("This QR code announces {0} parts, more than Gerfaut reads.")]
     TooManyParts(u32),
 
     /// A scan brought more distinct frames than one code of its size
@@ -166,9 +169,7 @@ pub enum CoreError {
     /// code that never ends, or frames of several codes. Under the same
     /// code as [`CoreError::TooManyParts`]: to the person, the code has
     /// more than Gerfaut reads.
-    #[error(
-        "invalid qr: {0} frames scanned without the code coming together, more than Gerfaut reads"
-    )]
+    #[error("{0} frames were scanned without the code coming together, more than Gerfaut reads.")]
     TooManyFrames(u32),
 
     /// The input belongs to a different network than the requested one.
@@ -229,6 +230,18 @@ pub enum CoreError {
     /// Internal invariant violation. Indicates a bug in this crate.
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+/// What an [`CoreError::InvalidInput`] says: the kind of input, then
+/// what is wrong with it, except for a QR code (`qr`, and `qr frame`
+/// for a damaged frame), whose refusal is written whole for the person
+/// scanning it.
+fn invalid_input(kind: &str, detail: &str) -> String {
+    if kind == "qr" || kind == crate::input::qr::DAMAGED_KIND {
+        detail.to_owned()
+    } else {
+        format!("invalid {kind}: {detail}")
+    }
 }
 
 impl CoreError {

@@ -452,12 +452,9 @@ pub struct DecodedInput {
 pub fn decode_transaction(input: &str) -> CoreResult<DecodedTx> {
     let mut text = squeezed(input)?;
     if crate::input::qr::is_envelope(&text) {
-        let progress = crate::input::qr::assemble(std::slice::from_ref(&text))?;
+        let progress = crate::input::qr::open_pasted(&text)?;
         let Some(inner) = progress.text else {
-            return Err(tx_error(format!(
-                "this is part 1 of a {}-part QR code: scan it with the camera",
-                progress.total
-            )));
+            return Err(crate::input::qr::pasted_part(&text, progress.total));
         };
         // Read the way the text around it was, whitespace taken out, so
         // that an envelope split by a space is seen for one.

@@ -1743,6 +1743,7 @@ dependencies = [
  "futures-util",
  "libc",
  "log",
+ "minicbor",
  "rand 0.10.3",
  "reqwest",
  "rustls",
