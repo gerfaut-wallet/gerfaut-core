@@ -84,7 +84,7 @@ const DAMAGED_FRAME: &str =
     "Part of this QR code could not be read. Hold the camera steady on the code.";
 
 /// The same, for a text pasted or opened from a file: no camera there.
-const DAMAGED_PASTE: &str = "This text starts like a QR code but is cut short or damaged. Paste it again in full, or scan the code with the camera.";
+const DAMAGED_PASTE: &str = "This text starts like a QR code but is cut short or damaged. Paste or open it again in full, or scan the code with the camera.";
 
 fn damaged_frame() -> CoreError {
     qr_error(DAMAGED_FRAME)
@@ -2639,7 +2639,7 @@ mod tests {
         // Pasted or read from a file, a damaged envelope is told about
         // the text: there is no camera to hold steady.
         let pasted = "This text starts like a QR code but is cut short or damaged. \
-                      Paste it again in full, or scan the code with the camera.";
+                      Paste or open it again in full, or scan the code with the camera.";
         for text in ["ur:bytes/x-y/z", "B$ZU0000AAAA"] {
             assert_eq!(
                 crate::input::parse_input(text).unwrap_err().to_string(),
