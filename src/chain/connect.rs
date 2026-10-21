@@ -341,7 +341,8 @@ fn typed_host(text: &str) -> &str {
 /// around an IPv6 literal. Typed with a scheme and a port of its own,
 /// `ssl://words:50002` reaches the core as
 /// `ssl://[ssl://words:50002]:50002`. Every bracket and scheme in front
-/// is peeled off before the host is cut out.
+/// is peeled off before the host is cut out, and a closing bracket
+/// after it.
 fn typed_words(text: &str) -> &str {
     let mut rest = text.trim();
     loop {
@@ -358,7 +359,7 @@ fn typed_words(text: &str) -> &str {
             _ => unbracketed,
         };
         if next == rest {
-            return typed_host(rest);
+            return typed_host(rest).trim_end_matches(']');
         }
         rest = next;
     }
@@ -897,6 +898,7 @@ mod tests {
                 // The same from the desktop, which brackets a host that
                 // holds a colon, as it would an IPv6 literal.
                 format!("ssl://[{secret}:50002]:50002"),
+                format!("ssl://[{secret}]:50002"),
                 // Typed with a scheme of its own, from either app.
                 format!("ssl://[ssl://{secret}:50002]:50002"),
                 format!("ssl://tcp://{secret}:50001:50002"),

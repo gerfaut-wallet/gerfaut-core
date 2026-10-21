@@ -366,12 +366,15 @@ pub async fn status(settings: &TorSettings) -> TorStatus {
 
 /// Checks a proxy address the user typed, `host:port` with the port in
 /// range, and returns it trimmed. A typo fails here, at the settings
-/// screen, not at the next sync.
+/// screen, not at the next sync. A private key or a seed phrase typed
+/// in its place is refused as private material, as in a server address,
+/// and a space unquoted: stored, the words would go to the resolver.
 pub fn parse_socks_address(value: &str) -> CoreResult<String> {
     let invalid = |detail: &str| CoreError::InvalidInput {
         kind: "tor proxy",
         detail: detail.to_owned(),
     };
+    super::connect::refuse_typed_secret(value, "tor proxy")?;
     let value = value.trim();
     let (host, port) = value
         .rsplit_once(':')
@@ -711,6 +714,7 @@ mod tests {
             "host:0",
             "host:65536",
             "host:tor",
+            "127.0.0.1 :9050",
         ] {
             assert!(
                 matches!(
@@ -723,6 +727,33 @@ mod tests {
                 "{wrong:?} must be refused"
             );
         }
+    }
+
+    /// A seed phrase or a private key typed into the proxy field, port
+    /// and all, is refused as private material, and none is quoted.
+    #[test]
+    fn a_secret_typed_as_a_proxy_is_refused_unquoted() {
+        let seed = ["abandon"; 11].join(" ") + " about";
+        let tprv = "tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L";
+        let wif = "5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ";
+        for text in [
+            format!("{seed}:9050"),
+            format!("[{seed}]:9050"),
+            format!("socks5h://{seed}:9050"),
+            format!("{}:9050", seed.replace(' ', "%20")),
+            format!("{tprv}:9050"),
+            format!("{wif}:9150"),
+        ] {
+            let error = parse_socks_address(&text).unwrap_err();
+            assert!(
+                matches!(error, CoreError::PrivateMaterialRejected),
+                "{text}: {error}"
+            );
+        }
+        let near = format!("{}:9050", ["abandon"; 11].join(" "));
+        let error = parse_socks_address(&near).unwrap_err().to_string();
+        assert!(error.contains("has a space in it"), "{error}");
+        assert!(!error.contains("abandon"), "{error}");
     }
 
     #[test]

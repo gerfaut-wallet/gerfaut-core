@@ -477,6 +477,19 @@ async fn tor_settings_are_checked_and_persisted() {
         }
     ));
 
+    // So is a seed phrase typed in its place, as private material.
+    let error = manager
+        .set_tor_settings(TorSettings {
+            mode: TorMode::System,
+            socks_proxy: Some(format!("{} about:9050", ["abandon"; 11].join(" "))),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, CoreError::PrivateMaterialRejected),
+        "{error}"
+    );
+
     drop(manager);
     let manager = WalletManager::open(dir.path(), key()).unwrap();
     assert_eq!(
