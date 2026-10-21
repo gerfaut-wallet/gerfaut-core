@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-21
+
 The first release: the Rust library both Gerfaut apps are built on. It does everything a watch-only wallet needs and nothing with keys: there is no code to generate a key, handle a seed or sign a transaction.
 
 ### Added
