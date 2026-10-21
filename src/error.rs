@@ -233,10 +233,11 @@ pub enum CoreError {
 }
 
 /// What an [`CoreError::InvalidInput`] says: the kind of input, then
-/// what is wrong with it, except for a QR code, whose refusal is
-/// written whole for the person scanning it.
+/// what is wrong with it, except for a QR code (`qr`, and `qr frame`
+/// for a damaged frame), whose refusal is written whole for the person
+/// scanning it.
 fn invalid_input(kind: &str, detail: &str) -> String {
-    if kind == "qr" {
+    if kind == "qr" || kind == crate::input::qr::DAMAGED_KIND {
         detail.to_owned()
     } else {
         format!("invalid {kind}: {detail}")

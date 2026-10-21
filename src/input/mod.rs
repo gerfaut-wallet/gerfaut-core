@@ -358,12 +358,7 @@ fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
             ..
         } = qr::open_pasted(trimmed)?;
         let Some(text) = text else {
-            return Err(CoreError::InvalidInput {
-                kind: "qr",
-                detail: format!(
-                    "This is one part of a {total}-part QR code. Scan it with the camera instead."
-                ),
-            });
+            return Err(qr::pasted_part(trimmed, total));
         };
         // A BSMS record in an envelope is checked as one pasted bare.
         let mut parsed = match qr::opened_once(text)? {

@@ -86,19 +86,59 @@ const DAMAGED_FRAME: &str =
 /// The same, for a text pasted or opened from a file: no camera there.
 const DAMAGED_PASTE: &str = "This text starts like a QR code but is cut short or damaged. Paste or open it again in full, or scan the code with the camera.";
 
+/// The kind of a refusal for a damaged frame: a sort of its own, which
+/// the paste path tells apart by kind, whatever the words say.
+pub(crate) const DAMAGED_KIND: &str = "qr frame";
+
 fn damaged_frame() -> CoreError {
-    qr_error(DAMAGED_FRAME)
+    CoreError::InvalidInput {
+        kind: DAMAGED_KIND,
+        detail: DAMAGED_FRAME.to_owned(),
+    }
 }
 
 /// Opens a QR envelope pasted as text, or read from a file: what
 /// [`assemble`] says of it as a single frame, but for a damaged one,
 /// which is told about the text rather than a camera.
 pub(crate) fn open_pasted(text: &str) -> CoreResult<QrProgress> {
-    assemble(&[text.to_owned()]).map_err(|e| match e {
-        CoreError::InvalidInput { kind: "qr", detail } if detail == DAMAGED_FRAME => {
-            qr_error(DAMAGED_PASTE)
-        }
+    assemble(&[text.to_owned()]).map_err(told_of_paste)
+}
+
+/// A refusal as a paste gets it: a damaged frame, known by its kind,
+/// is told about the text; anything else stays as it is.
+fn told_of_paste(error: CoreError) -> CoreError {
+    match error {
+        CoreError::InvalidInput {
+            kind: DAMAGED_KIND, ..
+        } => CoreError::InvalidInput {
+            kind: DAMAGED_KIND,
+            detail: DAMAGED_PASTE.to_owned(),
+        },
         other => other,
+    }
+}
+
+/// The refusal of one frame of a multi-part code pasted as text, with
+/// the `total` parts it announces: which part it is, when it says, and
+/// that the whole code is scanned instead.
+pub(crate) fn pasted_part(text: &str, total: u32) -> CoreError {
+    let text = text.trim();
+    let part = if is_ur(text) {
+        text.split('/')
+            .nth(1)
+            .and_then(|indices| indices.split_once('-'))
+            .and_then(|(seq, _)| seq.parse::<u32>().ok())
+    } else {
+        bbqr_header(text).ok().map(|(header, _)| header.index + 1)
+    };
+    qr_error(match part {
+        Some(part) if (1..=total).contains(&part) => format!(
+            "This is part {part} of a {total}-part QR code. Scan the whole code with the camera instead."
+        ),
+        // A mixed part of a fountain code is no one part of it.
+        _ => format!(
+            "This is one frame of a {total}-part animated QR code. Scan the whole code with the camera instead."
+        ),
     })
 }
 
@@ -1694,7 +1734,10 @@ mod tests {
         // A count of none is no count at all, not one too large.
         assert!(matches!(
             assemble(&[frame_announcing("bytes", 1, 0)]),
-            Err(CoreError::InvalidInput { kind: "qr", .. })
+            Err(CoreError::InvalidInput {
+                kind: DAMAGED_KIND,
+                ..
+            })
         ));
         let progress = assemble(&[frame_announcing("bytes", 1, MAX_UR_PARTS)]).unwrap();
         assert!(!progress.complete);
@@ -2009,7 +2052,13 @@ mod tests {
             assert!(is_envelope(text), "{text:?}");
             let error = assemble(&[text.to_owned()]).unwrap_err();
             assert!(
-                matches!(error, CoreError::InvalidInput { kind: "qr", .. }),
+                matches!(
+                    error,
+                    CoreError::InvalidInput {
+                        kind: "qr" | DAMAGED_KIND,
+                        ..
+                    }
+                ),
                 "{text:?}: {error}"
             );
             assert!(crate::input::parse_input(text).is_err(), "{text:?}");
@@ -2276,7 +2325,10 @@ mod tests {
         let long = format!("B$ZU0300{}", "A".repeat(MAX_FRAME_LEN));
         assert!(matches!(
             scans.push(id, &long),
-            Err(CoreError::InvalidInput { kind: "qr", .. })
+            Err(CoreError::InvalidInput {
+                kind: DAMAGED_KIND,
+                ..
+            })
         ));
 
         // So is a scan past its bytes, as a code larger than Gerfaut
@@ -2629,7 +2681,7 @@ mod tests {
         );
         assert_eq!(
             crate::input::parse_input(&a[0]).unwrap_err().to_string(),
-            "This is one part of a 3-part QR code. Scan it with the camera instead."
+            "This is part 1 of a 3-part QR code. Scan the whole code with the camera instead."
         );
         let scans = QrScans::default();
         assert_eq!(
@@ -2660,5 +2712,80 @@ mod tests {
             assemble(&[a[0].clone(), b[0].clone()]).unwrap_err().code(),
             crate::error::ErrorCode::InvalidInput
         );
+    }
+
+    /// The paste path knows a damaged frame by its kind, not its words:
+    /// a damaged frame told otherwise is still told about the text.
+    #[test]
+    fn a_damaged_paste_is_known_by_its_kind() {
+        let reworded = CoreError::InvalidInput {
+            kind: DAMAGED_KIND,
+            detail: "Some other words, one day.".to_owned(),
+        };
+        assert_eq!(told_of_paste(reworded).to_string(), DAMAGED_PASTE);
+        // Every damaged frame comes under that kind, and nothing else.
+        assert!(matches!(
+            assemble(&["ur:bytes/x-y/z".to_owned()]),
+            Err(CoreError::InvalidInput {
+                kind: DAMAGED_KIND,
+                ..
+            })
+        ));
+        let other = qr_error("Two different QR codes were in view at once.");
+        assert_eq!(
+            told_of_paste(other).to_string(),
+            "Two different QR codes were in view at once."
+        );
+        // Under the code the apps read, a sentence as it is.
+        assert_eq!(
+            damaged_frame().code(),
+            crate::error::ErrorCode::InvalidInput
+        );
+        assert_eq!(damaged_frame().to_string(), DAMAGED_FRAME);
+    }
+
+    /// A part of an animated code pasted as text is named for what it
+    /// is, at the import as on the broadcast page.
+    #[test]
+    fn a_pasted_part_says_which_part_it_is() {
+        let bbqr = bbqr_frames(&format!("wpkh({TPUB}/<0;1>/*)"), 3);
+        let mut descriptor = Vec::new();
+        ciborium::into_writer(&tag(TAG_WPKH, hdkey(None)), &mut descriptor).unwrap();
+        let ur = ur_parts("crypto-output", &descriptor, 20, 30);
+        let total = ur[0]
+            .split('/')
+            .nth(1)
+            .unwrap()
+            .split_once('-')
+            .unwrap()
+            .1
+            .to_owned();
+        let named = |part: &str, of: &str| {
+            format!(
+                "This is part {part} of a {of}-part QR code. Scan the whole code with the camera instead."
+            )
+        };
+        for (text, words) in [
+            (&bbqr[1], named("2", "3")),
+            (&bbqr[2], named("3", "3")),
+            (&ur[1], named("2", &total)),
+            (
+                &ur[25],
+                format!(
+                    "This is one frame of a {total}-part animated QR code. Scan the whole code with the camera instead."
+                ),
+            ),
+        ] {
+            assert_eq!(
+                crate::input::parse_input(text).unwrap_err().to_string(),
+                words
+            );
+            assert_eq!(
+                crate::broadcast::decode_transaction(text)
+                    .unwrap_err()
+                    .to_string(),
+                words
+            );
+        }
     }
 }
