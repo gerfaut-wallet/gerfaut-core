@@ -310,7 +310,7 @@ pub struct PriceQuote {
 /// `socks5h` and not `socks5`: the proxy resolves the name, so a
 /// `.onion` host never reaches this machine's DNS resolver.
 pub(crate) fn client_through(proxy: Option<&str>) -> CoreResult<reqwest::Client> {
-    let mut builder = crate::chain::http_client()
+    let builder = crate::chain::http_client()
         .timeout(std::time::Duration::from_secs(if proxy.is_some() {
             60
         } else {
@@ -318,13 +318,8 @@ pub(crate) fn client_through(proxy: Option<&str>) -> CoreResult<reqwest::Client>
         }))
         .user_agent("gerfaut")
         .redirect(crate::chain::redirects());
-    if let Some(proxy) = proxy {
-        builder = builder.proxy(
-            reqwest::Proxy::all(format!("socks5h://{proxy}"))
-                .map_err(|e| CoreError::Internal(format!("tor proxy: {e}")))?,
-        );
-    }
-    builder
+    crate::chain::route(builder, proxy)
+        .map_err(|e| CoreError::Internal(format!("tor proxy: {e}")))?
         .build()
         .map_err(|e| CoreError::Internal(format!("http client: {e}")))
 }

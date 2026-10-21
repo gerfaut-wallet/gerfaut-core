@@ -566,7 +566,8 @@ pub(crate) fn inspect(
     }
 }
 
-/// Connects to the first address the host resolves to that answers.
+/// Connects to whichever address the host resolves to answers first,
+/// the opening as a whole within `timeout` ([`super::dial`]).
 pub(crate) fn tcp_connect(
     host: &str,
     port: u16,
@@ -583,8 +584,9 @@ pub(crate) fn tcp_connect(
         .to_socket_addrs()
         .map_err(|e| ConnectError::Unreachable(format!("{host} does not resolve: {e}")))?;
     let mut last = None;
-    for address in addresses {
-        match TcpStream::connect_timeout(&address, timeout) {
+    let addresses: Vec<_> = addresses.collect();
+    if !addresses.is_empty() {
+        match super::dial::connect(addresses, timeout) {
             Ok(socket) => {
                 socket
                     .set_read_timeout(Some(timeout))

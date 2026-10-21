@@ -6,6 +6,7 @@
 //! (`redirects`).
 
 pub mod connect;
+mod dial;
 pub(crate) mod electrum;
 pub(crate) mod esplora;
 mod fault;
@@ -259,6 +260,29 @@ pub(crate) fn http_client() -> reqwest::ClientBuilder {
         }
         Err(_) => builder.tls_certs_only(Vec::new()),
     }
+}
+
+/// How long a direct connection of an HTTP client of the core may take
+/// to open, its TCP and TLS handshakes together. reqwest gives each
+/// address a name resolves to its share of it and then tries the next,
+/// so an address that ignores the connection costs its share. Without
+/// it, that address holds the connection until the request's own time
+/// is up, and the request fails though the other addresses answer.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The route of a request to a public service: through the Tor proxy
+/// when there is one, `socks5h` so the proxy resolves the name and an
+/// onion never reaches this machine's resolver, with the request's
+/// whole time for the circuit; directly otherwise, within
+/// [`CONNECT_TIMEOUT`].
+pub(crate) fn route(
+    builder: reqwest::ClientBuilder,
+    proxy: Option<&str>,
+) -> reqwest::Result<reqwest::ClientBuilder> {
+    Ok(match proxy {
+        Some(proxy) => builder.proxy(reqwest::Proxy::all(format!("socks5h://{proxy}"))?),
+        None => builder.connect_timeout(CONNECT_TIMEOUT),
+    })
 }
 
 /// Whether a client sends its requests through a proxy of any kind.

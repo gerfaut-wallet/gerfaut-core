@@ -391,16 +391,12 @@ fn budget(proxy: Option<&str>) -> std::time::Duration {
 /// The client the check goes out with: through the Tor proxy when there
 /// is one, and through no other proxy at all.
 fn client(proxy: Option<&str>) -> CoreResult<reqwest::Client> {
-    let mut builder = crate::chain::http_client()
+    let builder = crate::chain::http_client()
         .timeout(budget(proxy))
         .user_agent("gerfaut")
         .redirect(crate::chain::redirects());
-    if let Some(proxy) = proxy {
-        let proxy = reqwest::Proxy::all(format!("socks5h://{proxy}"))
-            .map_err(|e| CoreError::Tor(format!("invalid Tor proxy address: {e}")))?;
-        builder = builder.proxy(proxy);
-    }
-    builder
+    crate::chain::route(builder, proxy)
+        .map_err(|e| CoreError::Tor(format!("invalid Tor proxy address: {e}")))?
         .build()
         .map_err(|e| CoreError::Internal(format!("http client: {e}")))
 }
