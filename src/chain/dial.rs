@@ -88,8 +88,11 @@ impl Flights {
         self.0.len() - 1
     }
 
-    fn end(&mut self, id: usize) {
+    /// Whether the attempt that ended was the last one started: its
+    /// failure, and only its, starts the next at once.
+    fn end(&mut self, id: usize) -> bool {
         self.0[id] = None;
+        id + 1 == self.0.len()
     }
 
     fn alive(&self) -> usize {
@@ -191,12 +194,14 @@ fn race<T: Send + 'static>(
         let wake = opening.map_or(timeout, |at| at.min(timeout));
         // Past `wake`: time for the next address, or the deadline.
         if let Ok((id, result)) = results.recv_timeout(wake.saturating_sub(now)) {
-            flights.end(id);
+            let latest = flights.end(id);
             match result {
                 Ok(connected) => return Ok(connected),
                 Err(error) => {
                     last = Some(error);
-                    next = start.elapsed();
+                    if latest {
+                        next = start.elapsed();
+                    }
                 }
             }
         }
@@ -263,12 +268,14 @@ where
         let wake = opening.map_or(timeout, |at| at.min(timeout));
         tokio::select! {
             Some((id, result)) = running.next(), if !running.is_empty() => {
-                flights.end(id);
+                let latest = flights.end(id);
                 match result {
                     Ok(connected) => return Ok(connected),
                     Err(error) => {
                         last = Some(error);
-                        next = start.elapsed();
+                        if latest {
+                            next = start.elapsed();
+                        }
                     }
                 }
             }
@@ -305,6 +312,8 @@ mod tests {
         Refuses,
         /// Takes it after this long.
         Answers(Duration),
+        /// Turns it down after this long.
+        Fails(Duration),
     }
 
     /// What the attempts did: when each started, and how many were in
@@ -377,6 +386,10 @@ mod tests {
                         Err(timed_out())
                     }
                     Peer::Refuses => Err(io::ErrorKind::ConnectionRefused.into()),
+                    Peer::Fails(after) => {
+                        std::thread::sleep(after);
+                        Err(io::ErrorKind::HostUnreachable.into())
+                    }
                     Peer::Answers(after) => {
                         std::thread::sleep(after);
                         Ok(Connection(address, Arc::clone(&attempts)))
@@ -408,6 +421,10 @@ mod tests {
                         Err(timed_out())
                     }
                     Peer::Refuses => Err(io::ErrorKind::ConnectionRefused.into()),
+                    Peer::Fails(after) => {
+                        tokio::time::sleep(after).await;
+                        Err(io::ErrorKind::HostUnreachable.into())
+                    }
                     Peer::Answers(after) => {
                         tokio::time::sleep(after).await;
                         Ok(address)
@@ -553,7 +570,7 @@ mod tests {
     #[test]
     fn attempts_in_flight_are_bounded() {
         let peers: Vec<_> = (1..=9).map(|n| (v4(n), Peer::Silent)).collect();
-        let (connected, _, log) = dial(&peers, Duration::from_millis(1500));
+        let (connected, _, log) = dial(&peers, Duration::from_millis(1900));
         assert_eq!(connected.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(log.most.load(SeqCst), AT_ONCE);
         assert_eq!(log.order(), &[v4(1), v4(2), v4(3), v4(4), v4(5)]);
@@ -611,6 +628,18 @@ mod tests {
         assert!(took >= STALL && took < STALL * 2, "{took:?}");
     }
 
+    /// An earlier attempt that fails while a later one is still young
+    /// does not start the next at once beside it: only the failure of
+    /// the last attempt started does, as RFC 8305 has it.
+    #[tokio::test(start_paused = true)]
+    async fn only_the_last_attempt_failing_skips_the_stagger() {
+        let mut peers = vec![(v4(1), Peer::Fails(Duration::from_millis(400)))];
+        peers.extend((2..=4).map(|n| (v4(n), Peer::Silent)));
+        let (_, _, log) = dial_async(&peers, Duration::from_secs(1)).await;
+        let started: Vec<Duration> = log.started.lock().unwrap().iter().map(|s| s.1).collect();
+        assert_eq!(started, [Duration::ZERO, STAGGER, STAGGER * 2, STAGGER * 3]);
+    }
+
     #[test]
     fn a_place_opens_when_the_oldest_attempt_stalls() {
         let ms = Duration::from_millis;
@@ -648,7 +677,7 @@ mod tests {
     fn a_connection_that_loses_is_closed() {
         let log = Arc::new(Log::default());
         let attempts = Arc::clone(&log);
-        let slow = Duration::from_millis(600);
+        let slow = Duration::from_secs(2);
         let won = race(
             vec![v4(1), v4(2)],
             Duration::from_secs(5),
