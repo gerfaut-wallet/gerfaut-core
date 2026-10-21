@@ -22,9 +22,11 @@ embedded-tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:tor-config"]
 [dependencies]
 bdk_wallet = "3.2"
 # The blocking Electrum client a descriptor sync speaks through, over a
-# stream the core opens itself: the version and features `bdk_electrum`
-# brought, when it was kept only to reach this.
-electrum-client = { version = "0.25", default-features = false, features = ["proxy", "rustls-ring"] }
+# stream the core opens itself (`chain::tls`, `RawClient::from`). No TLS
+# feature: its own TLS would trust the authorities of `webpki-roots`
+# 0.25, which still holds roots since distrusted (RUSTSEC-2026-0381),
+# and no path of the core opens a connection through it.
+electrum-client = { version = "0.25", default-features = false, features = ["proxy"] }
 # `rustls-no-provider`: every client gets the core's own TLS, ring and
 # the authorities of `webpki-roots` (`chain::http_client`); `rustls`
 # would add aws-lc-rs as reqwest's default provider, for nothing.
@@ -38,7 +40,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # reqwest already pulls in, so nothing new is compiled.
 url = "2.5.8"
 # Direct, so Electrum connections can carry their own certificate
-# verifier; the same version and provider `electrum-client` pulls in.
+# verifier; the version and provider reqwest and tokio-rustls pull in.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"
 # The live watcher holds one connection open and waits on it, which the

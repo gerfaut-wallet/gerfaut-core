@@ -176,23 +176,17 @@ pub fn is_fingerprint(value: &str) -> bool {
             .all(|part| part.len() == 2 && part.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// The crypto provider this module, `electrum-client` and the embedded
+/// The crypto provider this module, the HTTP client and the embedded
 /// Tor client all use.
 ///
-/// It is ring, and it is installed rather than inferred. `rustls` can
-/// carry two backends at once, and it does here: `electrum-client`'s
-/// `rustls` feature turns on `rustls/default`, which pulls `aws-lc-rs`
-/// into the tree even under `use-rustls-ring`. With both compiled in,
-/// `rustls` has no single obvious default, and the first caller to
-/// install one decides for the whole process — which is this function.
-/// `aws-lc-rs` is therefore built and linked without ever being asked
-/// to do anything: it costs compile time and binary weight, and nothing
-/// else. The fix belongs upstream, in the feature list of
-/// `rust-electrum-client`.
+/// It is ring, and it is installed rather than inferred: `rustls` can
+/// carry two backends at once, and with both compiled in the first
+/// caller to install one decides for the whole process — which is this
+/// function. Only ring is in the tree today (`electrum-client` brought
+/// `aws-lc-rs` with its TLS feature, which the core no longer turns
+/// on), but a dependency that adds the other one must not change which
+/// serves.
 pub(crate) fn provider() -> Arc<CryptoProvider> {
-    // `electrum-client` installs the same ring provider the first time
-    // it opens a TLS connection; installing it here first is harmless
-    // and makes this module usable on its own.
     if CryptoProvider::get_default().is_none() {
         let _ = CryptoProvider::install_default(rustls::crypto::ring::default_provider());
     }
