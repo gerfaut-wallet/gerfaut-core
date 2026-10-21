@@ -32,11 +32,15 @@ use futures_util::stream::FuturesUnordered;
 pub(crate) const STAGGER: Duration = Duration::from_millis(250);
 
 /// The most attempts in flight at once. An address that ignores the
-/// connection keeps its place until the timeout, so this is also the
-/// number of silent addresses the opening gets past: five, one more
-/// than the four the previous one-after-the-other opening could get past
-/// within the ninety seconds of a call.
+/// connection keeps its place until the timeout, so the opening gets
+/// past one silent address fewer than this: four, as many as trying
+/// them one after the other, twenty seconds each, got past within the
+/// ninety seconds of a call.
 pub(crate) const AT_ONCE: usize = 5;
+
+/// The longest an opening is given, whatever the caller asks: a day
+/// keeps the deadline within what the clock can count.
+const LONGEST: Duration = Duration::from_secs(24 * 3600);
 
 /// The order the addresses are tried in: the resolver's, which already
 /// puts the preferred family first, with the two families alternating
@@ -93,7 +97,7 @@ fn race<T: Send + 'static>(
     attempt: impl Fn(SocketAddr, Duration) -> io::Result<T> + Send + Sync + 'static,
 ) -> io::Result<T> {
     let start = Instant::now();
-    let deadline = start.checked_add(timeout).unwrap_or(start);
+    let deadline = start + timeout.min(LONGEST);
     let attempt = Arc::new(attempt);
     let (sender, results) = mpsc::channel();
     let mut queue = ordered(addresses).into_iter().peekable();
@@ -118,7 +122,12 @@ fn race<T: Send + 'static>(
                     running += 1;
                     next = now + STAGGER;
                 }
-                Err(error) => last = Some(error),
+                // This device's shortage, not the server's silence.
+                Err(error) => {
+                    last = Some(io::Error::other(format!(
+                        "could not start a connection attempt: {error}"
+                    )))
+                }
             }
             continue;
         }
@@ -143,7 +152,7 @@ fn race<T: Send + 'static>(
             }
         }
     }
-    Err(if running > 0 {
+    Err(if running > 0 || queue.peek().is_some() {
         timed_out()
     } else {
         last.unwrap_or_else(nowhere)
@@ -179,7 +188,7 @@ where
 {
     use tokio::time::{Instant, sleep_until};
     let start = Instant::now();
-    let deadline = start.checked_add(timeout).unwrap_or(start);
+    let deadline = start + timeout.min(LONGEST);
     let mut queue = ordered(addresses).into_iter().peekable();
     let mut running = FuturesUnordered::new();
     let (mut next, mut last) = (start, None);
@@ -212,7 +221,7 @@ where
             () = sleep_until(deadline) => {}
         }
     }
-    Err(if running.is_empty() {
+    Err(if running.is_empty() && queue.peek().is_none() {
         last.unwrap_or_else(nowhere)
     } else {
         timed_out()
@@ -418,9 +427,10 @@ mod tests {
     #[test]
     fn a_refusal_moves_on_at_once() {
         let peers = [(v4(1), Peer::Refuses), (v4(2), ANSWER)];
-        let (connected, took, _) = dial(&peers, Duration::from_secs(20));
+        let (connected, _, log) = dial(&peers, Duration::from_secs(20));
         assert_eq!(connected.unwrap(), v4(2));
-        assert!(took < STAGGER, "{took:?}");
+        let second = log.started.lock().unwrap()[1].1;
+        assert!(second < STAGGER, "{second:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -440,7 +450,7 @@ mod tests {
             connected.unwrap_err().kind(),
             io::ErrorKind::ConnectionRefused
         );
-        assert!(took < STAGGER, "{took:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -548,6 +558,17 @@ mod tests {
         assert_eq!(connected.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
+    /// No time at all is a timeout, not an address missing; no limit
+    /// at all is a long one, not none.
+    #[test]
+    fn the_timeout_is_read_whatever_its_size() {
+        let (connected, _, log) = dial(&[(v4(1), ANSWER)], Duration::ZERO);
+        assert_eq!(connected.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(log.order().is_empty());
+        let (connected, _, _) = dial(&[(v4(1), ANSWER)], Duration::MAX);
+        assert_eq!(connected.unwrap(), v4(1));
+    }
+
     #[tokio::test]
     async fn an_onion_never_reaches_the_resolver() {
         let error = connect_async("abcdef.onion", 80, Duration::from_secs(1))
@@ -564,19 +585,28 @@ mod tests {
         use super::*;
         use crate::chain::tls::{ConnectError, tcp_connect};
 
-        /// A silent address, and the connection that fills its queue.
-        fn silent() -> (tokio::net::TcpListener, std::net::TcpStream, SocketAddr) {
+        /// A silent address, and the connections that fill its queue:
+        /// a backlog of one takes two, and drops every SYN after them.
+        fn silent() -> (
+            tokio::net::TcpListener,
+            Vec<std::net::TcpStream>,
+            SocketAddr,
+        ) {
             let socket = tokio::net::TcpSocket::new_v4().unwrap();
             socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-            let listener = socket.listen(0).unwrap();
+            let listener = socket.listen(1).unwrap();
             let address = listener.local_addr().unwrap();
-            let filler = std::net::TcpStream::connect(address).unwrap();
-            (listener, filler, address)
+            let fillers = (0..2)
+                .map(|_| {
+                    std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap()
+                })
+                .collect();
+            (listener, fillers, address)
         }
 
         #[tokio::test]
         async fn a_silent_socket_does_not_hold_back_one_that_answers() {
-            let (_silent, _filler, quiet) = silent();
+            let (_silent, _fillers, quiet) = silent();
             let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let answers = open.local_addr().unwrap();
             let start = Instant::now();
@@ -614,7 +644,7 @@ mod tests {
         /// the rest of the core reads it, after the timeout it was given.
         #[tokio::test]
         async fn a_silent_host_is_unreachable_after_its_timeout() {
-            let (_silent, _filler, quiet) = silent();
+            let (_silent, _fillers, quiet) = silent();
             let timeout = Duration::from_millis(700);
             let start = Instant::now();
             let error = tokio::task::spawn_blocking(move || {
