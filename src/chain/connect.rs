@@ -254,20 +254,10 @@ pub fn parse_backend(text: &str) -> CoreResult<ScannedBackend> {
 /// starts with. Taken for a host name, it would go to the system's
 /// resolver in the clear the first time the server was tried. The host
 /// is read as typed, since a base58 key or address only reads as one in
-/// its own case, and as the URL parser reads it. A private key anywhere
-/// in the text is refused as such, unquoted, and so is a seed phrase in
-/// the host: the form puts a scheme before what was typed and a port
-/// after it, which the check on the whole text does not read as words
-/// ([`typed_words`]).
-/// A space is refused next, without quoting the text either: no host
-/// holds one, and words that are not quite a seed phrase may still be
-/// one.
+/// its own case, and as the URL parser reads it. A private key or a
+/// seed phrase is refused first, unquoted ([`refuse_typed_secret`]).
 pub(crate) fn refuse_wallet_material(text: &str) -> CoreResult<()> {
-    crate::input::reject_private_material(text)?;
-    crate::input::reject_private_material(typed_words(text))?;
-    if text.trim().contains(char::is_whitespace) {
-        return Err(reject("the address has a space in it"));
-    }
+    refuse_typed_secret(text, "server")?;
     let canonical = super::host_of(text);
     for host in std::iter::once(typed_host(text)).chain(canonical.as_deref()) {
         if let Some(what) = wallet_material(host) {
@@ -277,6 +267,58 @@ pub(crate) fn refuse_wallet_material(text: &str) -> CoreResult<()> {
         }
     }
     Ok(())
+}
+
+/// Refuses an address typed by hand that holds a secret: a private key
+/// anywhere in it, or a seed phrase in its host. The form puts a scheme
+/// before what was typed and a port after it, which the check on the
+/// whole text does not read as words ([`typed_words`]), and the URL
+/// parser reads a host with its `%xx` escapes decoded, so the text is
+/// read both as typed and decoded. A space in the host is refused next,
+/// without quoting the text either: no host holds one, and words that
+/// are not quite a seed phrase may still be one. `kind` names the field
+/// in that refusal.
+pub(crate) fn refuse_typed_secret(text: &str, kind: &'static str) -> CoreResult<()> {
+    let decoded = percent_decoded(text);
+    for form in [text, &decoded] {
+        crate::input::reject_private_material(form)?;
+        crate::input::reject_private_material(typed_words(form))?;
+    }
+    if text.trim().contains(char::is_whitespace)
+        || typed_words(&decoded).contains(char::is_whitespace)
+    {
+        return Err(CoreError::InvalidInput {
+            kind,
+            detail: "the address has a space in it".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// The text with every `%xx` escape decoded, the way the URL parser
+/// reads a host; an escape that does not name a byte stays as written,
+/// and a byte that is not UTF-8 reads as the replacement character.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = bytes
+            .get(i + 1..i + 3)
+            .filter(|hex| bytes[i] == b'%' && hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok());
+        match escaped {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The host of a server address as it was typed: after the scheme and
@@ -882,6 +924,25 @@ mod tests {
             }
         }
 
+        // The URL parser reads a host with its escapes decoded: a seed
+        // or a key spelled in them is refused as one.
+        let escaped = twelve.replace(' ', "%20");
+        for text in [
+            format!("ssl://{escaped}:50002:50002"),
+            format!("ssl://[{escaped}:50002]:50002"),
+            format!("https://{escaped}/api"),
+            format!("https://%61{}:3002", &escaped[1..]),
+            format!("ssl://%78{}:50002", &xprv[1..]),
+            format!("tcp://%35{}:50001", &wif[1..]),
+        ] {
+            let error = parse_backend(&text).unwrap_err();
+            assert!(
+                matches!(error, CoreError::PrivateMaterialRejected),
+                "{text}: {error}"
+            );
+            assert!(refuse_typed_secret(&text, "server").is_err(), "{text}");
+        }
+
         // Words that are not quite a seed phrase are still never quoted:
         // no host holds a space.
         for text in [
@@ -889,6 +950,7 @@ mod tests {
             format!("ssl://Abandon {}:50002:50002", ["abandon"; 11].join(" ")),
             format!("https://{} about/api", ["abandon"; 10].join(" ")),
             format!("{}://node.example.org", ["abandon"; 12].join(" ")),
+            format!("ssl://{}:50002", ["abandon"; 11].join("%20")),
         ] {
             let error = parse_backend(&text).unwrap_err().to_string();
             assert!(error.contains("has a space in it"), "{text}: {error}");
@@ -929,6 +991,15 @@ mod tests {
         assert_eq!(
             ok("https://esplora.example.org/api").url,
             "https://esplora.example.org/api"
+        );
+        // An escape in a path is no host: it reads as it did.
+        assert_eq!(
+            ok("https://esplora.example.org/a%20b").url,
+            "https://esplora.example.org/a%20b"
+        );
+        assert_eq!(
+            ok("ssl://node%2Eexample.org:50002").host,
+            "node.example.org"
         );
     }
 }
