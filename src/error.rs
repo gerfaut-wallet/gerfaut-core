@@ -153,8 +153,8 @@ pub enum CoreError {
     /// The input is a recognized format but invalid in itself
     /// (bad checksum, malformed derivation path, ...).
     ///
-    /// A QR code refused (`kind` "qr") reads as its detail alone: a
-    /// sentence the apps show under the camera as it is.
+    /// A QR code refused (`kind` "qr", or "qr frame" for a damaged frame)
+    /// reads as its detail alone: a sentence the apps show as it is.
     #[error("{}", invalid_input(kind, detail))]
     InvalidInput { kind: &'static str, detail: String },
 
