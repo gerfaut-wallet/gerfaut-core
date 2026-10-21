@@ -12,7 +12,7 @@ pub(crate) mod sync;
 
 use page::PageTx;
 
-use crate::chain::{Failure, Fault};
+use crate::chain::{Failure, Fault, IoOutage};
 use crate::network::Network;
 use crate::wallet::snapshot::TxIo;
 use crate::wallet::{AddressTx, AddressUtxo, AddressWatchState, tx_extras};
@@ -682,21 +682,15 @@ fn fault_of(error: &reqwest::Error) -> Fault {
 /// Whether the server hung up before it answered, once connected: a
 /// reset, or a connection that ended first, in the words of hyper.
 fn closed_early(error: &reqwest::Error) -> bool {
-    use std::io::ErrorKind;
     !error.is_connect()
         && !error.is_timeout()
         && find_cause(error, &mut |cause| {
-            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-                matches!(
-                    io.kind(),
-                    ErrorKind::ConnectionReset
-                        | ErrorKind::ConnectionAborted
-                        | ErrorKind::BrokenPipe
-                        | ErrorKind::UnexpectedEof
-                )
-            }) || cause
-                .to_string()
-                .starts_with("connection closed before message completed")
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| IoOutage::of(io.kind()) == Some(IoOutage::Closed))
+                || cause
+                    .to_string()
+                    .starts_with("connection closed before message completed")
         })
         .is_some()
 }

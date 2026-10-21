@@ -64,7 +64,9 @@ pub(crate) async fn open(
             Some(proxy) => through_socks(proxy, host, port).await?,
             None => TcpStream::connect((host, port))
                 .await
-                .map_err(|e| describe_io(&e))?,
+                // The budget is held below: a time limit here is the
+                // system's own.
+                .map_err(|e| Fault::of_io(&e, None))?,
         };
         let _ = socket.set_nodelay(true);
         let config = match security {
@@ -179,36 +181,6 @@ async fn through_socks(proxy: &str, host: &str, port: u16) -> Result<TcpStream, 
     Ok(socket)
 }
 
-/// A socket that would not open, in words, and of its kind: the server
-/// refused it, could not be reached, or did not answer in time, and its
-/// name does not resolve, are outages; the rest is this device's word.
-fn describe_io(error: &std::io::Error) -> Fault {
-    use std::io::ErrorKind;
-    match error.kind() {
-        ErrorKind::ConnectionRefused
-        | ErrorKind::HostUnreachable
-        | ErrorKind::NetworkUnreachable
-        | ErrorKind::NetworkDown => Fault::outage("could not connect"),
-        ErrorKind::TimedOut => Fault::outage("timed out"),
-        _ => {
-            let lower = error.to_string().to_ascii_lowercase();
-            if [
-                "lookup",
-                "host is known",
-                "name or service",
-                "nodename nor servname",
-            ]
-            .iter()
-            .any(|phrase| lower.contains(phrase))
-            {
-                Fault::outage("host not found")
-            } else {
-                Fault::other(format!("connection failed: {error}"))
-            }
-        }
-    }
-}
-
 /// What [`LineReader`] fails with when a line runs past its limit,
 /// inside the `io::Error`, so a caller can tell it from a failure of
 /// the connection.
@@ -303,6 +275,21 @@ mod tests {
 
     const ONION: &str = "gerfautexample000000000000000000000000000000000000000.onion";
     const BUDGET: Duration = Duration::from_secs(5);
+
+    /// A port nothing listens on is a server out of reach, read from the
+    /// kind of the error by the list every socket reads.
+    #[tokio::test]
+    async fn a_closed_port_is_an_outage() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let fault = open("127.0.0.1", port, Security::Plain, None, BUDGET)
+            .await
+            .err()
+            .expect("nothing listens there");
+        assert!(fault.is_outage(), "{fault}");
+        assert_eq!(fault, "could not connect");
+    }
 
     /// An onion host with no proxy never becomes a connection, and so
     /// never a lookup: the refusal comes before any socket exists.

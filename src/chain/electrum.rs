@@ -393,7 +393,7 @@ fn connect(
             .map_err(|e| {
                 ConnectError::Io(format!(
                     "could not connect through Tor: {}",
-                    describe_io(&e, timeout)
+                    Fault::of_io(&e, Some(timeout))
                 ))
             })?
             .into_inner();
@@ -650,8 +650,8 @@ fn describe(error: &electrum_client::Error, timeout: Duration) -> Fault {
             Some(inner) => describe(inner, timeout),
             None => Fault::other("request failed"),
         },
-        Error::IOError(io) => describe_io(io, timeout),
-        Error::SharedIOError(io) => describe_io(io, timeout),
+        Error::IOError(io) => Fault::of_io(io, Some(timeout)),
+        Error::SharedIOError(io) => Fault::of_io(io, Some(timeout)),
         Error::Protocol(value) => {
             let refused = format!("the server refused the request: {}", words(value));
             if out_of_budget(value) {
@@ -685,57 +685,6 @@ pub(crate) fn words(error: &serde_json::Value) -> String {
         .and_then(serde_json::Value::as_str)
         .map_or_else(|| error.to_string(), str::to_owned);
     crate::chain::server_words(&message)
-}
-
-/// An I/O failure, of the kind the error has: a time limit, a connection
-/// that would not open or was cut, a name that does not resolve, are
-/// outages. A name that does not resolve has no kind of its own: the
-/// words of this device's system tell it, never a server's.
-fn describe_io(error: &std::io::Error, timeout: Duration) -> Fault {
-    use std::io::ErrorKind;
-    if let Some(fault) = error
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<Fault>())
-    {
-        return fault.clone();
-    }
-    match error.kind() {
-        // A socket read timeout is `WouldBlock` on Unix and `TimedOut`
-        // on Windows.
-        ErrorKind::TimedOut | ErrorKind::WouldBlock => {
-            Fault::outage(format!("timed out after {} s", timeout.as_secs()))
-        }
-        ErrorKind::ConnectionRefused
-        | ErrorKind::HostUnreachable
-        | ErrorKind::NetworkUnreachable
-        | ErrorKind::NetworkDown => Fault::outage("could not connect"),
-        ErrorKind::ConnectionReset
-        | ErrorKind::ConnectionAborted
-        | ErrorKind::BrokenPipe
-        | ErrorKind::UnexpectedEof
-        | ErrorKind::NotConnected => Fault::outage("the connection was closed"),
-        // What [`Guarded`] says of a line too long: its own words.
-        ErrorKind::InvalidData => Fault::other(error.to_string()),
-        _ => {
-            // Name resolution has no kind of its own, and each platform
-            // words it differently.
-            let text = error.to_string();
-            let lower = text.to_ascii_lowercase();
-            if [
-                "lookup",
-                "host is known",
-                "name or service",
-                "nodename nor servname",
-            ]
-            .iter()
-            .any(|phrase| lower.contains(phrase))
-            {
-                Fault::outage("host not found")
-            } else {
-                Fault::other(format!("connection failed: {text}"))
-            }
-        }
-    }
 }
 
 // --- broadcast ------------------------------------------------------------
@@ -1442,13 +1391,14 @@ mod tests {
         assert_eq!((calls, waits), (1, PAUSES));
     }
 
-    /// A connection that fails is an outage, told by the kind of its error,
-    /// and so is a server out of memory twice in a row; another refusal is
-    /// not, whatever its words. A failure the core raised inside a call
-    /// comes out as the fault it is.
+    /// A connection that fails is an outage, told by the kind of its error
+    /// ([`crate::chain::IoOutage`]), and so is a server out of memory
+    /// twice in a row; another refusal is not, whatever its words. A
+    /// failure the core raised inside a call comes out as the fault it is.
     #[test]
     fn connections_that_fail_are_outages() {
         use std::io::{Error, ErrorKind};
+        let io = |error: Error| describe(&electrum_client::Error::IOError(error), TIMEOUT);
         for kind in [
             ErrorKind::TimedOut,
             ErrorKind::WouldBlock,
@@ -1456,18 +1406,15 @@ mod tests {
             ErrorKind::ConnectionReset,
             ErrorKind::UnexpectedEof,
         ] {
-            let detail = describe_io(&Error::from(kind), TIMEOUT);
+            let detail = io(Error::from(kind));
             assert!(detail.is_outage(), "{kind:?}: {detail}");
         }
-        let unknown = describe_io(
-            &Error::other("failed to lookup address information"),
-            TIMEOUT,
-        );
+        let unknown = io(Error::other("failed to lookup address information"));
         assert_eq!(unknown, "host not found");
         assert!(unknown.is_outage());
         // The words of this device's system, a firewall that says no:
         // nothing tells that it is the server.
-        let local = describe_io(&Error::other("no route"), TIMEOUT);
+        let local = io(Error::other("no route"));
         assert_eq!(local, "connection failed: no route");
         assert!(!local.is_outage());
         assert!(describe(&out_of_memory(), TIMEOUT).is_outage());
@@ -1812,7 +1759,7 @@ mod tests {
         let error = reader.read_line(&mut line).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(
-            describe_io(&error, TIMEOUT),
+            Fault::of_io(&error, Some(TIMEOUT)),
             "the server sent an answer longer than 0 MiB"
         );
         assert!(line.len() <= 16 * 1024 + 1024, "{} bytes held", line.len());

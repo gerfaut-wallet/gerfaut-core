@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
 
-use crate::chain::Fault;
+use crate::chain::{Fault, IoOutage};
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature};
@@ -114,22 +114,6 @@ impl From<Fault> for ConnectError {
             ConnectError::Io(fault.to_string())
         }
     }
-}
-
-/// Whether a socket that would not open says the server is down: it
-/// refused the connection, could not be reached or did not answer in
-/// time. Read from the kind of the error, never from its words.
-pub(crate) fn unreachable(error: &std::io::Error) -> bool {
-    use std::io::ErrorKind;
-    matches!(
-        error.kind(),
-        ErrorKind::ConnectionRefused
-            | ErrorKind::HostUnreachable
-            | ErrorKind::NetworkUnreachable
-            | ErrorKind::NetworkDown
-            | ErrorKind::TimedOut
-            | ErrorKind::WouldBlock
-    )
 }
 
 /// SHA-256 of the certificate, in the shape every tool prints it:
@@ -612,7 +596,9 @@ pub(crate) fn tcp_connect(
         }
     }
     Err(match last {
-        Some(error) if unreachable(&error) => ConnectError::Unreachable(error.to_string()),
+        Some(error) if IoOutage::of(error.kind()).is_some() => {
+            ConnectError::Unreachable(error.to_string())
+        }
         Some(error) => ConnectError::Io(error.to_string()),
         None => ConnectError::Io(format!("{host}:{port} has no address to connect to")),
     })

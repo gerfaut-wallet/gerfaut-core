@@ -233,13 +233,51 @@ pub fn parse_input_with(input: &str, script: Option<ScriptKind>) -> CoreResult<P
 /// ignore those two.
 pub fn parse_input_with_options(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
     if bsms::is_bsms(input) {
-        return parse_bsms_record(input);
+        let parsed = parse_bsms_record(input)?;
+        engine_takes(&parsed)?;
+        return Ok(parsed);
     }
     let mut parsed = classify(input, options)?;
+    engine_takes(&parsed)?;
     if parsed.preview_address.is_none() {
         parsed.preview_address = preview_address(&parsed, options.network);
     }
     Ok(parsed)
+}
+
+/// Builds the engine a wallet of this input would be watched with, the
+/// way adding it builds it ([`crate::manager::engine_for`]), on the first
+/// network the input allows, and drops it: what only the engine refuses
+/// is refused at reading, where the person sees it, and never after they
+/// asked to add the wallet. The network does not change the verdict:
+/// the engine reads the kind of network of the keys, the same for every
+/// network the input allows.
+fn engine_takes(parsed: &ParsedInput) -> CoreResult<()> {
+    let ParsedPayload::Descriptors {
+        external,
+        internal,
+        script,
+    } = &parsed.payload
+    else {
+        return Ok(());
+    };
+    let Some(network) = parsed.networks.first() else {
+        return Ok(());
+    };
+    let kind = crate::wallet::meta::WalletKind::Descriptors {
+        external: external.clone(),
+        internal: internal.clone(),
+        script: *script,
+    };
+    crate::manager::engine_for(&kind, *network)
+        .map(|_| ())
+        .map_err(|error| match error {
+            CoreError::Descriptor(detail) => CoreError::InvalidInput {
+                kind: "descriptor",
+                detail,
+            },
+            other => other,
+        })
 }
 
 /// A BSMS record is its descriptor plus a promise: the first address the
@@ -466,7 +504,57 @@ pub(crate) fn read_descriptor(text: &str) -> CoreResult<Descriptor<DescriptorPub
              origin, as in `[fingerprint/84'/0'/0']xpub…/0/*`"
         )));
     }
+    if let Some((depth, steps)) = too_deep(&descriptor) {
+        let written = match steps {
+            1 => "the step written after it goes".to_owned(),
+            steps => format!("the {steps} steps written after it go"),
+        };
+        return Err(invalid(format!(
+            "an extended public key at depth {depth} cannot derive its addresses: {written} \
+             past depth {MAX_KEY_DEPTH}, the deepest a BIP32 key can be"
+        )));
+    }
     Ok(descriptor)
+}
+
+/// The deepest an extended key can be, BIP32 writing its depth on one
+/// byte.
+const MAX_KEY_DEPTH: u32 = u8::MAX as u32;
+
+/// The depth of an extended key in the descriptor that would derive
+/// past [`MAX_KEY_DEPTH`], and the steps that take it there: those
+/// written after it, plus one for a wildcard. Such a key has no address
+/// to give, and miniscript panics when asked for one; refused here, it
+/// never reaches a derivation, whether it was typed, scanned or read
+/// from a backup.
+fn too_deep(descriptor: &Descriptor<DescriptorPublicKey>) -> Option<(u32, u32)> {
+    let mut found = None;
+    descriptor.for_any_key(|key| {
+        let (depth, longest, wildcard) = match key {
+            DescriptorPublicKey::Single(_) => return false,
+            DescriptorPublicKey::XPub(xkey) => {
+                (xkey.xkey.depth, xkey.derivation_path.len(), xkey.wildcard)
+            }
+            DescriptorPublicKey::MultiXPub(xkey) => (
+                xkey.xkey.depth,
+                xkey.derivation_paths
+                    .paths()
+                    .iter()
+                    .map(|path| path.len())
+                    .max()
+                    .unwrap_or(0),
+                xkey.wildcard,
+            ),
+        };
+        let steps = u32::try_from(longest)
+            .unwrap_or(u32::MAX)
+            .saturating_add(u32::from(wildcard != Wildcard::None));
+        if u32::from(depth).saturating_add(steps) > MAX_KEY_DEPTH {
+            found = Some((u32::from(depth), steps));
+        }
+        found.is_some()
+    });
+    found
 }
 
 /// The deepest the parentheses and braces of `text` nest, counted on
@@ -814,6 +902,18 @@ fn pair_holds(
     if external.to_string() == internal.to_string() {
         return refuse("the two descriptors are the same; change needs a path of its own");
     }
+    let named = |what: &str, index: u32| {
+        Err(CoreError::InvalidInput {
+            kind: "descriptor",
+            detail: format!("{what} at index {index}; change needs a path of its own"),
+        })
+    };
+    if let Some(index) = address_of(external, internal) {
+        return named("the change descriptor is the receive address", index);
+    }
+    if let Some(index) = address_of(internal, external) {
+        return named("the receive descriptor is the change address", index);
+    }
     if external.desc_type() != internal.desc_type() {
         return refuse("the change descriptor is not of the receive descriptor's script type");
     }
@@ -849,6 +949,54 @@ fn pair_holds(
             }
         }
     }
+}
+
+/// The index of the address of `ranged` that `fixed` is, when it is
+/// one: a descriptor without a wildcard, beside one with it, that gives
+/// the same script as the ranged one at an index its own keys name, the
+/// last step of an extended key's path or of a single key's origin.
+/// Paired as receive and change, every payment's change would land on a
+/// receive address. Read on the keys alone, it refuses no wallet it does
+/// not prove; a key written another way (a bare key without an origin,
+/// a child key with its steps in the origin) goes unseen here, and the
+/// check of the keys' material refuses the latter as another wallet.
+fn address_of(
+    ranged: &Descriptor<DescriptorPublicKey>,
+    fixed: &Descriptor<DescriptorPublicKey>,
+) -> Option<u32> {
+    use bdk_wallet::bitcoin::bip32::ChildNumber;
+    // Deriving a hardened step panics in miniscript; reading refuses
+    // them before, and this holds without it.
+    if !ranged.has_wildcard()
+        || fixed.has_wildcard()
+        || hardened_derivation(ranged).is_some()
+        || hardened_derivation(fixed).is_some()
+    {
+        return None;
+    }
+    let script = fixed.at_derivation_index(0).ok()?.script_pubkey();
+    let mut named = Vec::new();
+    fixed.for_each_key(|key| {
+        let last = match key {
+            DescriptorPublicKey::XPub(xkey) => xkey.derivation_path.into_iter().last(),
+            DescriptorPublicKey::Single(single) => single
+                .origin
+                .as_ref()
+                .and_then(|(_, path)| path.into_iter().last()),
+            DescriptorPublicKey::MultiXPub(_) => None,
+        };
+        if let Some(ChildNumber::Normal { index }) = last
+            && !named.contains(index)
+        {
+            named.push(*index);
+        }
+        true
+    });
+    named.into_iter().find(|index| {
+        ranged
+            .at_derivation_index(*index)
+            .is_ok_and(|address| address.script_pubkey() == script)
+    })
 }
 
 // --- extended keys -----------------------------------------------------
@@ -1744,7 +1892,7 @@ mod tests {
 
         let cosigner = slip132(TPUB, UPUB_MULTI);
         let parsed = parse_input(&format!(
-            "sh(wsh(sortedmulti(1,{cosigner}/<0;1>/*,{TPUB}/<0;1>/*)))"
+            "sh(wsh(sortedmulti(1,{cosigner}/<0;1>/*,{TPUB}/<2;3>/*)))"
         ))
         .unwrap();
         assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
@@ -1899,6 +2047,175 @@ mod tests {
         let parsed = parse_input(&input).unwrap();
         assert_eq!(parsed.kind, RecognizedKind::DescriptorPair);
         assert!(parsed.warnings.is_empty());
+    }
+
+    /// A pair whose two branches begin with the same address under two
+    /// spellings, a key origin added or the keys of a `sortedmulti` in
+    /// another order, reads as one wallet on two branches; the engine
+    /// refuses it, and so does reading it, before anyone asks to add it.
+    #[test]
+    fn a_pair_the_engine_finds_the_same_is_refused_at_reading() {
+        for (external, internal) in [
+            (
+                format!("wpkh({TPUB}/0/*)"),
+                format!("wpkh([d34db33f/84h/1h/0h]{TPUB}/0/*)"),
+            ),
+            (
+                format!("wsh(sortedmulti(1,{TPUB}/0/*,{TPUB}/1/*))"),
+                format!("wsh(sortedmulti(1,{TPUB}/1/*,{TPUB}/0/*))"),
+            ),
+        ] {
+            let error = parse_input(&format!("{external}\n{internal}")).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "invalid descriptor: the two descriptors begin with the same address; change \
+                 needs a path of its own",
+                "{external} / {internal}"
+            );
+        }
+    }
+
+    /// `TPUB` re-encoded at another depth: a key a forged export or QR
+    /// code could carry.
+    fn at_depth(depth: u8) -> String {
+        let mut data = base58::decode_check(TPUB).unwrap();
+        data[4] = depth;
+        base58::encode_check(&data)
+    }
+
+    /// An extended key too deep to derive its addresses is refused at
+    /// reading, in words, whatever form carries it; before, miniscript
+    /// panicked on its first address. One step short of the limit is a
+    /// key like any other.
+    #[test]
+    fn a_key_too_deep_to_derive_is_refused_not_a_panic() {
+        let deep = at_depth(255);
+        let almost = at_depth(254);
+        for input in [
+            deep.clone(),
+            format!("wpkh({deep}/0/*)"),
+            format!("wpkh({deep}/*)"),
+            format!("wpkh({almost}/0/*)"),
+            format!("wpkh({deep}/<0;1>/*)"),
+            format!("wpkh([d34db33f/84h/1h/0h]{deep}/0/*)"),
+            format!("wsh(sortedmulti(1,{TPUB}/0/*,{deep}/0/*))"),
+            format!("tr({deep}/0/*)"),
+            format!("wpkh({deep}/0/*)\nwpkh({deep}/1/*)"),
+        ] {
+            let error = parse_input(&input).unwrap_err().to_string();
+            assert!(
+                error.contains("past depth 255, the deepest a BIP32 key can be"),
+                "{input}: {error}"
+            );
+        }
+        // A lone key whose path, edited, would go past the limit.
+        let edited = ImportOptions {
+            derivation: Some(DerivationChoice {
+                receive: "0/0/0/0/*".to_owned(),
+                change: Some("1/*".to_owned()),
+                origin: None,
+            }),
+            ..ImportOptions::default()
+        };
+        let error = parse_input_with_options(&at_depth(251), &edited).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid descriptor: an extended public key at depth 251 cannot derive its \
+             addresses: the 5 steps written after it go past depth 255, the deepest a BIP32 \
+             key can be"
+        );
+        let one = parse_input(&format!("wpkh({deep}/*)"))
+            .unwrap_err()
+            .to_string();
+        assert!(one.contains("the step written after it goes past"), "{one}");
+        // At the limit, not past it.
+        assert!(parse_input(&format!("wpkh({almost}/*)")).is_ok());
+        assert!(parse_input(&format!("wpkh({deep})")).is_ok());
+    }
+
+    /// A bare descriptor has no address: it is refused at reading,
+    /// where it used to be added and then crash the receive screen.
+    /// Wrapped, the same script is a wallet like any other.
+    #[test]
+    fn a_bare_descriptor_is_refused_at_reading() {
+        for input in [
+            format!("pk({TPUB}/0/*)"),
+            format!("multi(1,{TPUB}/0/*,{TPUB}/1/*)"),
+            format!("pk({TPUB}/0/*)\npk({TPUB}/1/*)"),
+        ] {
+            let error = parse_input(&input).unwrap_err().to_string();
+            assert!(
+                error.contains("a bare descriptor has no address"),
+                "{input}: {error}"
+            );
+        }
+        assert!(parse_input(&format!("sh(pk({TPUB}/0/*))")).is_ok());
+    }
+
+    /// A multisig that names one key twice is refused at reading, as
+    /// the engine refuses it, not after "Add wallet".
+    #[test]
+    fn a_key_repeated_in_a_multisig_is_refused_at_reading() {
+        let error = parse_input(&format!("wsh(multi(1,{TPUB}/<0;1>/*,{TPUB}/<0;1>/*))"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("repeated pubkeys"), "{error}");
+    }
+
+    /// A change descriptor that is one receive address, named by the
+    /// last step of its key's path or of its origin, is refused: every
+    /// change would land there. A fixed change address that is no
+    /// receive address is left alone, as is a pair of ranged branches.
+    #[test]
+    fn a_change_that_is_a_receive_address_is_refused() {
+        let receive = format!("wpkh({TPUB}/0/*)");
+        let refused = |internal: &str| {
+            parse_input(&format!("{receive}\n{internal}"))
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            refused(&format!("wpkh({TPUB}/0/1)")),
+            "invalid descriptor: the change descriptor is the receive address at index 1; \
+             change needs a path of its own"
+        );
+        assert!(refused(&format!("wpkh({TPUB}/0/0)")).contains("at index 0"));
+        // A fixed change address of the same key elsewhere: no proof.
+        let other = format!("{receive}\nwpkh({TPUB}/1/0)");
+        assert_eq!(
+            parse_input(&other).unwrap().kind,
+            RecognizedKind::DescriptorPair
+        );
+        // And a backup holding such a pair is refused alike.
+        let stored = |internal: &str| {
+            check_stored_pair(&receive.parse().unwrap(), &internal.parse().unwrap())
+        };
+        assert!(stored(&format!("wpkh({TPUB}/0/7)")).is_err());
+        assert!(stored(&format!("wpkh({TPUB}/1/*)")).is_ok());
+        // The other way round: a fixed receive address that the change
+        // branch derives at the index it names.
+        let reversed = parse_input(&format!("wpkh({TPUB}/1/3)\nwpkh({TPUB}/1/*)"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            reversed,
+            "invalid descriptor: the receive descriptor is the change address at index 3; \
+             change needs a path of its own"
+        );
+        // The same address as a bare key, its origin naming the step,
+        // which reading refuses already for its network.
+        let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::verification_only();
+        let fifth = receive
+            .parse::<Descriptor<DescriptorPublicKey>>()
+            .unwrap()
+            .at_derivation_index(5)
+            .unwrap()
+            .derived_descriptor(&secp)
+            .unwrap()
+            .to_string();
+        let key = &fifth[fifth.find('(').unwrap() + 1..fifth.find(')').unwrap()];
+        let bare = stored(&format!("wpkh([d34db33f/84h/1h/0h/0/5]{key})")).unwrap_err();
+        assert!(bare.to_string().contains("at index 5"), "{bare}");
     }
 
     /// The change descriptor of a pair is held to the receive one: the

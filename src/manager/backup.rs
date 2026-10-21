@@ -15,7 +15,9 @@ use crate::now_secs;
 use crate::store::{Settings, VaultPayload, WalletRecord};
 use crate::wallet::meta::WalletKind;
 
-use super::{WalletManager, build_record, check_material, find_record, find_watched, fresh_meta};
+use super::{
+    WalletManager, check_material, engine_for, find_record, find_watched, fresh_meta, record_with,
+};
 
 impl WalletManager {
     /// Seals the chosen wallets (every wallet by default) and, on
@@ -86,6 +88,8 @@ impl WalletManager {
     /// answer to a question the screen actually asked. All of it is read
     /// off [`plan_restore`], the plan [`Self::import_backup`] carries out:
     /// what the preview promises is what a restore of every wallet does.
+    /// It builds the engine of each wallet to restore, as the restore
+    /// does, and drops it: some 17 ms for a 2-of-3 wallet on a desktop.
     pub async fn preview_backup(&self, source: &str, password: &str) -> CoreResult<BackupPreview> {
         let payload = backup::open(&backup::decode_source(source)?, password)?;
         let state = self.state.lock().await;
@@ -115,7 +119,7 @@ impl WalletManager {
                         already_watched: matches!(fate, Fate::Watched),
                         refused: match fate {
                             Fate::Refused(error) => Some(error.to_string()),
-                            Fate::Watched | Fate::Restored => None,
+                            Fate::Watched | Fate::Restored(_) => None,
                         },
                     }
                 })
@@ -133,11 +137,12 @@ impl WalletManager {
     /// changed is exactly what pinning refuses to switch in silence),
     /// the gap limit is bounded like [`Self::set_gap_limit`]. What is
     /// restored and what is pinned is decided by [`plan_restore`], the
-    /// plan the preview shows. A wallet whose material does not hold
-    /// together, a change descriptor of another wallet among it, fails
-    /// the restore, named, and the vault is left as it was: the preview
-    /// marks such a wallet ([`BackupWalletPreview::refused`]) so it is
-    /// never asked for.
+    /// plan the preview shows, engines included: nothing is refused here
+    /// that the preview let through. A wallet whose material does not
+    /// hold together, a change descriptor of another wallet among it,
+    /// asked for by index, fails the restore, named, and the vault is
+    /// left as it was: the preview marks such a wallet
+    /// ([`BackupWalletPreview::refused`]) so it is never asked for.
     pub async fn import_backup(
         &self,
         source: &str,
@@ -176,7 +181,7 @@ impl WalletManager {
             let plan = plan_restore(&state.payload, &payload, chosen.iter().copied());
 
             // Everything that can fail happens before the vault changes: a
-            // descriptor the engine refuses leaves nothing half-restored.
+            // descriptor the engine refused leaves nothing half-restored.
             let mut pending: Vec<(WalletRecord, Option<bdk_wallet::Wallet>)> = Vec::new();
             let mut skipped = (payload.wallets.len() - chosen.len()) as u32;
             // A restore of every wallet leaves out, and names, one it
@@ -186,27 +191,12 @@ impl WalletManager {
             // the restore as it is.
             let asked_by_index = choices.indexes.is_some();
             let mut refused = Vec::new();
-            // The wallets whose building failed: a later copy of one, which
-            // the plan counted as restored with it, is built in turn, and
-            // refused the same, never counted as watched.
-            let mut unbuilt: Vec<(Network, &WalletKind)> = Vec::new();
             for (index, fate) in plan.wallets {
                 let wallet = &payload.wallets[index];
                 let name = wallet.name.trim();
-                let copy_of_unbuilt = unbuilt
-                    .iter()
-                    .any(|(network, kind)| *network == wallet.network && **kind == wallet.kind);
-                let built = match fate {
-                    Fate::Watched if !copy_of_unbuilt => {
-                        skipped += 1;
-                        continue;
-                    }
-                    Fate::Refused(error) => Err(error),
-                    // The plan checked the material the way the engine
-                    // reads it; building it can still fail on what only
-                    // a derivation meets, and is then refused all the
-                    // same, never half-restored.
-                    Fate::Watched | Fate::Restored => {
+                match fate {
+                    Fate::Watched => skipped += 1,
+                    Fate::Restored(engine) => {
                         let mut meta = fresh_meta(
                             name,
                             wallet.network,
@@ -216,23 +206,16 @@ impl WalletManager {
                         );
                         meta.labels = wallet.labels.clone();
                         meta.live_pinned = wallet.live_pinned;
-                        let built = build_record(meta);
-                        if built.is_err() {
-                            unbuilt.push((wallet.network, &wallet.kind));
-                        }
-                        built
+                        pending.push(record_with(meta, engine.map(|engine| *engine))?);
                     }
-                };
-                match built {
-                    Ok(record) => pending.push(record),
-                    Err(error) if !asked_by_index && is_refusal(&error) => {
+                    Fate::Refused(error) if !asked_by_index && is_refusal(&error) => {
                         refused.push(RefusedWallet {
                             index: index as u32,
                             name: wallet_called(index, name),
                             reason: error.to_string(),
                         })
                     }
-                    Err(error) => return Err(refused_wallet(index, name, error)),
+                    Fate::Refused(error) => return Err(refused_wallet(index, name, error)),
                 }
             }
 
@@ -297,18 +280,18 @@ enum Fate {
     Watched,
     /// Its name or its material is refused, for this reason.
     Refused(CoreError),
-    /// Restored as a new wallet.
-    Restored,
+    /// Restored as a new wallet, with the engine built for it, if it is
+    /// a descriptor wallet.
+    Restored(Option<Box<bdk_wallet::Wallet>>),
 }
 
 /// The plan of a restore of the wallets `chosen`, by index into the
-/// backup, read without building any engine: each wallet is checked the
-/// way an import checks one ([`check_restorable`]) and against the
-/// wallets restored before it, so two copies of a wallet in one backup
-/// come back as one. What it cannot see is what only building the engine
-/// meets, a refusal no wallet is known to raise: the import refuses such
-/// a wallet, and its later copies with it, where the preview had them
-/// restored once and skipped.
+/// backup: a wallet the vault watches, or one of the backup restored
+/// before it, is skipped, so two copies of a wallet in one backup come
+/// back as one; every other has its engine built ([`restorable`]), the
+/// one the import keeps. Whatever building it refuses, the preview shows
+/// refused: it never promises a wallet the import then refuses, nor
+/// skips as a copy one whose first copy is refused.
 fn plan_restore(
     vault: &VaultPayload,
     payload: &BackupPayload,
@@ -326,10 +309,10 @@ fn plan_restore(
             let fate = if watched {
                 Fate::Watched
             } else {
-                match check_restorable(wallet) {
-                    Ok(()) => {
+                match restorable(wallet) {
+                    Ok(engine) => {
                         restored.push(wallet);
-                        Fate::Restored
+                        Fate::Restored(engine.map(Box::new))
                     }
                     Err(error) => Fate::Refused(error),
                 }
@@ -482,12 +465,14 @@ fn check_name(name: &str) -> CoreResult<()> {
     Ok(())
 }
 
-/// What a restore refuses a wallet of the backup for, read without
-/// building its engine: its name, then its material, as
-/// [`check_material`] reads it the way the engine would.
-fn check_restorable(wallet: &BackupWallet) -> CoreResult<()> {
+/// The engine a wallet of the backup is restored with, built the way
+/// adding a wallet builds it ([`engine_for`]), or what it is refused
+/// for: its name, its material in the words of [`check_material`], then
+/// whatever the engine refuses, which has the last word.
+fn restorable(wallet: &BackupWallet) -> CoreResult<Option<bdk_wallet::Wallet>> {
     check_name(&wallet.name)?;
-    check_material(&wallet.kind, wallet.network)
+    check_material(&wallet.kind, wallet.network)?;
+    engine_for(&wallet.kind, wallet.network)
 }
 
 /// Whether a restore that failed on one wallet failed on that wallet's

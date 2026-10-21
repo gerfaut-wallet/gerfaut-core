@@ -1280,13 +1280,21 @@ mod tests {
 
     #[test]
     fn crypto_output_sorted_multisig() {
+        // The same key on two other branches: two cosigners to the
+        // engine, which refuses a key repeated.
+        let other = Value::Array(vec![
+            Value::Array(vec![Value::Integer(2.into()), Value::Integer(3.into())]),
+            Value::Bool(false),
+            Value::Array(vec![]),
+            Value::Bool(false),
+        ]);
         let multi = tag(
             TAG_WSH,
             tag(
                 TAG_SORTED_MULTI,
                 map(vec![
                     (1, Value::Integer(2.into())),
-                    (2, Value::Array(vec![hdkey(None), hdkey(None)])),
+                    (2, Value::Array(vec![hdkey(None), hdkey(Some(other))])),
                 ]),
             ),
         );
@@ -1543,6 +1551,15 @@ mod tests {
                 "{refused}"
             );
         }
+        // An origin that puts the key at depth 255: the code opens, and
+        // the descriptor it holds is refused in words, never a panic.
+        let deep = hdkey_with(6, origin_from(index(84), hardened.clone(), 255, fp));
+        let text = assemble(&[encode_ur("crypto-output", &tag(TAG_WPKH, deep))])
+            .unwrap()
+            .text
+            .unwrap();
+        let error = crate::input::parse_input(&text).unwrap_err().to_string();
+        assert!(error.contains("at depth 255"), "{error}");
         // The same origin, well formed, still opens.
         let key = hdkey_with(6, origin_from(index(84), hardened, 3, fp));
         let text = assemble(&[encode_ur("crypto-output", &tag(TAG_WPKH, key))])
