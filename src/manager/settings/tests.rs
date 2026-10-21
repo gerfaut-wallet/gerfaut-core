@@ -185,8 +185,7 @@ async fn a_backend_and_its_certificate_are_stored_together_or_not_at_all() {
         .trust_certificate("ssl://other.example.org:50002", &fingerprint("AA"))
         .await
         .unwrap();
-    let untouched = || async {
-        let settings = manager.settings().await;
+    let untouched = |settings: crate::store::Settings| {
         assert_eq!(settings.backend_for(Network::Signet), before);
         assert_eq!(
             settings.electrum_certs.into_iter().collect::<Vec<_>>(),
@@ -237,6 +236,22 @@ async fn a_backend_and_its_certificate_are_stored_together_or_not_at_all() {
             fingerprint("BB"),
             "not for the Electrum server of this backend",
         ),
+        // No server named, or one the catalogue does not hold: no
+        // rotation to fall back on here, there is nothing to pin.
+        (
+            BackendConfig::Public {
+                server: Some("electrum:nowhere".to_owned()),
+            },
+            "ssl://mempool.space:60602",
+            fingerprint("BB"),
+            "not for the Electrum server of this backend",
+        ),
+        (
+            BackendConfig::Public { server: None },
+            "ssl://mempool.space:60602",
+            fingerprint("BB"),
+            "not for the Electrum server of this backend",
+        ),
     ] {
         let refused = manager
             .set_backend_trusting(Network::Signet, config.clone(), url, &print)
@@ -246,14 +261,22 @@ async fn a_backend_and_its_certificate_are_stored_together_or_not_at_all() {
             matches!(&refused, CoreError::InvalidInput { detail, .. } if detail.contains(problem)),
             "{config:?} {url}: {refused}"
         );
-        untouched().await;
+        untouched(manager.settings().await);
     }
+    // Nor on disk.
+    drop(manager);
+    let manager = WalletManager::open(dir.path(), key()).unwrap();
+    untouched(manager.settings().await);
 
-    // Accepted: both at once, in their stored forms, and both on disk.
+    // Accepted: both at once, in their stored forms, "This is my node"
+    // kept, and both on disk.
     manager
         .set_backend_trusting(
             Network::Signet,
-            electrum("SSL://Node.Example.ORG.:50002"),
+            BackendConfig::CustomElectrum {
+                url: "SSL://Node.Example.ORG.:50002".to_owned(),
+                own_node: true,
+            },
             "ssl://node.example.org:50002",
             &fingerprint("bb"),
         )
@@ -264,7 +287,10 @@ async fn a_backend_and_its_certificate_are_stored_together_or_not_at_all() {
     let settings = manager.settings().await;
     assert_eq!(
         settings.backend_for(Network::Signet),
-        electrum("ssl://node.example.org:50002")
+        BackendConfig::CustomElectrum {
+            url: "ssl://node.example.org:50002".to_owned(),
+            own_node: true,
+        }
     );
     assert_eq!(
         settings.electrum_certs.get("node.example.org:50002"),
@@ -301,19 +327,14 @@ async fn a_backend_and_its_certificate_are_stored_together_or_not_at_all() {
     );
 }
 
-/// A vault that cannot be written takes neither the backend nor its
-/// certificate: the one write fails whole, and the settings in memory
-/// stay those on disk.
-#[cfg(unix)]
+/// A save the vault refuses, as on a full disk, takes neither the
+/// backend nor its certificate: the one write fails whole, and the
+/// settings stay those held before, in memory and on disk.
 #[tokio::test]
 async fn a_backend_the_vault_refuses_leaves_no_certificate() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(dir.path()).await;
-    let mode = |mode: u32| {
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
-    };
-    mode(0o555);
+    manager.state.lock().await.vault.fail_saves(true);
     let refused = manager
         .set_backend_trusting(
             Network::Signet,
@@ -325,16 +346,21 @@ async fn a_backend_the_vault_refuses_leaves_no_certificate() {
             &vec!["BB"; 32].join(":"),
         )
         .await;
-    mode(0o755);
-    assert!(
-        refused.is_err(),
-        "the vault took a write in a read-only directory"
-    );
-    let settings = manager.settings().await;
-    assert!(settings.electrum_certs.is_empty());
-    assert_eq!(
-        settings.backend_for(Network::Signet),
-        BackendConfig::default()
+    assert!(matches!(refused, Err(CoreError::Vault(_))), "{refused:?}");
+    let unchanged = |settings: crate::store::Settings| {
+        assert!(settings.electrum_certs.is_empty());
+        assert_eq!(
+            settings.backend_for(Network::Signet),
+            BackendConfig::default()
+        );
+    };
+    unchanged(manager.settings().await);
+    drop(manager);
+    unchanged(
+        WalletManager::open(dir.path(), key())
+            .unwrap()
+            .settings()
+            .await,
     );
 }
 

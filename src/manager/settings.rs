@@ -160,7 +160,7 @@ impl WalletManager {
             }
             let config = config.canonical()?;
             let server = match &config {
-                BackendConfig::CustomElectrum { url, .. } => Some(url.as_str()),
+                BackendConfig::CustomElectrum { url: server, .. } => Some(server.as_str()),
                 BackendConfig::Public { server: Some(id) } => chain::public::find(network, id)
                     .filter(|entry| entry.protocol() == chain::public::ServerProtocol::Electrum)
                     .map(|entry| entry.url()),
