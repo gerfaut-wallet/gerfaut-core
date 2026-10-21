@@ -587,13 +587,19 @@ mod tests {
 
         /// A silent address, and the connections that fill its queue:
         /// a backlog of one takes two, and drops every SYN after them.
-        fn silent() -> (
+        fn silent() -> Silent {
+            silent_at("127.0.0.1:0".parse().unwrap())
+        }
+
+        type Silent = (
             tokio::net::TcpListener,
             Vec<std::net::TcpStream>,
             SocketAddr,
-        ) {
+        );
+
+        fn silent_at(address: SocketAddr) -> Silent {
             let socket = tokio::net::TcpSocket::new_v4().unwrap();
-            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            socket.bind(address).unwrap();
             let listener = socket.listen(1).unwrap();
             let address = listener.local_addr().unwrap();
             let fillers = (0..2)
@@ -668,6 +674,44 @@ mod tests {
             .err()
             .unwrap();
             assert!(fault.is_outage(), "{fault:?}");
+        }
+
+        /// A request of the price or update checks gets past an address
+        /// that ignores it, at the cost of its share of the connect
+        /// timeout, where it used to wait out the request's whole time
+        /// and fail.
+        #[tokio::test]
+        async fn an_http_request_gets_past_a_silent_address() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // One port on two addresses: the client takes the port from
+            // the URL, whatever the addresses carry.
+            let live = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let answers = live.local_addr().unwrap();
+            let (_silent, _fillers, quiet) =
+                silent_at(SocketAddr::from(([127, 0, 0, 2], answers.port())));
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = live.accept().await {
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                }
+            });
+            let builder = crate::chain::http_client().timeout(Duration::from_secs(15));
+            let client = crate::chain::route(builder, None)
+                .unwrap()
+                .resolve_to_addrs("gerfaut.test", &[quiet, answers])
+                .build()
+                .unwrap();
+            let start = Instant::now();
+            let url = format!("http://gerfaut.test:{}/", answers.port());
+            let body = client.get(url).send().await.unwrap().text().await.unwrap();
+            assert_eq!(body, "ok");
+            let took = start.elapsed();
+            assert!(took < crate::chain::CONNECT_TIMEOUT, "{took:?}");
         }
     }
 }
