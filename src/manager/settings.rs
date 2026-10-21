@@ -132,6 +132,62 @@ impl WalletManager {
         result
     }
 
+    /// Remembers the backend of a network and the certificate the user
+    /// accepted for its Electrum server, in one write: both or neither.
+    /// Taken one after the other ([`Self::trust_certificate`], then
+    /// [`Self::set_backend`]), a backend refused after its certificate
+    /// left that certificate trusted for a server the user never saved,
+    /// and an app had to take it back by hand, which the vault may
+    /// refuse too. The checks are those two calls' own: a fingerprint of
+    /// 32 hexadecimal bytes, a configuration [`BackendConfig::canonical`]
+    /// can read. `url` must be the Electrum server of that configuration
+    /// (the custom one, or the public one it picks), compared under the
+    /// key the certificate is stored by: a certificate for anything else
+    /// is refused, and nothing is written.
+    pub async fn set_backend_trusting(
+        &self,
+        network: Network,
+        config: BackendConfig,
+        url: &str,
+        fingerprint: &str,
+    ) -> CoreResult<()> {
+        let result: CoreResult<()> = async {
+            if !chain::tls::is_fingerprint(fingerprint) {
+                return Err(CoreError::InvalidInput {
+                    kind: "certificate fingerprint",
+                    detail: "expected 32 hexadecimal bytes separated by colons".to_owned(),
+                });
+            }
+            let config = config.canonical()?;
+            let server = match &config {
+                BackendConfig::CustomElectrum { url, .. } => Some(url.as_str()),
+                BackendConfig::Public { server: Some(id) } => chain::public::find(network, id)
+                    .filter(|entry| entry.protocol() == chain::public::ServerProtocol::Electrum)
+                    .map(|entry| entry.url()),
+                _ => None,
+            };
+            let host = chain::electrum::certificate_key(url);
+            if server.map(chain::electrum::certificate_key).as_deref() != Some(host.as_str()) {
+                return Err(CoreError::InvalidInput {
+                    kind: "certificate",
+                    detail: "the certificate is not for the Electrum server of this backend"
+                        .to_owned(),
+                });
+            }
+            self.state.lock().await.commit(|payload| {
+                payload
+                    .settings
+                    .electrum_certs
+                    .insert(host, fingerprint.to_ascii_uppercase());
+                payload.settings.backends.insert(network, config);
+                Ok(())
+            })
+        }
+        .await;
+        self.live_refresh().await;
+        result
+    }
+
     /// Drops an accepted certificate: the next connection to that host
     /// asks again.
     pub async fn forget_certificate(&self, host: &str) -> CoreResult<()> {

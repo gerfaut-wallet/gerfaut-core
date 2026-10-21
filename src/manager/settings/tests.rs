@@ -161,6 +161,183 @@ async fn a_custom_backend_is_stored_canonical_or_refused() {
     }
 }
 
+/// The backend and the certificate accepted for its server are written
+/// together or not at all: a backend refused after its certificate used
+/// to leave the certificate trusted for a server nobody saved.
+#[tokio::test]
+async fn a_backend_and_its_certificate_are_stored_together_or_not_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let electrum = |url: &str| BackendConfig::CustomElectrum {
+        url: url.to_owned(),
+        own_node: false,
+    };
+    let fingerprint = |byte: &str| vec![byte; 32].join(":");
+    let before = BackendConfig::CustomEsplora {
+        url: "https://esplora.example.org/api".to_owned(),
+        own_node: false,
+    };
+    manager
+        .set_backend(Network::Signet, before.clone())
+        .await
+        .unwrap();
+    manager
+        .trust_certificate("ssl://other.example.org:50002", &fingerprint("AA"))
+        .await
+        .unwrap();
+    let untouched = || async {
+        let settings = manager.settings().await;
+        assert_eq!(settings.backend_for(Network::Signet), before);
+        assert_eq!(
+            settings.electrum_certs.into_iter().collect::<Vec<_>>(),
+            vec![("other.example.org:50002".to_owned(), fingerprint("AA"))],
+        );
+    };
+
+    // Refused, each for its own reason, and nothing written.
+    for (config, url, print, problem) in [
+        (
+            electrum("ssl://node.example.org:50002"),
+            "ssl://node.example.org:50002",
+            "not a fingerprint".to_owned(),
+            "32 hexadecimal bytes",
+        ),
+        (
+            electrum("ssl://node.example.org:50002"),
+            "ssl://elsewhere.example.org:50002",
+            fingerprint("BB"),
+            "not for the Electrum server of this backend",
+        ),
+        (
+            electrum("ssl://node.example.org:50002"),
+            "ssl://node.example.org:50003",
+            fingerprint("BB"),
+            "not for the Electrum server of this backend",
+        ),
+        (
+            electrum("ssl://x.onion:99999"),
+            "ssl://x.onion:99999",
+            fingerprint("BB"),
+            "99999 is not a port number",
+        ),
+        (
+            BackendConfig::CustomEsplora {
+                url: "https://node.example.org/api".to_owned(),
+                own_node: false,
+            },
+            "ssl://node.example.org:50002",
+            fingerprint("BB"),
+            "not for the Electrum server of this backend",
+        ),
+        (
+            BackendConfig::Public {
+                server: Some("mempool.space".to_owned()),
+            },
+            "ssl://mempool.space:60602",
+            fingerprint("BB"),
+            "not for the Electrum server of this backend",
+        ),
+    ] {
+        let refused = manager
+            .set_backend_trusting(Network::Signet, config.clone(), url, &print)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, CoreError::InvalidInput { detail, .. } if detail.contains(problem)),
+            "{config:?} {url}: {refused}"
+        );
+        untouched().await;
+    }
+
+    // Accepted: both at once, in their stored forms, and both on disk.
+    manager
+        .set_backend_trusting(
+            Network::Signet,
+            electrum("SSL://Node.Example.ORG.:50002"),
+            "ssl://node.example.org:50002",
+            &fingerprint("bb"),
+        )
+        .await
+        .unwrap();
+    drop(manager);
+    let manager = WalletManager::open(dir.path(), key()).unwrap();
+    let settings = manager.settings().await;
+    assert_eq!(
+        settings.backend_for(Network::Signet),
+        electrum("ssl://node.example.org:50002")
+    );
+    assert_eq!(
+        settings.electrum_certs.get("node.example.org:50002"),
+        Some(&fingerprint("BB"))
+    );
+    assert_eq!(
+        settings.electrum_certs.get("other.example.org:50002"),
+        Some(&fingerprint("AA")),
+        "another server's certificate stays"
+    );
+
+    // A public Electrum server picked by its identifier: its own address.
+    manager
+        .set_backend_trusting(
+            Network::Signet,
+            BackendConfig::Public {
+                server: Some("electrum:mempool.space".to_owned()),
+            },
+            "ssl://mempool.space:60602",
+            &fingerprint("CC"),
+        )
+        .await
+        .unwrap();
+    let settings = manager.settings().await;
+    assert_eq!(
+        settings.backend_for(Network::Signet),
+        BackendConfig::Public {
+            server: Some("electrum:mempool.space".to_owned())
+        }
+    );
+    assert_eq!(
+        settings.electrum_certs.get("mempool.space:60602"),
+        Some(&fingerprint("CC"))
+    );
+}
+
+/// A vault that cannot be written takes neither the backend nor its
+/// certificate: the one write fails whole, and the settings in memory
+/// stay those on disk.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_backend_the_vault_refuses_leaves_no_certificate() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let mode = |mode: u32| {
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    mode(0o555);
+    let refused = manager
+        .set_backend_trusting(
+            Network::Signet,
+            BackendConfig::CustomElectrum {
+                url: "ssl://node.example.org:50002".to_owned(),
+                own_node: false,
+            },
+            "ssl://node.example.org:50002",
+            &vec!["BB"; 32].join(":"),
+        )
+        .await;
+    mode(0o755);
+    assert!(
+        refused.is_err(),
+        "the vault took a write in a read-only directory"
+    );
+    let settings = manager.settings().await;
+    assert!(settings.electrum_certs.is_empty());
+    assert_eq!(
+        settings.backend_for(Network::Signet),
+        BackendConfig::default()
+    );
+}
+
 /// "This is my node" is stored with the backend, in its canonical
 /// form, lifts what the live watch lists of a wallet, and travels in
 /// a backup with the rest of the node settings.
