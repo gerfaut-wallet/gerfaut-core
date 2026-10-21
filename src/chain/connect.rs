@@ -66,6 +66,8 @@ fn reject(detail: impl Into<String>) -> CoreError {
 }
 
 /// Splits `host[:port]`, keeping an IPv6 literal's own colons out of it.
+/// Its refusals quote the address: what reaches it has been through
+/// [`refuse_wallet_material`], so it holds no key, no seed and no space.
 fn split_host_port(rest: &str) -> Result<(String, Option<u16>), CoreError> {
     let port_of = |port: &str| {
         port.parse::<u16>()
@@ -253,9 +255,19 @@ pub fn parse_backend(text: &str) -> CoreResult<ScannedBackend> {
 /// resolver in the clear the first time the server was tried. The host
 /// is read as typed, since a base58 key or address only reads as one in
 /// its own case, and as the URL parser reads it. A private key anywhere
-/// in the text is refused as such, unquoted.
+/// in the text is refused as such, unquoted, and so is a seed phrase in
+/// the host: the form puts a scheme before what was typed and a port
+/// after it, which the check on the whole text does not read as words
+/// ([`typed_words`]).
+/// A space is refused next, without quoting the text either: no host
+/// holds one, and words that are not quite a seed phrase may still be
+/// one.
 pub(crate) fn refuse_wallet_material(text: &str) -> CoreResult<()> {
     crate::input::reject_private_material(text)?;
+    crate::input::reject_private_material(typed_words(text))?;
+    if text.trim().contains(char::is_whitespace) {
+        return Err(reject("the address has a space in it"));
+    }
     let canonical = super::host_of(text);
     for host in std::iter::once(typed_host(text)).chain(canonical.as_deref()) {
         if let Some(what) = wallet_material(host) {
@@ -270,6 +282,7 @@ pub(crate) fn refuse_wallet_material(text: &str) -> CoreResult<()> {
 /// The host of a server address as it was typed: after the scheme and
 /// any userinfo, up to the port or the path. An IPv6 literal comes back
 /// as its opening bracket and first group, which is no wallet material.
+/// Spaces are kept, so a seed phrase comes back as its words.
 fn typed_host(text: &str) -> &str {
     let text = text.trim();
     let rest = text.split_once("://").map_or(text, |(_, rest)| rest);
@@ -278,6 +291,35 @@ fn typed_host(text: &str) -> &str {
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
     host.split(':').next().unwrap_or_default()
+}
+
+/// What was typed as the host, read for the words of a seed phrase.
+/// The settings form wraps what was typed: a scheme before it, a port
+/// after it, and on the desktop brackets around a host with a colon, as
+/// around an IPv6 literal. Typed with a scheme and a port of its own,
+/// `ssl://words:50002` reaches the core as
+/// `ssl://[ssl://words:50002]:50002`. Every bracket and scheme in front
+/// is peeled off before the host is cut out.
+fn typed_words(text: &str) -> &str {
+    let mut rest = text.trim();
+    loop {
+        let unbracketed = rest.trim_start_matches('[');
+        let next = match unbracketed.split_once("://") {
+            Some((scheme, after))
+                if !scheme.is_empty()
+                    && scheme
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) =>
+            {
+                after
+            }
+            _ => unbracketed,
+        };
+        if next == rest {
+            return typed_host(rest);
+        }
+        rest = next;
+    }
 }
 
 /// What a host is when it is wallet material rather than a name: a
@@ -782,5 +824,111 @@ mod tests {
         assert_eq!(ok("tcp://tpubnode.example:50001").host, "tpubnode.example");
         assert_eq!(ok("https://bc1.example.org/api").host, "bc1.example.org");
         assert_eq!(ok("[2001:db8::1]:50002").host, "2001:db8::1");
+    }
+
+    /// A seed phrase or a private key typed into the host field reaches
+    /// the parser between a scheme and a port, `ssl://` before it and
+    /// `:50002` after it: the first word and the last are then no words,
+    /// and the whole was quoted back in the refusal of its second colon.
+    /// Every form of it is refused as private material, and none is
+    /// quoted.
+    #[test]
+    fn a_secret_typed_as_a_host_is_refused_unquoted() {
+        use ScannedBackendKind::{Electrum, Esplora};
+        let twelve = ["abandon"; 11].join(" ") + " about";
+        let twenty_four = ["abandon"; 23].join(" ") + " art";
+        // Spelled as an extended private key: the check reads the
+        // prefix, so no key is needed to show it.
+        let xprv = "xprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L";
+        let tprv = "tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L";
+        let wif = "5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ";
+        for secret in [twelve.as_str(), twenty_four.as_str(), xprv, tprv, wif] {
+            let electrum = [
+                format!("{secret}:50002"),
+                format!("{secret}:50002:s"),
+                format!("ssl://{secret}"),
+                format!("ssl://{secret}:50002"),
+                // What the settings form sends for `secret:50002` typed
+                // in the host field, the port in its own.
+                format!("ssl://{secret}:50002:50002"),
+                format!("tcp://{secret}:50001:50001"),
+                // The same from the desktop, which brackets a host that
+                // holds a colon, as it would an IPv6 literal.
+                format!("ssl://[{secret}:50002]:50002"),
+                // Typed with a scheme of its own, from either app.
+                format!("ssl://[ssl://{secret}:50002]:50002"),
+                format!("ssl://tcp://{secret}:50001:50002"),
+            ];
+            let esplora = [
+                format!("https://{secret}"),
+                format!("https://{secret}:3002/api"),
+                format!("http://{secret}:3000"),
+            ];
+            let typed = electrum
+                .iter()
+                .map(|text| (Electrum, text))
+                .chain(esplora.iter().map(|text| (Esplora, text)));
+            for (kind, text) in typed {
+                for error in [
+                    parse_backend(text).unwrap_err(),
+                    stored_form(kind, text).unwrap_err(),
+                    refuse_wallet_material(text).unwrap_err(),
+                ] {
+                    assert!(
+                        matches!(error, CoreError::PrivateMaterialRejected),
+                        "{text}: {error}"
+                    );
+                }
+            }
+        }
+
+        // Words that are not quite a seed phrase are still never quoted:
+        // no host holds a space.
+        for text in [
+            format!("ssl://{}:50002:50002", ["abandon"; 11].join(" ")),
+            format!("ssl://Abandon {}:50002:50002", ["abandon"; 11].join(" ")),
+            format!("https://{} about/api", ["abandon"; 10].join(" ")),
+            format!("{}://node.example.org", ["abandon"; 12].join(" ")),
+        ] {
+            let error = parse_backend(&text).unwrap_err().to_string();
+            assert!(error.contains("has a space in it"), "{text}: {error}");
+            assert!(!error.contains("abandon"), "{text}: {error}");
+        }
+    }
+
+    /// A server name in a refusal says which part was read wrong: once
+    /// the address is known to hold no secret, it is still quoted.
+    #[test]
+    fn an_ordinary_host_is_still_named_in_its_refusals() {
+        for (text, quoted) in [
+            (
+                "ssl://node.example.org:50002:50002",
+                "node.example.org:50002:50002 has more than one colon",
+            ),
+            ("ssl://node.example.org:99999", "99999 is not a port number"),
+            (
+                "ssl://evil.com\\.onion:50002",
+                "evil.com\\.onion is not a host name",
+            ),
+            (
+                "nodeexample:50002",
+                "nodeexample does not look like a server address",
+            ),
+            (
+                "https://node.example.org:99999",
+                "https://node.example.org:99999",
+            ),
+        ] {
+            let error = parse_backend(text).unwrap_err().to_string();
+            assert!(error.contains(quoted), "{text}: {error}");
+        }
+        assert_eq!(
+            stored_form(ScannedBackendKind::Electrum, "node.example.org:50002").unwrap(),
+            "ssl://node.example.org:50002"
+        );
+        assert_eq!(
+            ok("https://esplora.example.org/api").url,
+            "https://esplora.example.org/api"
+        );
     }
 }

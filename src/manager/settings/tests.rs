@@ -569,6 +569,65 @@ async fn a_certificate_is_not_asked_of_wallet_material() {
     }
 }
 
+/// A seed phrase or a private key typed into the host field, port and
+/// all, is refused as private material by every call the settings
+/// screen makes with it, quoted by none, and stored by none.
+#[tokio::test]
+async fn a_secret_typed_as_a_host_is_refused_by_every_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let seed = ["abandon"; 11].join(" ") + " about";
+    let wif = "5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ";
+    let fingerprint = vec!["AA"; 32].join(":");
+    for url in [
+        format!("ssl://{seed}:50002:50002"),
+        format!("ssl://[{seed}:50002]:50002"),
+        format!("tcp://{seed}:50001"),
+        format!("ssl://{wif}:50002:50002"),
+    ] {
+        let config = BackendConfig::CustomElectrum {
+            url: url.clone(),
+            own_node: false,
+        };
+        let refusals = [
+            manager.inspect_certificate(&url).await.unwrap_err(),
+            manager
+                .set_backend(Network::Signet, config.clone())
+                .await
+                .unwrap_err(),
+            manager
+                .set_backend_trusting(Network::Signet, config, &url, &fingerprint)
+                .await
+                .unwrap_err(),
+        ];
+        for error in refusals {
+            assert!(
+                matches!(error, CoreError::PrivateMaterialRejected),
+                "{url}: {error}"
+            );
+        }
+    }
+    let esplora = BackendConfig::CustomEsplora {
+        url: format!("https://{seed}:3002/api"),
+        own_node: false,
+    };
+    let error = manager
+        .set_backend(Network::Signet, esplora)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, CoreError::PrivateMaterialRejected),
+        "{error}"
+    );
+
+    let settings = manager.settings().await;
+    assert_eq!(
+        settings.backend_for(Network::Signet),
+        BackendConfig::Public { server: None }
+    );
+    assert!(settings.electrum_certs.is_empty());
+}
+
 /// The preferences both apps keep are changed one field at a time, kept
 /// across a restart, and never left on a pair no source quotes.
 #[tokio::test]
