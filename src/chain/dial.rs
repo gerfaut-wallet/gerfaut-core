@@ -10,10 +10,14 @@
 //! back for the whole timeout.
 //!
 //! Someone else's server is not hit harder for it: [`AT_ONCE`] attempts
-//! at most are in flight, a new one starts only while none has
-//! connected, and a connection that loses the race is closed the moment
-//! it exists. The whole opening gets the one timeout, whatever the
-//! number of addresses, and fails as a timeout when it runs out.
+//! at most are waiting on an answer that can still come, a new one
+//! starts only while none has connected, and a connection that loses the
+//! race is closed the moment it exists. An attempt left unanswered for
+//! [`STALL`] gives its place to the next address, so silent addresses
+//! at the head of the list, IPv6 behind a route that goes nowhere say,
+//! cannot hold every place, and [`MOST`] bounds the attempts alive. The
+//! whole opening gets the one timeout, whatever the number of
+//! addresses, and fails as a timeout when it runs out.
 //!
 //! Only direct connections come here. A host reached through Tor is
 //! named to the proxy and never resolved on this machine.
@@ -31,12 +35,21 @@ use futures_util::stream::FuturesUnordered;
 /// beside it: the delay RFC 8305 recommends.
 pub(crate) const STAGGER: Duration = Duration::from_millis(250);
 
-/// The most attempts in flight at once. An address that ignores the
-/// connection keeps its place until the timeout, so the opening gets
-/// past one silent address fewer than this: four, as many as trying
-/// them one after the other, twenty seconds each, got past within the
-/// ninety seconds of a call.
+/// The most attempts waiting at once on an answer that can still come.
 pub(crate) const AT_ONCE: usize = 5;
+
+/// How long an attempt goes unanswered before it gives its place to the
+/// next address. A server that answers does so within a round trip, and
+/// a SYN that was lost is sent again after a second: past two, the
+/// address ignores the connection, or the link is so slow that one more
+/// attempt beside it costs nobody anything. The stalled attempt goes on
+/// and may still connect.
+pub(crate) const STALL: Duration = Duration::from_secs(2);
+
+/// The most attempts alive at once, stalled ones included: more than
+/// the fourteen addresses mempool.space's name carries, and few enough
+/// that a resolver answering hundreds opens no more.
+pub(crate) const MOST: usize = 16;
 
 /// The longest an opening is given, whatever the caller asks: a day
 /// keeps the deadline within what the clock can count.
@@ -61,6 +74,47 @@ fn ordered(addresses: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
             (None, None) => return order,
             (one, two) => order.extend(one.into_iter().chain(two)),
         }
+    }
+}
+
+/// The attempts started, by when each started since the opening began,
+/// while they are alive.
+#[derive(Default)]
+struct Flights(Vec<Option<Duration>>);
+
+impl Flights {
+    fn start(&mut self, at: Duration) -> usize {
+        self.0.push(Some(at));
+        self.0.len() - 1
+    }
+
+    fn end(&mut self, id: usize) {
+        self.0[id] = None;
+    }
+
+    fn alive(&self) -> usize {
+        self.0.iter().flatten().count()
+    }
+
+    /// When the next attempt may start, at `next` at the earliest: now if
+    /// a place is free, else once the oldest attempt holding one has gone
+    /// [`STALL`] unanswered. `None` while [`MOST`] attempts are alive.
+    fn opening(&self, now: Duration, next: Duration) -> Option<Duration> {
+        if self.alive() >= MOST {
+            return None;
+        }
+        // In the order they started: the first is the oldest.
+        let waiting: Vec<Duration> = self
+            .0
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|at| now < *at + STALL)
+            .collect();
+        Some(match waiting.len().checked_sub(AT_ONCE) {
+            None => next,
+            Some(over) => next.max(waiting[over] + STALL),
+        })
     }
 }
 
@@ -97,33 +151,33 @@ fn race<T: Send + 'static>(
     attempt: impl Fn(SocketAddr, Duration) -> io::Result<T> + Send + Sync + 'static,
 ) -> io::Result<T> {
     let start = Instant::now();
-    let deadline = start + timeout.min(LONGEST);
+    let timeout = timeout.min(LONGEST);
     let attempt = Arc::new(attempt);
     let (sender, results) = mpsc::channel();
     let mut queue = ordered(addresses).into_iter().peekable();
-    let (mut running, mut next, mut last) = (0usize, start, None);
+    let mut flights = Flights::default();
+    let (mut next, mut last) = (Duration::ZERO, None);
     loop {
-        let now = Instant::now();
-        if now >= deadline {
+        let now = start.elapsed();
+        if now >= timeout {
             break;
         }
-        if running < AT_ONCE
-            && now >= next
+        let opening = queue.peek().and_then(|_| flights.opening(now, next));
+        if opening.is_some_and(|at| at <= now)
             && let Some(address) = queue.next()
         {
-            let (sender, attempt, left) = (sender.clone(), Arc::clone(&attempt), deadline - now);
+            let id = flights.start(now);
+            let (sender, attempt, left) = (sender.clone(), Arc::clone(&attempt), timeout - now);
             let spawned = std::thread::Builder::new()
                 .name("gerfaut-dial".to_owned())
                 .spawn(move || {
-                    let _ = sender.send(attempt(address, left));
+                    let _ = sender.send((id, attempt(address, left)));
                 });
             match spawned {
-                Ok(_) => {
-                    running += 1;
-                    next = now + STAGGER;
-                }
+                Ok(_) => next = now + STAGGER,
                 // This device's shortage, not the server's silence.
                 Err(error) => {
+                    flights.end(id);
                     last = Some(io::Error::other(format!(
                         "could not start a connection attempt: {error}"
                     )))
@@ -131,28 +185,23 @@ fn race<T: Send + 'static>(
             }
             continue;
         }
-        let more = queue.peek().is_some();
-        if running == 0 && !more {
+        if flights.alive() == 0 && opening.is_none() {
             break;
         }
-        let wake = if running < AT_ONCE && more {
-            next.min(deadline)
-        } else {
-            deadline
-        };
+        let wake = opening.map_or(timeout, |at| at.min(timeout));
         // Past `wake`: time for the next address, or the deadline.
-        if let Ok(result) = results.recv_timeout(wake.saturating_duration_since(now)) {
-            running -= 1;
+        if let Ok((id, result)) = results.recv_timeout(wake.saturating_sub(now)) {
+            flights.end(id);
             match result {
                 Ok(connected) => return Ok(connected),
                 Err(error) => {
                     last = Some(error);
-                    next = Instant::now();
+                    next = start.elapsed();
                 }
             }
         }
     }
-    Err(if running > 0 || queue.peek().is_some() {
+    Err(if flights.alive() > 0 || queue.peek().is_some() {
         timed_out()
     } else {
         last.unwrap_or_else(nowhere)
@@ -188,37 +237,42 @@ where
 {
     use tokio::time::{Instant, sleep_until};
     let start = Instant::now();
-    let deadline = start + timeout.min(LONGEST);
+    let timeout = timeout.min(LONGEST);
     let mut queue = ordered(addresses).into_iter().peekable();
     let mut running = FuturesUnordered::new();
-    let (mut next, mut last) = (start, None);
+    let mut flights = Flights::default();
+    let (mut next, mut last) = (Duration::ZERO, None);
     loop {
-        let now = Instant::now();
-        if now >= deadline {
+        let now = start.elapsed();
+        if now >= timeout {
             break;
         }
-        if running.len() < AT_ONCE
-            && now >= next
+        let opening = queue.peek().and_then(|_| flights.opening(now, next));
+        if opening.is_some_and(|at| at <= now)
             && let Some(address) = queue.next()
         {
-            running.push(attempt(address));
+            let id = flights.start(now);
+            let connecting = attempt(address);
+            running.push(async move { (id, connecting.await) });
             next = now + STAGGER;
             continue;
         }
-        let more = running.len() < AT_ONCE && queue.peek().is_some();
-        if running.is_empty() && !more {
+        if running.is_empty() && opening.is_none() {
             break;
         }
+        let wake = opening.map_or(timeout, |at| at.min(timeout));
         tokio::select! {
-            Some(result) = running.next(), if !running.is_empty() => match result {
-                Ok(connected) => return Ok(connected),
-                Err(error) => {
-                    last = Some(error);
-                    next = Instant::now();
+            Some((id, result)) = running.next(), if !running.is_empty() => {
+                flights.end(id);
+                match result {
+                    Ok(connected) => return Ok(connected),
+                    Err(error) => {
+                        last = Some(error);
+                        next = start.elapsed();
+                    }
                 }
-            },
-            () = sleep_until(next), if more => {}
-            () = sleep_until(deadline) => {}
+            }
+            () = sleep_until(start + wake) => {}
         }
     }
     Err(if running.is_empty() && queue.peek().is_none() {
@@ -494,25 +548,87 @@ mod tests {
         );
     }
 
-    /// However many addresses ignore it, no more than [`AT_ONCE`]
-    /// connections are tried at the same time, and none is started
-    /// past the deadline.
+    /// Before any attempt has stalled, no more than [`AT_ONCE`]
+    /// connections are tried at the same time.
     #[test]
     fn attempts_in_flight_are_bounded() {
         let peers: Vec<_> = (1..=9).map(|n| (v4(n), Peer::Silent)).collect();
-        let (connected, _, log) = dial(&peers, Duration::from_millis(2500));
+        let (connected, _, log) = dial(&peers, Duration::from_millis(1500));
         assert_eq!(connected.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(log.most.load(SeqCst), AT_ONCE);
         assert_eq!(log.order(), &[v4(1), v4(2), v4(3), v4(4), v4(5)]);
     }
 
+    /// However many addresses ignore it, no more than [`AT_ONCE`]
+    /// attempts started within [`STALL`] of each other, one stagger
+    /// apart at least, and [`MOST`] alive in all.
     #[tokio::test(start_paused = true)]
     async fn attempts_in_flight_are_bounded_on_the_runtime() {
-        let peers: Vec<_> = (1..=9).map(|n| (v4(n), Peer::Silent)).collect();
-        let (connected, _, log) = dial_async(&peers, Duration::from_secs(20)).await;
+        let peers: Vec<_> = (1..=40).map(|n| (v4(n), Peer::Silent)).collect();
+        let (connected, took, log) = dial_async(&peers, Duration::from_secs(20)).await;
         assert_eq!(connected.unwrap_err().kind(), io::ErrorKind::TimedOut);
-        assert_eq!(log.most.load(SeqCst), AT_ONCE);
-        assert_eq!(log.order().len(), AT_ONCE);
+        assert_eq!(took, Duration::from_secs(20));
+        assert_eq!(log.most.load(SeqCst), MOST);
+        let started: Vec<Duration> = log.started.lock().unwrap().iter().map(|s| s.1).collect();
+        assert_eq!(started.len(), MOST);
+        for (i, at) in started.iter().enumerate() {
+            let waiting = started[..=i].iter().filter(|s| **s + STALL > *at).count();
+            assert!(waiting <= AT_ONCE, "{started:?}");
+            if i > 0 {
+                assert!(*at >= started[i - 1] + STAGGER, "{started:?}");
+            }
+        }
+    }
+
+    /// The case the bound alone left open: an IPv6 route that goes
+    /// nowhere and two silent IPv4 addresses fill every place. Once the
+    /// oldest has stalled, the next address gets its place.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_attempts_give_their_place_to_the_next_address() {
+        let mut peers: Vec<_> = (1..=4).map(|n| (v6(n), Peer::Silent)).collect();
+        peers.extend([
+            (v4(1), Peer::Silent),
+            (v4(2), Peer::Silent),
+            (v4(3), ANSWER),
+        ]);
+        let (connected, took, log) = dial_async(&peers, Duration::from_secs(20)).await;
+        assert_eq!(connected.unwrap(), v4(3));
+        assert_eq!(took, STALL + Duration::from_millis(10));
+        assert_eq!(log.order()[AT_ONCE], v4(3));
+        assert_eq!(log.in_flight.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn stalled_attempts_give_their_place_to_the_next_address_blocking() {
+        let mut peers: Vec<_> = (1..=3).map(|n| (v6(n), Peer::Silent)).collect();
+        peers.extend([
+            (v4(1), Peer::Silent),
+            (v4(2), Peer::Silent),
+            (v4(3), ANSWER),
+        ]);
+        let (connected, took, _) = dial(&peers, Duration::from_secs(20));
+        assert_eq!(connected.unwrap(), v4(3));
+        assert!(took >= STALL && took < STALL * 2, "{took:?}");
+    }
+
+    #[test]
+    fn a_place_opens_when_the_oldest_attempt_stalls() {
+        let ms = Duration::from_millis;
+        let mut flights = Flights::default();
+        for n in 0..AT_ONCE as u64 {
+            flights.start(ms(250 * n));
+        }
+        // Every place held: the next waits for the oldest to stall.
+        assert_eq!(flights.opening(ms(1250), ms(1250)), Some(STALL));
+        // An attempt that ends frees its place at once.
+        flights.end(2);
+        assert_eq!(flights.opening(ms(1250), ms(1250)), Some(ms(1250)));
+        // Never more than MOST alive.
+        let mut crowd = Flights::default();
+        for _ in 0..MOST {
+            crowd.start(Duration::ZERO);
+        }
+        assert_eq!(crowd.opening(ms(10_000), ms(10_000)), None);
     }
 
     /// A slot freed by a failure goes to the next address.
