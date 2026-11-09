@@ -1330,19 +1330,12 @@ fn wallet() -> Vec<Fixture> {
             let states = vec![
                 ("idle", WalletSyncState::Idle),
                 ("syncing", WalletSyncState::Syncing),
-                (
-                    "failed",
-                    WalletSyncState::Failed {
-                        message: sync_failure_stamp().message,
-                        kind: sync_failure_stamp().kind,
-                        at: sync_failure_stamp().at,
-                    },
-                ),
+                ("failed", WalletSyncState::Failed(sync_failure_stamp())),
             ];
             reaches_every("WalletSyncState", &states, 3, |state| match state {
                 WalletSyncState::Idle => 0,
                 WalletSyncState::Syncing => 1,
-                WalletSyncState::Failed { .. } => 2,
+                WalletSyncState::Failed(_) => 2,
             });
             fixture(
                 "WalletSync",

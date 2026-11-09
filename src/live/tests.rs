@@ -2191,12 +2191,11 @@ async fn a_proven_confirmation_clears_a_kept_failure() {
     let dir = tempfile::tempdir().unwrap();
     let (manager, wallet, mut events, script, paid) =
         waiting_for_a_block(&server, dir.path()).await;
-    manager
-        .record_sync_failure(
-            &wallet,
-            &crate::error::CoreError::BackendUnavailable("down".to_owned()),
-        )
-        .await;
+    crate::manager::keep_sync_failure(
+        &mut *manager.state.lock().await,
+        &wallet,
+        &crate::error::CoreError::BackendUnavailable("down".to_owned()),
+    );
     let mut changes = manager.sync_changes();
 
     server.set_history(&script, &[(paid, 101)]);

@@ -16,12 +16,12 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::error::{CoreError, ErrorCode};
+use crate::error::CoreError;
 use crate::network::Network;
 use crate::now_secs;
 use crate::wallet::meta::{StoredMeta, SyncFailureStamp};
 
-use super::super::{WalletManager, find_record, find_record_mut};
+use super::super::{ManagerState, WalletManager, find_record, find_record_mut};
 
 /// Where the sync of a wallet stands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,15 +32,9 @@ pub enum WalletSyncState {
     /// A sync runs, whoever asked for it.
     Syncing,
     /// No sync runs, and the last one failed: what the wallet shows is
-    /// from its last good sync, if it ever had one.
-    Failed {
-        /// The core's words.
-        message: String,
-        /// The code of the failure, the one an app picks its sentence on.
-        kind: ErrorCode,
-        /// When it failed, Unix seconds.
-        at: u64,
-    },
+    /// from its last good sync, if it ever had one. Its fields sit flat
+    /// beside `state`.
+    Failed(SyncFailureStamp),
 }
 
 impl WalletSyncState {
@@ -49,11 +43,7 @@ impl WalletSyncState {
             return WalletSyncState::Syncing;
         }
         match &meta.last_failure {
-            Some(failure) => WalletSyncState::Failed {
-                message: failure.message.clone(),
-                kind: failure.kind,
-                at: failure.at,
-            },
+            Some(failure) => WalletSyncState::Failed(failure.clone()),
             None => WalletSyncState::Idle,
         }
     }
@@ -106,36 +96,48 @@ impl SyncBoard {
 
 /// A turn of a wallet on the board, out while a sync of it runs. Given
 /// back by [`SyncTurn::end`]; dropped without it, a sync given up
-/// halfway, it is given back all the same.
+/// halfway, it is given back all the same, and where the wallet stands
+/// is said all the same.
 pub(crate) struct SyncTurn {
     manager: WalletManager,
     id: String,
-    ended: bool,
+    left: bool,
+    settled: bool,
 }
 
 impl SyncTurn {
     /// Gives the turn back, and says where the wallet stands if it was
     /// the last one out.
     pub(crate) async fn end(mut self) {
-        self.ended = true;
         self.manager.leave(&self.id);
+        self.left = true;
         self.manager.settle(&self.id).await;
+        self.settled = true;
     }
 }
 
 impl Drop for SyncTurn {
     fn drop(&mut self) {
-        if self.ended {
+        if !self.left {
+            self.manager.leave(&self.id);
+        }
+        if self.settled {
             return;
         }
-        self.manager.leave(&self.id);
-        // The vault's lock cannot be awaited here: where the wallet
-        // stands is said from a task of its own, when a runtime is
-        // there to run one.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let manager = self.manager.clone();
-            let id = std::mem::take(&mut self.id);
-            runtime.spawn(async move { manager.settle(&id).await });
+        // The vault's lock cannot be awaited here. With a runtime, where
+        // the wallet stands is said from a task of its own; without one,
+        // now, if the lock is free.
+        let manager = self.manager.clone();
+        let id = std::mem::take(&mut self.id);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move { manager.settle(&id).await });
+            }
+            Err(_) => {
+                if let Ok(state) = manager.state.try_lock() {
+                    manager.settle_in(&state, &id);
+                }
+            }
         }
     }
 }
@@ -178,42 +180,8 @@ impl WalletManager {
         SyncTurn {
             manager: self.clone(),
             id: id.to_owned(),
-            ended: false,
-        }
-    }
-
-    /// Keeps the failure of a sync of `id` with the wallet, until a sync
-    /// succeeds. A wallet that is gone has nothing to keep it in. The
-    /// vault is saved after, as for any chain state: a save that fails
-    /// keeps it in memory, and a later save writes it.
-    pub(crate) async fn record_sync_failure(&self, id: &str, error: &CoreError) {
-        let mut state = self.state.lock().await;
-        let Ok(record) = find_record_mut(&mut state.payload, id) else {
-            return;
-        };
-        record.meta.last_failure = Some(SyncFailureStamp {
-            at: now_secs(),
-            message: error.to_string(),
-            kind: error.code(),
-        });
-        if let Err(error) = state.vault.save(&state.payload) {
-            log::warn!("a failed sync was not saved with its wallet: {error}");
-        }
-    }
-
-    /// Forgets the failure kept with `id`, after a read that stands for
-    /// a good sync without going through one: confirmations the live
-    /// watch proved. A sync clears it as it records its stamp.
-    pub(crate) async fn clear_sync_failure(&self, id: &str) {
-        let mut state = self.state.lock().await;
-        let Ok(record) = find_record_mut(&mut state.payload, id) else {
-            return;
-        };
-        if record.meta.last_failure.take().is_none() {
-            return;
-        }
-        if let Err(error) = state.vault.save(&state.payload) {
-            log::warn!("a cleared sync failure was not saved with its wallet: {error}");
+            left: false,
+            settled: false,
         }
     }
 
@@ -232,7 +200,16 @@ impl WalletManager {
     /// ends. Read under the vault's lock, so no failure is written
     /// between the reading and the saying.
     async fn settle(&self, id: &str) {
+        // Nothing to say while another turn is out: the vault's lock is
+        // not waited for.
+        if self.board().running(id) {
+            return;
+        }
         let state = self.state.lock().await;
+        self.settle_in(&state, id);
+    }
+
+    fn settle_in(&self, state: &ManagerState, id: &str) {
         let board = self.board();
         if board.running(id) {
             return;
@@ -250,5 +227,49 @@ impl WalletManager {
         self.sync_board
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Keeps the failure of a sync of `id` with the wallet, until a sync
+/// succeeds; called under the wallet's turn to sync, so no later sync
+/// of it can be overwritten. A wallet that is gone has nothing to keep
+/// it in. The same failure again keeps the time of the first, and the
+/// vault is not written for it; a new one is saved as any chain state
+/// is: a save that fails keeps it in memory, and a later save writes it.
+pub(crate) fn keep_sync_failure(state: &mut ManagerState, id: &str, error: &CoreError) {
+    let Ok(record) = find_record_mut(&mut state.payload, id) else {
+        return;
+    };
+    let (message, kind) = (error.to_string(), error.code());
+    if record
+        .meta
+        .last_failure
+        .as_ref()
+        .is_some_and(|kept| kept.kind == kind && kept.message == message)
+    {
+        return;
+    }
+    record.meta.last_failure = Some(SyncFailureStamp {
+        at: now_secs(),
+        message,
+        kind,
+    });
+    if let Err(error) = state.vault.save(&state.payload) {
+        log::warn!("a failed sync was not saved with its wallet: {error}");
+    }
+}
+
+/// Forgets the failure kept with `id`, after a read that stands for a
+/// good sync without going through one: confirmations the live watch
+/// proved. A sync clears it as it records its stamp.
+pub(crate) fn clear_sync_failure(state: &mut ManagerState, id: &str) {
+    let Ok(record) = find_record_mut(&mut state.payload, id) else {
+        return;
+    };
+    if record.meta.last_failure.take().is_none() {
+        return;
+    }
+    if let Err(error) = state.vault.save(&state.payload) {
+        log::warn!("a cleared sync failure was not saved with its wallet: {error}");
     }
 }

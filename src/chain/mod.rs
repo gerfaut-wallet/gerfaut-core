@@ -2006,7 +2006,7 @@ mod tests {
         assert!(manager.sync_wallet(&wallet).await.is_err());
         assert!(matches!(
             manager.sync_states(None).await[0].state,
-            WalletSyncState::Failed { .. }
+            WalletSyncState::Failed(_)
         ));
 
         let mut changes = manager.sync_changes();

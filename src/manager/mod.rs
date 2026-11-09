@@ -56,6 +56,10 @@ mod sync;
 mod updates;
 mod wallets;
 
+/// For the tests of the live watch, which plant a failure as a sync
+/// would have kept it.
+#[cfg(test)]
+pub(crate) use sync::keep_sync_failure;
 pub(crate) use sync::{Reach, complete_lately, sync_code};
 pub use sync::{SyncAllReport, SyncFailure, WalletSync, WalletSyncState};
 

@@ -169,10 +169,10 @@ async fn a_sync_says_when_it_starts_and_where_it_ends() {
     // One start and one end, however many turns the sync took inside.
     let ended = changes.try_recv().unwrap();
     assert!(changes.try_recv().is_err(), "said once");
-    let WalletSyncState::Failed { kind, .. } = &ended.state else {
+    let WalletSyncState::Failed(failure) = &ended.state else {
         panic!("not failed: {ended:?}");
     };
-    assert_eq!(*kind, ErrorCode::BackendUnavailable);
+    assert_eq!(failure.kind, ErrorCode::BackendUnavailable);
     assert_eq!(manager.sync_states(None).await, vec![ended.clone()]);
 
     // The shape both apps read: the state beside the id, flat.
@@ -204,6 +204,33 @@ async fn a_sync_given_up_halfway_is_not_syncing_for_ever() {
         manager.sync_states(None).await[0].state,
         WalletSyncState::Idle
     );
+}
+
+/// A sync given up while it says where it ends, the vault's lock busy,
+/// still says it once the lock is free.
+#[tokio::test]
+async fn a_sync_given_up_while_it_ends_still_says_where_it_stands() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let parsed = parse_input(MULTIPATH).unwrap();
+    let meta = manager
+        .add_wallet("Regtest", &parsed, Network::Regtest)
+        .await
+        .unwrap();
+    let mut changes = manager.sync_changes();
+    let turn = manager.sync_turn(&meta.id);
+    let busy = manager.state.lock().await;
+    tokio::select! {
+        biased;
+        () = turn.end() => panic!("ended with the vault's lock held"),
+        () = tokio::task::yield_now() => {}
+    }
+    drop(busy);
+    assert_eq!(
+        changes.recv().await.unwrap().state,
+        WalletSyncState::Syncing
+    );
+    assert_eq!(changes.recv().await.unwrap().state, WalletSyncState::Idle);
 }
 
 /// The server that answered the last sync goes first in the next one,

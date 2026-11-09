@@ -49,11 +49,6 @@ impl WalletManager {
     ) -> CoreResult<Option<SyncReport>> {
         let turn = self.sync_turn(id);
         let taken = self.take_in_turn(id, proven).await;
-        match &taken {
-            Ok(Some(_)) => self.clear_sync_failure(id).await,
-            Ok(None) | Err(CoreError::WalletNotFound(_)) => {}
-            Err(error) => self.record_sync_failure(id, error).await,
-        }
         turn.end().await;
         taken
     }
@@ -65,7 +60,16 @@ impl WalletManager {
         };
         let turn = slot.lock().await;
         let started = Instant::now();
-        let report = take(&mut *self.state.lock().await, id, proven, started)?;
+        let report = {
+            let mut state = self.state.lock().await;
+            let report = take(&mut state, id, proven, started);
+            match &report {
+                Ok(Some(_)) => super::state::clear_sync_failure(&mut state, id),
+                Ok(None) | Err(CoreError::WalletNotFound(_)) => {}
+                Err(error) => super::state::keep_sync_failure(&mut state, id, error),
+            }
+            report
+        }?;
         drop(turn);
         if report.is_some() {
             self.live_refresh().await;

@@ -323,11 +323,6 @@ impl WalletManager {
     ) -> CoreResult<(SyncReport, Option<Endpoint>)> {
         let turn = self.sync_turn(id);
         let read = self.sync_wallet_in_turn(id, reach, prefer).await;
-        if let Err(error) = &read
-            && !matches!(error, CoreError::WalletNotFound(_))
-        {
-            self.record_sync_failure(id, error).await;
-        }
         turn.end().await;
         read
     }
@@ -357,7 +352,17 @@ impl WalletManager {
             return Ok((report, None));
         }
         let started = Instant::now();
-        let (report, read, answered) = self.sync_wallet_alone(id, reach, prefer).await?;
+        let (report, read, answered) = match self.sync_wallet_alone(id, reach, prefer).await {
+            Ok(done) => done,
+            Err(error) => {
+                // Kept while the wallet's turn is still held: no later
+                // sync of it has read anything yet.
+                if !matches!(error, CoreError::WalletNotFound(_)) {
+                    state::keep_sync_failure(&mut *self.state.lock().await, id, &error);
+                }
+                return Err(error);
+            }
+        };
         *last = Some((started, report.clone(), read));
         drop(last);
         // The scripts this sync revealed, and whether something is
@@ -1092,4 +1097,6 @@ mod state;
 mod tests;
 
 pub(crate) use state::SyncBoard;
+#[cfg(test)]
+pub(crate) use state::keep_sync_failure;
 pub use state::{WalletSync, WalletSyncState};
