@@ -741,7 +741,10 @@ pub(crate) fn create_owner_only_dir(dir: &Path) -> std::io::Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    #[cfg_attr(not(unix), allow(unused_mut))]
+    #[cfg_attr(
+        not(unix),
+        allow(unused_mut, reason = "only unix sets a mode on the builder")
+    )]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -1407,7 +1410,10 @@ mod tests {
         let lock = dir.path().join("gerfaut.vault.lock");
         let set_read_only = |read_only: bool| {
             let mut permissions = std::fs::metadata(&lock).unwrap().permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
+            #[allow(
+                clippy::permissions_set_readonly_false,
+                reason = "it gives write access back to a test file in a temporary directory"
+            )]
             permissions.set_readonly(read_only);
             std::fs::set_permissions(&lock, permissions).unwrap();
         };

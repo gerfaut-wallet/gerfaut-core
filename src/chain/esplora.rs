@@ -788,7 +788,10 @@ pub(crate) async fn fetch_address_state(
 /// read again, counted against what the sync may keep, found to pay it,
 /// and its confirmation proven. Any other coin is taken as unconfirmed.
 /// A coin listed twice counts once.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the sync's address step and a proof test pass these separately; a struct would only rename them"
+)]
 pub(crate) async fn coins(
     client: &Client,
     network: Network,
@@ -1021,7 +1024,10 @@ pub(crate) fn parse_address(address: &str, network: Network) -> Result<Address, 
 /// address paid a thousand times reads one page a sync, not forty. When
 /// what the wallet holds below would come to more than the server counts,
 /// the pages are read on.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "two callers in this file, each with its own paging state; a struct would only rename them"
+)]
 async fn history_round(
     client: &Client,
     address: &Address,

@@ -213,7 +213,10 @@ fn take_descriptor(
 /// The update `proven` makes of a descriptor wallet, and the scripts it
 /// reads: `None` when the wallet cannot take them, `Some(None)` when it
 /// holds them already.
-#[allow(clippy::type_complexity)]
+#[allow(
+    clippy::type_complexity,
+    reason = "the nested Option is the three outcomes documented above"
+)]
 fn descriptor_update(
     engine: &bdk_wallet::Wallet,
     proven: &[Proven],
