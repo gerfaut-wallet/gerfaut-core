@@ -62,7 +62,7 @@ async fn start(data_dir: &Path) -> CoreResult<Embedded> {
             Ok(embedded)
         }
         Err(error) => {
-            update(|progress| progress.fail(error.to_string()));
+            update(|embedded| embedded.fail(error.to_string()));
             Err(error)
         }
     }
@@ -87,11 +87,15 @@ async fn bootstrap(data_dir: &Path) -> CoreResult<Embedded> {
     let reporter = tokio::spawn(async move {
         while let Some(status) = events.next().await {
             let percent = (status.as_frac() * 100.0).clamp(0.0, 99.0) as u8;
-            update(|progress| progress.advance(percent));
+            update(|embedded| embedded.advance(percent));
         }
     });
     let outcome = tokio::time::timeout(BOOTSTRAP_BUDGET, client.bootstrap()).await;
     reporter.abort();
+    // Wait for it to stop: an estimate it was still writing would
+    // otherwise land on the next start, the one a waiting caller begins
+    // as soon as this one gives up.
+    let _ = reporter.await;
     match outcome {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(tor(format!("Tor could not reach the network: {error}"))),

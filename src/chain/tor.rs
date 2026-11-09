@@ -220,11 +220,11 @@ impl EmbeddedTor {
     }
 
     /// arti's estimate moved. Read only while starting, where the shown
-    /// percentage never goes back; one that arrives once the start
-    /// settled is dropped.
+    /// percentage never goes back and stays below 100 until the start
+    /// returns; one that arrives once the start settled is dropped.
     fn advance(&mut self, estimate: u8) {
         if let EmbeddedTor::Starting { percent } = self {
-            *percent = (*percent).max(estimate);
+            *percent = (*percent).max(estimate.min(99));
         }
     }
 
@@ -927,6 +927,24 @@ mod tests {
         assert!(status.running && status.bootstrapped);
         assert_eq!(status.bootstrap_percent, 100);
         assert_eq!(status.error, None);
+    }
+
+    /// While starting, the percentage only climbs, stops short of 100,
+    /// and a new start forgets the last failure.
+    #[test]
+    fn a_start_climbs_below_100_and_forgets_the_last_failure() {
+        let mut embedded = EmbeddedTor::default();
+        embedded.begin();
+        embedded.fail("Tor could not start".to_owned());
+        embedded.begin();
+        embedded.advance(50);
+        embedded.advance(30);
+        let status = status_with(&settings(TorMode::Embedded, None), embedded.clone());
+        assert!(status.running && !status.bootstrapped);
+        assert_eq!(status.bootstrap_percent, 50);
+        assert_eq!(status.error, None);
+        embedded.advance(100);
+        assert_eq!(embedded, EmbeddedTor::Starting { percent: 99 });
     }
 
     #[test]
