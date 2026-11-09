@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 use tokio::sync::OnceCell;
 use tor_rtcompat::tokio::TokioRustlsRuntime;
 
-use super::{Progress, attempts, socks, update};
+use super::{EmbeddedTor, attempts, socks, update};
 use crate::error::{CoreError, CoreResult};
 
 /// How long a bootstrap may take. A first run downloads the network
@@ -55,25 +55,14 @@ pub(super) fn running_access() -> Option<socks::Access> {
 }
 
 async fn start(data_dir: &Path) -> CoreResult<Embedded> {
-    update(|progress| {
-        *progress = Progress {
-            running: true,
-            ..Progress::default()
-        }
-    });
+    update(EmbeddedTor::begin);
     match bootstrap(data_dir).await {
         Ok(embedded) => {
-            update(|progress| {
-                progress.bootstrapped = true;
-                progress.percent = 100;
-            });
+            update(EmbeddedTor::finish);
             Ok(embedded)
         }
         Err(error) => {
-            update(|progress| {
-                progress.running = false;
-                progress.error = Some(error.to_string());
-            });
+            update(|embedded| embedded.fail(error.to_string()));
             Err(error)
         }
     }
@@ -98,11 +87,15 @@ async fn bootstrap(data_dir: &Path) -> CoreResult<Embedded> {
     let reporter = tokio::spawn(async move {
         while let Some(status) = events.next().await {
             let percent = (status.as_frac() * 100.0).clamp(0.0, 99.0) as u8;
-            update(|progress| progress.percent = progress.percent.max(percent));
+            update(|embedded| embedded.advance(percent));
         }
     });
     let outcome = tokio::time::timeout(BOOTSTRAP_BUDGET, client.bootstrap()).await;
     reporter.abort();
+    // Wait for it to stop: an estimate it was still writing would
+    // otherwise land on the next start, the one a waiting caller begins
+    // as soon as this one gives up.
+    let _ = reporter.await;
     match outcome {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(tor(format!("Tor could not reach the network: {error}"))),
