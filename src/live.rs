@@ -1093,7 +1093,10 @@ impl WalletManager {
 
     /// Runs the sync `asked` of a wallet, or, with one under way, keeps
     /// it for when that one ends.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "it borrows the run loop's locals one by one; a struct would have to own the loop's state"
+    )]
     fn ask(
         &self,
         syncs: &mut JoinSet<Synced>,
@@ -1136,7 +1139,10 @@ impl WalletManager {
     /// script past what it follows of a wallet. And the scripts of a
     /// payment a sync saw vanish, ten minutes on, for a second sync to
     /// say whether it dropped: nothing moves on them after it left.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "it borrows the run loop's locals one by one; a struct would have to own the loop's state"
+    )]
     async fn look(
         &self,
         syncs: &mut JoinSet<Synced>,

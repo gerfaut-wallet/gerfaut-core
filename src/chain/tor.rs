@@ -14,13 +14,25 @@
 //! Android, and this proxy carries this wallet's traffic only.
 
 // Built and tested in every configuration, like `socks`.
-#[cfg_attr(not(feature = "embedded-tor"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "embedded-tor"),
+    allow(
+        dead_code,
+        reason = "only the embedded client uses it, yet it is built and tested in every configuration"
+    )
+)]
 mod attempts;
 #[cfg(feature = "embedded-tor")]
 mod embedded;
 // Only the embedded client runs the server; it is built and tested in
 // every configuration so the feature never drifts from what CI sees.
-#[cfg_attr(not(feature = "embedded-tor"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "embedded-tor"),
+    allow(
+        dead_code,
+        reason = "only the embedded client runs the server, yet it is built and tested in every configuration"
+    )
+)]
 pub(crate) mod socks;
 
 use std::path::Path;
@@ -256,7 +268,13 @@ pub async fn resolve_running(settings: &TorSettings) -> CoreResult<TorRoute> {
 
 /// What a starter that starts nothing hands back: the proxy of the
 /// embedded client when it runs, a Tor error when it does not.
-#[cfg_attr(not(feature = "embedded-tor"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "embedded-tor"),
+    allow(
+        dead_code,
+        reason = "only the build with the embedded client calls it outside tests"
+    )
+)]
 fn already_running(access: Option<socks::Access>) -> CoreResult<socks::Access> {
     access.ok_or_else(|| CoreError::Tor("the built-in Tor is not running yet".to_owned()))
 }
