@@ -266,6 +266,15 @@ pub enum TxReadiness {
     InMempool,
 }
 
+impl TxReadiness {
+    /// Whether a transaction that stands here can be sent: every input
+    /// signed, and no caution the network is sure to refuse it for
+    /// ([`TxWarning::blocking`]).
+    pub fn sendable(self) -> bool {
+        matches!(self, Self::Ready | Self::InMempool)
+    }
+}
+
 /// What the fee rate is measured on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -328,18 +337,22 @@ pub struct TxPreview {
     pub locktime: u32,
     /// Whether the transaction signals replaceability (BIP-125).
     pub rbf: bool,
-    /// Whether the transaction can be sent: every input is signed, and
-    /// no caution says the network is sure to refuse it
-    /// ([`TxWarning::blocking`]). The same as `readiness` being ready or
-    /// in the mempool.
-    pub ready: bool,
-    /// Where it stands, in the words of the readiness pill.
+    /// Where it stands, in the words of the readiness pill: whether it
+    /// can be sent is [`TxPreview::ready`].
     pub readiness: TxReadiness,
     pub warnings: Vec<TxWarning>,
     /// The transaction as the network takes it, hex. Present only when
     /// ready: an unsigned transaction, or one the network is sure to
     /// refuse, has nothing to broadcast.
     pub hex: Option<String>,
+}
+
+impl TxPreview {
+    /// Whether the transaction can be sent: what `readiness` says, and
+    /// what `hex` being there says to an application.
+    pub fn ready(&self) -> bool {
+        self.readiness.sendable()
+    }
 }
 
 /// Outcome of a broadcast.
@@ -1341,7 +1354,7 @@ pub fn build_preview(
     } else {
         TxReadiness::Ready
     };
-    let ready = matches!(readiness, TxReadiness::Ready | TxReadiness::InMempool);
+    let ready = readiness.sendable();
     TxPreview {
         txid: txid.to_string(),
         source: decoded.source,
@@ -1360,7 +1373,6 @@ pub fn build_preview(
         version: tx.version.0,
         locktime,
         rbf: tx.is_explicitly_rbf(),
-        ready,
         readiness,
         warnings,
         hex: ready.then(|| encode::serialize_hex(tx)),
@@ -1942,7 +1954,7 @@ mod tests {
         );
         assert_eq!(preview.fee_sats, Some(1_000));
         assert!(preview.fee_rate_sat_vb.unwrap() > 0.0);
-        assert!(preview.ready);
+        assert!(preview.ready());
         assert!(preview.rbf);
         assert!(preview.hex.is_some());
         assert!(
@@ -1975,7 +1987,7 @@ mod tests {
             satisfaction: None,
         }];
         let preview = build_preview(&decoded, Network::Mainnet, &facts, &[], Some(100), 0);
-        assert!(!preview.ready);
+        assert!(!preview.ready());
         assert!(preview.hex.is_none());
         let kinds: Vec<TxWarningKind> = preview.warnings.into_iter().map(|w| w.kind).collect();
         assert!(kinds.contains(&TxWarningKind::Unsigned));
@@ -2036,7 +2048,7 @@ mod tests {
                 verified: true,
             }));
             let preview = build_preview(&decoded, Network::Signet, &facts, &[], Some(100), 0);
-            assert!(!preview.ready, "{says}");
+            assert!(!preview.ready(), "{says}");
             assert_eq!(preview.readiness, TxReadiness::Refused, "{says}");
             assert!(preview.hex.is_none(), "{says}");
             let spent = preview
@@ -2077,7 +2089,7 @@ mod tests {
                 Some(100),
                 0,
             );
-            assert!(preview.ready, "{says}");
+            assert!(preview.ready(), "{says}");
             assert_eq!(preview.readiness, TxReadiness::Ready, "{says}");
             assert!(preview.hex.is_some(), "{says}");
             let spent = preview
@@ -2115,7 +2127,7 @@ mod tests {
                 0,
             );
             assert_eq!(preview.readiness, TxReadiness::InMempool);
-            assert!(preview.ready);
+            assert!(preview.ready());
             assert!(preview.hex.is_some());
             assert!(
                 preview
@@ -2165,7 +2177,7 @@ mod tests {
                 .find(|w| w.kind == TxWarningKind::InputSpent)
                 .expect("the backend's word is said either way");
             assert_eq!(spent.blocking, verified, "{}", spent.message);
-            assert_eq!(preview.ready, !verified);
+            assert_eq!(preview.ready(), !verified);
             if verified {
                 assert_eq!(preview.readiness, TxReadiness::Refused);
             } else {
@@ -2193,7 +2205,7 @@ mod tests {
             ..Default::default()
         }];
         let preview = build_preview(&decoded, Network::Signet, &facts, &[], Some(100), 0);
-        assert!(!preview.ready);
+        assert!(!preview.ready());
         assert_eq!(preview.readiness, TxReadiness::Refused);
         assert!(preview.hex.is_none());
         let fee = preview
@@ -2320,7 +2332,7 @@ mod tests {
             "{}",
             fee.message
         );
-        assert!(preview.ready);
+        assert!(preview.ready());
         assert_eq!(preview.readiness, TxReadiness::Ready);
         assert!(preview.hex.is_some());
         assert!(preview.amounts_declared);
@@ -2662,7 +2674,7 @@ mod tests {
         let signed = decode_transaction(&encode::serialize_hex(&signed_tx())).unwrap();
         let ready = build_preview(&signed, Network::Signet, &[], &[], Some(100), 0);
         assert_eq!(ready.readiness, TxReadiness::Ready);
-        assert!(ready.ready);
+        assert!(ready.ready());
     }
 
     /// Red is not a refusal. A fee that hurts, a time lock read against
@@ -2695,7 +2707,7 @@ mod tests {
             assert!(kinds.contains(&kind), "{kind:?} in {kinds:?}");
         }
         assert!(preview.warnings.iter().all(|w| !w.blocking), "{kinds:?}");
-        assert!(preview.ready);
+        assert!(preview.ready());
         assert!(preview.hex.is_some());
 
         let unknown = build_preview(
@@ -2709,7 +2721,7 @@ mod tests {
             Some(1_000),
             0,
         );
-        assert!(unknown.ready);
+        assert!(unknown.ready());
         assert!(unknown.warnings.iter().all(|w| !w.blocking));
     }
 
@@ -3639,7 +3651,7 @@ mod tests {
             0,
         );
         assert_eq!(preview.readiness, TxReadiness::Unsigned);
-        assert!(!preview.ready);
+        assert!(!preview.ready());
         assert!(preview.hex.is_none());
         let kinds: Vec<TxWarningKind> = preview.warnings.iter().map(|w| w.kind).collect();
         assert!(!kinds.contains(&TxWarningKind::Unsigned), "{kinds:?}");

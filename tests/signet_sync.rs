@@ -204,7 +204,7 @@ async fn broadcast_paths_answer_on_a_mined_transaction() {
         .preview_transaction(&hex, Network::Signet)
         .await
         .unwrap();
-    assert!(preview.ready, "a mined transaction is fully signed");
+    assert!(preview.ready(), "a mined transaction is fully signed");
     assert!(preview.fee_sats.is_some(), "prevouts come from the chain");
     assert!(
         preview
