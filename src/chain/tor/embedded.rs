@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 use tokio::sync::OnceCell;
 use tor_rtcompat::tokio::TokioRustlsRuntime;
 
-use super::{Progress, attempts, socks, update};
+use super::{EmbeddedTor, attempts, socks, update};
 use crate::error::{CoreError, CoreResult};
 
 /// How long a bootstrap may take. A first run downloads the network
@@ -55,10 +55,10 @@ pub(super) fn running_access() -> Option<socks::Access> {
 }
 
 async fn start(data_dir: &Path) -> CoreResult<Embedded> {
-    update(Progress::begin);
+    update(EmbeddedTor::begin);
     match bootstrap(data_dir).await {
         Ok(embedded) => {
-            update(Progress::finish);
+            update(EmbeddedTor::finish);
             Ok(embedded)
         }
         Err(error) => {

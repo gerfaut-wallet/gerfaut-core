@@ -191,64 +191,65 @@ pub struct TorStatus {
 /// like the embedded client.
 static LAST_ROUTE: Mutex<Option<TorRoute>> = Mutex::new(None);
 
-/// Where the embedded client stands, updated as it bootstraps.
-#[derive(Debug, Clone, Default)]
-struct Progress {
-    running: bool,
-    bootstrapped: bool,
-    percent: u8,
-    error: Option<String>,
+/// Where the embedded client stands in this process. One value, so
+/// the settings screen never reads a percentage left by a start that
+/// failed, or by one that finished.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum EmbeddedTor {
+    /// Never started in this process.
+    #[default]
+    Idle,
+    /// Bootstrapping; `percent` is arti's estimate, below 100.
+    Starting { percent: u8 },
+    /// Reached the network, its proxy listening.
+    Ready,
+    /// The last start gave up, and why, until the next one.
+    Failed { error: String },
 }
 
-static PROGRESS: Mutex<Progress> = Mutex::new(Progress {
-    running: false,
-    bootstrapped: false,
-    percent: 0,
-    error: None,
-});
+static EMBEDDED: Mutex<EmbeddedTor> = Mutex::new(EmbeddedTor::Idle);
 
 #[cfg_attr(
     not(feature = "embedded-tor"),
     allow(dead_code, reason = "only the embedded client moves it")
 )]
-impl Progress {
+impl EmbeddedTor {
     /// A start begins: whatever an earlier one left is dropped.
     fn begin(&mut self) {
-        *self = Progress {
-            running: true,
-            ..Progress::default()
-        };
+        *self = EmbeddedTor::Starting { percent: 0 };
     }
 
-    /// arti's estimate moved; the shown percentage never goes back.
-    fn advance(&mut self, percent: u8) {
-        self.percent = self.percent.max(percent);
+    /// arti's estimate moved. Read only while starting, where the shown
+    /// percentage never goes back; one that arrives once the start
+    /// settled is dropped.
+    fn advance(&mut self, estimate: u8) {
+        if let EmbeddedTor::Starting { percent } = self {
+            *percent = (*percent).max(estimate);
+        }
     }
 
     /// The bootstrap returned and the proxy listens.
     fn finish(&mut self) {
-        self.bootstrapped = true;
-        self.percent = 100;
+        *self = EmbeddedTor::Ready;
     }
 
     /// The start failed, and says why until the next one.
     fn fail(&mut self, error: String) {
-        self.running = false;
-        self.error = Some(error);
+        *self = EmbeddedTor::Failed { error };
     }
 }
 
-fn progress() -> Progress {
-    PROGRESS
+fn embedded_tor() -> EmbeddedTor {
+    EMBEDDED
         .lock()
-        .map(|progress| progress.clone())
+        .map(|embedded| embedded.clone())
         .unwrap_or_default()
 }
 
 #[cfg(feature = "embedded-tor")]
-fn update(change: impl FnOnce(&mut Progress)) {
-    if let Ok(mut progress) = PROGRESS.lock() {
-        change(&mut progress);
+fn update(change: impl FnOnce(&mut EmbeddedTor)) {
+    if let Ok(mut embedded) = EMBEDDED.lock() {
+        change(&mut embedded);
     }
 }
 
@@ -397,20 +398,26 @@ pub(crate) async fn probe(address: &str) -> bool {
 /// Where Tor stands, for a settings screen. Reads only: nothing is
 /// probed or started.
 pub async fn status(settings: &TorSettings) -> TorStatus {
-    status_with(settings, progress())
+    status_with(settings, embedded_tor())
 }
 
-fn status_with(settings: &TorSettings, embedded: Progress) -> TorStatus {
+fn status_with(settings: &TorSettings, embedded: EmbeddedTor) -> TorStatus {
     let last = LAST_ROUTE.lock().ok().and_then(|route| route.clone());
+    let (running, bootstrapped, bootstrap_percent, error) = match embedded {
+        EmbeddedTor::Idle => (false, false, 0, None),
+        EmbeddedTor::Starting { percent } => (true, false, percent, None),
+        EmbeddedTor::Ready => (true, true, 100, None),
+        EmbeddedTor::Failed { error } => (false, false, 0, Some(error)),
+    };
     TorStatus {
         mode: settings.mode,
         socks_proxy: settings.system_socks().to_owned(),
         via: last.as_ref().map(|route| route.via),
         socks: last.map(|route| route.socks),
-        running: embedded.running,
-        bootstrapped: embedded.bootstrapped,
-        bootstrap_percent: embedded.percent,
-        error: embedded.error,
+        running,
+        bootstrapped,
+        bootstrap_percent,
+        error,
         embedded_available: EMBEDDED_AVAILABLE,
         system_socks_trusted: TRUST_LOOPBACK_SOCKS,
     }
@@ -881,6 +888,45 @@ mod tests {
         assert_eq!(status.embedded_available, cfg!(feature = "embedded-tor"));
         assert_eq!(status.system_socks_trusted, TRUST_LOOPBACK_SOCKS);
         assert!(!status.bootstrapped);
+    }
+
+    /// A start that fails partway leaves nothing of its progress: the
+    /// four fields say "failed", and nothing else.
+    #[test]
+    fn a_failed_start_shows_no_progress() {
+        let mut embedded = EmbeddedTor::default();
+        embedded.begin();
+        embedded.advance(40);
+        embedded.fail("Tor did not reach the network within 90 seconds".to_owned());
+        let status = status_with(&settings(TorMode::Embedded, None), embedded);
+        assert!(!status.running);
+        assert!(!status.bootstrapped);
+        assert_eq!(status.bootstrap_percent, 0);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("Tor did not reach the network within 90 seconds")
+        );
+    }
+
+    /// A late estimate from arti, after the start settled, moves
+    /// nothing.
+    #[test]
+    fn an_estimate_after_the_start_settled_is_dropped() {
+        let mut failed = EmbeddedTor::default();
+        failed.begin();
+        failed.fail("Tor could not start".to_owned());
+        failed.advance(60);
+        let status = status_with(&settings(TorMode::Embedded, None), failed);
+        assert_eq!(status.bootstrap_percent, 0);
+
+        let mut ready = EmbeddedTor::default();
+        ready.begin();
+        ready.finish();
+        ready.advance(60);
+        let status = status_with(&settings(TorMode::Embedded, None), ready);
+        assert!(status.running && status.bootstrapped);
+        assert_eq!(status.bootstrap_percent, 100);
+        assert_eq!(status.error, None);
     }
 
     #[test]
