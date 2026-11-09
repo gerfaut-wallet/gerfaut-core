@@ -55,25 +55,14 @@ pub(super) fn running_access() -> Option<socks::Access> {
 }
 
 async fn start(data_dir: &Path) -> CoreResult<Embedded> {
-    update(|progress| {
-        *progress = Progress {
-            running: true,
-            ..Progress::default()
-        }
-    });
+    update(Progress::begin);
     match bootstrap(data_dir).await {
         Ok(embedded) => {
-            update(|progress| {
-                progress.bootstrapped = true;
-                progress.percent = 100;
-            });
+            update(Progress::finish);
             Ok(embedded)
         }
         Err(error) => {
-            update(|progress| {
-                progress.running = false;
-                progress.error = Some(error.to_string());
-            });
+            update(|progress| progress.fail(error.to_string()));
             Err(error)
         }
     }
@@ -98,7 +87,7 @@ async fn bootstrap(data_dir: &Path) -> CoreResult<Embedded> {
     let reporter = tokio::spawn(async move {
         while let Some(status) = events.next().await {
             let percent = (status.as_frac() * 100.0).clamp(0.0, 99.0) as u8;
-            update(|progress| progress.percent = progress.percent.max(percent));
+            update(|progress| progress.advance(percent));
         }
     });
     let outcome = tokio::time::timeout(BOOTSTRAP_BUDGET, client.bootstrap()).await;

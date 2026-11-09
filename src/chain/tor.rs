@@ -207,6 +207,37 @@ static PROGRESS: Mutex<Progress> = Mutex::new(Progress {
     error: None,
 });
 
+#[cfg_attr(
+    not(feature = "embedded-tor"),
+    allow(dead_code, reason = "only the embedded client moves it")
+)]
+impl Progress {
+    /// A start begins: whatever an earlier one left is dropped.
+    fn begin(&mut self) {
+        *self = Progress {
+            running: true,
+            ..Progress::default()
+        };
+    }
+
+    /// arti's estimate moved; the shown percentage never goes back.
+    fn advance(&mut self, percent: u8) {
+        self.percent = self.percent.max(percent);
+    }
+
+    /// The bootstrap returned and the proxy listens.
+    fn finish(&mut self) {
+        self.bootstrapped = true;
+        self.percent = 100;
+    }
+
+    /// The start failed, and says why until the next one.
+    fn fail(&mut self, error: String) {
+        self.running = false;
+        self.error = Some(error);
+    }
+}
+
 fn progress() -> Progress {
     PROGRESS
         .lock()
@@ -366,8 +397,11 @@ pub(crate) async fn probe(address: &str) -> bool {
 /// Where Tor stands, for a settings screen. Reads only: nothing is
 /// probed or started.
 pub async fn status(settings: &TorSettings) -> TorStatus {
+    status_with(settings, progress())
+}
+
+fn status_with(settings: &TorSettings, embedded: Progress) -> TorStatus {
     let last = LAST_ROUTE.lock().ok().and_then(|route| route.clone());
-    let embedded = progress();
     TorStatus {
         mode: settings.mode,
         socks_proxy: settings.system_socks().to_owned(),
