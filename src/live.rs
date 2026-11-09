@@ -1292,8 +1292,25 @@ impl WalletManager {
         if !hold.is_zero() {
             tokio::time::sleep(hold).await;
         }
+        // One sync for the screens, from the proofs to the last retry:
+        // the turns inside say nothing while this one is out.
+        let turn = self.sync_turn(&wallet_id);
+        let synced = self
+            .live_sync_in_turn(&wallet_id, &asked, &permits, retries)
+            .await;
+        turn.end().await;
+        synced
+    }
+
+    async fn live_sync_in_turn(
+        &self,
+        wallet_id: &str,
+        asked: &Asked,
+        permits: &Semaphore,
+        retries: [Duration; 2],
+    ) -> Synced {
         if !asked.proven.is_empty() {
-            match self.take_confirmations(&wallet_id, &asked.proven).await {
+            match self.take_confirmations(wallet_id, &asked.proven).await {
                 Ok(Some(report)) => return Ok(report),
                 // The wallet no longer holds what they were foretold
                 // from: their scripts are read.
@@ -1306,7 +1323,7 @@ impl WalletManager {
             let _permit = permits.acquire().await;
             let serving = self.watch_serving();
             let outcome = self
-                .sync_wallet_read(&wallet_id, reach.clone(), serving.clone())
+                .sync_wallet_read(wallet_id, reach.clone(), serving.clone())
                 .await;
             (outcome, serving)
         };
@@ -1323,7 +1340,7 @@ impl WalletManager {
             if asked.reason != ChangeReason::Activity
                 || !found_nothing
                 || read_where_told
-                || self.news_waiting(&wallet_id).await > 0
+                || self.news_waiting(wallet_id).await > 0
             {
                 break;
             }

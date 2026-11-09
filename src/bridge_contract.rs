@@ -66,7 +66,7 @@ use crate::input::{
 use crate::live::notice::{self, Context, Held, Notice, NoticeId, NoticeKind};
 use crate::live::{LiveEvent, LiveTx};
 use crate::lock::{AppLock, LockKind, LockVerdict};
-use crate::manager::{SyncAllReport, SyncFailure};
+use crate::manager::{SyncAllReport, SyncFailure, WalletSync, WalletSyncState};
 use crate::network::Network;
 use crate::prefs::{Preferences, PreferencesChange, Unit};
 use crate::price::{
@@ -75,7 +75,9 @@ use crate::price::{
 };
 use crate::store::{Settings, TxStage};
 use crate::updates::UpdateStatus;
-use crate::wallet::meta::{CachedTotals, SyncStamp, WalletIcon, WalletKind, WalletMeta};
+use crate::wallet::meta::{
+    CachedTotals, SyncFailureStamp, SyncStamp, WalletIcon, WalletKind, WalletMeta,
+};
 use crate::wallet::policy::{
     AbsoluteLock, BranchRole, BranchState, BranchTone, Coin, Condition, LockState, PolicyBranch,
     PolicyInput, PolicyKind, PolicySnapshot, RelativeLock, Remaining, TimeBasis, Timelock,
@@ -828,6 +830,7 @@ fn savings() -> WalletMeta {
         scan_gap: 20,
         labels: BTreeMap::from([(txid("salary"), "October salary".to_owned())]),
         last_sync: Some(electrum_stamp()),
+        last_failure: None,
         complete_at: Some(NOW - 3_600),
         cached: CachedTotals {
             balance: balance(),
@@ -850,6 +853,7 @@ fn fresh() -> WalletMeta {
         scan_gap: 20,
         labels: BTreeMap::new(),
         last_sync: None,
+        last_failure: None,
         complete_at: None,
         cached: CachedTotals::default(),
         live_pinned: false,
@@ -876,6 +880,7 @@ fn donations() -> WalletMeta {
             backend: "mempool.space".to_owned(),
             server: None,
         }),
+        last_failure: None,
         complete_at: None,
         cached: CachedTotals {
             balance: BalanceSnapshot {
@@ -886,6 +891,15 @@ fn donations() -> WalletMeta {
             tx_count: 1,
         },
         live_pinned: false,
+    }
+}
+
+/// The last sync of a wallet failed, a minute ago.
+fn sync_failure_stamp() -> SyncFailureStamp {
+    SyncFailureStamp {
+        at: NOW - 60,
+        message: "sync failed via electrum.example.org: connection refused".to_owned(),
+        kind: ErrorCode::Sync,
     }
 }
 
@@ -1094,6 +1108,13 @@ fn wallet() -> Vec<Fixture> {
                 ("synced", savings()),
                 ("just_added", fresh()),
                 ("single_address", donations()),
+                (
+                    "failed",
+                    WalletMeta {
+                        last_failure: Some(sync_failure_stamp()),
+                        ..savings()
+                    },
+                ),
             ],
         ),
         fixture(
@@ -1305,6 +1326,28 @@ fn wallet() -> Vec<Fixture> {
                 ),
             ],
         ),
+        {
+            let states = vec![
+                ("idle", WalletSyncState::Idle),
+                ("syncing", WalletSyncState::Syncing),
+                ("failed", WalletSyncState::Failed(sync_failure_stamp())),
+            ];
+            reaches_every("WalletSyncState", &states, 3, |state| match state {
+                WalletSyncState::Idle => 0,
+                WalletSyncState::Syncing => 1,
+                WalletSyncState::Failed(_) => 2,
+            });
+            fixture(
+                "WalletSync",
+                states
+                    .into_iter()
+                    .map(|(case, state)| {
+                        let wallet_id = COLD.to_owned();
+                        (case, WalletSync { wallet_id, state })
+                    })
+                    .collect(),
+            )
+        },
         fixture(
             "SyncAllReport",
             vec![(

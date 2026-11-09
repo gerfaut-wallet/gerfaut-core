@@ -1,0 +1,17 @@
+{
+  "idle": {
+    "wallet_id": "a7d40b19-5c3e-4f82-b6a1-2e9c8d7f0b54",
+    "state": "idle"
+  },
+  "syncing": {
+    "wallet_id": "a7d40b19-5c3e-4f82-b6a1-2e9c8d7f0b54",
+    "state": "syncing"
+  },
+  "failed": {
+    "wallet_id": "a7d40b19-5c3e-4f82-b6a1-2e9c8d7f0b54",
+    "state": "failed",
+    "at": 1749999940,
+    "message": "sync failed via electrum.example.org: connection refused",
+    "kind": "sync"
+  }
+}

@@ -2181,6 +2181,39 @@ async fn a_confirmation_the_status_foretold_costs_one_proof() {
     manager.live_stop().await;
 }
 
+/// A confirmation the watch proved and took stands for a good sync of
+/// the wallet: it is syncing while it is taken, and the failure it kept
+/// from an earlier sync is gone after.
+#[tokio::test]
+async fn a_proven_confirmation_clears_a_kept_failure() {
+    use crate::manager::WalletSyncState;
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet, mut events, script, paid) =
+        waiting_for_a_block(&server, dir.path()).await;
+    crate::manager::keep_sync_failure(
+        &mut *manager.state.lock().await,
+        &wallet,
+        &crate::error::CoreError::BackendUnavailable("down".to_owned()),
+    );
+    let mut changes = manager.sync_changes();
+
+    server.set_history(&script, &[(paid, 101)]);
+    block(&server, 101, &script, &[(paid, 101)]);
+    next_announcement(&mut events).await;
+    next_sync(&mut events, &wallet).await;
+    let mut seen = Vec::new();
+    while let Ok(change) = changes.try_recv() {
+        if change.wallet_id == wallet {
+            seen.push(change.state);
+        }
+    }
+    assert_eq!(seen, [WalletSyncState::Syncing, WalletSyncState::Idle]);
+    let listed = manager.list_wallets(None).await;
+    assert_eq!(listed[0].last_failure, None);
+    manager.live_stop().await;
+}
+
 /// A server pushes the status of a payment confirmed in its new block
 /// while that block does not hold it: its header commits to no such
 /// transaction, so no branch the server hands proves it there. Nothing

@@ -1994,6 +1994,34 @@ mod tests {
         assert_eq!(manager.sync_wallet(&wallet).await.unwrap().tip_height, 500);
     }
 
+    /// A failed sync stays with the wallet until the next good one,
+    /// which clears it, and says so.
+    #[tokio::test]
+    async fn a_good_sync_clears_the_failure_before_it() {
+        use crate::manager::WalletSyncState;
+        let electrum = crate::testkit::FakeElectrum::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, wallet) = synced_wallet(dir.path(), electrum.backend()).await;
+        electrum.state.lock().unwrap().height = 4_000_000_000;
+        assert!(manager.sync_wallet(&wallet).await.is_err());
+        assert!(matches!(
+            manager.sync_states(None).await[0].state,
+            WalletSyncState::Failed(_)
+        ));
+
+        let mut changes = manager.sync_changes();
+        electrum.state.lock().unwrap().height = 100;
+        manager.sync_wallet(&wallet).await.unwrap();
+        assert_eq!(
+            changes.recv().await.unwrap().state,
+            WalletSyncState::Syncing
+        );
+        assert_eq!(changes.recv().await.unwrap().state, WalletSyncState::Idle);
+        let listed = manager.list_wallets(None).await;
+        assert_eq!(listed[0].last_failure, None);
+        assert!(listed[0].last_sync.is_some());
+    }
+
     /// A block a lying server once put in a wallet's chain, far above
     /// any real tip, is stored with it. No update can take it out, and
     /// every Esplora sync failed on it for good. The next sync, on an

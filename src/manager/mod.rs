@@ -56,8 +56,12 @@ mod sync;
 mod updates;
 mod wallets;
 
+/// For the tests of the live watch, which plant a failure as a sync
+/// would have kept it.
+#[cfg(test)]
+pub(crate) use sync::keep_sync_failure;
 pub(crate) use sync::{Reach, complete_lately, sync_code};
-pub use sync::{SyncAllReport, SyncFailure};
+pub use sync::{SyncAllReport, SyncFailure, WalletSync, WalletSyncState};
 
 /// Vault file name inside the data directory.
 const VAULT_FILE: &str = "gerfaut.vault";
@@ -141,6 +145,9 @@ pub struct Shared {
     pub(crate) notice_budgets: std::sync::Mutex<crate::live::notice::Budgets>,
     /// One sync at a time per wallet, and when the last one ended.
     syncing: std::sync::Mutex<HashMap<String, SyncSlot>>,
+    /// The syncs under way by wallet, and who listens to where each
+    /// wallet stands: see [`WalletManager::sync_states`].
+    sync_board: std::sync::Mutex<sync::SyncBoard>,
     /// The wallets a complete sync has read since the vault was opened:
     /// see [`WalletManager::sync_wallet`].
     complete_here: std::sync::Mutex<HashSet<String>>,
@@ -188,6 +195,7 @@ impl WalletManager {
                 live_starting: tokio::sync::watch::Sender::new(0),
                 notice_budgets: std::sync::Mutex::new(crate::live::notice::Budgets::new()),
                 syncing: std::sync::Mutex::new(HashMap::new()),
+                sync_board: std::sync::Mutex::new(sync::SyncBoard::default()),
                 complete_here: std::sync::Mutex::new(HashSet::new()),
                 relegated: std::sync::Mutex::new(sync::Relegations::default()),
             }),
@@ -327,6 +335,7 @@ fn fresh_meta(
         scan_gap: 0,
         labels: Default::default(),
         last_sync: None,
+        last_failure: None,
         complete_at: None,
         cached: CachedTotals::default(),
         live_pinned: false,

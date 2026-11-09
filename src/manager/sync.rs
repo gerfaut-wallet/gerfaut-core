@@ -236,6 +236,9 @@ impl WalletManager {
     /// a replacement paying the same amount leaves the counters as they
     /// were.
     pub async fn sync_wallet(&self, id: &str) -> CoreResult<SyncReport> {
+        // Syncing from the moment it is asked for, the wait below
+        // included.
+        let turn = self.sync_turn(id);
         let (reach, network) = self.routine_reach(id).await;
         // The sync the app runs, the one as it opens among them, waits
         // for the first pass of a watch of the wallet's network
@@ -243,7 +246,9 @@ impl WalletManager {
         if let Some(network) = network {
             self.live_first_pass(network).await;
         }
-        let (report, _) = self.sync_wallet_read(id, reach, None).await?;
+        let read = self.sync_wallet_read(id, reach, None).await;
+        turn.end().await;
+        let (report, _) = read?;
         self.live_offer(&report);
         Ok(report)
     }
@@ -307,7 +312,22 @@ impl WalletManager {
     /// still comes first ([`Self::live_server`]). Returns the report and
     /// the server that answered; none when the report is another
     /// caller's.
+    ///
+    /// The wallet is syncing for as long as this runs, and failed after
+    /// it if it fails: see [`WalletSyncState`].
     pub(crate) async fn sync_wallet_read(
+        &self,
+        id: &str,
+        reach: Reach,
+        prefer: Option<(Network, Endpoint)>,
+    ) -> CoreResult<(SyncReport, Option<Endpoint>)> {
+        let turn = self.sync_turn(id);
+        let read = self.sync_wallet_in_turn(id, reach, prefer).await;
+        turn.end().await;
+        read
+    }
+
+    async fn sync_wallet_in_turn(
         &self,
         id: &str,
         reach: Reach,
@@ -332,7 +352,17 @@ impl WalletManager {
             return Ok((report, None));
         }
         let started = Instant::now();
-        let (report, read, answered) = self.sync_wallet_alone(id, reach, prefer).await?;
+        let (report, read, answered) = match self.sync_wallet_alone(id, reach, prefer).await {
+            Ok(done) => done,
+            Err(error) => {
+                // Kept while the wallet's turn is still held: no later
+                // sync of it has read anything yet.
+                if !matches!(error, CoreError::WalletNotFound(_)) {
+                    state::keep_sync_failure(&mut *self.state.lock().await, id, &error);
+                }
+                return Err(error);
+            }
+        };
         *last = Some((started, report.clone(), read));
         drop(last);
         // The scripts this sync revealed, and whether something is
@@ -1055,11 +1085,18 @@ fn finish_sync(
             backend: report.backend.clone(),
             server: Some(answered.key()),
         });
+        record.meta.last_failure = None;
     }
     state.vault.save(&state.payload)?;
     Ok(())
 }
 
 mod foretold;
+mod state;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use state::SyncBoard;
+#[cfg(test)]
+pub(crate) use state::keep_sync_failure;
+pub use state::{WalletSync, WalletSyncState};
