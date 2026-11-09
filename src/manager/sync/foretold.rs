@@ -18,14 +18,16 @@ use bdk_wallet::bitcoin::block::Header;
 use bdk_wallet::bitcoin::{Address, ScriptBuf, Txid};
 use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 
-use super::{Reach, SyncSlot, WalletManager, apply_address_state, apply_synced, nothing_new};
+use super::{
+    Reach, Scanned, SyncSlot, WalletManager, apply_address_state, apply_synced, nothing_new,
+};
 use crate::chain::electrum::status::history_status;
 use crate::chain::proof::checkpoint_for;
 use crate::chain::{self, Endpoint, has_proof_of_work};
 use crate::error::CoreResult;
 use crate::manager::{ManagerState, ensure_engine, find_record};
 use crate::network::Network;
-use crate::wallet::meta::{WalletKind, WalletMeta};
+use crate::wallet::meta::{StoredMeta, WalletKind};
 use crate::wallet::snapshot::SyncReport;
 use crate::wallet::views;
 use crate::watch::{Headers, Proven, confirmed_at};
@@ -91,7 +93,7 @@ fn take(
 
 /// The server that proved them all, when a sync of the wallet may be
 /// sent there: one its backend names on its network.
-fn server_of(state: &ManagerState, meta: &WalletMeta, proven: &[Proven]) -> Option<Endpoint> {
+fn server_of(state: &ManagerState, meta: &StoredMeta, proven: &[Proven]) -> Option<Endpoint> {
     let server = &proven.first()?.server;
     if proven.iter().any(|proven| proven.server != *server) {
         return None;
@@ -180,7 +182,7 @@ fn carried(tip: &CheckPoint, headers: &Headers) -> Option<CheckPoint> {
 
 fn take_descriptor(
     state: &mut ManagerState,
-    meta: &WalletMeta,
+    meta: &StoredMeta,
     proven: &[Proven],
     top: &Headers,
     server: &Endpoint,
@@ -204,7 +206,11 @@ fn take_descriptor(
             &meta.id, balance, tip_height, server, started,
         ))),
         Some(Some((synced, reach))) => {
-            apply_synced(state, meta, synced, server, &reach, &known, started)
+            let scanned = Scanned {
+                reach: &reach,
+                gap_limit: state.payload.settings.gap_limit,
+            };
+            apply_synced(state, meta, scanned, synced, server, &known, started)
                 .map(|(report, _)| Some(report))
         }
     }
@@ -278,7 +284,7 @@ fn descriptor_update(
 
 fn take_address(
     state: &mut ManagerState,
-    meta: &WalletMeta,
+    meta: &StoredMeta,
     address: &str,
     proven: &[Proven],
     top: &Headers,

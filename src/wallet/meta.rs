@@ -80,8 +80,10 @@ pub enum WalletIcon {
     Wallet,
 }
 
-/// A wallet's stored identity. Everything here is metadata: chain state
-/// lives in the wallet record next to it.
+/// A wallet's identity as the apps read it: what the vault keeps of it
+/// ([`StoredMeta`]), and the gap limit of the settings, which every
+/// wallet shares. Only [`StoredMeta::presented`] makes one from a
+/// stored wallet.
 ///
 /// The `labels` map is shaped for BIP-329 interoperability: keys are
 /// `"<type>:<ref>"` with the BIP-329 types (`tx`, `addr`, `output`, ...),
@@ -101,9 +103,7 @@ pub struct WalletMeta {
     pub recognized_as: RecognizedKind,
     /// Unix timestamp, seconds.
     pub created_at: u64,
-    /// The gap limit of the settings, which every wallet shares: written
-    /// over from them whenever the wallet is read or synced, and kept
-    /// here for the vaults and the apps that read it.
+    /// The gap limit of the settings when the wallet was read.
     pub gap_limit: u32,
     /// Gap limit the last full scan actually used. When the setting is
     /// raised above it, the next sync is a full scan again: incremental
@@ -137,9 +137,148 @@ fn default_scan_gap() -> u32 {
     DEFAULT_GAP_LIMIT
 }
 
+/// A wallet's identity as the vault keeps it. Everything here is
+/// metadata: chain state lives in the wallet record next to it. The
+/// fields are those of [`WalletMeta`], documented there, but the gap
+/// limit: one setting every wallet shares, which a wallet has no copy of
+/// to fall behind it. A sync compares [`Self::scan_gap`] with the
+/// setting itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredForm", into = "StoredForm")]
+pub struct StoredMeta {
+    pub id: String,
+    pub name: String,
+    pub icon: WalletIcon,
+    pub network: Network,
+    pub kind: WalletKind,
+    pub recognized_as: RecognizedKind,
+    pub created_at: u64,
+    pub scan_gap: u32,
+    pub labels: BTreeMap<String, String>,
+    pub last_sync: Option<SyncStamp>,
+    pub complete_at: Option<u64>,
+    pub cached: CachedTotals,
+    pub live_pinned: bool,
+}
+
+impl StoredMeta {
+    /// The wallet as the apps read it, with the gap limit of the
+    /// settings: the one way a stored wallet leaves the core.
+    pub fn presented(self, gap_limit: u32) -> WalletMeta {
+        let StoredMeta {
+            id,
+            name,
+            icon,
+            network,
+            kind,
+            recognized_as,
+            created_at,
+            scan_gap,
+            labels,
+            last_sync,
+            complete_at,
+            cached,
+            live_pinned,
+        } = self;
+        WalletMeta {
+            id,
+            name,
+            icon,
+            network,
+            kind,
+            recognized_as,
+            created_at,
+            gap_limit,
+            scan_gap,
+            labels,
+            last_sync,
+            complete_at,
+            cached,
+            live_pinned,
+        }
+    }
+}
+
+/// The stored form of a wallet: the form of [`WalletMeta`], gap limit
+/// included. Every build up to this one requires the field to open a
+/// vault, and writes the setting over it before any use: what is
+/// written there is never read back.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct StoredForm(WalletMeta);
+
+impl From<StoredMeta> for StoredForm {
+    fn from(meta: StoredMeta) -> Self {
+        StoredForm(meta.presented(DEFAULT_GAP_LIMIT))
+    }
+}
+
+impl From<StoredForm> for StoredMeta {
+    fn from(StoredForm(meta): StoredForm) -> Self {
+        meta.into()
+    }
+}
+
+/// A wallet as the apps read it, as the vault keeps it: without the gap
+/// limit, the setting's.
+impl From<WalletMeta> for StoredMeta {
+    fn from(meta: WalletMeta) -> Self {
+        let WalletMeta {
+            id,
+            name,
+            icon,
+            network,
+            kind,
+            recognized_as,
+            created_at,
+            gap_limit: _,
+            scan_gap,
+            labels,
+            last_sync,
+            complete_at,
+            cached,
+            live_pinned,
+        } = meta;
+        StoredMeta {
+            id,
+            name,
+            icon,
+            network,
+            kind,
+            recognized_as,
+            created_at,
+            scan_gap,
+            labels,
+            last_sync,
+            complete_at,
+            cached,
+            live_pinned,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STORED: &str = r#"{"id":"w","name":"Cold","icon":"wallet","network":"signet","kind":{"type":"single_address","address":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"},"recognized_as":"address","created_at":1,"gap_limit":35,"scan_gap":20,"labels":{},"last_sync":null,"cached":{"balance":{"confirmed":0,"trusted_pending":0,"untrusted_pending":0,"immature":0,"total":0},"tx_count":0}}"#;
+
+    /// The vault keeps no gap limit of a wallet: one stored with its own
+    /// reads as any other, presented with the setting's. It is written
+    /// back in the form every build reads, gap limit included, which
+    /// the builds that require it write the setting over.
+    #[test]
+    fn a_stored_wallet_takes_the_gap_limit_of_the_settings() {
+        let stored: StoredMeta = serde_json::from_str(STORED).unwrap();
+        assert_eq!(stored.scan_gap, 20);
+        assert_eq!(stored.clone().presented(50).gap_limit, 50);
+
+        let written = serde_json::to_value(&stored).unwrap();
+        assert_eq!(written["gap_limit"], DEFAULT_GAP_LIMIT);
+        assert_eq!(written["scan_gap"], 20);
+        let older: WalletMeta = serde_json::from_value(written).unwrap();
+        assert_eq!(StoredMeta::from(older), stored);
+    }
 
     /// A wallet stored before pinning existed reads as not pinned and
     /// is stored back as it was; a pinned one says so.

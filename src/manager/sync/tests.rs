@@ -380,7 +380,7 @@ async fn older_history_goes_first_to_the_server_of_the_watch() {
     }
     let (_, served) = watcher.live_server().unwrap();
     let (config, certs) = watcher.state.lock().await.chain_setup(Network::Signet);
-    let meta = watcher.list_wallets(None).await.remove(0);
+    let meta: StoredMeta = watcher.list_wallets(None).await.remove(0).into();
     assert_eq!(meta.id, wallet.id);
     let order = watcher
         .sync_endpoints(&meta, &config, &certs, None)
@@ -488,4 +488,33 @@ fn a_failure_without_its_code_reads_as_a_sync_failure() {
         ),
         "{event:?}"
     );
+}
+
+/// A wallet scanned with the gap limit of the settings is not scanned
+/// again until the setting goes above it, and one never synced is
+/// scanned in full whatever it is asked.
+#[test]
+fn only_a_gap_limit_above_the_last_scan_asks_for_a_full_scan() {
+    let now = now_secs();
+    let mut meta = crate::manager::fresh_meta(
+        "Cold",
+        Network::Signet,
+        WalletKind::SingleAddress {
+            address: "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx".to_owned(),
+        },
+        crate::input::RecognizedKind::Address,
+    );
+    assert_eq!(reach_for(Reach::Checked, &meta, 20, now), Reach::Full);
+
+    meta.last_sync = Some(SyncStamp {
+        at: now,
+        tip_height: 100,
+        backend: "test".to_owned(),
+        server: None,
+    });
+    meta.scan_gap = 50;
+    meta.complete_at = Some(now);
+    assert_eq!(reach_for(Reach::Checked, &meta, 50, now), Reach::Checked);
+    assert_eq!(reach_for(Reach::Checked, &meta, 20, now), Reach::Checked);
+    assert_eq!(reach_for(Reach::Checked, &meta, 51, now), Reach::Full);
 }
