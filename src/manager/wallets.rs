@@ -28,12 +28,7 @@ impl WalletManager {
             .payload
             .wallets
             .iter()
-            .map(|record| {
-                let mut meta = record.meta.clone();
-                // Present the effective, global gap limit.
-                meta.gap_limit = gap_limit;
-                meta
-            })
+            .map(|record| record.meta.clone().presented(gap_limit))
             .filter(|meta| network.is_none_or(|n| meta.network == n))
             .collect()
     }
@@ -78,13 +73,7 @@ impl WalletManager {
                 return Err(CoreError::DuplicateWallet(existing.meta.name.clone()));
             }
 
-            let meta = fresh_meta(
-                name,
-                network,
-                kind,
-                parsed.kind,
-                state.payload.settings.gap_limit,
-            );
+            let meta = fresh_meta(name, network, kind, parsed.kind);
             let (record, engine) = build_record(meta.clone())?;
             state.commit(|payload| {
                 payload.wallets.push(record);
@@ -93,7 +82,7 @@ impl WalletManager {
             if let Some(engine) = engine {
                 state.engines.insert(meta.id.clone(), engine);
             }
-            Ok(meta)
+            Ok(meta.presented(state.payload.settings.gap_limit))
         }
         .await;
         self.live_refresh().await;
@@ -208,9 +197,8 @@ impl WalletManager {
 
     pub async fn wallet_snapshot(&self, id: &str) -> CoreResult<WalletSnapshot> {
         let mut state = self.state.lock().await;
-        let mut record = find_record(&state.payload, id)?.clone();
-        // Present the effective, global gap limit.
-        record.meta.gap_limit = state.payload.settings.gap_limit;
+        let record = find_record(&state.payload, id)?.clone();
+        let gap_limit = state.payload.settings.gap_limit;
         match &record.meta.kind {
             WalletKind::Descriptors { .. } => {
                 let engine = ensure_engine(&mut state, id)?;
@@ -219,7 +207,7 @@ impl WalletManager {
                     txs: views::tx_summaries(engine),
                     tip_height: views::tip_height(engine),
                     truncated: false,
-                    meta: record.meta,
+                    meta: record.meta.presented(gap_limit),
                 })
             }
             WalletKind::SingleAddress { .. } => {
@@ -229,7 +217,7 @@ impl WalletManager {
                     txs: views::address_tx_summaries(&watch),
                     tip_height: watch.tip_height,
                     truncated: watch.truncated,
-                    meta: record.meta,
+                    meta: record.meta.presented(gap_limit),
                 })
             }
         }

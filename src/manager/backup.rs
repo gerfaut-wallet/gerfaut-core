@@ -202,7 +202,6 @@ impl WalletManager {
                             wallet.network,
                             wallet.kind.clone(),
                             recognized_kind(&wallet.kind),
-                            gap_limit,
                         );
                         meta.labels = wallet.labels.clone();
                         meta.live_pinned = wallet.live_pinned;
@@ -236,7 +235,7 @@ impl WalletManager {
                     if let Some(engine) = engine {
                         engines.push((record.meta.id.clone(), engine));
                     }
-                    added.push(record.meta.clone());
+                    added.push(record.meta.clone().presented(gap_limit));
                     next.wallets.push(record);
                 }
                 Ok(())

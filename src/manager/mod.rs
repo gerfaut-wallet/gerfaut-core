@@ -43,7 +43,7 @@ use crate::lock::LockAttempts;
 use crate::network::Network;
 use crate::now_secs;
 use crate::store::{Vault, VaultKey, VaultPayload, WalletRecord};
-use crate::wallet::meta::{CachedTotals, WalletIcon, WalletKind, WalletMeta};
+use crate::wallet::meta::{CachedTotals, StoredMeta, WalletIcon, WalletKind};
 use crate::wallet::snapshot::SyncReport;
 use crate::wallet::views;
 
@@ -315,9 +315,8 @@ fn fresh_meta(
     network: Network,
     kind: WalletKind,
     recognized_as: RecognizedKind,
-    gap_limit: u32,
-) -> WalletMeta {
-    WalletMeta {
+) -> StoredMeta {
+    StoredMeta {
         id: uuid::Uuid::new_v4().to_string(),
         name: name.to_owned(),
         icon: WalletIcon::default(),
@@ -325,7 +324,6 @@ fn fresh_meta(
         kind,
         recognized_as,
         created_at: now_secs(),
-        gap_limit,
         scan_gap: 0,
         labels: Default::default(),
         last_sync: None,
@@ -340,7 +338,7 @@ fn fresh_meta(
 /// descriptor/network combination fails here, not at the first sync; a
 /// single address is re-checked against its network as a defense in
 /// depth, whatever validated it upstream.
-fn build_record(meta: WalletMeta) -> CoreResult<(WalletRecord, Option<bdk_wallet::Wallet>)> {
+fn build_record(meta: StoredMeta) -> CoreResult<(WalletRecord, Option<bdk_wallet::Wallet>)> {
     let engine = engine_for(&meta.kind, meta.network)?;
     record_with(meta, engine)
 }
@@ -349,7 +347,7 @@ fn build_record(meta: WalletMeta) -> CoreResult<(WalletRecord, Option<bdk_wallet
 /// built already, from the same material on the same network: what a
 /// restore keeps of the engine its plan built.
 fn record_with(
-    meta: WalletMeta,
+    meta: StoredMeta,
     mut engine: Option<bdk_wallet::Wallet>,
 ) -> CoreResult<(WalletRecord, Option<bdk_wallet::Wallet>)> {
     let changeset = match &mut engine {

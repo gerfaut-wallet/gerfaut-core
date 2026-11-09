@@ -380,7 +380,7 @@ async fn older_history_goes_first_to_the_server_of_the_watch() {
     }
     let (_, served) = watcher.live_server().unwrap();
     let (config, certs) = watcher.state.lock().await.chain_setup(Network::Signet);
-    let meta = watcher.list_wallets(None).await.remove(0);
+    let meta: StoredMeta = watcher.list_wallets(None).await.remove(0).into();
     assert_eq!(meta.id, wallet.id);
     let order = watcher
         .sync_endpoints(&meta, &config, &certs, None)

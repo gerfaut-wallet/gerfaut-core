@@ -24,7 +24,7 @@ use crate::network::Network;
 use crate::prefs::Preferences;
 use crate::updates::UpdateRecord;
 use crate::wallet::AddressWatchState;
-use crate::wallet::meta::WalletMeta;
+use crate::wallet::meta::StoredMeta;
 
 pub use cipher::VaultKey;
 
@@ -42,7 +42,7 @@ const PAYLOAD_VERSION: u32 = 3;
 /// One wallet and its chain state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletRecord {
-    pub meta: WalletMeta,
+    pub meta: StoredMeta,
     /// Aggregate BDK change set for descriptor wallets. The full wallet
     /// state reloads from this alone.
     #[serde(default)]
@@ -767,8 +767,8 @@ mod tests {
         VaultKey::Raw([42u8; 32])
     }
 
-    fn sample_meta() -> WalletMeta {
-        WalletMeta {
+    fn sample_meta() -> StoredMeta {
+        StoredMeta {
             id: "0000-test".to_owned(),
             name: "Cold storage".to_owned(),
             icon: WalletIcon::default(),
@@ -780,7 +780,6 @@ mod tests {
             },
             recognized_as: RecognizedKind::Descriptor,
             created_at: 1_755_000_000,
-            gap_limit: DEFAULT_GAP_LIMIT,
             scan_gap: DEFAULT_GAP_LIMIT,
             labels: Default::default(),
             last_sync: None,

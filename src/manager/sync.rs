@@ -11,7 +11,7 @@ use crate::chain::{self, Endpoint};
 use crate::error::{CoreError, CoreResult, ErrorCode};
 use crate::network::Network;
 use crate::now_secs;
-use crate::wallet::meta::{CachedTotals, SyncStamp, WalletKind, WalletMeta};
+use crate::wallet::meta::{CachedTotals, StoredMeta, SyncStamp, WalletKind};
 use crate::wallet::snapshot::SyncReport;
 use crate::wallet::views;
 use crate::wallet::{AddressTx, AddressWatchState};
@@ -65,9 +65,26 @@ pub(crate) fn sync_code() -> ErrorCode {
 const COMPLETE_EVERY_SECS: u64 = 24 * 60 * 60;
 
 /// Whether a sync read every script of the wallet less than a day ago.
-pub(crate) fn complete_lately(meta: &WalletMeta, now: u64) -> bool {
+pub(crate) fn complete_lately(meta: &StoredMeta, now: u64) -> bool {
     meta.complete_at
         .is_some_and(|at| now.saturating_sub(at) < COMPLETE_EVERY_SECS)
+}
+
+/// How far a sync of the wallet of `meta` reads, asked to read `asked`,
+/// `gap_limit` being the setting now. A wallet never synced, or scanned
+/// with a gap limit below the setting, is scanned in full: only a full
+/// scan looks past the addresses already revealed, and a gap limit was
+/// raised to find funds there. And a day at most since a sync read
+/// every script: the syncs the live watch asks for read only what
+/// moved, whoever asks.
+fn reach_for(asked: Reach, meta: &StoredMeta, gap_limit: u32, now: u64) -> Reach {
+    if meta.last_sync.is_none() || meta.scan_gap < gap_limit {
+        Reach::Full
+    } else if asked.rank() < Reach::Complete.rank() && !complete_lately(meta, now) {
+        Reach::Complete
+    } else {
+        asked
+    }
 }
 
 /// How much of a descriptor wallet a sync reads.
@@ -252,15 +269,25 @@ impl WalletManager {
             .lock()
             .map(|done| done.contains(id))
             .unwrap_or(false);
-        let state = self.state.lock().await;
-        let record = find_record(&state.payload, id).ok();
-        let recent = record.is_some_and(|record| complete_lately(&record.meta, now_secs()));
-        let reach = if done_here && recent {
+        // The first sync since the vault was opened reads every script.
+        let asked = if done_here {
             Reach::Checked
         } else {
             Reach::Complete
         };
-        (reach, record.map(|record| record.meta.network))
+        let state = self.state.lock().await;
+        match find_record(&state.payload, id) {
+            Ok(record) => (
+                reach_for(
+                    asked,
+                    &record.meta,
+                    state.payload.settings.gap_limit,
+                    now_secs(),
+                ),
+                Some(record.meta.network),
+            ),
+            Err(_) => (Reach::Complete, None),
+        }
     }
 
     /// One sync of a wallet at a time, whoever asks: the app, a
@@ -323,22 +350,31 @@ impl WalletManager {
         let started = Instant::now();
 
         // Snapshot what the sync needs; do not hold the lock during I/O.
-        let (meta, config, certs) = {
+        let (meta, gap_limit, config, certs) = {
             let state = self.state.lock().await;
             let record = find_record(&state.payload, id)?;
-            let mut meta = record.meta.clone();
-            // The effective gap limit is the global setting.
-            meta.gap_limit = state.payload.settings.gap_limit;
             let (config, certs) = state.chain_setup(record.meta.network);
-            (meta, config, certs)
+            (
+                record.meta.clone(),
+                state.payload.settings.gap_limit,
+                config,
+                certs,
+            )
         };
         let endpoints = self.sync_endpoints(&meta, &config, &certs, prefer)?;
         let proxy = self.tor_proxy_for(&endpoints).await?;
 
         match &meta.kind {
             WalletKind::Descriptors { .. } => {
-                self.sync_descriptor_wallet(&meta, &endpoints, proxy.as_deref(), started, reach)
-                    .await
+                self.sync_descriptor_wallet(
+                    &meta,
+                    gap_limit,
+                    &endpoints,
+                    proxy.as_deref(),
+                    started,
+                    reach,
+                )
+                .await
             }
             WalletKind::SingleAddress { address } => self
                 .sync_address_wallet(&meta, address, &endpoints, proxy.as_deref(), started)
@@ -349,24 +385,14 @@ impl WalletManager {
 
     async fn sync_descriptor_wallet(
         &self,
-        meta: &WalletMeta,
+        meta: &StoredMeta,
+        gap_limit: u32,
         endpoints: &[Endpoint],
         proxy: Option<&str>,
         started: Instant,
         reach: Reach,
     ) -> CoreResult<(SyncReport, Reach, Endpoint)> {
-        // First sync, a gap limit raised since the last full scan, or a
-        // rescan asked for: only a full scan looks past the addresses
-        // already revealed.
-        // And a day at most since a sync read every script: the syncs
-        // the live watch asks for read only what moved, whoever asks.
-        let reach = if meta.last_sync.is_none() || meta.scan_gap < meta.gap_limit {
-            Reach::Full
-        } else if reach.rank() < Reach::Complete.rank() && !complete_lately(meta, now_secs()) {
-            Reach::Complete
-        } else {
-            reach
-        };
+        let reach = reach_for(reach, meta, gap_limit, now_secs());
         let mut attempts = Attempts::default();
 
         for endpoint in endpoints {
@@ -375,7 +401,7 @@ impl WalletManager {
             let (mut plan, known, reach) = {
                 let mut state = self.state.lock().await;
                 let engine = ensure_engine(&mut state, &meta.id)?;
-                let (plan, reach) = plan_for(engine, &reach, meta.gap_limit);
+                let (plan, reach) = plan_for(engine, &reach, gap_limit);
                 (plan, views::known(engine), reach)
             };
             plan.told = self.told_on(endpoint);
@@ -385,8 +411,18 @@ impl WalletManager {
                 Err(detail) => attempts.failed(endpoint, &detail),
                 Ok(synced) => {
                     let mut state = self.state.lock().await;
-                    let (report, complete) =
-                        apply_synced(&mut state, meta, synced, endpoint, &reach, &known, started)?;
+                    let (report, complete) = apply_synced(
+                        &mut state,
+                        meta,
+                        Scanned {
+                            reach: &reach,
+                            gap_limit,
+                        },
+                        synced,
+                        endpoint,
+                        &known,
+                        started,
+                    )?;
                     drop(state);
                     self.answered_after(endpoint, &attempts.down);
                     if complete && let Ok(mut done) = self.complete_here.lock() {
@@ -402,7 +438,7 @@ impl WalletManager {
 
     async fn sync_address_wallet(
         &self,
-        meta: &WalletMeta,
+        meta: &StoredMeta,
         address: &str,
         endpoints: &[Endpoint],
         proxy: Option<&str>,
@@ -541,7 +577,7 @@ impl WalletManager {
     /// ([`Relegations`]), and never before the server of the watch.
     fn sync_endpoints(
         &self,
-        meta: &WalletMeta,
+        meta: &StoredMeta,
         config: &chain::BackendConfig,
         certs: &chain::TrustedCerts,
         prefer: Option<(Network, Endpoint)>,
@@ -631,21 +667,29 @@ pub(super) fn nothing_new(
     }
 }
 
-/// Takes what a sync of a descriptor wallet that read `reach` came to,
-/// read from `endpoint`, `known` being what the wallet held before:
-/// applied to the wallet, what it found recorded for whoever announces,
-/// and the vault saved. Also says whether it read every script: a sync
-/// that set a history aside is not the complete read of the day, nor
-/// the scan of a gap limit.
+/// How far a sync of a descriptor wallet read: its reach, and the gap
+/// limit its scans stopped at.
+struct Scanned<'a> {
+    reach: &'a Reach,
+    gap_limit: u32,
+}
+
+/// Takes what a sync of a descriptor wallet that read as far as
+/// `scanned` came to, read from `endpoint`, `known` being what the
+/// wallet held before: applied to the wallet, what it found recorded
+/// for whoever announces, and the vault saved. Also says whether it
+/// read every script: a sync that set a history aside is not the
+/// complete read of the day, nor the scan of a gap limit.
 fn apply_synced(
     state: &mut ManagerState,
-    meta: &WalletMeta,
+    meta: &StoredMeta,
+    scanned: Scanned<'_>,
     synced: chain::Synced,
     endpoint: &Endpoint,
-    reach: &Reach,
     known: &views::Known,
     started: Instant,
 ) -> CoreResult<(SyncReport, bool)> {
+    let Scanned { reach, gap_limit } = scanned;
     let whole = !synced.set_aside;
     state.orders.extend(synced.orders);
     let vanishing = crate::live::news::vanishing(&state.payload, &meta.id);
@@ -694,7 +738,7 @@ fn apply_synced(
         took_ms: started.elapsed().as_millis() as u64,
         backend: endpoint.label(),
     };
-    let scanned = (*reach == Reach::Full && whole).then_some(meta.gap_limit);
+    let scanned = (*reach == Reach::Full && whole).then_some(gap_limit);
     let complete = matches!(reach, Reach::Full | Reach::Complete) && whole;
     finish_sync(
         state,
@@ -714,7 +758,7 @@ fn apply_synced(
 /// says it was read whole.
 fn apply_address_state(
     state: &mut ManagerState,
-    meta: &WalletMeta,
+    meta: &StoredMeta,
     mut watch: AddressWatchState,
     endpoint: &Endpoint,
     started: Instant,
