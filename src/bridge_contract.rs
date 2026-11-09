@@ -47,9 +47,9 @@ use crate::backup::{
     ImportChoices, ImportReport, RefusedWallet,
 };
 use crate::broadcast::{
-    self, BroadcastReport, BroadcastStatus, DecodedInput, DecodedTx, FeeRateBasis, InputFacts,
-    OutputFacts, RecentBroadcast, SigningHints, TxOutputPreview, TxPreview, TxReadiness,
-    TxSeverity, TxSource, TxWarning, TxWarningKind, WalletRef,
+    self, BroadcastReport, BroadcastStanding, BroadcastStatus, DecodedInput, DecodedTx,
+    FeeRateBasis, InputFacts, OutputFacts, RecentBroadcast, SigningHints, TxOutputPreview,
+    TxPreview, TxReadiness, TxSeverity, TxSource, TxWarning, TxWarningKind, WalletRef,
 };
 use crate::chain::connect::{ScannedBackendKind, parse_backend};
 use crate::chain::public::{PublicServer, ServerProtocol, public_servers};
@@ -2025,14 +2025,15 @@ fn broadcasts() -> Vec<Fixture> {
         warnings.iter().any(|(_, w)| w.blocking) && warnings.iter().any(|(_, w)| !w.blocking),
         "the warnings show both a blocking caution and one that is not"
     );
-    let found = BroadcastStatus {
-        txid: ready.txid.clone(),
-        found: true,
-        confirmed: true,
-        block_height: Some(TIP + 1),
-        confirmations: 1,
-        backend: "electrum.example.org".to_owned(),
-        at: NOW + 700,
+    let status = |found: bool, block_height: Option<u32>| {
+        BroadcastStatus::new(
+            ready.txid.clone(),
+            found,
+            block_height,
+            TIP + 1,
+            "electrum.example.org".to_owned(),
+            NOW + 700,
+        )
     };
 
     vec![
@@ -2131,27 +2132,18 @@ fn broadcasts() -> Vec<Fixture> {
         fixture(
             "BroadcastStatus",
             vec![
-                ("confirmed", found.clone()),
-                (
-                    "in_mempool",
-                    BroadcastStatus {
-                        confirmed: false,
-                        block_height: None,
-                        confirmations: 0,
-                        ..found.clone()
-                    },
-                ),
-                (
-                    "not_found",
-                    BroadcastStatus {
-                        found: false,
-                        confirmed: false,
-                        block_height: None,
-                        confirmations: 0,
-                        ..found
-                    },
-                ),
+                ("confirmed", status(true, Some(TIP + 1))),
+                ("in_mempool", status(true, None)),
+                ("not_found", status(false, None)),
             ],
+        ),
+        variants(
+            "BroadcastStanding",
+            every!(BroadcastStanding {
+                NotSeen,
+                InMempool,
+                Confirmed,
+            }),
         ),
         fixture(
             "RecentBroadcast",

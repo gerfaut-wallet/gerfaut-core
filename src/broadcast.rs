@@ -352,10 +352,30 @@ pub struct BroadcastReport {
     pub at: u64,
 }
 
-/// Where a transaction stands, as the backend sees it.
+/// Where a sent transaction stands, in one word: what the status pill of
+/// either application says, decided here once so neither screen has to
+/// work it out of `found` and `confirmed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BroadcastStanding {
+    /// The backend does not have it: not relayed yet, or dropped out of
+    /// the mempool (evicted or replaced). Sending it again does no harm.
+    NotSeen,
+    /// The backend holds it, and no block it can prove does.
+    InMempool,
+    /// Proven in a block.
+    Confirmed,
+}
+
+/// Where a transaction stands, as the backend sees it. Build it with
+/// [`BroadcastStatus::new`], as the core does: the flat fields and
+/// `standing` then tell the same story.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BroadcastStatus {
     pub txid: String,
+    /// The one word for where it stands; the fields below say the same,
+    /// flat, for an application that reads them.
+    pub standing: BroadcastStanding,
     /// Whether the backend knows the transaction at all. A transaction
     /// can drop out of the mempool: evicted, replaced, or never relayed.
     pub found: bool,
@@ -367,6 +387,40 @@ pub struct BroadcastStatus {
     pub backend: String,
     /// Unix timestamp, seconds.
     pub at: u64,
+}
+
+impl BroadcastStatus {
+    /// Where `txid` stands at `backend`: unknown to it when not `found`,
+    /// in its mempool when found with no proven block, confirmed at
+    /// `block_height` otherwise, counted against `tip_height`. A height
+    /// for a transaction the backend does not have counts for nothing.
+    pub fn new(
+        txid: String,
+        found: bool,
+        block_height: Option<u32>,
+        tip_height: u32,
+        backend: String,
+        at: u64,
+    ) -> Self {
+        let block_height = block_height.filter(|_| found);
+        let standing = match (found, block_height) {
+            (false, _) => BroadcastStanding::NotSeen,
+            (true, None) => BroadcastStanding::InMempool,
+            (true, Some(_)) => BroadcastStanding::Confirmed,
+        };
+        Self {
+            txid,
+            standing,
+            found,
+            confirmed: block_height.is_some(),
+            block_height,
+            confirmations: block_height
+                .map(|height| tip_height.saturating_sub(height) + 1)
+                .unwrap_or(0),
+            backend,
+            at,
+        }
+    }
 }
 
 /// How many broadcasts the vault remembers, every network together.
@@ -2515,6 +2569,46 @@ mod tests {
             assert!(preview.hex.is_none());
             assert_eq!(preview.fee_sats, None);
         }
+    }
+
+    /// A status says where the transaction stands once, in `standing`,
+    /// and the flat fields never say otherwise: a height the backend
+    /// gives for a transaction it does not have counts for nothing.
+    #[test]
+    fn a_status_tells_one_story() {
+        let status = |found, height| {
+            BroadcastStatus::new("txid".to_owned(), found, height, 110, "host".to_owned(), 7)
+        };
+
+        let confirmed = status(true, Some(108));
+        assert_eq!(confirmed.standing, BroadcastStanding::Confirmed);
+        assert!(confirmed.found && confirmed.confirmed);
+        assert_eq!(confirmed.block_height, Some(108));
+        assert_eq!(confirmed.confirmations, 3);
+
+        let pending = status(true, None);
+        assert_eq!(pending.standing, BroadcastStanding::InMempool);
+        assert!(pending.found && !pending.confirmed);
+        assert_eq!(pending.confirmations, 0);
+
+        for height in [None, Some(108)] {
+            let gone = status(false, height);
+            assert_eq!(gone.standing, BroadcastStanding::NotSeen);
+            assert!(!gone.found && !gone.confirmed);
+            assert_eq!(gone.block_height, None);
+            assert_eq!(gone.confirmations, 0);
+        }
+
+        let json = serde_json::to_value(&confirmed).unwrap();
+        assert_eq!(json["standing"], "confirmed");
+        assert_eq!(
+            serde_json::to_value(&pending).unwrap()["standing"],
+            "in_mempool"
+        );
+        assert_eq!(
+            serde_json::to_value(status(false, None)).unwrap()["standing"],
+            "not_seen"
+        );
     }
 
     /// Coins declared at more than all the bitcoin there will ever be,
