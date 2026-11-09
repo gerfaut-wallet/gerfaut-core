@@ -24,7 +24,7 @@ use super::{
 use crate::chain::electrum::status::history_status;
 use crate::chain::proof::checkpoint_for;
 use crate::chain::{self, Endpoint, has_proof_of_work};
-use crate::error::CoreResult;
+use crate::error::{CoreError, CoreResult};
 use crate::manager::{ManagerState, ensure_engine, find_record};
 use crate::network::Network;
 use crate::wallet::meta::{StoredMeta, WalletKind};
@@ -38,11 +38,27 @@ impl WalletManager {
     /// what they confirm is recorded for whoever announces, and the
     /// watch is handed the wallet as it now stands. `None` when they
     /// cannot be taken as they are, and their scripts are to be synced.
+    ///
+    /// Taken, they stand for a good sync of the wallet, and clear the
+    /// failure it kept; refused, they are its failure: see
+    /// [`super::WalletSyncState`].
     pub(crate) async fn take_confirmations(
         &self,
         id: &str,
         proven: &[Proven],
     ) -> CoreResult<Option<SyncReport>> {
+        let turn = self.sync_turn(id);
+        let taken = self.take_in_turn(id, proven).await;
+        match &taken {
+            Ok(Some(_)) => self.clear_sync_failure(id).await,
+            Ok(None) | Err(CoreError::WalletNotFound(_)) => {}
+            Err(error) => self.record_sync_failure(id, error).await,
+        }
+        turn.end().await;
+        taken
+    }
+
+    async fn take_in_turn(&self, id: &str, proven: &[Proven]) -> CoreResult<Option<SyncReport>> {
         let slot = match self.syncing.lock() {
             Ok(mut slots) => slots.entry(id.to_owned()).or_default().clone(),
             Err(_) => SyncSlot::default(),

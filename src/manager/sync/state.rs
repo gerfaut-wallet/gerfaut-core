@@ -201,6 +201,22 @@ impl WalletManager {
         }
     }
 
+    /// Forgets the failure kept with `id`, after a read that stands for
+    /// a good sync without going through one: confirmations the live
+    /// watch proved. A sync clears it as it records its stamp.
+    pub(crate) async fn clear_sync_failure(&self, id: &str) {
+        let mut state = self.state.lock().await;
+        let Ok(record) = find_record_mut(&mut state.payload, id) else {
+            return;
+        };
+        if record.meta.last_failure.take().is_none() {
+            return;
+        }
+        if let Err(error) = state.vault.save(&state.payload) {
+            log::warn!("a cleared sync failure was not saved with its wallet: {error}");
+        }
+    }
+
     fn leave(&self, id: &str) {
         let mut board = self.board();
         if let Some(turns) = board.running.get_mut(id) {
