@@ -28,8 +28,8 @@ impl WalletManager {
             .payload
             .wallets
             .iter()
+            .filter(|record| network.is_none_or(|n| record.meta.network == n))
             .map(|record| record.meta.clone().presented(gap_limit))
-            .filter(|meta| network.is_none_or(|n| meta.network == n))
             .collect()
     }
 
