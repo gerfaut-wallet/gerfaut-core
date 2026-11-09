@@ -41,6 +41,16 @@ ignore = [
     # an RSA private key, and this code does not use rsa itself. No fixed
     # release exists: remove this entry once one is in Cargo.lock.
     { id = "RUSTSEC-2023-0071", reason = "Marvin needs an RSA private-key operation, which a Tor client never performs; no fixed rsa release yet" },
+    # libsqlite3-sys: SQLite before 3.54.0 can hand back stale page-cache
+    # memory when it opens a database beside a crafted -wal file of another
+    # page size. Only arti pulls it in (tor-dirmgr, rusqlite), for its
+    # directory cache under <data dir>/tor/cache. Planting that pair of
+    # files takes write access to the app's own data folder, which already
+    # means control of the user's account. The fix ships in libsqlite3-sys
+    # 0.39 with rusqlite 0.41, but tor-dirmgr 0.48, the latest, still asks
+    # for rusqlite below 0.41. Review on 2026-12-07, after the next arti
+    # release; remove this entry once Cargo.lock has libsqlite3-sys 0.39.
+    { id = "RUSTSEC-2026-0459", reason = "needs crafted files in arti's cache inside the app data folder; no arti release accepts rusqlite 0.41 yet; review 2026-12-07" },
 ]
 
 [licenses]
