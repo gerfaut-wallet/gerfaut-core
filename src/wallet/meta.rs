@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::ErrorCode;
 use crate::input::{RecognizedKind, ScriptKind};
 use crate::network::Network;
 use crate::wallet::snapshot::BalanceSnapshot;
@@ -43,6 +44,20 @@ pub struct SyncStamp {
     /// and then that sync tries the servers in their usual order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
+}
+
+/// The last sync of a wallet that failed, kept until one succeeds: a
+/// wallet that cannot be read says so after a restart too, rather than
+/// showing its last good sync as if nothing had gone wrong since.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncFailureStamp {
+    /// Unix timestamp, seconds.
+    pub at: u64,
+    /// The core's words, for logs and for a failure an app has no
+    /// sentence of its own for.
+    pub message: String,
+    /// The code of the failure, the one an app picks its sentence on.
+    pub kind: ErrorCode,
 }
 
 /// Totals cached in the vault so list views render without loading
@@ -115,6 +130,11 @@ pub struct WalletMeta {
     pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub last_sync: Option<SyncStamp>,
+    /// The last sync that failed, while none has succeeded since: the
+    /// wallet is then failed, whatever `last_sync` says. Left out of the
+    /// stored form while there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<SyncFailureStamp>,
     /// When a sync last read every script of the wallet, Unix seconds:
     /// a full scan, or a sync that read each revealed script down to
     /// what the wallet holds. The syncs in between may read only the
@@ -156,6 +176,7 @@ pub struct StoredMeta {
     pub scan_gap: u32,
     pub labels: BTreeMap<String, String>,
     pub last_sync: Option<SyncStamp>,
+    pub last_failure: Option<SyncFailureStamp>,
     pub complete_at: Option<u64>,
     pub cached: CachedTotals,
     pub live_pinned: bool,
@@ -176,6 +197,7 @@ impl StoredMeta {
             scan_gap,
             labels,
             last_sync,
+            last_failure,
             complete_at,
             cached,
             live_pinned,
@@ -192,6 +214,7 @@ impl StoredMeta {
             scan_gap,
             labels,
             last_sync,
+            last_failure,
             complete_at,
             cached,
             live_pinned,
@@ -235,6 +258,7 @@ impl From<WalletMeta> for StoredMeta {
             scan_gap,
             labels,
             last_sync,
+            last_failure,
             complete_at,
             cached,
             live_pinned,
@@ -250,6 +274,7 @@ impl From<WalletMeta> for StoredMeta {
             scan_gap,
             labels,
             last_sync,
+            last_failure,
             complete_at,
             cached,
             live_pinned,

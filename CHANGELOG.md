@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `BroadcastStatus` carries `standing`, where a sent transaction stands in one word: `not_seen`, `in_mempool` or `confirmed`. The flat fields stay and always agree with it, so both apps read the same answer instead of working it out of `found` and `confirmed`.
+- Each wallet's sync state, kept by the core: `idle`, `syncing` or `failed`, whoever started the sync (the app, a rescan, a sync of every wallet, the live watch). `sync_states` lists the state of each wallet, and `sync_changes` sends a change when a sync starts and when it ends. Both apps read it, so a screen no longer shows another wallet's sync as its own.
+- A wallet keeps its last failed sync in `last_failure`, beside `last_sync`, until a sync succeeds. It still reads as failed after a restart.
 
 ### Removed
 

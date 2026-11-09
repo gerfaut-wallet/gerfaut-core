@@ -119,6 +119,93 @@ async fn regtest_public_backend_is_unavailable() {
     ));
 }
 
+/// A wallet whose last sync failed says so after the vault is opened
+/// again: until a sync succeeds, the app must not show it as synced.
+#[tokio::test]
+async fn a_failed_sync_is_still_failed_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = {
+        let manager = manager(dir.path()).await;
+        let parsed = parse_input(MULTIPATH).unwrap();
+        let meta = manager
+            .add_wallet("Regtest", &parsed, Network::Regtest)
+            .await
+            .unwrap();
+        assert!(manager.sync_wallet(&meta.id).await.is_err());
+        meta.id
+    };
+    let manager = manager(dir.path()).await;
+    let listed = serde_json::to_value(manager.list_wallets(None).await).unwrap();
+    let wallet = &listed[0];
+    assert_eq!(wallet["id"], id.as_str());
+    assert_eq!(
+        wallet["last_failure"]["kind"], "backend_unavailable",
+        "{wallet}"
+    );
+}
+
+/// A sync says the wallet is syncing when it starts, and where it
+/// stands when it ends; the list says the same.
+#[tokio::test]
+async fn a_sync_says_when_it_starts_and_where_it_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let parsed = parse_input(MULTIPATH).unwrap();
+    let meta = manager
+        .add_wallet("Regtest", &parsed, Network::Regtest)
+        .await
+        .unwrap();
+    let idle = WalletSync {
+        wallet_id: meta.id.clone(),
+        state: WalletSyncState::Idle,
+    };
+    assert_eq!(manager.sync_states(None).await, vec![idle]);
+    assert!(manager.sync_states(Some(Network::Signet)).await.is_empty());
+
+    let mut changes = manager.sync_changes();
+    assert!(manager.sync_wallet(&meta.id).await.is_err());
+    let started = changes.try_recv().unwrap();
+    assert_eq!(started.state, WalletSyncState::Syncing);
+    // One start and one end, however many turns the sync took inside.
+    let ended = changes.try_recv().unwrap();
+    assert!(changes.try_recv().is_err(), "said once");
+    let WalletSyncState::Failed { kind, .. } = &ended.state else {
+        panic!("not failed: {ended:?}");
+    };
+    assert_eq!(*kind, ErrorCode::BackendUnavailable);
+    assert_eq!(manager.sync_states(None).await, vec![ended.clone()]);
+
+    // The shape both apps read: the state beside the id, flat.
+    let json = serde_json::to_value(&ended).unwrap();
+    assert_eq!(json["wallet_id"], meta.id.as_str());
+    assert_eq!(json["state"], "failed");
+    assert_eq!(json["kind"], "backend_unavailable");
+}
+
+/// A sync given up halfway, its task dropped, still says where the
+/// wallet stands: never syncing for ever.
+#[tokio::test]
+async fn a_sync_given_up_halfway_is_not_syncing_for_ever() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let parsed = parse_input(MULTIPATH).unwrap();
+    let meta = manager
+        .add_wallet("Regtest", &parsed, Network::Regtest)
+        .await
+        .unwrap();
+    let mut changes = manager.sync_changes();
+    drop(manager.sync_turn(&meta.id));
+    assert_eq!(
+        changes.recv().await.unwrap().state,
+        WalletSyncState::Syncing
+    );
+    assert_eq!(changes.recv().await.unwrap().state, WalletSyncState::Idle);
+    assert_eq!(
+        manager.sync_states(None).await[0].state,
+        WalletSyncState::Idle
+    );
+}
+
 /// The server that answered the last sync goes first in the next one,
 /// told by its protocol and port as well as its host. Blockstream's
 /// Electrum server, `blockstream.info:700`, answering a sync the live
