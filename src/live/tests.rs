@@ -707,6 +707,32 @@ async fn a_narrow_sync_a_day_after_a_complete_one_reads_it_all() {
     assert!(complete_at(&manager, &wallet).await.unwrap() > old);
 }
 
+async fn scan_gap(manager: &WalletManager, wallet: &str) -> u32 {
+    let state = manager.state.lock().await;
+    find_record(&state.payload, wallet).unwrap().meta.scan_gap
+}
+
+/// A gap limit raised after a wallet was scanned scans it again with the
+/// new limit at the next sync, and the wallet keeps how far it was
+/// scanned: a payment past the old limit is found, and the scan is not
+/// asked for again.
+#[tokio::test]
+async fn a_raised_gap_limit_scans_the_wallet_again_that_far() {
+    let server = FakeElectrum::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (manager, wallet) = cold_wallet(dir.path(), &server).await;
+    assert_eq!(scan_gap(&manager, &wallet).await, 20);
+
+    manager.set_gap_limit(50).await.unwrap();
+    // Thirty addresses past the one used: beyond the old limit, within
+    // the new one.
+    pay(&server, 2, &receive_script(30), 5_000, 91);
+    let report = manager.sync_wallet(&wallet).await.unwrap();
+
+    assert_eq!(report.balance.total, 15_000, "{report:?}");
+    assert_eq!(scan_gap(&manager, &wallet).await, 50);
+}
+
 /// A watch that hears nothing for a day still reads every wallet whole
 /// once that day, on its own: a phone may keep a watch for days with no
 /// other sync, and some scripts it never hears of. Not again after.
