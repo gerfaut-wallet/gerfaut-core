@@ -1,6 +1,7 @@
 {
   "confirmed": {
     "txid": "40d6a7e07b4c3e49fc00670b4b309f13f4534f60f9dfbae3706d10947a2163e0",
+    "standing": "confirmed",
     "found": true,
     "confirmed": true,
     "block_height": 800001,
@@ -10,6 +11,7 @@
   },
   "in_mempool": {
     "txid": "40d6a7e07b4c3e49fc00670b4b309f13f4534f60f9dfbae3706d10947a2163e0",
+    "standing": "in_mempool",
     "found": true,
     "confirmed": false,
     "block_height": null,
@@ -19,6 +21,7 @@
   },
   "not_found": {
     "txid": "40d6a7e07b4c3e49fc00670b4b309f13f4534f60f9dfbae3706d10947a2163e0",
+    "standing": "not_seen",
     "found": false,
     "confirmed": false,
     "block_height": null,

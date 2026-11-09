@@ -486,19 +486,14 @@ impl WalletManager {
             {
                 Ok(standing) => {
                     self.note_send(endpoint, &failures);
-                    let confirmations = standing
-                        .block_height
-                        .map(|height| standing.tip_height.saturating_sub(height) + 1)
-                        .unwrap_or(0);
-                    return Ok(BroadcastStatus {
-                        txid: txid.to_string(),
-                        found: standing.found,
-                        confirmed: standing.block_height.is_some(),
-                        block_height: standing.block_height,
-                        confirmations,
-                        backend: endpoint.label(),
-                        at: now_secs(),
-                    });
+                    return Ok(BroadcastStatus::new(
+                        txid.to_string(),
+                        standing.found,
+                        standing.block_height,
+                        standing.tip_height,
+                        endpoint.label(),
+                        now_secs(),
+                    ));
                 }
                 Err(fault) => {
                     attempts.failed(endpoint, &fault);

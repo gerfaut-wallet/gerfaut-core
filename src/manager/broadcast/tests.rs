@@ -237,7 +237,7 @@ async fn a_psbt_lie_about_an_unwatched_coin_is_caught_by_the_backend() {
         .preview_transaction(&text, Network::Regtest)
         .await
         .unwrap();
-    assert!(preview.ready);
+    assert!(preview.ready());
     assert_eq!(preview.inputs[0].value_sats, Some(REAL));
     assert_eq!(preview.fee_sats, Some(REAL - PAID));
     let mismatch = preview
@@ -354,7 +354,7 @@ async fn a_backend_that_stops_answering_confirms_nothing_about_the_rest() {
         .await
         .unwrap();
 
-    assert!(preview.ready);
+    assert!(preview.ready());
     assert_eq!(
         preview.inputs[0].value_sats,
         Some(REAL),
@@ -482,7 +482,7 @@ async fn a_watched_coin_spent_in_a_block_blocks_the_send() {
             .expect("the spent coin is named");
         assert!(spent.message.contains(says), "{}", spent.message);
         assert!(spent.blocking);
-        assert!(!preview.ready);
+        assert!(!preview.ready());
         assert!(preview.hex.is_none());
     }
 }
@@ -504,7 +504,7 @@ async fn a_watched_coin_spent_in_the_mempool_leaves_the_send_to_the_node() {
         .await
         .unwrap();
     assert_eq!(again.readiness, TxReadiness::InMempool);
-    assert!(again.ready);
+    assert!(again.ready());
     assert!(again.hex.is_some());
     assert!(
         !again
@@ -605,7 +605,7 @@ async fn the_backend_places_a_spend_the_vault_does_not_know() {
             .expect("the backend's answer is named");
         let case = format!("served {served}, confirmed {confirmed}: {}", spent.message);
         assert_eq!(spent.blocking, blocks, "{case}");
-        assert_eq!(preview.ready, !blocks, "{case}");
+        assert_eq!(preview.ready(), !blocks, "{case}");
         assert_eq!(preview.inputs[0].value_sats, Some(50_000));
     }
 }
