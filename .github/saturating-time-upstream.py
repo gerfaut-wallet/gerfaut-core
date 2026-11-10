@@ -8,7 +8,8 @@ The fork's version is the one Cargo.lock records for the git source of
 the [patch.crates-io] section: the fork keeps the version of the release
 it patches, never one of its own. A release counts when it is not yanked,
 not a pre-release, newer than the fork, and missing from REVIEWED, the
-space-separated releases already read and found without the fix. A list
+space-separated releases already read and found unable to replace the
+fork: without the fix, or not yet asked for by arti. A list
 rather than a ceiling, so that each release is read once, whatever its
 number.
 

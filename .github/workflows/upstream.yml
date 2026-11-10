@@ -32,9 +32,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      # The releases that were read and do not carry the fix, the one the
-      # fork patches among them, separated by spaces.
-      REVIEWED: 0.5.0
+      # The releases that were read and cannot replace the fork, the one
+      # the fork patches among them, separated by spaces: 0.5.0 lacks the
+      # fix; 0.6.0 carries it, but arti 0.47 asks for 0.5 and only arti
+      # 0.48 takes 0.6, and once arti moves the patch stops applying and
+      # the script below fails.
+      REVIEWED: 0.5.0 0.6.0
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
