@@ -131,12 +131,38 @@ const BRANCH_MAX: usize = 32;
 /// there: its hash meets its own target, and that target is no easier
 /// than the network allows at that height ([`easiest_target`]). A
 /// header of a network whose blocks work does not prove passes.
+///
+/// In a period of the table, a mainnet header carries the `bits` of its
+/// period exactly, as every block of a mainnet period does: no easier,
+/// and no harder either. A target no easier was enough to prove the
+/// work, and not where the block sits: a recent header, harder than any
+/// period before it, passed at any height under its own, and a server
+/// could serve the real blocks of the chain at the heights it liked.
+/// Held to its period, a header is at most one period away from where
+/// it claims to be; what binds it to its very height is chaining to a
+/// checkpoint, or its coinbase.
 pub(crate) fn has_proof_of_work(network: Network, height: u32, header: &Header) -> bool {
     let Some(easiest) = easiest_target(network, height) else {
         return true;
     };
+    if let Some(bits) = period_bits(network, height)
+        && header.bits.to_consensus() != bits
+    {
+        return false;
+    }
     let target = header.target();
     target <= easiest && target.is_met_by(header.block_hash())
+}
+
+/// The `bits` every header of the period of `height` carries, when the
+/// table has that period: mainnet alone.
+fn period_bits(network: Network, height: u32) -> Option<u32> {
+    if network != Network::Mainnet {
+        return None;
+    }
+    targets::MAINNET_BITS
+        .get((height / RETARGET_PERIOD) as usize)
+        .copied()
 }
 
 /// The easiest target a header of `network` at `height` may carry, or

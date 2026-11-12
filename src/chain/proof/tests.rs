@@ -341,12 +341,6 @@ fn a_header_easier_than_its_period_has_no_work() {
     assert!(has_proof_of_work(Network::Mainnet, 34_271, &old));
     assert!(!has_proof_of_work(Network::Mainnet, 963_647, &old));
     assert!(!has_proof_of_work(Network::Mainnet, 980_000, &old));
-    // A recent header claimed earlier carries more work than asked.
-    assert!(has_proof_of_work(
-        Network::Mainnet,
-        34_271,
-        &last_checkpoint()
-    ));
     let unmined = Header {
         nonce: last_checkpoint().nonce.wrapping_add(1),
         ..last_checkpoint()
@@ -361,6 +355,31 @@ fn a_header_easier_than_its_period_has_no_work() {
     assert!(!has_proof_of_work(Network::Testnet4, 0, &easiest));
     assert!(has_proof_of_work(Network::Signet, 963_647, &unmined));
     assert!(has_proof_of_work(Network::Regtest, 963_647, &easiest));
+}
+
+/// Every block of a mainnet period carries the `bits` of its period, so
+/// within the table a header is held to those exactly: a recent header,
+/// harder than any period before it, claimed in one of them is refused,
+/// where its work alone let it through at any earlier height. The last
+/// period of the table is held the same, and past the table the target
+/// may still ease as consensus lets it.
+#[test]
+fn a_header_carries_the_bits_of_its_period() {
+    let recent = last_checkpoint();
+    assert_eq!(recent.bits.to_consensus(), targets::MAINNET_BITS[477]);
+    assert!(has_proof_of_work(Network::Mainnet, 963_647, &recent));
+    for height in [34_271, 702_861, 963_647 - RETARGET_PERIOD, 963_648, 965_663] {
+        assert!(
+            !has_proof_of_work(Network::Mainnet, height, &recent),
+            "{height}"
+        );
+    }
+    let last = (targets::MAINNET_BITS.len() as u32) * RETARGET_PERIOD;
+    assert!(has_proof_of_work(Network::Mainnet, last, &recent));
+    assert!(has_proof_of_work(Network::Mainnet, 2_963_647, &recent));
+    // Signet and testnet4 keep the check they had.
+    assert!(has_proof_of_work(Network::Signet, 34_271, &recent));
+    assert!(has_proof_of_work(Network::Testnet4, 34_271, &recent));
 }
 
 /// Past the table, a period's target may be four times easier than the
