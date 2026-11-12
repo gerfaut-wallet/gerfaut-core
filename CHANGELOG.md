@@ -16,6 +16,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Removed
 
 - `TxPreview.ready`, which repeated `readiness`: a preview can be sent when `readiness` is `ready` or `in_mempool`, which is also when `hex` is present.
+- `WalletManager::trust_certificate`, which pinned a certificate on its own, for no server the user saved. Both apps accept a certificate through `set_backend_trusting`, with the backend it belongs to.
+
+### Fixed
+
+- A PSBT input whose final scriptSig or witness is present but empty reads as unsigned. It used to count as finalized, so the preview could call a transaction ready that no node would take.
+- A coinbase paid to a watched address counts as immature until it has 100 confirmations, as it already did in a descriptor wallet. Its amount used to count as confirmed from its first block.
+- An Electrum certificate that has expired, is not valid yet or names another host is reported for that reason. It used to read as a certificate nobody vouches for, which hid a server that presents a certificate signed for another host. The name the certificate carries reaches the app cleaned like any other word of a server: one short line, without control characters or bidirectional marks.
+
+### Security
+
+- A server can no longer pass real blocks off at heights of its own. The work of a header proves it was mined, not where it sits in the chain. On mainnet, a header inside the table of retarget periods must now carry the exact bits of its period, where a target at least as hard used to be enough. Past the table, the height of a block is proven by its coinbase (BIP-34): the transaction at position 0, proven under the header by its merkle branch, must open with that height. This holds for every tip a server gives, the tip a transaction preview or a watched address counts from included, and for the block of every confirmation that no checkpoint chain binds. A proven height is kept for the session, so a block costs its proof once: two more requests over Electrum, three over Esplora.
+- A wallet that a server once fooled with heights too high is repaired by the next server whose tip is fresh. When a server more than 144 blocks below the wallet shows a tip header at most 6 hours old, and no more than 2 hours ahead of the device's clock, the wallet's blocks above that tip are dropped, confirmations included, and proven again. That tip must also sit in one of the latest periods, where a header costs about today's work to forge: in an old period, a header that claims to be recent is a few cents of work and the miner's word for its time. A server that far behind with any other tip is refused, and the wallet keeps everything it holds.
+- The live watch counts confirmations only from a tip it has checked, and starts from a fresh one when it moves to another server.
+- Over Esplora, a confirmation is chained in the block it was proven in. A server that named another block at that height used to get its block into the wallet's chain, and the payment stayed pending for good. A confirmation the wallet already holds also keeps the time it was proven with.
 
 ## [0.1.0] - 2026-10-21
 
