@@ -1501,18 +1501,20 @@ mod tests {
 
     #[test]
     fn an_address_coin_counts_its_depth_from_the_tip() {
-        let coin = |txid: &str, height: Option<u32>| crate::wallet::AddressUtxo {
+        let coin = |txid: &str, value_sats: u64, height: Option<u32>| crate::wallet::AddressUtxo {
             txid: txid.into(),
             vout: 0,
-            value_sats: 1000,
+            value_sats,
             height,
             timestamp: None,
         };
         let state = AddressWatchState {
             utxos: vec![
-                coin("tip", Some(100)),
-                coin("deep", Some(95)),
-                coin("waiting", None),
+                coin("tip", 1000, Some(100)),
+                coin("deep", 4000, Some(95)),
+                coin("waiting", 3000, None),
+                // A block the tip of this sync has not reached yet.
+                coin("ahead", 2000, Some(101)),
             ],
             tip_height: 100,
             ..Default::default()
@@ -1521,12 +1523,14 @@ mod tests {
             .into_iter()
             .map(|utxo| (utxo.txid, utxo.confirmations))
             .collect();
+        // Largest first, as before: the depth changes nothing to the order.
         assert_eq!(
             depths,
             vec![
-                ("tip".to_owned(), 1),
                 ("deep".to_owned(), 6),
-                ("waiting".to_owned(), 0)
+                ("waiting".to_owned(), 0),
+                ("ahead".to_owned(), 1),
+                ("tip".to_owned(), 1)
             ]
         );
     }
@@ -1551,7 +1555,7 @@ mod tests {
             )
         };
         let mined = pay(1, 50_000);
-        let waiting = pay(2, 20_000);
+        let waiting = pay(2, 80_000);
         let block = |height: u32| BlockId {
             height,
             hash: BlockHash::from_byte_array([height as u8; 32]),
@@ -1576,8 +1580,9 @@ mod tests {
                 .map(|utxo| (utxo.value_sats, utxo.confirmations))
                 .collect()
         };
-        // In the tip block it counts one, and the one that waits none.
-        assert_eq!(depths(&engine), vec![(50_000, 1), (20_000, 0)]);
+        // In the tip block it counts one, and the one that waits none;
+        // the larger one still comes first, mined or not.
+        assert_eq!(depths(&engine), vec![(80_000, 0), (50_000, 1)]);
 
         // Two blocks on top: three deep.
         let mut tip = engine.latest_checkpoint();
@@ -1590,7 +1595,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(depths(&engine), vec![(50_000, 3), (20_000, 0)]);
+        assert_eq!(depths(&engine), vec![(80_000, 0), (50_000, 3)]);
     }
 
     #[test]
