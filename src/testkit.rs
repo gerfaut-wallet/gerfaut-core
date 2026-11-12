@@ -309,6 +309,10 @@ pub(crate) struct ElectrumState {
     /// The tip the server moves to once it has given its tip once: blocks
     /// that come in while a client reads.
     pub tip_later: Option<u32>,
+    /// What `blockchain.transaction.id_from_pos` answers for position 0
+    /// of the block at a height, a txid and its branch as hashes in hex,
+    /// in place of the first transaction the histories put there.
+    pub from_pos: HashMap<u32, (Txid, Vec<String>)>,
 }
 
 /// Heights past which the fake Electrum server makes a header up on the
@@ -694,6 +698,28 @@ impl FakeElectrum {
                 };
                 json!({ "block_height": height, "merkle": merkle, "pos": pos })
             }
+            // The transaction at a position of the block at a height, its
+            // branch with it when asked for: one set for position 0, or
+            // the one the histories put there. A block without one is
+            // refused, as servers refuse a position past a block.
+            "blockchain.transaction.id_from_pos" => {
+                let height = param.as_u64().unwrap_or(0) as u32;
+                let pos = request["params"][1].as_u64().unwrap_or(0) as usize;
+                let set = state.from_pos.get(&height).filter(|_| pos == 0).cloned();
+                let found = set.or_else(|| {
+                    let mined = state.mined_at(i64::from(height));
+                    mined
+                        .get(pos)
+                        .map(|txid| (*txid, merkle_of(&mined, pos).1))
+                });
+                match found {
+                    Some((txid, merkle)) if request["params"][2] == true => {
+                        json!({ "tx_hash": txid.to_string(), "merkle": merkle })
+                    }
+                    Some((txid, _)) => json!(txid.to_string()),
+                    None => return refusal("No transaction at that position"),
+                }
+            }
             "blockchain.scripthash.subscribe" => {
                 state.connections[index].0.push(scripthash.clone());
                 // A status set by the test, or the one of the history,
@@ -921,6 +947,21 @@ pub(crate) struct MempoolState {
     pub blocks_listed: Option<u32>,
     /// Heights a listing down from which is refused with a 400.
     pub blocks_refused: std::collections::HashSet<u32>,
+    /// What `/block/:hash/txid/0` answers for a block, by its hash, in
+    /// place of the first transaction confirmed at its height.
+    pub first_txids: HashMap<String, String>,
+    /// Transactions served raw (`/tx/:txid/raw`) though no history
+    /// lists them: the coinbase of a block, for one.
+    pub raw: HashMap<String, Vec<u8>>,
+    /// What `/tx/:txid/merkle-proof` answers for a txid, in place of the
+    /// branch its block makes.
+    pub proofs: HashMap<String, Value>,
+    /// The hash `/block-height/:height` names at a height, in place of
+    /// the chain's: a server that lies about a block below its latest.
+    pub height_hashes: HashMap<u32, String>,
+    /// The block time a history lists a transaction with, by txid, in
+    /// place of the time of its block's header.
+    pub listed_times: HashMap<String, u64>,
 }
 
 /// The headers of the chain the fake mempool serves, by height: see
@@ -1069,6 +1110,12 @@ impl MempoolState {
             };
             tx["status"]["block_hash"] = json!(header.block_hash().to_string());
             tx["status"]["block_time"] = json!(header.time);
+            if let Some(time) = tx["txid"]
+                .as_str()
+                .and_then(|txid| self.listed_times.get(txid))
+            {
+                tx["status"]["block_time"] = json!(time);
+            }
         }
         tx
     }
@@ -1129,8 +1176,12 @@ impl MempoolState {
         self.header_in(chain, height).block_hash().to_string()
     }
 
-    /// A transaction listed anywhere, in its raw bytes.
+    /// A transaction listed anywhere, or served raw alone, in its raw
+    /// bytes.
     fn raw_tx(&self, txid: &str) -> Option<Vec<u8>> {
+        if let Some(raw) = self.raw.get(txid) {
+            return Some(raw.clone());
+        }
         let listed = self
             .address_txs
             .iter()
@@ -1146,6 +1197,9 @@ impl MempoolState {
     /// The branch of a confirmed transaction in its block, as Esplora
     /// sends it, unless one was set for it.
     fn merkle_proof(&self, txid: &str) -> Option<Value> {
+        if let Some(proof) = self.proofs.get(txid) {
+            return Some(proof.clone());
+        }
         let (_, height, _) = self
             .confirmed()
             .into_iter()
@@ -1291,6 +1345,23 @@ impl FakeMempool {
                     Some(header) => ("200 OK", serialize_hex(&header)),
                     None => ("404 Not Found", "Block not found".to_owned()),
                 }
+            } else if let Some(hash) = path
+                .strip_suffix("/txid/0")
+                .and_then(|path| path.rsplit_once("/block/"))
+                .map(|(_, hash)| hash)
+            {
+                // The first transaction of the block: one set for it, or
+                // the first one confirmed at its height in the chain.
+                let first = state.first_txids.get(hash).cloned().or_else(|| {
+                    let (&height, _) = chain
+                        .iter()
+                        .find(|(_, header)| header.block_hash().to_string() == hash)?;
+                    state.mined_at(height).first().map(Txid::to_string)
+                });
+                match first {
+                    Some(txid) => ("200 OK", txid),
+                    None => ("404 Not Found", "Block not found".to_owned()),
+                }
             } else if let Some(txid) = path
                 .strip_suffix("/raw")
                 .and_then(|path| path.rsplit_once("/tx/"))
@@ -1347,7 +1418,9 @@ impl FakeMempool {
                 .rsplit_once("/block-height/")
                 .and_then(|(_, height)| height.parse::<u32>().ok())
             {
-                if height <= state.tip {
+                if let Some(hash) = state.height_hashes.get(&height) {
+                    ("200 OK", hash.clone())
+                } else if height <= state.tip {
                     ("200 OK", state.block_id(&chain, height))
                 } else {
                     ("404 Not Found", "Block not found".to_owned())

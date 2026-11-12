@@ -42,6 +42,12 @@
 //! either way, and the work of a recent block is the price of a forged
 //! confirmation, as it is for any wallet that reads headers.
 //!
+//! Work proves a block was mined, not where it sits. Within the table a
+//! header carries the `bits` of its period exactly, and wherever no
+//! chain to a checkpoint binds a block to its height, the coinbase of
+//! the block does ([`height`]): the tip of every server, and the block of
+//! a confirmation past what is chained.
+//!
 //! The chain is read down from the end of the period, to the checkpoint
 //! that follows the block. The one before it proves nothing: a forger
 //! builds on the real block that ends the previous period as easily as
@@ -91,6 +97,7 @@ use electrum_client::GetMerkleRes;
 
 use crate::network::Network;
 
+pub(crate) mod height;
 mod targets;
 #[cfg(test)]
 mod tests;
@@ -131,12 +138,51 @@ const BRANCH_MAX: usize = 32;
 /// there: its hash meets its own target, and that target is no easier
 /// than the network allows at that height ([`easiest_target`]). A
 /// header of a network whose blocks work does not prove passes.
+///
+/// In a period of the table, a mainnet header carries the `bits` of its
+/// period exactly, as every block of a mainnet period does: no easier,
+/// and no harder either. A target no easier was enough to prove the
+/// work, and not where the block sits: a recent header, harder than any
+/// period before it, passed at any height under its own, and a server
+/// could serve the real blocks of the chain at the heights it liked.
+/// Held to its period, a header is at most one period away from where
+/// it claims to be; what binds it to its very height is chaining to a
+/// checkpoint, or its coinbase ([`height`]).
 pub(crate) fn has_proof_of_work(network: Network, height: u32, header: &Header) -> bool {
     let Some(easiest) = easiest_target(network, height) else {
         return true;
     };
+    if let Some(bits) = period_bits(network, height)
+        && header.bits.to_consensus() != bits
+    {
+        return false;
+    }
     let target = header.target();
     target <= easiest && target.is_met_by(header.block_hash())
+}
+
+/// Whether a header at `height` costs about the work of today's chain
+/// to forge: on mainnet, from the last period with a checkpoint on,
+/// where it carries the target of one of the latest periods of the
+/// table, or one sixteen times easier than the last at most. An older
+/// period was easy to mine in its time, some of them still are,
+/// and a header's time is the miner's to write: a header there that
+/// claims to be recent is one made for the purpose. Another network's
+/// work proves little anywhere, and passes.
+pub(crate) fn at_the_head(network: Network, height: u32) -> bool {
+    network != Network::Mainnet
+        || (height / RETARGET_PERIOD) as usize + 1 >= targets::MAINNET_ENDS.len()
+}
+
+/// The `bits` every header of the period of `height` carries, when the
+/// table has that period: mainnet alone.
+fn period_bits(network: Network, height: u32) -> Option<u32> {
+    if network != Network::Mainnet {
+        return None;
+    }
+    targets::MAINNET_BITS
+        .get((height / RETARGET_PERIOD) as usize)
+        .copied()
 }
 
 /// The easiest target a header of `network` at `height` may carry, or

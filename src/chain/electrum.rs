@@ -929,15 +929,38 @@ fn spent_status(
     (None, None)
 }
 
-/// The height of the server's tip.
-pub(crate) async fn tip_height(target: &Target, proxy: Option<&str>) -> Result<u32, Failure> {
-    let timeout = timeout_for(target);
-    on_one(target, proxy, move |client| {
-        patiently(|| client.block_headers_subscribe())
-            .map(|header| header.height as u32)
-            .map_err(|e| failure(&e, timeout))
+/// The height of the server's tip, proven as a sync's is
+/// ([`proven_tip`]).
+pub(crate) async fn tip_height(
+    target: &Target,
+    network: crate::network::Network,
+    proxy: Option<&str>,
+) -> Result<u32, Failure> {
+    let fail = failed(target);
+    run(target, proxy, call_deadline(target), move |client| {
+        proven_tip(client, network, &fail)
     })
     .await
+    .map_err(Failure::Transport)
+}
+
+/// The server's tip, refused past any height a chain of `network` can
+/// have reached and in a header without the work of its height
+/// ([`crate::chain::checked_tip`]), its height proven by its coinbase
+/// ([`sync::prove_height`]). Without the last, a server served a real
+/// recent block at whatever height it liked.
+fn proven_tip(
+    client: &Connection,
+    network: crate::network::Network,
+    fail: &impl Fn(electrum_client::Error) -> Fault,
+) -> Result<u32, Fault> {
+    let announced = patiently(|| client.block_headers_subscribe()).map_err(fail)?;
+    let height =
+        u32::try_from(announced.height).map_err(|_| Fault::other(crate::chain::IMPOSSIBLE_TIP))?;
+    let tip = crate::chain::checked_tip(network, height, &announced.header)?;
+    let proof = sync::prove_height(client, network, tip, &announced.header).map_err(fail)?;
+    crate::chain::proof::height::tip_proven(proof)?;
+    Ok(tip)
 }
 
 /// Where a transaction stands, read off the history of one of its
@@ -959,10 +982,7 @@ pub(crate) async fn tx_standing(
 ) -> Result<(bool, Option<u32>, u32), Fault> {
     let fail = failed(target);
     run(target, proxy, call_deadline(target), move |client| {
-        let announced = patiently(|| client.block_headers_subscribe()).map_err(&fail)?;
-        let height = u32::try_from(announced.height)
-            .map_err(|_| Fault::other(crate::chain::IMPOSSIBLE_TIP))?;
-        let tip = crate::chain::checked_tip(network, height, &announced.header)?;
+        let tip = proven_tip(client, network, &fail)?;
         let mut refused = None;
         for script in &scripts {
             // A server short of memory is asked again first: the next
@@ -1005,7 +1025,7 @@ fn proven_on(
 ) -> Result<bool, Fault> {
     use crate::chain::proof::{
         Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, check_confirmation,
-        recheck,
+        checkpoint_for, recheck,
     };
     match above_the_tip(height, tip) {
         Some(Proof::False) => return Err(Fault::false_proof()),
@@ -1040,7 +1060,14 @@ fn proven_on(
         let hashes = chain_to_checkpoint(network, from, &headers).ok_or_else(Fault::false_proof)?;
         read.insert(from, hashes);
     }
-    match chained(network, height, hash, &read) {
+    let proof = match chained(network, height, hash, &read) {
+        // Past the checkpoints, the block's height is its coinbase's.
+        Proof::Holds if checkpoint_for(network, height).is_none() => {
+            sync::prove_height(client, network, height, &header).map_err(fail)?
+        }
+        verdict => verdict,
+    };
+    match proof {
         Proof::Holds => Ok(true),
         Proof::Unsure => Ok(false),
         Proof::False | Proof::Elsewhere => Err(Fault::false_proof()),

@@ -251,7 +251,7 @@ impl WalletManager {
                     if down[e] {
                         continue;
                     }
-                    match chain::tip_height(endpoint, proxy.as_deref()).await {
+                    match chain::tip_height(endpoint, network, proxy.as_deref()).await {
                         Ok(height) => {
                             tip_height = Some(height);
                             self.note_send(endpoint, &failures);

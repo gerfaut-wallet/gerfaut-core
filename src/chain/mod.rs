@@ -155,25 +155,65 @@ pub(crate) fn is_genesis_of(network: Network, hash: bdk_wallet::bitcoin::BlockHa
 /// height held was never a real one.
 pub(crate) const TIP_LAG_MAX: u32 = 144;
 
-/// What a server is refused with when it is behind a block of the
-/// wallet that holds a confirmation, and its answer would take that
-/// block out ([`drops_a_confirmation`]).
+/// What a server behind the wallet is refused with when it disagrees
+/// with the wallet below its tip, and its answer would take a block of
+/// the wallet that holds a confirmation out.
 pub(crate) const BEHIND: &str = "the server is behind a confirmation the wallet holds";
 
-/// Whether a server whose tip is `server_tip`, more than [`TIP_LAG_MAX`]
-/// below the wallet's, would have the wallet drop a block holding one of
-/// its confirmations, at the heights in `confirmed`. On mainnet such a
-/// block carries the work of its height, and none at a height a chain
-/// can have reached (`limit`) was made up: the server lags, or hides
-/// it, and is refused rather than followed. Where work proves nothing,
-/// the blocks go, as any a server made up.
-pub(crate) fn drops_a_confirmation(
+/// What a server far behind the wallet, whose tip is no block of today,
+/// is refused with ([`follows_far_below`]).
+pub(crate) const FAR_BEHIND: &str = "the server is far behind the wallet, its tip no recent block";
+
+/// How old, by the device's clock, the tip of a server far below the
+/// wallet's may be for the server to be followed: six hours. A block's
+/// time may sit an hour or two behind the moment it was found, as
+/// consensus only asks it to be past the median of the eleven before
+/// it; two hours or so between two blocks comes a few times a year; and
+/// the device's clock may be off by some minutes. A lagging server is
+/// a day behind at least, 144 blocks, and its tip that old. A clock set
+/// behind a tip finds it fresh, two hours behind at most
+/// ([`AHEAD_TIP_SECS`]): the server then proves again what it lists, and
+/// lists nothing it does not have.
+pub(crate) const FRESH_TIP_SECS: u64 = 6 * 3_600;
+
+/// How far ahead of the device's clock the tip of a server far below the
+/// wallet's may be for the server to be followed: two hours, what
+/// consensus lets a block's time run ahead of the nodes' clocks. A time
+/// further ahead is no block found today, and would make a header
+/// written once pass for fresh for good.
+pub(crate) const AHEAD_TIP_SECS: u64 = 2 * 3_600;
+
+/// Whether a server whose tip is `server_tip`, a block of `tip_time`,
+/// is followed when the wallet holds blocks above it, `highest` the
+/// highest of those a chain can have reached: the wallet's blocks above
+/// that tip then go, confirmations with them, and the server proves
+/// again what it lists.
+///
+/// On mainnet, a tip's height is proven ([`proof::height`]), so a server
+/// whose tip is fresh at `now`, and costs today's work to forge
+/// ([`proof::at_the_head`]), is at the chain's tip, and the wallet's
+/// blocks far above it were never real, put there by a server that
+/// lied: they go, and a vault it fooled is repaired. A fresh tip in an
+/// older period is a header made for the purpose, a few cents of work,
+/// and would take every confirmation of the wallet out: it is refused
+/// as one that lags. One whose tip is old lags, or stopped, and is
+/// refused, the wallet left as it is; it
+/// used to drop the wallet's blocks when none held a confirmation, and
+/// to be refused for good once one did, whatever the server. Within
+/// [`TIP_LAG_MAX`], or where work proves nothing, the blocks go, as any
+/// a server made up.
+pub(crate) fn follows_far_below(
     network: Network,
-    mut confirmed: impl Iterator<Item = u32>,
+    highest: u32,
     server_tip: u32,
-    limit: u32,
+    tip_time: u32,
+    now: u64,
 ) -> bool {
-    network == Network::Mainnet && confirmed.any(|height| height > server_tip && height <= limit)
+    network != Network::Mainnet
+        || highest <= server_tip.saturating_add(TIP_LAG_MAX)
+        || (proof::at_the_head(network, server_tip)
+            && now.saturating_sub(u64::from(tip_time)) <= FRESH_TIP_SECS
+            && u64::from(tip_time).saturating_sub(now) <= AHEAD_TIP_SECS)
 }
 
 /// What a server whose tip is higher than any chain of its network can
@@ -1227,15 +1267,33 @@ pub(crate) async fn fetch_prevouts(
 }
 
 /// The height of the endpoint's tip: the one a time lock is judged
-/// against when the transaction reaches that node.
-pub(crate) async fn tip_height(endpoint: &Endpoint, proxy: Option<&str>) -> Result<u32, Failure> {
+/// against when the transaction reaches that node. Checked as the tip
+/// of a sync is: on mainnet, proven, its work and the coinbase of its
+/// block ([`proof::height`]); anywhere, no higher than a chain can have
+/// reached ([`height_limit`]). It was the server's word, and a lock
+/// still far off was shown as one that holds nothing back.
+pub(crate) async fn tip_height(
+    endpoint: &Endpoint,
+    network: Network,
+    proxy: Option<&str>,
+) -> Result<u32, Failure> {
     match endpoint {
-        Endpoint::Esplora(url) => esplora::client(url, proxy)
-            .map_err(Failure::Transport)?
-            .height()
-            .await
-            .map_err(Failure::Transport),
-        Endpoint::Electrum(target) => electrum::tip_height(target, proxy).await,
+        Endpoint::Esplora(url) => {
+            let client = esplora::client(url, proxy).map_err(Failure::Transport)?;
+            let height = if network == Network::Mainnet {
+                esplora::sync::proven_tip(&client, network).await
+            } else {
+                client.height().await.and_then(|height| {
+                    if height > height_limit(network, crate::now_secs()) {
+                        Err(Fault::other(IMPOSSIBLE_TIP))
+                    } else {
+                        Ok(height)
+                    }
+                })
+            };
+            height.map_err(Failure::Transport)
+        }
+        Endpoint::Electrum(target) => electrum::tip_height(target, network, proxy).await,
     }
 }
 
@@ -2150,23 +2208,154 @@ mod tests {
         }
     }
 
-    /// Blocks far above a server's tip are dropped unless one holds a
-    /// confirmation proven with the work of mainnet, at a height a chain
-    /// can have reached.
+    /// A descriptor wallet on signet over the Esplora instance `server`,
+    /// synced once, and the script of its first address.
+    async fn esplora_wallet(
+        dir: &std::path::Path,
+        server: &crate::testkit::FakeMempool,
+    ) -> (crate::WalletManager, String, String) {
+        let (manager, wallet) = synced_wallet(dir, server.backend()).await;
+        let address = &manager.receive_addresses(&wallet, 0).await.unwrap()[0].address;
+        let ours = address
+            .parse::<bdk_wallet::bitcoin::Address<_>>()
+            .unwrap()
+            .assume_checked()
+            .script_pubkey()
+            .to_hex_string();
+        (manager, wallet, ours)
+    }
+
+    /// A payment labelled `label` of `sats` to `ours`, confirmed at
+    /// `height`, as Esplora lists it.
+    fn paying(ours: &str, label: u8, sats: u64, height: u32) -> serde_json::Value {
+        let mut payment = crate::testkit::esplora_payment(label, label, sats, true);
+        payment["vout"][0]["scriptpubkey"] = serde_json::json!(ours);
+        payment["status"]["block_height"] = serde_json::json!(height);
+        payment["txid"] = serde_json::json!(crate::testkit::listed_txid(&payment));
+        payment
+    }
+
+    /// Where each transaction of the wallet stands: its confirmations and
+    /// the time of its block.
+    async fn standing(manager: &crate::WalletManager, wallet: &str) -> Vec<(u32, Option<u64>)> {
+        use crate::wallet::snapshot::TxStatus;
+        let mut txs: Vec<(u32, Option<u64>)> = manager
+            .wallet_snapshot(wallet)
+            .await
+            .unwrap()
+            .txs
+            .iter()
+            .map(|tx| match tx.status {
+                TxStatus::Confirmed { timestamp, .. } => (tx.confirmations, timestamp),
+                TxStatus::Pending => (tx.confirmations, None),
+            })
+            .collect();
+        txs.sort_unstable();
+        txs
+    }
+
+    /// A payment proven in block 80 of an Esplora instance at 500 that
+    /// names another block at 80 when asked for the hash there: the
+    /// wallet's chain takes the block the payment was proven in, and the
+    /// payment is confirmed, then still after a sync on an honest
+    /// instance. The hash the server named went into the chain instead,
+    /// and the payment stayed pending for good.
+    #[tokio::test]
+    async fn an_esplora_confirmation_is_chained_in_its_proven_block() {
+        let server = crate::testkit::FakeMempool::start(false, 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, wallet, ours) = esplora_wallet(dir.path(), &server).await;
+        {
+            let mut state = server.state.lock().unwrap();
+            let key = crate::testkit::FakeMempool::rest_key(&ours);
+            state
+                .scripts
+                .insert(key, vec![paying(&ours, 0x71, 50_000, 80)]);
+            state.height_hashes.insert(80, "ab".repeat(32));
+        }
+        manager.sync_wallet(&wallet).await.unwrap();
+        let mined = Some(1_700_000_000);
+        assert_eq!(standing(&manager, &wallet).await, [(421, mined)]);
+        server.state.lock().unwrap().height_hashes.clear();
+        manager.sync_wallet(&wallet).await.unwrap();
+        assert_eq!(standing(&manager, &wallet).await, [(421, mined)]);
+    }
+
+    /// A confirmation the wallet holds, listed again by an Esplora
+    /// instance at another time for its block, as a new payment to the
+    /// same address has its history read again: the wallet keeps the
+    /// time of the block's header, then still after a sync on an honest
+    /// instance. The earlier time the server gave stood for good, the
+    /// engine keeping the earliest of two times for one block.
+    #[tokio::test]
+    async fn an_esplora_confirmation_held_keeps_its_time() {
+        let server = crate::testkit::FakeMempool::start(false, 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, wallet, ours) = esplora_wallet(dir.path(), &server).await;
+        let key = crate::testkit::FakeMempool::rest_key(&ours);
+        let first = paying(&ours, 0x73, 50_000, 80);
+        let txid = first["txid"].as_str().unwrap().to_owned();
+        server
+            .state
+            .lock()
+            .unwrap()
+            .scripts
+            .insert(key.clone(), vec![first.clone()]);
+        manager.sync_wallet(&wallet).await.unwrap();
+        let mined = Some(1_700_000_000);
+        assert_eq!(standing(&manager, &wallet).await, [(421, mined)]);
+
+        // A new payment, and the first one listed at the time 1.
+        {
+            let mut state = server.state.lock().unwrap();
+            state
+                .scripts
+                .insert(key, vec![paying(&ours, 0x74, 20_000, 90), first]);
+            state.listed_times.insert(txid, 1);
+        }
+        manager.sync_wallet(&wallet).await.unwrap();
+        assert_eq!(
+            standing(&manager, &wallet).await,
+            [(411, mined), (421, mined)]
+        );
+        server.state.lock().unwrap().listed_times.clear();
+        manager.sync_wallet(&wallet).await.unwrap();
+        assert_eq!(
+            standing(&manager, &wallet).await,
+            [(411, mined), (421, mined)]
+        );
+    }
+
+    /// On mainnet, a server far below the wallet's blocks is followed
+    /// only on a tip six hours old at most by the device's clock, two
+    /// hours ahead of it at most, and from the last period with a
+    /// checkpoint on; within a day of blocks, or on another network, it always
+    /// is. A fresh tip in an older period is no real block: a header
+    /// mined there costs the work of its period, a few cents in 2013,
+    /// and its time is the miner's to write. It used to be followed, and
+    /// take every confirmation of the wallet out, as one whose time is
+    /// set far ahead.
     #[test]
-    fn a_server_far_behind_drops_no_confirmation_on_mainnet() {
-        let confirmed = [500_u32, 900_000];
-        let drops =
-            |network, tip| drops_a_confirmation(network, confirmed.into_iter(), tip, 950_000);
-        assert!(drops(Network::Mainnet, 899_000));
-        assert!(!drops(Network::Mainnet, 900_000));
-        assert!(!drops(Network::Signet, 899_000));
-        assert!(!drops_a_confirmation(
-            Network::Mainnet,
-            [4_000_000_000].into_iter(),
-            899_000,
-            950_000
-        ));
+    fn a_server_far_behind_is_followed_on_a_fresh_tip_alone() {
+        let mined = 1_790_000_000;
+        let follows = |network, highest, tip, age: i64| {
+            let now = u64::try_from(i64::from(mined) + age).unwrap();
+            follows_far_below(network, highest, tip, mined, now)
+        };
+        let head = 963_000;
+        assert!(follows(Network::Mainnet, 1_000_000, head, 0));
+        assert!(follows(Network::Mainnet, 1_000_000, head, 6 * 3_600));
+        assert!(!follows(Network::Mainnet, 1_000_000, head, 6 * 3_600 + 1));
+        assert!(follows(Network::Mainnet, 1_000_000, head, -2 * 3_600));
+        assert!(!follows(Network::Mainnet, 1_000_000, head, -2 * 3_600 - 1));
+        assert!(!follows(Network::Mainnet, 963_600, 228_000, 0));
+        assert!(!follows(Network::Mainnet, 1_000_000, 900_000, 0));
+        assert!(follows(Network::Mainnet, 1_100_000, 1_000_000, 0));
+        let month = 30 * 24 * 3_600;
+        assert!(follows(Network::Mainnet, head + 144, head, month));
+        assert!(!follows(Network::Mainnet, head + 145, head, month));
+        assert!(follows(Network::Mainnet, 900_144, 900_000, month));
+        assert!(follows(Network::Signet, 1_000_000, 228_000, -month));
     }
 
     /// A previous transaction is read only if it is the one asked for:

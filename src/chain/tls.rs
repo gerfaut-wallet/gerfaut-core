@@ -133,10 +133,13 @@ pub fn fingerprint_of(der: &[u8]) -> String {
 /// What the certificate says about itself: the name it carries and the
 /// day it stops being valid. Both are `None` when it cannot be read,
 /// which never blocks anything — the fingerprint is what is trusted.
+/// The name is whatever the server wrote into its certificate, so it
+/// reaches the dialog as any server's words do
+/// ([`crate::chain::server_words`]).
 fn describe(der: &[u8]) -> (Option<String>, Option<i64>) {
     match x509_parser::parse_x509_certificate(der) {
         Ok((_, cert)) => (
-            Some(cert.subject().to_string()).filter(|s| !s.is_empty()),
+            Some(crate::chain::server_words(&cert.subject().to_string())).filter(|s| !s.is_empty()),
             Some(cert.validity().not_after.timestamp()),
         ),
         Err(_) => (None, None),
@@ -344,11 +347,18 @@ fn reason_of(error: &rustls::Error) -> String {
         rustls::Error::InvalidCertificate(C::UnknownIssuer) => {
             "self-signed, or signed by an authority this machine does not know".to_owned()
         }
-        rustls::Error::InvalidCertificate(C::Expired) => "expired".to_owned(),
-        rustls::Error::InvalidCertificate(C::NotValidYet) => "not valid yet".to_owned(),
-        rustls::Error::InvalidCertificate(C::NotValidForName) => {
-            "issued for a different host name".to_owned()
+        // The verifier raises these with the dates or the names that make
+        // the certificate wrong attached; the bare ones are kept for any
+        // other path that raises them.
+        rustls::Error::InvalidCertificate(C::Expired | C::ExpiredContext { .. }) => {
+            "expired".to_owned()
         }
+        rustls::Error::InvalidCertificate(C::NotValidYet | C::NotValidYetContext { .. }) => {
+            "not valid yet".to_owned()
+        }
+        rustls::Error::InvalidCertificate(
+            C::NotValidForName | C::NotValidForNameContext { .. },
+        ) => "issued for a different host name".to_owned(),
         // Certificates written before X.509 v3 are still served by
         // long-lived Electrum servers; the standard verifier declines to
         // read them at all, which is not the same as finding them wrong.
@@ -360,6 +370,10 @@ fn reason_of(error: &rustls::Error) -> String {
         rustls::Error::InvalidCertificate(_) => {
             "it cannot be checked against the public authorities".to_owned()
         }
+        // Left to the verifier's words: no server writes them. The
+        // verifier raises a refused certificate as one of the errors
+        // above, and a revocation list only when it is given one, which
+        // it never is here; what is left is a fixed sentence of rustls.
         other => other.to_string(),
     }
 }
@@ -633,6 +647,45 @@ mod tests {
         assert!(!reason_of(&unreadable).contains("Other("));
     }
 
+    /// The verifier says why it refuses a certificate with the dates or
+    /// the names that make it wrong attached, and those are the errors
+    /// a handshake actually raises. A certificate a public authority
+    /// signed for another host is the one a server taken over presents:
+    /// the dialog has to say so, not fall back to the sentence for a
+    /// certificate nobody vouches for.
+    #[test]
+    fn the_reason_reads_the_errors_the_verifier_raises() {
+        use std::time::Duration;
+
+        use rustls::CertificateError as C;
+
+        let at = |secs| UnixTime::since_unix_epoch(Duration::from_secs(secs));
+        let expired = rustls::Error::InvalidCertificate(C::ExpiredContext {
+            time: at(2_000_000_000),
+            not_after: at(1_000_000_000),
+        });
+        assert_eq!(reason_of(&expired), "expired");
+        let early = rustls::Error::InvalidCertificate(C::NotValidYetContext {
+            time: at(1_000_000_000),
+            not_before: at(2_000_000_000),
+        });
+        assert_eq!(reason_of(&early), "not valid yet");
+        let other_name = rustls::Error::InvalidCertificate(C::NotValidForNameContext {
+            expected: ServerName::try_from("electrum.example").unwrap(),
+            presented: vec!["DnsName(\"other.example\")".to_owned()],
+        });
+        assert_eq!(reason_of(&other_name), "issued for a different host name");
+
+        // The same three without their context still read the same.
+        for (error, reason) in [
+            (C::Expired, "expired"),
+            (C::NotValidYet, "not valid yet"),
+            (C::NotValidForName, "issued for a different host name"),
+        ] {
+            assert_eq!(reason_of(&rustls::Error::InvalidCertificate(error)), reason);
+        }
+    }
+
     /// Stands in for the error webpki raises on a pre-v3 certificate.
     #[derive(Debug)]
     struct UnsupportedCertVersion;
@@ -651,6 +704,38 @@ mod tests {
         // never stands in the way of showing the fingerprint.
         assert_eq!(describe(b"not a certificate"), (None, None));
         assert_eq!(public_key_of(b"not a certificate"), None);
+    }
+
+    /// A self-signed P-256 certificate whose common name hides a
+    /// right-to-left override and a bell between its letters:
+    /// `node\u{202E}.example\u{7}`. Its key was thrown away once it was
+    /// signed; only the name is read.
+    const SPOOFED_NAME_CERT: [&str; 11] = [
+        "3082015c30820101a0030201020214088a59585fe7bacdf4d165b92964274d6c",
+        "02a3a6300a06082a8648ce3d040302301b3119301706035504030c106e6f6465",
+        "e280ae2e6578616d706c65073020170d3236313131323232303934325a180f32",
+        "313236313031393232303934325a301b3119301706035504030c106e6f6465e2",
+        "80ae2e6578616d706c65073059301306072a8648ce3d020106082a8648ce3d03",
+        "0107034200045eff483b4b9ba737b3dc499e54c80259f291e94ee157dfc3903a",
+        "141398c109e81a5ff73fe4f3558c80a66ac7ded71ef9a0afb73cbe62a676fcae",
+        "79a45e3669dba321301f301d0603551d0e04160414bf8dcf14f287a55ee4327d",
+        "edec109b605aaec3a1300a06082a8648ce3d0403020349003046022100ffda05",
+        "d37944c555ad8f9cc3ef15a64b6493937c21c988de428382e0e0f10b0a022100",
+        "8ade751bc99bbd04841f525c962cf9a3266cd3b52b822248aa9b86dc483e151e",
+    ];
+
+    /// The name a certificate gives itself is whatever its server wrote,
+    /// and the trust dialog shows it beside the fingerprint: it is held
+    /// to what a server's words may be on a screen, without the marks
+    /// that turn the text around them or break its line.
+    #[test]
+    fn a_certificate_name_is_shown_as_a_server_s_words() {
+        let der = data_encoding::HEXLOWER
+            .decode(SPOOFED_NAME_CERT.concat().as_bytes())
+            .unwrap();
+        let (subject, expires) = describe(&der);
+        assert_eq!(subject.as_deref(), Some("CN=node.example"));
+        assert!(expires.is_some());
     }
 
     #[test]

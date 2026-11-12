@@ -33,7 +33,7 @@ use bdk_wallet::bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Tx
 use serde::Deserialize;
 use serde_json::json;
 
-use electrum_client::GetMerkleRes;
+use electrum_client::{GetMerkleRes, TxidFromPosRes};
 
 use super::rpc::{CallError, Connection};
 use super::status::{Check, Told, Verdict, scripthash};
@@ -41,7 +41,7 @@ use super::{MAX_LINE, Target};
 use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
 use crate::chain::proof::{
     Proof, ProvenCoin, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
-    check_confirmation, proven_coin, recheck, remember_coin,
+    check_confirmation, checkpoint_for, height, proven_coin, recheck, remember_coin,
 };
 use crate::chain::{Fault, KEEP_MAX, Kept};
 use crate::network::Network;
@@ -620,7 +620,8 @@ fn unproven(round: &[Picked], held: &[AddressTx]) -> Vec<(Txid, u32)> {
 /// refuses the server. An early confirmation is then chained to its
 /// checkpoint ([`chains_to_read`]): a chain that does not end there, or
 /// holds another block, refuses the server; one it would not send leaves
-/// the confirmation unsure.
+/// the confirmation unsure. Past the checkpoints, the height of the block
+/// is proven by its coinbase ([`prove_height`]).
 async fn prove(
     connection: &mut Connection,
     network: Network,
@@ -705,8 +706,25 @@ async fn prove(
         let hashes = chain_to_checkpoint(network, from, &headers).ok_or_else(Fault::false_proof)?;
         read.insert(from, hashes);
     }
-    for (txid, height, hash) in proven {
-        match chained(network, height, hash, &read) {
+    // And the heights of the blocks past the checkpoints by their
+    // coinbase, once a block.
+    let mut heights: HashMap<u32, Proof> = HashMap::new();
+    for (txid, at, hash) in proven {
+        let verdict = match chained(network, at, hash, &read) {
+            Proof::Holds if checkpoint_for(network, at).is_none() => match heights.get(&at) {
+                Some(verdict) => *verdict,
+                None => {
+                    let verdict = match headers.found.get(&at) {
+                        Some(header) => prove_height(connection, network, at, header).await?,
+                        None => Proof::Unsure,
+                    };
+                    heights.insert(at, verdict);
+                    verdict
+                }
+            },
+            verdict => verdict,
+        };
+        match verdict {
             Proof::Holds => {}
             Proof::Unsure => {
                 unsure.insert(txid.to_string());
@@ -761,14 +779,70 @@ async fn headers_from(
 
 /// The server's tip, refused past any height a chain of `network` can
 /// have reached, or in a header without the work of its height
-/// ([`crate::chain::checked_tip`]).
+/// ([`crate::chain::checked_tip`]), its height proven by its coinbase
+/// ([`prove_height`]).
 async fn read_tip(connection: &mut Connection, network: Network) -> Result<u32, Fault> {
     let tip: Tip = connection
         .call("blockchain.headers.subscribe", json!([]))
         .await?;
     let header: Header =
         deserialize_hex(&tip.hex).map_err(|_| Fault::other("unexpected response"))?;
-    crate::chain::checked_tip(network, tip.height, &header)
+    let height = crate::chain::checked_tip(network, tip.height, &header)?;
+    height::tip_proven(prove_height(connection, network, height, &header).await?)?;
+    Ok(height)
+}
+
+/// What the server proves of the height of `header`, its block at
+/// `height`, as a descriptor wallet's sync asks it
+/// ([`crate::chain::electrum::sync::prove_height`]): known already, or
+/// its coinbase, txid and branch at position 0, then the transaction.
+async fn prove_height(
+    connection: &mut Connection,
+    network: Network,
+    height: u32,
+    header: &Header,
+) -> Result<Proof, Fault> {
+    let hash = header.block_hash();
+    if let Some(known) = height::known(network, height, hash) {
+        return Ok(known);
+    }
+    let found: TxidFromPosRes = match connection
+        .call(
+            "blockchain.transaction.id_from_pos",
+            json!([height, 0, true]),
+        )
+        .await
+    {
+        Ok(found) => found,
+        Err(CallError::Refused { .. }) => return Ok(Proof::Unsure),
+        Err(other) => return Err(other.into()),
+    };
+    let coinbase = match connection
+        .call::<String>(
+            "blockchain.transaction.get",
+            json!([found.tx_hash.to_string()]),
+        )
+        .await
+    {
+        Ok(hex) => {
+            deserialize_hex::<Transaction>(&hex).map_err(|_| Fault::other("unexpected response"))?
+        }
+        Err(CallError::Refused { .. }) => return Ok(Proof::Unsure),
+        Err(other) => return Err(other.into()),
+    };
+    let verdict =
+        match height::coinbase_proof(height, header, &coinbase, found.tx_hash, 0, &found.merkle) {
+            Proof::Elsewhere => match header_again(connection, height).await? {
+                Some(again) if again.block_hash() != hash => Proof::Unsure,
+                Some(_) => Proof::False,
+                None => Proof::Unsure,
+            },
+            verdict => verdict,
+        };
+    if verdict == Proof::Holds {
+        height::remember(network, [(height, hash)]);
+    }
+    Ok(verdict)
 }
 
 /// The header at `height`, read again; `None` when the server refuses it.

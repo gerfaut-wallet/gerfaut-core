@@ -107,10 +107,13 @@ impl WalletManager {
         Ok(CertificateReport { host, status })
     }
 
-    /// Remembers the certificate the user accepted for this server.
-    /// From then on that host must present exactly this certificate:
-    /// anything else is refused, never accepted again in silence.
-    pub async fn trust_certificate(&self, url: &str, fingerprint: &str) -> CoreResult<()> {
+    /// Pins a certificate for a server, alone, as a test sets the vault
+    /// up. The apps accept one through [`Self::set_backend_trusting`],
+    /// with the backend it is for: a pin on its own, tied to no report
+    /// the user was shown and no server they saved, is no step of
+    /// theirs, so it is no call of the public interface either.
+    #[cfg(test)]
+    pub(crate) async fn trust_certificate(&self, url: &str, fingerprint: &str) -> CoreResult<()> {
         let result: CoreResult<()> = async {
             if !chain::tls::is_fingerprint(fingerprint) {
                 return Err(CoreError::InvalidInput {
@@ -134,8 +137,8 @@ impl WalletManager {
 
     /// Remembers the backend of a network and the certificate the user
     /// accepted for its Electrum server, in one write: both or neither.
-    /// Taken one after the other ([`Self::trust_certificate`], then
-    /// [`Self::set_backend`]), a backend refused after its certificate
+    /// Taken one after the other (a pin, then [`Self::set_backend`]),
+    /// a backend refused after its certificate
     /// left that certificate trusted for a server the user never saved,
     /// and an app had to take it back by hand, which the vault may
     /// refuse too. The checks are those two calls' own: a fingerprint of

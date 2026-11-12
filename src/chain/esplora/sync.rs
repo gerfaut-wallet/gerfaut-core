@@ -51,11 +51,11 @@ use super::page::PageTx;
 use super::{Client, Counts, PAGE, PARALLEL_REQUESTS};
 use crate::chain::proof::{
     Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, chains_up_to,
-    check_confirmation, esplora_chains, recheck,
+    check_confirmation, esplora_chains, height, recheck,
 };
 use crate::chain::{
-    BEHIND, Fault, Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX,
-    drops_a_confirmation, has_proof_of_work, height_limit,
+    BEHIND, FAR_BEHIND, Fault, Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced,
+    TIP_LAG_MAX, follows_far_below, has_proof_of_work, height_limit,
 };
 use crate::network::Network;
 /// Pages read of one script at most: 10,000 confirmed transactions. A
@@ -180,12 +180,13 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
     // Before any history, and so never past it: the tip of the answer
     // is what the wallet counts itself synced up to.
     let limit = height_limit(network, start_time);
-    let latest = latest_blocks(client, network, limit).await?;
+    let (latest, tip_header) = latest_blocks(client, network, limit).await?;
     let server_tip = latest.keys().next_back().copied().unwrap_or_default();
-    // The wallet's blocks far above the server's tip, or past any height
-    // a chain can have reached, came from a server that made them up:
-    // left out of the walk, and dropped (see [`Synced::drop_above`]),
-    // unless one of them holds a confirmation ([`drops_a_confirmation`]).
+    // The wallet's blocks past any height a chain can have reached, or
+    // far above a fresh tip of the server's, came from a server that
+    // made them up: left out of the walk, and dropped, confirmations and
+    // all (see [`Synced::drop_above`]). A server whose tip is old lags,
+    // and is refused ([`follows_far_below`]).
     let confirmed: BTreeSet<u32> = held
         .anchors
         .values()
@@ -193,8 +194,13 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
         .collect();
     let (tip, dropped) =
         if tip.height() > server_tip.saturating_add(TIP_LAG_MAX) || tip.height() > limit {
-            if drops_a_confirmation(network, confirmed.iter().copied(), server_tip, limit) {
-                return Err(Fault::other(BEHIND));
+            let highest = tip
+                .iter()
+                .map(|checkpoint| checkpoint.height())
+                .find(|at| *at <= limit)
+                .unwrap_or_default();
+            if !follows_far_below(network, highest, server_tip, tip_header.time, start_time) {
+                return Err(Fault::other(FAR_BEHIND));
             }
             let kept = tip
                 .iter()
@@ -286,7 +292,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
     let mut update = found.update;
     check_spent(&held, &update)?;
     prove(client, network, server_tip, &held, start_time, &mut update).await?;
-    let chain = meeting.chain(client, &latest, &update.anchors).await?;
+    let chain = meeting.chain(&latest, &update.anchors)?;
     Ok(Synced {
         update: bdk_wallet::Update {
             last_active_indices: last_active,
@@ -593,7 +599,10 @@ impl Found {
 /// Proves the confirmations of `update` the wallet does not hold in the
 /// same block ([`prove_confirmations`]). One proven takes the time of its
 /// block's header; one unsure is taken as unconfirmed, as the server's
-/// word alone is; a false one refuses the server.
+/// word alone is; a false one refuses the server. One the wallet holds in
+/// the same block keeps the time it holds, proven when it was taken: the
+/// time the server lists it with is its word, and the engine keeps the
+/// earliest of two times for one block, for good.
 async fn prove(
     client: &Client,
     network: Network,
@@ -602,6 +611,18 @@ async fn prove(
     start_time: u64,
     update: &mut TxUpdate<ConfirmationBlockTime>,
 ) -> Result<(), Fault> {
+    let retimed: Vec<(ConfirmationBlockTime, Txid, ConfirmationBlockTime)> = update
+        .anchors
+        .iter()
+        .filter_map(|(anchor, txid)| {
+            let kept = held.anchors.get(txid)?;
+            (kept.block_id == anchor.block_id && kept != anchor).then_some((*anchor, *txid, *kept))
+        })
+        .collect();
+    for (listed, txid, kept) in retimed {
+        update.anchors.remove(&(listed, txid));
+        update.anchors.insert((kept, txid));
+    }
     let new: Vec<(ConfirmationBlockTime, Txid)> = update
         .anchors
         .iter()
@@ -653,10 +674,11 @@ async fn prove(
 ///
 /// A confirmation in one of the first periods of the chain, whose
 /// header costs next to nothing to forge, is chained to the checkpoint
-/// that ends its period ([`read_chains`]); one later on stands on its
+/// that ends its period ([`read_chains`]). One later on stands on its
 /// header's work, as Esplora sends headers ten at a time and chaining
 /// them all would cost more requests than the rest of the sync (see
-/// [`crate::chain::proof`]).
+/// [`crate::chain::proof`]), and on its block's coinbase for its height
+/// ([`prove_height`]): three requests a block, once a session.
 pub(crate) async fn prove_confirmations(
     client: &Client,
     network: Network,
@@ -727,6 +749,8 @@ async fn prove_below_the_tip(
     // The confirmations proven in a period whose header costs little to
     // forge: where each sits in `times`, its height and its block.
     let mut early: Vec<(usize, u32, BlockHash)> = Vec::new();
+    // The others, whose block's height its coinbase proves.
+    let mut late: Vec<(usize, u32, BlockHash)> = Vec::new();
     for chunk in claimed.chunks(PARALLEL_REQUESTS) {
         let branches = try_join_all(chunk.iter().map(|(txid, _)| async move {
             let path = format!("/tx/{txid}/merkle-proof");
@@ -752,6 +776,8 @@ async fn prove_below_the_tip(
                 Proof::Holds => {
                     if esplora_chains(network, block.height) {
                         early.push((times.len(), block.height, block.hash));
+                    } else {
+                        late.push((times.len(), block.height, block.hash));
                     }
                     times.push(Some(u64::from(headers[&block.hash].time)));
                 }
@@ -772,6 +798,29 @@ async fn prove_below_the_tip(
                 Proof::Unsure => times[at] = None,
                 Proof::False | Proof::Elsewhere => return Err(Fault::false_proof()),
             }
+        }
+    }
+    let mut late_blocks: Vec<(u32, BlockHash)> = late
+        .iter()
+        .map(|(_, height, hash)| (*height, *hash))
+        .collect();
+    late_blocks.sort_unstable();
+    late_blocks.dedup();
+    let mut heights: HashMap<(u32, BlockHash), Proof> = HashMap::with_capacity(late_blocks.len());
+    for chunk in late_blocks.chunks(PARALLEL_REQUESTS) {
+        let proofs = try_join_all(
+            chunk
+                .iter()
+                .map(|(height, hash)| prove_height(client, network, *height, &headers[hash])),
+        )
+        .await?;
+        heights.extend(chunk.iter().copied().zip(proofs));
+    }
+    for (at, height, hash) in late {
+        match heights[&(height, hash)] {
+            Proof::Holds => {}
+            Proof::Unsure => times[at] = None,
+            Proof::False | Proof::Elsewhere => return Err(Fault::false_proof()),
         }
     }
     Ok(times)
@@ -912,13 +961,71 @@ async fn block_at_height(client: &Client, height: u32) -> Result<Option<Header>,
 }
 
 /// The latest blocks, by height: ten on the instances there are,
-/// checked ([`checked_latest`]).
+/// checked ([`checked_latest`]), the height of the tip proven by its
+/// coinbase ([`prove_height`]) and those of the others with it, each
+/// the parent of the one above.
 async fn latest_blocks(
     client: &Client,
     network: Network,
     limit: u32,
-) -> Result<BTreeMap<u32, BlockHash>, Fault> {
-    checked_latest(network, client.get_json("/blocks").await?, limit)
+) -> Result<(BTreeMap<u32, BlockHash>, Header), Fault> {
+    let (latest, tip) = checked_latest(network, client.get_json("/blocks").await?, limit)?;
+    let height = latest.keys().next_back().copied().unwrap_or_default();
+    height::tip_proven(prove_height(client, network, height, &tip).await?)?;
+    height::remember(network, latest.iter().map(|(at, hash)| (*at, *hash)));
+    Ok((latest, tip))
+}
+
+/// What the server proves of the height of `header`, its block at
+/// `height` ([`height`]): nothing to ask when it is known already, the
+/// coinbase of the block otherwise: its txid (`/block/:hash/txid/0`),
+/// the transaction (`/tx/:txid/raw`) and its branch
+/// (`/tx/:txid/merkle-proof`), which must be the one at position 0 of a
+/// block at that height. The block is asked for by its hash, so a branch
+/// into another root is no reorganisation but a false proof. What the
+/// server does not have leaves it unsure. Kept for the session once it
+/// holds.
+async fn prove_height(
+    client: &Client,
+    network: Network,
+    height: u32,
+    header: &Header,
+) -> Result<Proof, Fault> {
+    let hash = header.block_hash();
+    if let Some(known) = height::known(network, height, hash) {
+        return Ok(known);
+    }
+    let Some(text) = client
+        .fetch(&format!("/block/{hash}/txid/0"), 1 << 10)
+        .await?
+    else {
+        return Ok(Proof::Unsure);
+    };
+    let txid: Txid = std::str::from_utf8(&text)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .ok_or_else(|| Fault::other("unexpected response"))?;
+    let Some(coinbase) = client.tx(&txid).await? else {
+        return Ok(Proof::Unsure);
+    };
+    let Some(branch) = client
+        .get_json_opt::<GetMerkleRes>(&format!("/tx/{txid}/merkle-proof"))
+        .await?
+    else {
+        return Ok(Proof::Unsure);
+    };
+    if u32::try_from(branch.block_height) != Ok(height) {
+        return Ok(Proof::False);
+    }
+    let verdict =
+        match height::coinbase_proof(height, header, &coinbase, txid, branch.pos, &branch.merkle) {
+            Proof::Elsewhere => Proof::False,
+            verdict => verdict,
+        };
+    if verdict == Proof::Holds {
+        height::remember(network, [(height, hash)]);
+    }
+    Ok(verdict)
 }
 
 /// The server's tip, proven as a descriptor wallet's sync proves it
@@ -926,7 +1033,7 @@ async fn latest_blocks(
 /// confirmations from. One request, the one that read the height alone.
 pub(crate) async fn proven_tip(client: &Client, network: Network) -> Result<u32, Fault> {
     let limit = height_limit(network, crate::now_secs());
-    let latest = latest_blocks(client, network, limit).await?;
+    let (latest, _) = latest_blocks(client, network, limit).await?;
     latest
         .keys()
         .next_back()
@@ -947,12 +1054,12 @@ const UNCHAINED: &str = "the server's latest blocks do not chain";
 /// ([`height_limit`]). A server that lists blocks that do not chain, or
 /// a tip no one mined, is refused, and so is one past the limit: a tip
 /// made up costs what mining a block of its height costs, as over
-/// Electrum.
+/// Electrum. With them, the header of the tip.
 fn checked_latest(
     network: Network,
     mut blocks: Vec<Block>,
     limit: u32,
-) -> Result<BTreeMap<u32, BlockHash>, Fault> {
+) -> Result<(BTreeMap<u32, BlockHash>, Header), Fault> {
     blocks.sort_by_key(|block| std::cmp::Reverse(block.height));
     blocks.truncate(LATEST);
     let tip = blocks
@@ -972,10 +1079,12 @@ fn checked_latest(
     if !chained || !worked {
         return Err(Fault::other(UNCHAINED));
     }
-    Ok(blocks
+    let tip = tip.header();
+    let latest = blocks
         .into_iter()
         .map(|block| (block.height, block.id))
-        .collect())
+        .collect();
+    Ok((latest, tip))
 }
 
 /// The hash of the block at `height`: from the latest blocks when it is
@@ -1106,9 +1215,8 @@ impl Meeting {
     /// builds it this way. A server behind the wallet leaves the
     /// wallet's blocks above its tip where they are, which an update
     /// built from the meeting point could not.
-    async fn chain(
+    fn chain(
         self,
-        client: &Client,
         latest: &BTreeMap<u32, BlockHash>,
         anchors: &BTreeSet<(ConfirmationBlockTime, Txid)>,
     ) -> Result<CheckPoint, Fault> {
@@ -1120,11 +1228,16 @@ impl Meeting {
                 .extend(self.conflicts.into_iter().rev())
                 .map_err(|_| "the server's chain never meets the wallet's".to_owned())?,
         };
+        // The block each confirmation was proven in, as over Electrum: the
+        // one the latest blocks hold at its height, or the proven one. The
+        // server's word for the hash at a height below the latest is no
+        // proof, and a block it named there in place of the proven one
+        // kept the confirmation out of the chain for good.
+        let server_tip = latest.keys().next_back().copied().unwrap_or_default();
         for (anchor, _) in anchors {
             let height = anchor.block_id.height;
-            if tip.get(height).is_none()
-                && let Some(hash) = block_at(client, latest, height).await?
-            {
+            if tip.get(height).is_none() && height <= server_tip {
+                let hash = latest.get(&height).copied().unwrap_or(anchor.block_id.hash);
                 tip = tip.insert(BlockId { height, hash });
             }
         }
@@ -1175,20 +1288,12 @@ mod tests {
             conflicts: Vec::new(),
             ahead: None,
         };
-        // Never asked anything: every height it needs is in the latest.
-        let client = super::super::client("http://127.0.0.1:9", None).unwrap();
         let lying = BTreeMap::from([(0, hash(9)), (1, hash(1)), (2, hash(2))]);
-        let refused = meeting()
-            .chain(&client, &lying, &BTreeSet::new())
-            .await
-            .unwrap_err();
+        let refused = meeting().chain(&lying, &BTreeSet::new()).unwrap_err();
         assert!(refused.contains("contradicts"), "{refused}");
 
         let honest = BTreeMap::from([(0, hash(0)), (1, hash(1)), (2, hash(2))]);
-        let tip = meeting()
-            .chain(&client, &honest, &BTreeSet::new())
-            .await
-            .unwrap();
+        let tip = meeting().chain(&honest, &BTreeSet::new()).unwrap();
         assert_eq!(tip.height(), 2);
         assert_eq!(tip.get(0).unwrap().hash(), hash(0));
     }
@@ -1203,7 +1308,7 @@ mod tests {
         server.state.lock().unwrap().tip = 500;
         let client =
             super::super::client_for_run(&format!("http://{}/api", server.address), None).unwrap();
-        let latest = latest_blocks(&client, Network::Signet, u32::MAX)
+        let (latest, _) = latest_blocks(&client, Network::Signet, u32::MAX)
             .await
             .unwrap();
         let real = crate::testkit::FakeMempool::header_at_height(&server.state.lock().unwrap(), 80)
@@ -1273,9 +1378,12 @@ mod tests {
         }
         let block = |height: u32| summary(height, &headers[height as usize]);
         let latest = |range: std::ops::RangeInclusive<u32>| range.rev().map(block).collect();
-        let checked =
-            |blocks: Vec<Block>, limit: u32| checked_latest(Network::Signet, blocks, limit);
+        let checked = |blocks: Vec<Block>, limit: u32| {
+            checked_latest(Network::Signet, blocks, limit).map(|(latest, _)| latest)
+        };
         let read = checked(latest(91..=100), 1_000).unwrap();
+        let (_, tip) = checked_latest(Network::Signet, latest(91..=100), 1_000).unwrap();
+        assert_eq!(tip, headers[100]);
         assert_eq!(
             read.keys().copied().collect::<Vec<_>>(),
             (91..=100).collect::<Vec<_>>()
