@@ -5,6 +5,7 @@
     "address": "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx",
     "value_sats": 1000000,
     "status": {"state": "confirmed", "height": 799995, "timestamp": 1749997000},
+    "confirmations": 6,
     "keychain": "external",
     "derivation_index": 0
   },
@@ -14,6 +15,7 @@
     "address": "tb1qgtw9wgs0gtszee9feyd4fs00wprftdqxkr6f8n",
     "value_sats": 749660,
     "status": {"state": "pending"},
+    "confirmations": 0,
     "keychain": "internal",
     "derivation_index": 0
   },
@@ -23,6 +25,7 @@
     "address": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
     "value_sats": 21000,
     "status": {"state": "confirmed", "height": 799900, "timestamp": 1749940000},
+    "confirmations": 101,
     "keychain": null,
     "derivation_index": null
   }
