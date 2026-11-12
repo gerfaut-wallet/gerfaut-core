@@ -675,8 +675,18 @@ fn decode_psbt(mut psbt: Psbt) -> CoreResult<DecodedTx> {
     let mut inputs = Vec::with_capacity(psbt.inputs.len());
     for (index, input) in psbt.inputs.iter().enumerate() {
         let outpoint = psbt.unsigned_tx.input[index].previous_output;
-        let final_present =
-            input.final_script_sig.is_some() || input.final_script_witness.is_some();
+        // Signed as a raw transaction is: a script or a witness that
+        // holds something. The finalizer takes a final field for done
+        // as soon as it is there, empty or not, and an empty one is
+        // what the extracted transaction would carry to the network.
+        let final_present = input
+            .final_script_sig
+            .as_ref()
+            .is_some_and(|script| !script.is_empty())
+            || input
+                .final_script_witness
+                .as_ref()
+                .is_some_and(|witness| !witness.is_empty());
         // The previous transaction, checked above to be the one this
         // input spends, is the truth about the coin: its txid commits
         // to every output in it. The witness entry commits to nothing
@@ -2903,9 +2913,9 @@ mod tests {
     }
 
     /// A P2WPKH spend of the coin with its witness in place: the fixed
-    /// signature and key, laid out as a signer would. A finalized input
-    /// is taken as signed on presence alone, so these bytes are read
-    /// exactly as a genuine witness would be.
+    /// signature and key, laid out as a signer would. A final witness
+    /// that holds something is taken as signed without being checked,
+    /// so these bytes are read exactly as a genuine witness would be.
     fn finalized_p2wpkh() -> (Transaction, ScriptBuf) {
         let pk = fixed_pubkey();
         let spk = ScriptBuf::new_p2wpkh(&pk.wpubkey_hash());
@@ -3202,6 +3212,88 @@ mod tests {
         );
         assert_eq!(preview.fee_sats, Some(REAL - PAID));
         assert!(!kinds(&preview).contains(&TxWarningKind::InputMismatch));
+    }
+
+    /// A final field that is there but empty signs nothing: the input
+    /// reads unsigned, as the transaction taken out of the PSBT reads
+    /// once it is pasted as hex, and the preview sends it back to the
+    /// signer instead of calling it ready. Fixed bytes, no key.
+    #[test]
+    fn an_empty_final_field_is_no_signature() {
+        let (tx, spk) = finalized_p2wpkh();
+        let empty_witness = |psbt: &mut Psbt| {
+            psbt.inputs[0].final_script_witness = Some(Witness::new());
+        };
+        let empty_script = |psbt: &mut Psbt| {
+            psbt.inputs[0].final_script_sig = Some(ScriptBuf::new());
+        };
+        let both_empty = |psbt: &mut Psbt| {
+            empty_witness(psbt);
+            empty_script(psbt);
+        };
+        let fills: [&dyn Fn(&mut Psbt); 3] = [&empty_witness, &empty_script, &both_empty];
+        for fill in fills {
+            let mut psbt = Psbt::from_unsigned_tx(spend(tx.input[0].previous_output)).unwrap();
+            psbt.inputs[0].witness_utxo = Some(TxOut {
+                value: Amount::from_sat(REAL),
+                script_pubkey: spk.clone(),
+            });
+            fill(&mut psbt);
+            let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+            assert!(
+                !decoded.inputs[0].signed,
+                "an empty final field is no signature"
+            );
+            assert!(decoded.inputs[0].finalized.is_none());
+            assert!(!decoded.ready);
+
+            let preview = build_preview(
+                &decoded,
+                Network::Regtest,
+                &wallet_facts(&spk),
+                &[],
+                Some(100),
+                0,
+            );
+            assert_eq!(preview.readiness, TxReadiness::Unsigned);
+            assert!(!preview.ready());
+            let unsigned = preview
+                .warnings
+                .iter()
+                .find(|w| w.kind == TxWarningKind::Unsigned)
+                .expect("the missing signature is named");
+            assert!(unsigned.blocking);
+        }
+    }
+
+    /// "Ready" means the same in a PSBT and in the transaction taken out
+    /// of it: the send reads that transaction again as hex, and refuses
+    /// what is not signed there.
+    #[test]
+    fn a_ready_psbt_holds_a_transaction_that_reads_ready() {
+        let (lying, _, _) = lying_finalized_psbt();
+        let (agreeing, _) = psbt_with_both_descriptions(TxOut {
+            value: Amount::from_sat(REAL),
+            script_pubkey: coin_script(),
+        });
+        let mut finalized = Psbt::from_unsigned_tx(unsigned_tx()).unwrap();
+        finalized.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: p2wpkh(0x33),
+        });
+        finalized.inputs[0].final_script_witness = Some(signed_tx().input[0].witness.clone());
+        let unsigned = Psbt::from_unsigned_tx(unsigned_tx()).unwrap();
+        let mut empty = lying.clone();
+        empty.inputs[0].final_script_witness = Some(Witness::new());
+        for psbt in [lying, agreeing, finalized, unsigned, empty] {
+            let decoded = decode_bytes_as_transaction(&psbt.serialize()).unwrap();
+            let again = decode_transaction(&encode::serialize_hex(&decoded.tx)).unwrap();
+            assert_eq!(again.ready, decoded.ready);
+            let signed = |d: &DecodedTx| d.inputs.iter().map(|i| i.signed).collect::<Vec<_>>();
+            if decoded.ready {
+                assert_eq!(signed(&again), signed(&decoded));
+            }
+        }
     }
 
     /// The script the coin pays to: what `finalized_p2wpkh` spends.
