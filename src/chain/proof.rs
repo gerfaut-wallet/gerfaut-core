@@ -161,6 +161,19 @@ pub(crate) fn has_proof_of_work(network: Network, height: u32, header: &Header) 
     target <= easiest && target.is_met_by(header.block_hash())
 }
 
+/// Whether a header at `height` costs about the work of today's chain
+/// to forge: on mainnet, from the last period with a checkpoint on,
+/// where it carries the target of one of the latest periods of the
+/// table, or one sixteen times easier than the last at most. An older
+/// period was easy to mine in its time, some of them still are,
+/// and a header's time is the miner's to write: a header there that
+/// claims to be recent is one made for the purpose. Another network's
+/// work proves little anywhere, and passes.
+pub(crate) fn at_the_head(network: Network, height: u32) -> bool {
+    network != Network::Mainnet
+        || (height / RETARGET_PERIOD) as usize + 1 >= targets::MAINNET_ENDS.len()
+}
+
 /// The `bits` every header of the period of `height` carries, when the
 /// table has that period: mainnet alone.
 fn period_bits(network: Network, height: u32) -> Option<u32> {

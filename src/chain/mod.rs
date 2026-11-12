@@ -160,9 +160,9 @@ pub(crate) const TIP_LAG_MAX: u32 = 144;
 /// the wallet that holds a confirmation out.
 pub(crate) const BEHIND: &str = "the server is behind a confirmation the wallet holds";
 
-/// What a server far behind the wallet, whose tip is hours old, is
-/// refused with ([`follows_far_below`]).
-pub(crate) const FAR_BEHIND: &str = "the server is far behind the wallet, its tip hours old";
+/// What a server far behind the wallet, whose tip is no block of today,
+/// is refused with ([`follows_far_below`]).
+pub(crate) const FAR_BEHIND: &str = "the server is far behind the wallet, its tip no recent block";
 
 /// How old, by the device's clock, the tip of a server far below the
 /// wallet's may be for the server to be followed: six hours. A block's
@@ -171,9 +171,17 @@ pub(crate) const FAR_BEHIND: &str = "the server is far behind the wallet, its ti
 /// it; two hours or so between two blocks comes a few times a year; and
 /// the device's clock may be off by some minutes. A lagging server is
 /// a day behind at least, 144 blocks, and its tip that old. A clock set
-/// behind a tip finds it fresh: the server then proves again what it
-/// lists, and lists nothing it does not have.
+/// behind a tip finds it fresh, two hours behind at most
+/// ([`AHEAD_TIP_SECS`]): the server then proves again what it lists, and
+/// lists nothing it does not have.
 pub(crate) const FRESH_TIP_SECS: u64 = 6 * 3_600;
+
+/// How far ahead of the device's clock the tip of a server far below the
+/// wallet's may be for the server to be followed: two hours, what
+/// consensus lets a block's time run ahead of the nodes' clocks. A time
+/// further ahead is no block found today, and would make a header
+/// written once pass for fresh for good.
+pub(crate) const AHEAD_TIP_SECS: u64 = 2 * 3_600;
 
 /// Whether a server whose tip is `server_tip`, a block of `tip_time`,
 /// is followed when the wallet holds blocks above it, `highest` the
@@ -182,10 +190,14 @@ pub(crate) const FRESH_TIP_SECS: u64 = 6 * 3_600;
 /// again what it lists.
 ///
 /// On mainnet, a tip's height is proven ([`proof::height`]), so a server
-/// whose tip is fresh at `now` is at the chain's tip, and the wallet's
+/// whose tip is fresh at `now`, and costs today's work to forge
+/// ([`proof::at_the_head`]), is at the chain's tip, and the wallet's
 /// blocks far above it were never real, put there by a server that
-/// lied: they go, and a vault it fooled is repaired. One whose tip is
-/// old lags, or stopped, and is refused, the wallet left as it is; it
+/// lied: they go, and a vault it fooled is repaired. A fresh tip in an
+/// older period is a header made for the purpose, a few cents of work,
+/// and would take every confirmation of the wallet out: it is refused
+/// as one that lags. One whose tip is old lags, or stopped, and is
+/// refused, the wallet left as it is; it
 /// used to drop the wallet's blocks when none held a confirmation, and
 /// to be refused for good once one did, whatever the server. Within
 /// [`TIP_LAG_MAX`], or where work proves nothing, the blocks go, as any
@@ -199,7 +211,9 @@ pub(crate) fn follows_far_below(
 ) -> bool {
     network != Network::Mainnet
         || highest <= server_tip.saturating_add(TIP_LAG_MAX)
-        || now.saturating_sub(u64::from(tip_time)) <= FRESH_TIP_SECS
+        || (proof::at_the_head(network, server_tip)
+            && now.saturating_sub(u64::from(tip_time)) <= FRESH_TIP_SECS
+            && u64::from(tip_time).saturating_sub(now) <= AHEAD_TIP_SECS)
 }
 
 /// What a server whose tip is higher than any chain of its network can
@@ -2313,23 +2327,35 @@ mod tests {
     }
 
     /// On mainnet, a server far below the wallet's blocks is followed
-    /// only on a tip six hours old at most, by the device's clock, and
-    /// one in the device's future counts as fresh; within a day of
-    /// blocks, or on another network, it always is.
+    /// only on a tip six hours old at most by the device's clock, two
+    /// hours ahead of it at most, and from the last period with a
+    /// checkpoint on; within a day of blocks, or on another network, it always
+    /// is. A fresh tip in an older period is no real block: a header
+    /// mined there costs the work of its period, a few cents in 2013,
+    /// and its time is the miner's to write. It used to be followed, and
+    /// take every confirmation of the wallet out, as one whose time is
+    /// set far ahead.
     #[test]
     fn a_server_far_behind_is_followed_on_a_fresh_tip_alone() {
         let mined = 1_790_000_000;
-        let follows = |network, highest, age: i64| {
+        let follows = |network, highest, tip, age: i64| {
             let now = u64::try_from(i64::from(mined) + age).unwrap();
-            follows_far_below(network, highest, 900_000, mined, now)
+            follows_far_below(network, highest, tip, mined, now)
         };
-        assert!(follows(Network::Mainnet, 1_000_000, 0));
-        assert!(follows(Network::Mainnet, 1_000_000, 6 * 3_600));
-        assert!(!follows(Network::Mainnet, 1_000_000, 6 * 3_600 + 1));
-        assert!(follows(Network::Mainnet, 1_000_000, -3_600));
-        assert!(follows(Network::Mainnet, 900_144, 30 * 24 * 3_600));
-        assert!(!follows(Network::Mainnet, 900_145, 30 * 24 * 3_600));
-        assert!(follows(Network::Signet, 1_000_000, 30 * 24 * 3_600));
+        let head = 963_000;
+        assert!(follows(Network::Mainnet, 1_000_000, head, 0));
+        assert!(follows(Network::Mainnet, 1_000_000, head, 6 * 3_600));
+        assert!(!follows(Network::Mainnet, 1_000_000, head, 6 * 3_600 + 1));
+        assert!(follows(Network::Mainnet, 1_000_000, head, -2 * 3_600));
+        assert!(!follows(Network::Mainnet, 1_000_000, head, -2 * 3_600 - 1));
+        assert!(!follows(Network::Mainnet, 963_600, 228_000, 0));
+        assert!(!follows(Network::Mainnet, 1_000_000, 900_000, 0));
+        assert!(follows(Network::Mainnet, 1_100_000, 1_000_000, 0));
+        let month = 30 * 24 * 3_600;
+        assert!(follows(Network::Mainnet, head + 144, head, month));
+        assert!(!follows(Network::Mainnet, head + 145, head, month));
+        assert!(follows(Network::Mainnet, 900_144, 900_000, month));
+        assert!(follows(Network::Signet, 1_000_000, 228_000, -month));
     }
 
     /// A previous transaction is read only if it is the one asked for:
