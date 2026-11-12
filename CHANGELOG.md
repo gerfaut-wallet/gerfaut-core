@@ -11,6 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `BroadcastStatus` carries `standing`, where a sent transaction stands in one word: `not_seen`, `in_mempool` or `confirmed`. The flat fields stay and always agree with it, so both apps read the same answer instead of working it out of `found` and `confirmed`.
 - Each wallet's sync state, kept by the core: `idle`, `syncing` or `failed`, whoever started the sync (the app, a rescan, a sync of every wallet, the live watch). `sync_states` lists the state of each wallet, and `sync_changes` sends a change when a sync starts and when it ends. An app can then show each wallet's own sync, never another wallet's.
 - A wallet keeps its last failed sync in `last_failure`, beside `last_sync`, until a sync succeeds. It still reads as failed after a restart.
+- `UtxoInfo` carries `confirmations`, counted as for a transaction: 0 while the output waits, 1 once it is in the tip block. An app can show how deep a coin is without working it out of the block height.
 
 ### Removed
 
