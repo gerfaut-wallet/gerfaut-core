@@ -589,7 +589,7 @@ impl Session {
             let refused = error.is_some();
             match request {
                 Request::Headers if !refused => {
-                    if let Some(height) = height_of(&message["result"]) {
+                    if let Some(height) = checked_height(hub.config.network, &message["result"]) {
                         self.take_header(hub.config.network, height, &message["result"]);
                         self.tip = Some(height);
                         // Behind a block the watch already heard of,
@@ -615,7 +615,8 @@ impl Session {
                     if !matches!(self.look, Look::Asking { id: asked, .. } if asked == id) {
                         return;
                     }
-                    let height = height_of(&message["result"]).filter(|_| !refused);
+                    let height =
+                        checked_height(hub.config.network, &message["result"]).filter(|_| !refused);
                     if let Some(height) = height {
                         self.take_header(hub.config.network, height, &message["result"]);
                     }
@@ -675,7 +676,7 @@ impl Session {
                 }
             }
             Some("blockchain.headers.subscribe") => {
-                if let Some(height) = height_of(&params[0]) {
+                if let Some(height) = checked_height(hub.config.network, &params[0]) {
                     self.take_header(hub.config.network, height, &params[0]);
                     let back = self.tip.is_some_and(|tip| height < tip);
                     self.tip = Some(height);
@@ -1332,9 +1333,7 @@ async fn tip_of(
     let header = answer(&mut reader, 2, budget)
         .await
         .map_err(Unopened::into_words)?;
-    height_of(&header)
-        .filter(|height| *height <= crate::chain::height_limit(network, crate::now_secs()))
-        .ok_or_else(|| "unexpected response".to_owned())
+    checked_height(network, &header).ok_or_else(|| "unexpected response".to_owned())
 }
 
 /// What a probe found, once it ends; never, without one.
@@ -1362,6 +1361,20 @@ async fn write_lines(writer: &mut WriteHalf<BoxStream>, lines: &[u8]) -> Result<
         Ok(Err(error)) => Err(format!("the connection was closed: {error}")),
         Err(_) => Err("the server stopped reading".to_owned()),
     }
+}
+
+/// The height of a tip the server sent, when the tip of a sync would be
+/// taken: no higher than a chain can have reached, in a header with the
+/// work of its height ([`crate::chain::checked_tip`]). Anything else is
+/// no tip at all, as the server's word alone once set the height every
+/// block after it was compared with.
+fn checked_height(network: Network, sent: &Value) -> Option<u32> {
+    let height = height_of(sent)?;
+    let header = sent
+        .get("hex")
+        .and_then(Value::as_str)
+        .and_then(|hex| deserialize_hex::<Header>(hex).ok())?;
+    crate::chain::checked_tip(network, height, &header).ok()
 }
 
 fn height_of(header: &Value) -> Option<u32> {

@@ -1265,19 +1265,19 @@ async fn an_address_is_never_read_on_another_network() {
 async fn a_new_network_drops_what_the_watch_owed_the_old_one() {
     let old = FakeElectrum::start().await;
     let new = FakeElectrum::start().await;
-    new.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    new.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Regtest);
     let dir = tempfile::tempdir().unwrap();
     let (manager, wallet) = watching(dir.path(), old.backend()).await;
     manager.sync_wallet(&wallet).await.unwrap();
     manager
-        .set_backend(Network::Testnet4, new.backend())
+        .set_backend(Network::Regtest, new.backend())
         .await
         .unwrap();
     manager
         .add_wallet(
             "Elsewhere",
             &crate::input::parse_input(DESCRIPTOR).unwrap(),
-            Network::Testnet4,
+            Network::Regtest,
         )
         .await
         .unwrap();
@@ -1305,7 +1305,7 @@ async fn a_new_network_drops_what_the_watch_owed_the_old_one() {
         }
     }
     let asked_before = old.state.lock().unwrap().asked.len();
-    manager.set_active_network(Network::Testnet4).await.unwrap();
+    manager.set_active_network(Network::Regtest).await.unwrap();
     old.state.lock().unwrap().refuse.clear();
 
     // Subscribed on the new server, then a block there.

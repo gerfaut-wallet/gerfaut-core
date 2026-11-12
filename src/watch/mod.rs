@@ -944,6 +944,7 @@ impl LiveWatch {
             status: status_tx,
             debounce: Debouncer::default(),
             tip: None,
+            tip_moved: false,
             caught_up: false,
             interrupted: false,
             statuses: HashMap::new(),
@@ -1612,6 +1613,9 @@ pub(crate) struct Hub {
     first_pass: watch::Sender<FirstPass>,
     debounce: Debouncer,
     tip: Option<u32>,
+    /// The watch moved to another server since the last tip it read:
+    /// see [`Hub::new_tip`].
+    tip_moved: bool,
     /// Every wallet was reported once under this configuration, when
     /// its first session was ready.
     pub caught_up: bool,
@@ -1733,6 +1737,9 @@ impl Hub {
     pub fn serve(&mut self, endpoint: Option<&Endpoint>) {
         if let Some(endpoint) = endpoint {
             self.settle();
+            if self.heard_by.as_ref() != Some(endpoint) {
+                self.tip_moved = true;
+            }
             self.heard_by = Some(endpoint.clone());
             let held = Some((self.config.network, endpoint.clone()));
             self.held.send_if_modified(|was| {
@@ -1805,13 +1812,21 @@ impl Hub {
     /// address. One far lower says the height kept was never real, a
     /// server's invention or a slip: it becomes the baseline again,
     /// silently, so that one height of four billion does not hide every
-    /// block after it.
+    /// block after it. So does the first one no higher from a server the
+    /// watch moved to: the height kept was another server's word, and one
+    /// that set it a few blocks too high silenced the blocks of every
+    /// server after it for a day. A height no chain can have reached
+    /// ([`chain::height_limit`]) is not read at all.
     pub fn new_tip(&mut self, height: u32, sync_pending: bool) {
+        if height > chain::height_limit(self.config.network, crate::now_secs()) {
+            return;
+        }
+        let moved = std::mem::take(&mut self.tip_moved);
         let Some(previous) = self.tip else {
             self.tip = Some(height);
             return;
         };
-        if height.saturating_add(chain::TIP_LAG_MAX) < previous {
+        if height.saturating_add(chain::TIP_LAG_MAX) < previous || (moved && height <= previous) {
             self.tip = Some(height);
             return;
         }
@@ -1960,6 +1975,7 @@ impl Hub {
 
     fn forget_baselines(&mut self) {
         self.tip = None;
+        self.tip_moved = false;
         self.caught_up = false;
         self.interrupted = false;
         self.statuses.clear();

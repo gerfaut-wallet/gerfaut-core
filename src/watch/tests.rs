@@ -230,7 +230,7 @@ async fn electrum_pushes_a_change_once_per_burst() {
     server.push(
         json!({
             "jsonrpc": "2.0", "method": "blockchain.headers.subscribe",
-            "params": [{ "height": 101, "hex": "00" }],
+            "params": [{ "height": 101, "hex": crate::testkit::header_at(101) }],
         })
         .to_string(),
     );
@@ -1110,7 +1110,7 @@ async fn a_block_syncs_a_waiting_wallet_the_watch_does_not_hear_whole() {
     server.push(
         json!({
             "jsonrpc": "2.0", "method": "blockchain.headers.subscribe",
-            "params": [{ "height": 101, "hex": "00" }],
+            "params": [{ "height": 101, "hex": crate::testkit::header_at(101) }],
         })
         .to_string(),
     );
@@ -1510,6 +1510,47 @@ async fn a_session_that_opens_behind_compares_at_once() {
     let looked = other.subscriptions();
     assert_eq!(looked.len(), 3, "the session, a look, the session");
     assert!(looked[1].is_empty());
+}
+
+/// A tip one server set too high is forgotten once the watch moves to
+/// another: the next block the other announces is a block, where every
+/// block under the height kept went unheard for up to a day.
+#[tokio::test]
+async fn a_tip_set_too_high_is_forgotten_on_another_server() {
+    let rotation = FakeMempool::start(false, 0).await;
+    let (high, honest) = (FakeElectrum::start().await, FakeElectrum::start().await);
+    high.state.lock().unwrap().height = 110;
+    honest.state.lock().unwrap().height = 101;
+    let _stand_in = automatic(&rotation, &[&high, &honest]);
+    let (watch, mut events) = LiveWatch::start_with(
+        config(BackendConfig::default()),
+        vec![wallet("a", &[1], &[], false)],
+        Some(Timings {
+            refused: Duration::from_secs(3600),
+            ..timings()
+        }),
+    );
+    until(&watch, "on the high one", |_| {
+        watch.serving().map(|(_, at)| at) == Some(electrum_endpoint(&high))
+    })
+    .await;
+    high.state.lock().unwrap().genesis = Some(bdk_wallet::bitcoin::Network::Testnet4);
+    high.hang_up();
+    until(&watch, "on the honest one", |_| {
+        watch.serving().map(|(_, at)| at) == Some(electrum_endpoint(&honest))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    block(&honest, 102);
+    loop {
+        match next_event(&mut events).await {
+            WatchEvent::NewBlock { height } => {
+                assert_eq!(height, 102);
+                break;
+            }
+            _ => continue,
+        }
+    }
 }
 
 /// When the wait without a block runs out, the server is asked for its
@@ -1963,9 +2004,9 @@ async fn a_first_poll_is_compared_with_what_the_wallet_holds() {
     no_event(&mut events, Duration::from_millis(500)).await;
 }
 
-/// One impossible height, from a lying server or a slip, does not hide
-/// the blocks that follow it: the honest height after it becomes the
-/// baseline again, and the next block is a block.
+/// One impossible height, from a lying server or a slip, is not read:
+/// it is no block, and hides none of the blocks that follow it. It used
+/// to be a block, and the baseline until a height far below it came.
 #[tokio::test]
 async fn one_impossible_height_does_not_hide_later_blocks() {
     let server = FakeMempool::start(false, 0).await;
@@ -1978,23 +2019,15 @@ async fn one_impossible_height_does_not_hide_later_blocks() {
     reported(&mut events, &["a"], ChangeReason::Started).await;
 
     server.state.lock().unwrap().tip = 4_000_000_000;
+    no_event(&mut events, Duration::from_millis(300)).await;
+    server.state.lock().unwrap().tip = 501;
     assert_eq!(
         next_event(&mut events).await,
-        WatchEvent::NewBlock {
-            height: 4_000_000_000
-        }
+        WatchEvent::NewBlock { height: 501 }
     );
     assert_eq!(
         next_event(&mut events).await,
         changed("a", ChangeReason::NewBlock, false)
-    );
-
-    server.state.lock().unwrap().tip = 501;
-    no_event(&mut events, Duration::from_millis(300)).await;
-    server.state.lock().unwrap().tip = 502;
-    assert_eq!(
-        next_event(&mut events).await,
-        WatchEvent::NewBlock { height: 502 }
     );
 }
 
@@ -3828,10 +3861,11 @@ async fn a_false_proof_of_a_foretold_confirmation_refuses_the_server() {
 }
 
 /// On a network whose blocks prove their work, a header the server
-/// pushes without the work of its height is taken for nothing: no
-/// confirmation is foretold on it and no proof asked for, and the
-/// status that says the block took the payment is a change to sync,
-/// whose sync holds the server to the same rule.
+/// pushes without the work of its height is taken for nothing: no block
+/// is heard of, no confirmation is foretold on it and no proof asked
+/// for, and the status that says the block took the payment is a change
+/// to sync, whose sync holds the server to the same rule. Such a header
+/// used to be a block all the same.
 #[tokio::test]
 async fn a_header_without_its_work_foretells_nothing() {
     let server = FakeElectrum::start().await;
@@ -3847,10 +3881,6 @@ async fn a_header_without_its_work_foretells_nothing() {
     no_event(&mut events, Duration::from_millis(300)).await;
 
     mined(&server, 1, txid, 101);
-    assert_eq!(
-        next_event(&mut events).await,
-        WatchEvent::NewBlock { height: 101 }
-    );
     assert_eq!(
         next_event(&mut events).await,
         moved("a", ChangeReason::Activity, false, &[1])
