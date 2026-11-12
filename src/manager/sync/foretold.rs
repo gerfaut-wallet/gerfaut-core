@@ -22,7 +22,7 @@ use super::{
     Reach, Scanned, SyncSlot, WalletManager, apply_address_state, apply_synced, nothing_new,
 };
 use crate::chain::electrum::status::history_status;
-use crate::chain::proof::checkpoint_for;
+use crate::chain::proof::{Proof, checkpoint_for, height};
 use crate::chain::{self, Endpoint, has_proof_of_work};
 use crate::error::{CoreError, CoreResult};
 use crate::manager::{ManagerState, ensure_engine, find_record};
@@ -146,6 +146,23 @@ fn top_chain(network: Network, proven: &[Proven]) -> Option<&Headers> {
         })
     });
     (chained && worked && holds_all && !top.chain.is_empty()).then_some(top)
+}
+
+/// Whether the heights of `headers` hold for a wallet with no chain of
+/// its own, a watched address: no higher than a chain of `network` can
+/// have reached ([`chain::height_limit`]) and, on mainnet, chained to a
+/// block whose height a sync proved ([`height::known`]), the tip it
+/// took most likely. Otherwise the height is the server's word alone,
+/// which the address would keep until its next sync, and the address
+/// is synced instead.
+fn heights_hold(network: Network, headers: &Headers) -> bool {
+    if headers.last_height() > chain::height_limit(network, crate::now_secs()) {
+        return false;
+    }
+    network != Network::Mainnet
+        || (headers.first..).zip(&headers.chain).any(|(at, header)| {
+            height::known(network, at, header.block_hash()) == Some(Proof::Holds)
+        })
 }
 
 /// The block a confirmation was proven in: its height and header.
@@ -339,7 +356,7 @@ fn take_address(
     let (Some(_), Some((height, header))) = (foretells(&held, proven), block_of(proven)) else {
         return Ok(None);
     };
-    if height < watch.tip_height {
+    if height < watch.tip_height || !heights_hold(meta.network, top) {
         return Ok(None);
     }
     let confirmed = waiting(&held);
@@ -363,4 +380,31 @@ fn take_address(
     }
     taken.tip_height = taken.tip_height.max(top.last_height());
     apply_address_state(state, meta, taken, server, started, false).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use bdk_wallet::bitcoin::consensus::encode::deserialize_hex;
+
+    use super::*;
+
+    /// The last block the checkpoints name, 963,647 on mainnet.
+    const CHECKPOINT: &str = "00000020a9936e1d318143a031b88854ea08e9ba3bd8659ca7b101000000000000000000c971243030a38ed9ad149393c4c4947a82a9622101e9a31a15710f32aeee0184f5388a6a3d35021788eedf2e";
+
+    /// A watched address takes the heights of the watch's headers only
+    /// where they hold: a block whose height is known, and not that block
+    /// two million blocks up; elsewhere, any height a chain can have
+    /// reached.
+    #[test]
+    fn a_watched_address_takes_only_heights_that_hold() {
+        let header: Header = deserialize_hex(CHECKPOINT).unwrap();
+        let at = |first: u32| Headers {
+            first,
+            chain: vec![header],
+        };
+        assert!(heights_hold(Network::Mainnet, &at(963_647)));
+        assert!(!heights_hold(Network::Mainnet, &at(2_963_647)));
+        assert!(heights_hold(Network::Signet, &at(2_963_647)));
+        assert!(!heights_hold(Network::Signet, &at(4_000_000_000)));
+    }
 }
