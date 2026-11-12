@@ -1227,15 +1227,33 @@ pub(crate) async fn fetch_prevouts(
 }
 
 /// The height of the endpoint's tip: the one a time lock is judged
-/// against when the transaction reaches that node.
-pub(crate) async fn tip_height(endpoint: &Endpoint, proxy: Option<&str>) -> Result<u32, Failure> {
+/// against when the transaction reaches that node. Checked as the tip
+/// of a sync is: on mainnet, proven, its work and the coinbase of its
+/// block ([`proof::height`]); anywhere, no higher than a chain can have
+/// reached ([`height_limit`]). It was the server's word, and a lock
+/// still far off was shown as one that holds nothing back.
+pub(crate) async fn tip_height(
+    endpoint: &Endpoint,
+    network: Network,
+    proxy: Option<&str>,
+) -> Result<u32, Failure> {
     match endpoint {
-        Endpoint::Esplora(url) => esplora::client(url, proxy)
-            .map_err(Failure::Transport)?
-            .height()
-            .await
-            .map_err(Failure::Transport),
-        Endpoint::Electrum(target) => electrum::tip_height(target, proxy).await,
+        Endpoint::Esplora(url) => {
+            let client = esplora::client(url, proxy).map_err(Failure::Transport)?;
+            let height = if network == Network::Mainnet {
+                esplora::sync::proven_tip(&client, network).await
+            } else {
+                client.height().await.and_then(|height| {
+                    if height > height_limit(network, crate::now_secs()) {
+                        Err(Fault::other(IMPOSSIBLE_TIP))
+                    } else {
+                        Ok(height)
+                    }
+                })
+            };
+            height.map_err(Failure::Transport)
+        }
+        Endpoint::Electrum(target) => electrum::tip_height(target, network, proxy).await,
     }
 }
 

@@ -42,6 +42,12 @@
 //! either way, and the work of a recent block is the price of a forged
 //! confirmation, as it is for any wallet that reads headers.
 //!
+//! Work proves a block was mined, not where it sits. Within the table a
+//! header carries the `bits` of its period exactly, and wherever no
+//! chain to a checkpoint binds a block to its height, the coinbase of
+//! the block does ([`height`]): the tip of every server, and the block of
+//! a confirmation past what is chained.
+//!
 //! The chain is read down from the end of the period, to the checkpoint
 //! that follows the block. The one before it proves nothing: a forger
 //! builds on the real block that ends the previous period as easily as
@@ -91,6 +97,7 @@ use electrum_client::GetMerkleRes;
 
 use crate::network::Network;
 
+pub(crate) mod height;
 mod targets;
 #[cfg(test)]
 mod tests;
@@ -140,7 +147,7 @@ const BRANCH_MAX: usize = 32;
 /// could serve the real blocks of the chain at the heights it liked.
 /// Held to its period, a header is at most one period away from where
 /// it claims to be; what binds it to its very height is chaining to a
-/// checkpoint, or its coinbase.
+/// checkpoint, or its coinbase ([`height`]).
 pub(crate) fn has_proof_of_work(network: Network, height: u32, header: &Header) -> bool {
     let Some(easiest) = easiest_target(network, height) else {
         return true;

@@ -32,9 +32,9 @@ use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
 use electrum_client::{self, ElectrumApi, GetHistoryRes};
 
 use super::status::{Check, Entry, Told, Verdict};
-use crate::chain::proof::chains_up_to;
 use crate::chain::proof::{
-    Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, check_confirmation, recheck,
+    Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, chains_up_to,
+    check_confirmation, checkpoint_for, height, recheck,
 };
 use crate::chain::{
     ANOTHER_NETWORK, BEHIND, Fault, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX,
@@ -266,7 +266,8 @@ impl Chain {
     /// wallet holds would look gone from the chain.
     ///
     /// The tip is a claim, refused past any height a chain of the
-    /// network can have reached ([`height_limit`]), and the latest
+    /// network can have reached ([`height_limit`]); its height is proven
+    /// by the coinbase of its block ([`prove_height`]), and the latest
     /// blocks under it are checked ([`checked_suffix`]). The wallet's
     /// own blocks are read the same way: those far above the server's
     /// tip, or past that height, came from a server that made them up.
@@ -289,6 +290,8 @@ impl Chain {
             .ok()
             .filter(|height| *height <= limit)
             .ok_or_else(|| Error::Message(IMPOSSIBLE_TIP.to_owned()))?;
+        let proof = prove_height(client, network, height, &notification.header)?;
+        height::tip_proven(proof).map_err(super::raised)?;
         let (local, dropped) =
             if local.height() > height.saturating_add(TIP_LAG_MAX) || local.height() > limit {
                 if drops_a_confirmation(network, confirmed.iter().copied(), height, limit) {
@@ -334,6 +337,12 @@ impl Chain {
         let start = height.saturating_sub(CHAIN_SUFFIX - 1);
         let latest = client.block_headers(start as usize, CHAIN_SUFFIX as usize)?;
         let latest = checked_suffix(network, start, height, &notification.header, latest.headers)?;
+        // Each the parent of the next up to the tip, whose height holds:
+        // theirs hold too.
+        height::remember(
+            network,
+            (start..).zip(latest.iter().map(Header::block_hash)),
+        );
         let mut headers = HashMap::new();
         let mut hashes = BTreeMap::new();
         for (at, header) in (start..).zip(latest) {
@@ -588,7 +597,8 @@ impl Pass<'_> {
     /// chain to its checkpoint the server would not send. That chain is
     /// read last, a period at a time ([`chains_to_read`]): one that does
     /// not end at the checkpoint, or holds another block, refuses the
-    /// server.
+    /// server. Past the checkpoints, the block's height is proven by its
+    /// coinbase ([`prove_height`]), unless the latest blocks bind it.
     fn prove(
         &mut self,
         client: &impl ElectrumApi,
@@ -697,8 +707,24 @@ impl Pass<'_> {
             let hashes = chain_to_checkpoint(network, from, &headers).ok_or_else(false_proof)?;
             read.insert(from, hashes);
         }
+        // And the heights of the blocks past the checkpoints, which
+        // nothing above binds, by their coinbase: once a block.
+        let mut heights: HashMap<u32, Proof> = HashMap::new();
         for (txid, height, header) in proven {
-            match chained(network, height, header.block_hash(), &read) {
+            let verdict = match chained(network, height, header.block_hash(), &read) {
+                Proof::Holds if checkpoint_for(network, height).is_none() => {
+                    match heights.get(&height) {
+                        Some(verdict) => *verdict,
+                        None => {
+                            let verdict = prove_height(client, network, height, &header)?;
+                            heights.insert(height, verdict);
+                            verdict
+                        }
+                    }
+                }
+                verdict => verdict,
+            };
+            match verdict {
                 Proof::Holds => {}
                 Proof::Unsure => {
                     self.update.seen_ats.insert((txid, self.start_time));
@@ -780,6 +806,49 @@ fn branches(
             .collect(),
         Err(error) => Err(error),
     }
+}
+
+/// What the server proves of the height of `header`, its block at
+/// `height` ([`height`]): nothing to ask when it is known already, its
+/// coinbase otherwise, txid and branch at position 0 then the
+/// transaction. A branch into another root has the header at that
+/// height read again: another block there is a reorganisation in
+/// between, unsure; the same one, a false proof. A request the server
+/// refuses leaves it unsure. Kept for the session once it holds.
+pub(crate) fn prove_height(
+    client: &impl ElectrumApi,
+    network: Network,
+    height: u32,
+    header: &Header,
+) -> Result<Proof, Error> {
+    let hash = header.block_hash();
+    if let Some(known) = height::known(network, height, hash) {
+        return Ok(known);
+    }
+    let found = match super::patiently(|| client.txid_from_pos_with_merkle(height as usize, 0)) {
+        Ok(found) => found,
+        Err(error) if refused(&error) => return Ok(Proof::Unsure),
+        Err(error) => return Err(error),
+    };
+    let coinbase = match super::patiently(|| client.transaction_get(&found.tx_hash)) {
+        Ok(coinbase) => coinbase,
+        Err(error) if refused(&error) => return Ok(Proof::Unsure),
+        Err(error) => return Err(error),
+    };
+    let verdict =
+        match height::coinbase_proof(height, header, &coinbase, found.tx_hash, 0, &found.merkle) {
+            Proof::Elsewhere => match client.block_header(height as usize) {
+                Ok(again) if again.block_hash() != hash => Proof::Unsure,
+                Ok(_) => Proof::False,
+                Err(error) if refused(&error) => Proof::Unsure,
+                Err(error) => return Err(error),
+            },
+            verdict => verdict,
+        };
+    if verdict == Proof::Holds {
+        height::remember(network, [(height, hash)]);
+    }
+    Ok(verdict)
 }
 
 /// The `count` headers from `from`, asked as many times as the server's

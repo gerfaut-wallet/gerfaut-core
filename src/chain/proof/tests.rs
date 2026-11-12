@@ -78,6 +78,35 @@ pub(super) const REAL_BRANCH: [&str; 13] = [
     "b4f5a93b4048a1ef481973403e458a3add170740e66622643144646ad113b4b1",
 ];
 
+/// Block 702,861 of mainnet, from the full block rust-bitcoin keeps in
+/// its tests (`bitcoin/tests/data/mainnet_block_000000000000000000000c835b2adcaedc20fdf6ee440009c249452c726dafae.raw`,
+/// CC0): its header, its coinbase, and the branch of the coinbase,
+/// computed from the 2,500 transactions of the block.
+pub(super) const CB_HEIGHT: u32 = 702_861;
+pub(super) const CB_HEADER: &str = "04e0ff3f5f3b2119529dc4013ff0f427a457bed706e7b5b8dec30900000000000000000022906797f7ab258c0f896c35b2d6725c0554f579af99754b241aec8c76727d4091a45561ebd00e17e3d6da41";
+pub(super) const CB_HASH: &str = "000000000000000000000c835b2adcaedc20fdf6ee440009c249452c726dafae";
+pub(super) const CB_TX: &str = "020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff58038db90a0475a45561fabe6d6db43c2ece440513219decd96f67a31bf0191f9a5f2d6c952e5029005e3d30f562040000001e34c5f062696e616e63652f6672323134818226021704159799809b19f82f7807000000000000ffffffff02f53f8c25000000001600143156afc4249915008020f932783319f3e610b97d0000000000000000266a24aa21a9ed71bfcc287cd6271682f35f5fba3963861571e0f186899eb0a41a5ebc360a3faa0120000000000000000000000000000000000000000000000000000000000000000000000000";
+pub(super) const CB_TXID: &str = "764b60c3d9a2c3c5bb6fe7141d9ca6e6778122df75f19366a2c5cb948d1d7d84";
+pub(super) const CB_BRANCH: [&str; 12] = [
+    "7bf717689b9033eafb2f3272719989b304bb7db616c2bfb5ded2e1b76d50a4f0",
+    "c33efb2d2e19d7b4848b5ea50ad371c0e7e44b26034e9e39383e62db76845fa2",
+    "6316efaf69d36150b9daa77087ebc1bcf2f0679f1a374425badfc20d193ed3ed",
+    "fc8b390ffbf99da7447d78bdc4786b15dedc07ac5de827793eb8384b46d0b969",
+    "c24465994132b18b56d4b382fe9ebb0057a5d9718bc7faa3264f5c4c15c195d9",
+    "f799f0b9f12f8f5042af272b981508fa8f97388b3034aeba502acbab187be8fc",
+    "281a7d421e647a489771ee986c74f8198d34e31126b1707fa91aab4456657272",
+    "d4ba1f20ca766d736dc735f991022e44b0f2f94b07b0c9d7b7de7d2ae08c933d",
+    "394a1cedc30fe891aed1ce4e5d293d0f6d504981fdd4e14e0d61777c6fb96661",
+    "03dda320e6e7f6adeec4b8d8342400292017fa6b690da849ceaf767eb9cc4390",
+    "cf8c859005920559d385c85ec148f0d349222d83f6505ae406ab181010de9fc9",
+    "7ecf96ba0693eea963175dc4283422d0db37296884092b18f0d50eb8bbfa3c59",
+];
+
+/// The branch of [`CB_TX`], as the crate reads one.
+pub(super) fn coinbase_branch() -> Vec<[u8; 32]> {
+    branch(CB_HEIGHT, 0, &CB_BRANCH).merkle
+}
+
 /// Whether a branch proves a confirmation.
 pub(super) fn proves_confirmation(
     network: Network,
@@ -764,6 +793,155 @@ fn a_branch_that_proves_nothing_is_refused() {
     );
 }
 
+/// A coinbase whose script starts with `height` as BIP-34 writes it:
+/// what anyone may write, no key in it.
+pub(super) fn coinbase_writing(height: u32) -> Transaction {
+    let script_sig = ScriptBuf::builder()
+        .push_int(i64::from(height))
+        .push_slice(b"made up")
+        .into_script();
+    coinbase_with(script_sig)
+}
+
+/// A coinbase whose script is `script_sig`.
+fn coinbase_with(script_sig: ScriptBuf) -> Transaction {
+    Transaction {
+        version: bdk_wallet::bitcoin::transaction::Version::TWO,
+        lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig,
+            sequence: Sequence::MAX,
+            witness: bdk_wallet::bitcoin::Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(312_500_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    }
+}
+
+/// The real coinbase of block 702,861, proven by its real branch, binds
+/// the block to that height and no other; at another position, for
+/// another transaction, or under a branch that leads elsewhere, it
+/// proves nothing. Alone in a block of its own, a transaction proves
+/// its height only when it is a coinbase whose script starts with that
+/// height, written the one way BIP-34 writes it. Below BIP-34, a
+/// coinbase says nothing.
+#[test]
+fn a_coinbase_proves_the_height_of_its_block() {
+    let block = header(CB_HEADER);
+    assert_eq!(block.block_hash().to_string(), CB_HASH);
+    assert!(has_proof_of_work(Network::Mainnet, CB_HEIGHT, &block));
+    let coinbase: Transaction = deserialize_hex(CB_TX).unwrap();
+    let txid: Txid = CB_TXID.parse().unwrap();
+    assert_eq!(coinbase.compute_txid(), txid);
+    let real = coinbase_branch();
+    let proof = |height: u32, tx: &Transaction, txid: Txid, pos: usize, branch: &[[u8; 32]]| {
+        height::coinbase_proof(height, &block, tx, txid, pos, branch)
+    };
+    assert_eq!(proof(CB_HEIGHT, &coinbase, txid, 0, &real), Proof::Holds);
+    // The same block a block higher, where the bits of its period still
+    // hold, and a period on.
+    for height in [CB_HEIGHT + 1, CB_HEIGHT - 1, CB_HEIGHT + RETARGET_PERIOD] {
+        assert_eq!(
+            proof(height, &coinbase, txid, 0, &real),
+            Proof::False,
+            "{height}"
+        );
+    }
+    assert_eq!(proof(CB_HEIGHT, &coinbase, txid, 1, &real), Proof::False);
+    let other: Transaction = deserialize_hex(REAL_TX).unwrap();
+    assert_eq!(
+        proof(CB_HEIGHT, &other, other.compute_txid(), 0, &real),
+        Proof::False
+    );
+    assert_eq!(
+        proof(CB_HEIGHT, &coinbase, other.compute_txid(), 0, &real),
+        Proof::False
+    );
+    let mut elsewhere = real.clone();
+    elsewhere[3] = real[4];
+    assert_eq!(
+        proof(CB_HEIGHT, &coinbase, txid, 0, &elsewhere),
+        Proof::Elsewhere
+    );
+    assert_eq!(
+        proof(height::BIP34_HEIGHT - 1, &coinbase, txid, 0, &real),
+        Proof::Unsure
+    );
+
+    // Alone in a block: the header's root is the transaction's txid.
+    let alone = |tx: &Transaction, height: u32| {
+        let root = TxMerkleNode::from_byte_array(tx.compute_txid().to_byte_array());
+        let header = Header {
+            merkle_root: root,
+            ..last_checkpoint()
+        };
+        height::coinbase_proof(height, &header, tx, tx.compute_txid(), 0, &[])
+    };
+    let written = coinbase_writing(970_000);
+    assert_eq!(alone(&written, 970_000), Proof::Holds);
+    assert_eq!(alone(&written, 970_001), Proof::False);
+    // The same script on a transaction that spends a coin.
+    let spends = Transaction {
+        input: vec![TxIn {
+            previous_output: OutPoint::new(Txid::from_byte_array([3; 32]), 0),
+            ..written.input[0].clone()
+        }],
+        ..written.clone()
+    };
+    assert_eq!(alone(&spends, 970_000), Proof::False);
+    // The height after something else, or written longer than it needs.
+    let after = ScriptBuf::builder()
+        .push_slice(b"made up")
+        .push_int(970_000)
+        .into_script();
+    assert_eq!(alone(&coinbase_with(after), 970_000), Proof::False);
+    let longer = ScriptBuf::from_bytes(vec![0x04, 0x10, 0xcd, 0x0e, 0x00]);
+    assert_eq!(alone(&coinbase_with(longer), 970_000), Proof::False);
+    let exact = ScriptBuf::from_bytes(vec![0x03, 0x10, 0xcd, 0x0e]);
+    assert_eq!(alone(&coinbase_with(exact), 970_000), Proof::Holds);
+}
+
+/// A checkpoint's height is known with no request, and so is one this
+/// session proved: the same block at another height is a false proof.
+/// Other networks need none.
+#[test]
+fn a_height_is_known_from_the_checkpoints_and_the_session() {
+    let end: BlockHash = REAL[3].1.parse().unwrap();
+    assert_eq!(
+        height::known(Network::Mainnet, 963_647, end),
+        Some(Proof::Holds)
+    );
+    for elsewhere in [963_646, 963_647 + 2_000_000] {
+        assert_eq!(
+            height::known(Network::Mainnet, elsewhere, end),
+            Some(Proof::False),
+            "{elsewhere}"
+        );
+    }
+    let block = BlockHash::from_byte_array([0x5c; 32]);
+    assert_eq!(height::known(Network::Mainnet, 980_000, block), None);
+    assert_eq!(
+        height::known(Network::Signet, 980_000, block),
+        Some(Proof::Holds)
+    );
+    height::remember(Network::Mainnet, [(980_000, block)]);
+    assert_eq!(
+        height::known(Network::Mainnet, 980_000, block),
+        Some(Proof::Holds)
+    );
+    assert_eq!(
+        height::known(Network::Mainnet, 980_001, block),
+        Some(Proof::False)
+    );
+    // What another network proves is kept nowhere.
+    let signet = BlockHash::from_byte_array([0x5d; 32]);
+    height::remember(Network::Signet, [(980_000, signet)]);
+    assert_eq!(height::known(Network::Mainnet, 980_000, signet), None);
+}
+
 // --- servers that prove, and servers that lie --------------------------------
 
 mod servers {
@@ -1179,6 +1357,234 @@ mod servers {
                 "{height}: {refused}"
             );
         }
+    }
+
+    /// How far the servers below shift the real blocks they serve.
+    const SHIFT: u32 = 2_000_000;
+
+    /// A mainnet server that serves the real blocks 963,640 to 963,647
+    /// [`SHIFT`] blocks too high, its tip at `top` shifted, the real
+    /// transaction of block 963,647 with its real branch, and, for the
+    /// height of its tip, the best it can do: a coinbase that writes it,
+    /// beside the branch of the real transaction.
+    async fn shifted(top: u32) -> FakeElectrum {
+        let real: Transaction = deserialize_hex(REAL_TX).unwrap();
+        let parent: Transaction = deserialize_hex(REAL_PARENT).unwrap();
+        let made_up = coinbase_writing(top + SHIFT);
+        let server = FakeElectrum::start().await;
+        {
+            let mut state = server.state.lock().unwrap();
+            state.genesis = Some(Network::Mainnet.to_bitcoin());
+            state.height = top + SHIFT;
+            for (at, hex) in (963_640 + SHIFT..).zip(BELOW_LAST) {
+                state.served.insert(at, header(hex));
+            }
+            state.served.insert(963_647 + SHIFT, last_checkpoint());
+            let real_branch: Vec<String> =
+                REAL_BRANCH.iter().map(|hash| hash.to_string()).collect();
+            state
+                .branches
+                .insert(real.compute_txid(), (real_branch.clone(), REAL_POS));
+            state
+                .from_pos
+                .insert(top + SHIFT, (made_up.compute_txid(), real_branch));
+        }
+        server.add_tx(&real);
+        server.add_tx(&parent);
+        server.add_tx(&made_up);
+        server.set_history(
+            &ours(),
+            &[(real.compute_txid(), i64::from(963_647 + SHIFT))],
+        );
+        server
+    }
+
+    /// A server that serves the real blocks of mainnet two million blocks
+    /// too high, where their work and the branch of a real transaction
+    /// still hold, is refused at the first sync as a false proof: a tip
+    /// that is a checkpoint claimed at another height, or one whose
+    /// coinbase it cannot show at the height it claims. It used to be
+    /// followed, the confirmation two million blocks deep, and every
+    /// honest server after it refused as one that lags.
+    #[tokio::test]
+    async fn a_server_that_shifts_heights_is_refused() {
+        for top in [963_647, 963_646] {
+            let hostile = shifted(top).await;
+            let refused = refusal(electrum_sync(&hostile, Network::Mainnet).await);
+            assert!(refused.is_false_proof(), "{top}: {refused}");
+        }
+    }
+
+    /// The tests that count what proving block 702,861 costs, one at a
+    /// time: what one proves, the session keeps for the others.
+    static COINBASE_BLOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A mainnet server whose tip is block 702,861, real, at `top`, with
+    /// its real coinbase and branch.
+    async fn at_coinbase_block(top: u32) -> FakeElectrum {
+        let server = FakeElectrum::start().await;
+        {
+            let mut state = server.state.lock().unwrap();
+            state.genesis = Some(Network::Mainnet.to_bitcoin());
+            state.height = top;
+            state.served.insert(top, header(CB_HEADER));
+            let branch = CB_BRANCH.iter().map(|hash| hash.to_string()).collect();
+            state
+                .from_pos
+                .insert(top, (CB_TXID.parse().unwrap(), branch));
+        }
+        server.add_tx(&deserialize_hex::<Transaction>(CB_TX).unwrap());
+        server
+    }
+
+    /// A plan for a mainnet wallet whose chain holds the block of `top`
+    /// at its height and one a few blocks above: the server, at `top`, is
+    /// behind it, and sends no latest blocks.
+    fn behind(top: u32) -> Plan {
+        let genesis = bdk_wallet::bitcoin::constants::genesis_block(Network::Mainnet.to_bitcoin());
+        let tip = CheckPoint::new(BlockId {
+            height: 0,
+            hash: genesis.block_hash(),
+        })
+        .extend([
+            BlockId {
+                height: top,
+                hash: header(CB_HEADER).block_hash(),
+            },
+            BlockId {
+                height: top + 9,
+                hash: BlockHash::from_byte_array([7; 32]),
+            },
+        ])
+        .unwrap();
+        Plan {
+            tip,
+            ..plan(Network::Mainnet)
+        }
+    }
+
+    /// How many times `server` was asked to prove a height.
+    fn proving(server: &FakeElectrum) -> (usize, usize) {
+        let state = server.state.lock().unwrap();
+        let count = |method: &str| state.asked.iter().filter(|asked| *asked == method).count();
+        (
+            count("blockchain.transaction.id_from_pos"),
+            count("blockchain.transaction.get"),
+        )
+    }
+
+    /// The tip of an Electrum server is proven by its block's coinbase,
+    /// for a descriptor wallet and a watched address: two requests, and
+    /// none at the next sync of either. The same real block served a
+    /// block higher refuses the server as a false proof, from its
+    /// coinbase and then from what the session proved. A server that
+    /// will not send the coinbase is not followed, and not taken for a
+    /// liar either.
+    #[tokio::test]
+    async fn an_electrum_tip_is_proven_by_its_coinbase() {
+        let _one_at_a_time = COINBASE_BLOCK.lock().await;
+        let hash: BlockHash = CB_HASH.parse().unwrap();
+        let sync = |server: &FakeElectrum, plan: Plan| {
+            let target = Target::new(format!("tcp://{}", server.address), None);
+            async move {
+                crate::chain::electrum::sync(&target, plan, None, Duration::from_secs(30)).await
+            }
+        };
+        height::forget(hash);
+        let server = at_coinbase_block(CB_HEIGHT).await;
+        let synced = sync(&server, behind(CB_HEIGHT)).await.unwrap();
+        assert_eq!(synced.update.chain.unwrap().height(), CB_HEIGHT + 9);
+        assert_eq!(proving(&server), (1, 1));
+        sync(&server, behind(CB_HEIGHT)).await.unwrap();
+        let state = address_state(&server, MAINNET_ADDRESS, Network::Mainnet)
+            .await
+            .unwrap();
+        assert_eq!(state.tip_height, CB_HEIGHT);
+        assert_eq!(proving(&server), (1, 1));
+
+        // Over a watched address, the first proof is the same.
+        height::forget(hash);
+        let state = address_state(&server, MAINNET_ADDRESS, Network::Mainnet)
+            .await
+            .unwrap();
+        assert_eq!(state.tip_height, CB_HEIGHT);
+        assert_eq!(proving(&server), (2, 2));
+
+        // A block higher: the bits of its period hold, its coinbase does
+        // not; once the session knows the block, nothing is asked.
+        for known in [false, true] {
+            height::forget(hash);
+            if known {
+                sync(&server, behind(CB_HEIGHT)).await.unwrap();
+            }
+            let shifted = at_coinbase_block(CB_HEIGHT + 1).await;
+            let refused = refusal(sync(&shifted, behind(CB_HEIGHT + 1)).await);
+            assert!(refused.is_false_proof(), "{refused}");
+            let refused = address_state(&shifted, MAINNET_ADDRESS, Network::Mainnet)
+                .await
+                .unwrap_err();
+            assert!(refused.is_false_proof(), "{refused}");
+            assert_eq!(proving(&shifted).0, if known { 0 } else { 2 });
+        }
+
+        // No coinbase to be had.
+        height::forget(hash);
+        let silent = at_coinbase_block(CB_HEIGHT).await;
+        silent.state.lock().unwrap().refuse.insert(
+            "blockchain.transaction.id_from_pos",
+            "no such block".to_owned(),
+        );
+        let refused = refusal(sync(&silent, behind(CB_HEIGHT)).await);
+        assert!(
+            !refused.is_false_proof() && refused.contains(height::UNPROVEN_TIP),
+            "{refused}"
+        );
+        height::forget(hash);
+    }
+
+    /// The tip a preview judges a height lock against is proven as a
+    /// sync's: the real tip, over Electrum and Esplora, and a server that
+    /// shifts the real blocks refused as a false proof, where its height
+    /// was taken as it came.
+    #[tokio::test]
+    async fn the_tip_of_a_preview_is_proven() {
+        use crate::chain::{Endpoint, Failure, tip_height};
+        let electrum = |server: &FakeElectrum| {
+            Endpoint::Electrum(Target::new(format!("tcp://{}", server.address), None))
+        };
+        let esplora =
+            |server: &FakeMempool| Endpoint::Esplora(format!("http://{}/api", server.address));
+        let false_proof = |tip: Result<u32, Failure>| match tip {
+            Err(Failure::Transport(fault)) => fault.is_false_proof(),
+            _ => false,
+        };
+        let honest = mainnet().await;
+        assert_eq!(
+            tip_height(&electrum(&honest), Network::Mainnet, None).await,
+            Ok(963_647)
+        );
+        let hostile = shifted(963_647).await;
+        assert!(false_proof(
+            tip_height(&electrum(&hostile), Network::Mainnet, None).await
+        ));
+        let honest = mainnet_mempool(10).await;
+        assert_eq!(
+            tip_height(&esplora(&honest), Network::Mainnet, None).await,
+            Ok(963_647)
+        );
+        let hostile = shifted_mempool().await;
+        assert!(false_proof(
+            tip_height(&esplora(&hostile), Network::Mainnet, None).await
+        ));
+        // Elsewhere, a height no chain has reached.
+        let far = mempool(Network::Signet).await;
+        far.state.lock().unwrap().tip = 4_000_000_000;
+        let Err(Failure::Transport(refused)) =
+            tip_height(&esplora(&far), Network::Signet, None).await
+        else {
+            panic!("a tip of four billion was taken");
+        };
+        assert!(refused.contains(crate::chain::IMPOSSIBLE_TIP), "{refused}");
     }
 
     /// The BIP-173 address on mainnet and on signet, and its script.
@@ -1851,6 +2257,127 @@ mod servers {
         list(&server, vec![esplora_payment(0x32, 0x42, 50_000, true)]);
         let refused = esplora_sync(&server, address_plan(Network::Mainnet, Held::default())).await;
         assert!(refusal(refused).is_false_proof());
+    }
+
+    /// A mainnet instance that lists the real blocks 963,640 to 963,647
+    /// [`SHIFT`] blocks too high.
+    async fn shifted_mempool() -> FakeMempool {
+        let server = mempool(Network::Mainnet).await;
+        {
+            let mut state = server.state.lock().unwrap();
+            state.tip = 963_647 + SHIFT;
+            state.latest_listed = Some(8);
+            for (at, hex) in (963_640 + SHIFT..).zip(BELOW_LAST) {
+                state.served.insert(at, header(hex));
+            }
+            state.served.insert(963_647 + SHIFT, last_checkpoint());
+        }
+        server
+    }
+
+    /// A transaction as Esplora lists it, every input and output of it,
+    /// witness included, confirmed at `height`.
+    fn listed_whole(tx: &Transaction, height: u32) -> serde_json::Value {
+        let vin: Vec<serde_json::Value> = tx
+            .input
+            .iter()
+            .map(|input| {
+                let witness: Vec<String> = input
+                    .witness
+                    .iter()
+                    .map(|item| item.iter().map(|byte| format!("{byte:02x}")).collect())
+                    .collect();
+                serde_json::json!({
+                    "txid": input.previous_output.txid.to_string(),
+                    "vout": input.previous_output.vout,
+                    "is_coinbase": input.previous_output.is_null(),
+                    "scriptsig": serialize_hex_of(&input.script_sig),
+                    "witness": witness, "sequence": input.sequence.0, "prevout": null,
+                })
+            })
+            .collect();
+        let vout: Vec<serde_json::Value> = tx
+            .output
+            .iter()
+            .map(|output| {
+                serde_json::json!({
+                    "scriptpubkey": serialize_hex_of(&output.script_pubkey),
+                    "value": output.value.to_sat(),
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "txid": tx.compute_txid().to_string(), "version": tx.version.0,
+            "locktime": tx.lock_time.to_consensus_u32(), "size": tx.total_size(),
+            "weight": tx.weight().to_wu(), "fee": 0, "vin": vin, "vout": vout,
+            "status": {
+                "confirmed": true, "block_height": height, "block_hash": "00".repeat(32),
+                "block_time": 0,
+            },
+        })
+    }
+
+    /// The real coinbase of block 702,861, paid to a wallet, listed as
+    /// confirmed in that block: its branch proves it there, and the
+    /// coinbase proves the block's height, three requests the first
+    /// time and none after. The same block claimed a block higher,
+    /// where its work and the branch still hold, refuses the server as a
+    /// false proof, where the confirmation was taken there.
+    #[tokio::test]
+    async fn an_esplora_confirmation_is_proven_at_its_height() {
+        let _one_at_a_time = COINBASE_BLOCK.lock().await;
+        let hash: BlockHash = CB_HASH.parse().unwrap();
+        let coinbase: Transaction = deserialize_hex(CB_TX).unwrap();
+        let ours = coinbase.output[0].script_pubkey.clone();
+        let listing = |claimed: u32| async move {
+            let server = mainnet_mempool(10).await;
+            {
+                let mut state = server.state.lock().unwrap();
+                state.served.insert(claimed, header(CB_HEADER));
+                let branch = CB_BRANCH.iter().map(|hash| hash.to_string()).collect();
+                state.branches.insert(CB_TXID.to_owned(), (branch, 0));
+            }
+            server
+        };
+        let wallet = || Plan {
+            scripts: vec![ours.clone()],
+            ..plan(Network::Mainnet)
+        };
+        let list = |server: &FakeMempool, claimed: u32| {
+            server.state.lock().unwrap().scripts.insert(
+                FakeMempool::rest_key(&ours.to_hex_string()),
+                vec![listed_whole(&coinbase, claimed)],
+            );
+        };
+        height::forget(hash);
+        let server = listing(CB_HEIGHT).await;
+        list(&server, CB_HEIGHT);
+        let synced = esplora_sync(&server, wallet()).await.unwrap();
+        assert_eq!(
+            anchored(&synced),
+            [(CB_TXID.parse().unwrap(), CB_HEIGHT, hash)]
+        );
+        let cost = |server: &FakeMempool| {
+            (
+                asked(server, "/txid/0"),
+                asked(server, "/raw"),
+                asked(server, "/merkle-proof"),
+            )
+        };
+        // The branch of the confirmation, then the coinbase's: the same
+        // transaction here.
+        assert_eq!(cost(&server), (1, 1, 2));
+        let synced = esplora_sync(&server, wallet()).await.unwrap();
+        assert_eq!(anchored(&synced).len(), 1);
+        assert_eq!(cost(&server), (1, 1, 3));
+
+        height::forget(hash);
+        let shifted = listing(CB_HEIGHT + 1).await;
+        list(&shifted, CB_HEIGHT + 1);
+        let refused = refusal(esplora_sync(&shifted, wallet()).await);
+        assert!(refused.is_false_proof(), "{refused}");
+        assert_eq!(asked(&shifted, "/txid/0"), 1);
+        height::forget(hash);
     }
 
     /// A confirmation the wallet holds in the same block is not proven
