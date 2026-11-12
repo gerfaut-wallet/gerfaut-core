@@ -344,11 +344,18 @@ fn reason_of(error: &rustls::Error) -> String {
         rustls::Error::InvalidCertificate(C::UnknownIssuer) => {
             "self-signed, or signed by an authority this machine does not know".to_owned()
         }
-        rustls::Error::InvalidCertificate(C::Expired) => "expired".to_owned(),
-        rustls::Error::InvalidCertificate(C::NotValidYet) => "not valid yet".to_owned(),
-        rustls::Error::InvalidCertificate(C::NotValidForName) => {
-            "issued for a different host name".to_owned()
+        // The verifier raises these with the dates or the names that make
+        // the certificate wrong attached; the bare ones are kept for any
+        // other path that raises them.
+        rustls::Error::InvalidCertificate(C::Expired | C::ExpiredContext { .. }) => {
+            "expired".to_owned()
         }
+        rustls::Error::InvalidCertificate(C::NotValidYet | C::NotValidYetContext { .. }) => {
+            "not valid yet".to_owned()
+        }
+        rustls::Error::InvalidCertificate(
+            C::NotValidForName | C::NotValidForNameContext { .. },
+        ) => "issued for a different host name".to_owned(),
         // Certificates written before X.509 v3 are still served by
         // long-lived Electrum servers; the standard verifier declines to
         // read them at all, which is not the same as finding them wrong.
@@ -631,6 +638,45 @@ mod tests {
             "written in X.509 version 1, older than the standard verifier reads"
         );
         assert!(!reason_of(&unreadable).contains("Other("));
+    }
+
+    /// The verifier says why it refuses a certificate with the dates or
+    /// the names that make it wrong attached, and those are the errors
+    /// a handshake actually raises. A certificate a public authority
+    /// signed for another host is the one a server taken over presents:
+    /// the dialog has to say so, not fall back to the sentence for a
+    /// certificate nobody vouches for.
+    #[test]
+    fn the_reason_reads_the_errors_the_verifier_raises() {
+        use std::time::Duration;
+
+        use rustls::CertificateError as C;
+
+        let at = |secs| UnixTime::since_unix_epoch(Duration::from_secs(secs));
+        let expired = rustls::Error::InvalidCertificate(C::ExpiredContext {
+            time: at(2_000_000_000),
+            not_after: at(1_000_000_000),
+        });
+        assert_eq!(reason_of(&expired), "expired");
+        let early = rustls::Error::InvalidCertificate(C::NotValidYetContext {
+            time: at(1_000_000_000),
+            not_before: at(2_000_000_000),
+        });
+        assert_eq!(reason_of(&early), "not valid yet");
+        let other_name = rustls::Error::InvalidCertificate(C::NotValidForNameContext {
+            expected: ServerName::try_from("electrum.example").unwrap(),
+            presented: vec!["DnsName(\"other.example\")".to_owned()],
+        });
+        assert_eq!(reason_of(&other_name), "issued for a different host name");
+
+        // The same three without their context still read the same.
+        for (error, reason) in [
+            (C::Expired, "expired"),
+            (C::NotValidYet, "not valid yet"),
+            (C::NotValidForName, "issued for a different host name"),
+        ] {
+            assert_eq!(reason_of(&rustls::Error::InvalidCertificate(error)), reason);
+        }
     }
 
     /// Stands in for the error webpki raises on a pre-v3 certificate.
