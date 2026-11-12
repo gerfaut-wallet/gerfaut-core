@@ -25,6 +25,14 @@ fn confirmations(height: u32, tip: u32) -> u32 {
     tip.saturating_sub(height).saturating_add(1)
 }
 
+/// How deep `status` is when the tip is `tip`: 0 while it waits.
+fn depth(status: &TxStatus, tip: u32) -> u32 {
+    match status {
+        TxStatus::Confirmed { height, .. } => confirmations(*height, tip),
+        TxStatus::Pending => 0,
+    }
+}
+
 /// A transaction as a list shows it, its confirmations counted against
 /// `tip`.
 fn summary(
@@ -38,10 +46,7 @@ fn summary(
         txid,
         net_sats,
         fee_sats,
-        confirmations: match status {
-            TxStatus::Confirmed { height, .. } => confirmations(height, tip),
-            TxStatus::Pending => 0,
-        },
+        confirmations: depth(&status, tip),
         status,
     }
 }
@@ -846,19 +851,24 @@ pub(crate) fn tx_detail(
 }
 
 pub(crate) fn utxos(wallet: &bdk_wallet::Wallet, network: Network) -> Vec<UtxoInfo> {
+    let tip = tip_height(wallet);
     let mut utxos: Vec<UtxoInfo> = wallet
         .list_unspent()
-        .map(|output| UtxoInfo {
-            txid: output.outpoint.txid.to_string(),
-            vout: output.outpoint.vout,
-            address: address_of(&output.txout.script_pubkey, network),
-            value_sats: output.txout.value.to_sat(),
-            status: status_of(&output.chain_position),
-            keychain: Some(match output.keychain {
-                KeychainKind::External => Keychain::External,
-                KeychainKind::Internal => Keychain::Internal,
-            }),
-            derivation_index: Some(output.derivation_index),
+        .map(|output| {
+            let status = status_of(&output.chain_position);
+            UtxoInfo {
+                txid: output.outpoint.txid.to_string(),
+                vout: output.outpoint.vout,
+                address: address_of(&output.txout.script_pubkey, network),
+                value_sats: output.txout.value.to_sat(),
+                confirmations: depth(&status, tip),
+                status,
+                keychain: Some(match output.keychain {
+                    KeychainKind::External => Keychain::External,
+                    KeychainKind::Internal => Keychain::Internal,
+                }),
+                derivation_index: Some(output.derivation_index),
+            }
         })
         .collect();
     utxos.sort_by_key(|utxo| std::cmp::Reverse(utxo.value_sats));
@@ -1103,20 +1113,24 @@ pub(crate) fn address_utxos(state: &AddressWatchState, address: &str) -> Vec<Utx
     let mut utxos: Vec<UtxoInfo> = state
         .utxos
         .iter()
-        .map(|utxo| UtxoInfo {
-            txid: utxo.txid.clone(),
-            vout: utxo.vout,
-            address: Some(address.to_owned()),
-            value_sats: utxo.value_sats,
-            status: match utxo.height {
+        .map(|utxo| {
+            let status = match utxo.height {
                 Some(height) => TxStatus::Confirmed {
                     height,
                     timestamp: utxo.timestamp,
                 },
                 None => TxStatus::Pending,
-            },
-            keychain: None,
-            derivation_index: None,
+            };
+            UtxoInfo {
+                txid: utxo.txid.clone(),
+                vout: utxo.vout,
+                address: Some(address.to_owned()),
+                value_sats: utxo.value_sats,
+                confirmations: depth(&status, state.tip_height),
+                status,
+                keychain: None,
+                derivation_index: None,
+            }
         })
         .collect();
     utxos.sort_by_key(|utxo| std::cmp::Reverse(utxo.value_sats));
@@ -1483,6 +1497,100 @@ mod tests {
         assert_eq!(confirmations(100, 100), 1);
         assert_eq!(confirmations(90, 100), 11);
         assert_eq!(confirmations(101, 100), 1, "tip behind anchor saturates");
+    }
+
+    #[test]
+    fn an_address_coin_counts_its_depth_from_the_tip() {
+        let coin = |txid: &str, height: Option<u32>| crate::wallet::AddressUtxo {
+            txid: txid.into(),
+            vout: 0,
+            value_sats: 1000,
+            height,
+            timestamp: None,
+        };
+        let state = AddressWatchState {
+            utxos: vec![
+                coin("tip", Some(100)),
+                coin("deep", Some(95)),
+                coin("waiting", None),
+            ],
+            tip_height: 100,
+            ..Default::default()
+        };
+        let depths: Vec<(String, u32)> = address_utxos(&state, "an address")
+            .into_iter()
+            .map(|utxo| (utxo.txid, utxo.confirmations))
+            .collect();
+        assert_eq!(
+            depths,
+            vec![
+                ("tip".to_owned(), 1),
+                ("deep".to_owned(), 6),
+                ("waiting".to_owned(), 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wallet_coin_counts_its_depth_from_the_tip() {
+        use bdk_wallet::bitcoin::BlockHash;
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::chain::{BlockId, ConfirmationBlockTime};
+
+        let mut engine = bdk_wallet::Wallet::create(EXTERNAL, INTERNAL)
+            .network(bdk_wallet::bitcoin::Network::Signet)
+            .create_wallet_no_persist()
+            .unwrap();
+        let ours = engine
+            .reveal_next_address(KeychainKind::External)
+            .script_pubkey();
+        let pay = |from: u8, sats: u64| {
+            crate::testkit::transaction(
+                &[crate::testkit::nowhere(from, 0)],
+                &[(ours.to_hex_string().as_str(), sats)],
+            )
+        };
+        let mined = pay(1, 50_000);
+        let waiting = pay(2, 20_000);
+        let block = |height: u32| BlockId {
+            height,
+            hash: BlockHash::from_byte_array([height as u8; 32]),
+        };
+        let mut update = bdk_wallet::Update {
+            chain: Some(engine.latest_checkpoint().push(block(10)).unwrap()),
+            ..Default::default()
+        };
+        update.tx_update.anchors.insert((
+            ConfirmationBlockTime {
+                block_id: block(10),
+                confirmation_time: 1_700_000_000,
+            },
+            mined.compute_txid(),
+        ));
+        update.tx_update.txs.push(std::sync::Arc::new(mined));
+        engine.apply_update(update).unwrap();
+        engine.apply_unconfirmed_txs([(waiting, 1_700_000_100)]);
+        let depths = |engine: &bdk_wallet::Wallet| -> Vec<(u64, u32)> {
+            utxos(engine, Network::Signet)
+                .into_iter()
+                .map(|utxo| (utxo.value_sats, utxo.confirmations))
+                .collect()
+        };
+        // In the tip block it counts one, and the one that waits none.
+        assert_eq!(depths(&engine), vec![(50_000, 1), (20_000, 0)]);
+
+        // Two blocks on top: three deep.
+        let mut tip = engine.latest_checkpoint();
+        for height in [11, 12] {
+            tip = tip.push(block(height)).unwrap();
+        }
+        engine
+            .apply_update(bdk_wallet::Update {
+                chain: Some(tip),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(depths(&engine), vec![(50_000, 3), (20_000, 0)]);
     }
 
     #[test]

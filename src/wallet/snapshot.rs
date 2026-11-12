@@ -128,6 +128,9 @@ pub struct UtxoInfo {
     pub address: Option<String>,
     pub value_sats: u64,
     pub status: TxStatus,
+    /// How deep the output is at the last sync, counted like a
+    /// transaction's: 0 while it waits, 1 in the tip block.
+    pub confirmations: u32,
     /// Derivation info; absent for single-address wallets.
     pub keychain: Option<Keychain>,
     pub derivation_index: Option<u32>,
