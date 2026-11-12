@@ -1029,24 +1029,42 @@ fn derivation_path(wallet: &bdk_wallet::Wallet, index: u32) -> Option<String> {
 // --- single-address wallets --------------------------------------------
 
 pub(crate) fn address_balance(state: &AddressWatchState) -> BalanceSnapshot {
+    use bdk_wallet::bitcoin::constants::COINBASE_MATURITY;
+
+    // A block's reward is spendable from its hundredth confirmation, as
+    // the engine counts it for a descriptor. Whether a coin is one is
+    // read from its transaction's facts, when the sync holds them.
+    let rewards: std::collections::HashSet<&str> = state
+        .txs
+        .iter()
+        .filter(|tx| tx.extras.as_ref().is_some_and(|extras| extras.is_coinbase))
+        .map(|tx| tx.txid.as_str())
+        .collect();
+    let mut confirmed = 0u64;
+    let mut pending = 0u64;
+    let mut immature = 0u64;
     // The coins are the server's word. Summed with a plain `+`, values
     // no coin can hold panicked a debug build and wrapped around to a
     // small balance in a release one.
-    let funded = |confirmed: bool| {
-        state
-            .utxos
-            .iter()
-            .filter(|u| u.height.is_some() == confirmed)
-            .fold(0u64, |sum, u| sum.saturating_add(u.value_sats))
-    };
-    let confirmed_funded = funded(true);
-    let pending_funded = funded(false);
+    for coin in &state.utxos {
+        let bucket = match coin.height {
+            None => &mut pending,
+            Some(height)
+                if rewards.contains(coin.txid.as_str())
+                    && confirmations(height, state.tip_height) < COINBASE_MATURITY =>
+            {
+                &mut immature
+            }
+            Some(_) => &mut confirmed,
+        };
+        *bucket = bucket.saturating_add(coin.value_sats);
+    }
     BalanceSnapshot {
-        confirmed: confirmed_funded,
+        confirmed,
         trusted_pending: 0,
-        untrusted_pending: pending_funded,
-        immature: 0,
-        total: confirmed_funded.saturating_add(pending_funded),
+        untrusted_pending: pending,
+        immature,
+        total: confirmed.saturating_add(pending).saturating_add(immature),
         pending_net_sats: pending_net(
             state
                 .txs
@@ -1624,6 +1642,53 @@ mod tests {
         assert_eq!(balance.untrusted_pending, 500);
         assert_eq!(balance.total, 1500);
         assert_eq!(balance.pending_net_sats, None, "no transaction listed");
+    }
+
+    /// A coin a block's reward pays to the address cannot be spent
+    /// before its hundredth confirmation, as consensus has it: until
+    /// then it is maturing, the way the engine counts one for a
+    /// descriptor, and never confirmed. A coin of a transaction the
+    /// sync does not hold, or holds without its facts, stays where it
+    /// was.
+    #[test]
+    fn a_young_coinbase_coin_of_an_address_is_immature() {
+        let coin = |txid: &str, value_sats: u64, height: Option<u32>| crate::wallet::AddressUtxo {
+            txid: txid.into(),
+            vout: 0,
+            value_sats,
+            height,
+            timestamp: None,
+        };
+        let reward = |txid: &str, height: u32| AddressTx {
+            extras: Some(tx_extras::TxExtras {
+                is_coinbase: true,
+                ..Default::default()
+            }),
+            ..address_tx(txid, 0, Some(height))
+        };
+        let state = AddressWatchState {
+            utxos: vec![
+                // 99 confirmations at a tip of 1000: one block short.
+                coin("young", 5_000, Some(902)),
+                // 100 confirmations: spendable.
+                coin("ripe", 7_000, Some(901)),
+                coin("plain", 1_000, Some(1000)),
+                coin("unknown", 300, Some(1000)),
+                coin("waiting", 20, None),
+            ],
+            txs: vec![
+                reward("young", 902),
+                reward("ripe", 901),
+                address_tx("plain", 1_000, Some(1000)),
+            ],
+            tip_height: 1000,
+            ..Default::default()
+        };
+        let balance = address_balance(&state);
+        assert_eq!(balance.immature, 5_000);
+        assert_eq!(balance.confirmed, 7_000 + 1_000 + 300);
+        assert_eq!(balance.untrusted_pending, 20);
+        assert_eq!(balance.total, 5_000 + 7_000 + 1_000 + 300 + 20);
     }
 
     /// Coins no one can hold, as a hostile server may list them, stop
