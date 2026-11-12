@@ -155,25 +155,51 @@ pub(crate) fn is_genesis_of(network: Network, hash: bdk_wallet::bitcoin::BlockHa
 /// height held was never a real one.
 pub(crate) const TIP_LAG_MAX: u32 = 144;
 
-/// What a server is refused with when it is behind a block of the
-/// wallet that holds a confirmation, and its answer would take that
-/// block out ([`drops_a_confirmation`]).
+/// What a server behind the wallet is refused with when it disagrees
+/// with the wallet below its tip, and its answer would take a block of
+/// the wallet that holds a confirmation out.
 pub(crate) const BEHIND: &str = "the server is behind a confirmation the wallet holds";
 
-/// Whether a server whose tip is `server_tip`, more than [`TIP_LAG_MAX`]
-/// below the wallet's, would have the wallet drop a block holding one of
-/// its confirmations, at the heights in `confirmed`. On mainnet such a
-/// block carries the work of its height, and none at a height a chain
-/// can have reached (`limit`) was made up: the server lags, or hides
-/// it, and is refused rather than followed. Where work proves nothing,
-/// the blocks go, as any a server made up.
-pub(crate) fn drops_a_confirmation(
+/// What a server far behind the wallet, whose tip is hours old, is
+/// refused with ([`follows_far_below`]).
+pub(crate) const FAR_BEHIND: &str = "the server is far behind the wallet, its tip hours old";
+
+/// How old, by the device's clock, the tip of a server far below the
+/// wallet's may be for the server to be followed: six hours. A block's
+/// time may sit an hour or two behind the moment it was found, as
+/// consensus only asks it to be past the median of the eleven before
+/// it; two hours or so between two blocks comes a few times a year; and
+/// the device's clock may be off by some minutes. A lagging server is
+/// a day behind at least, 144 blocks, and its tip that old. A clock set
+/// behind a tip finds it fresh: the server then proves again what it
+/// lists, and lists nothing it does not have.
+pub(crate) const FRESH_TIP_SECS: u64 = 6 * 3_600;
+
+/// Whether a server whose tip is `server_tip`, a block of `tip_time`,
+/// is followed when the wallet holds blocks above it, `highest` the
+/// highest of those a chain can have reached: the wallet's blocks above
+/// that tip then go, confirmations with them, and the server proves
+/// again what it lists.
+///
+/// On mainnet, a tip's height is proven ([`proof::height`]), so a server
+/// whose tip is fresh at `now` is at the chain's tip, and the wallet's
+/// blocks far above it were never real, put there by a server that
+/// lied: they go, and a vault it fooled is repaired. One whose tip is
+/// old lags, or stopped, and is refused, the wallet left as it is; it
+/// used to drop the wallet's blocks when none held a confirmation, and
+/// to be refused for good once one did, whatever the server. Within
+/// [`TIP_LAG_MAX`], or where work proves nothing, the blocks go, as any
+/// a server made up.
+pub(crate) fn follows_far_below(
     network: Network,
-    mut confirmed: impl Iterator<Item = u32>,
+    highest: u32,
     server_tip: u32,
-    limit: u32,
+    tip_time: u32,
+    now: u64,
 ) -> bool {
-    network == Network::Mainnet && confirmed.any(|height| height > server_tip && height <= limit)
+    network != Network::Mainnet
+        || highest <= server_tip.saturating_add(TIP_LAG_MAX)
+        || now.saturating_sub(u64::from(tip_time)) <= FRESH_TIP_SECS
 }
 
 /// What a server whose tip is higher than any chain of its network can
@@ -2168,23 +2194,24 @@ mod tests {
         }
     }
 
-    /// Blocks far above a server's tip are dropped unless one holds a
-    /// confirmation proven with the work of mainnet, at a height a chain
-    /// can have reached.
+    /// On mainnet, a server far below the wallet's blocks is followed
+    /// only on a tip six hours old at most, by the device's clock, and
+    /// one in the device's future counts as fresh; within a day of
+    /// blocks, or on another network, it always is.
     #[test]
-    fn a_server_far_behind_drops_no_confirmation_on_mainnet() {
-        let confirmed = [500_u32, 900_000];
-        let drops =
-            |network, tip| drops_a_confirmation(network, confirmed.into_iter(), tip, 950_000);
-        assert!(drops(Network::Mainnet, 899_000));
-        assert!(!drops(Network::Mainnet, 900_000));
-        assert!(!drops(Network::Signet, 899_000));
-        assert!(!drops_a_confirmation(
-            Network::Mainnet,
-            [4_000_000_000].into_iter(),
-            899_000,
-            950_000
-        ));
+    fn a_server_far_behind_is_followed_on_a_fresh_tip_alone() {
+        let mined = 1_790_000_000;
+        let follows = |network, highest, age: i64| {
+            let now = u64::try_from(i64::from(mined) + age).unwrap();
+            follows_far_below(network, highest, 900_000, mined, now)
+        };
+        assert!(follows(Network::Mainnet, 1_000_000, 0));
+        assert!(follows(Network::Mainnet, 1_000_000, 6 * 3_600));
+        assert!(!follows(Network::Mainnet, 1_000_000, 6 * 3_600 + 1));
+        assert!(follows(Network::Mainnet, 1_000_000, -3_600));
+        assert!(follows(Network::Mainnet, 900_144, 30 * 24 * 3_600));
+        assert!(!follows(Network::Mainnet, 900_145, 30 * 24 * 3_600));
+        assert!(follows(Network::Signet, 1_000_000, 30 * 24 * 3_600));
     }
 
     /// A previous transaction is read only if it is the one asked for:

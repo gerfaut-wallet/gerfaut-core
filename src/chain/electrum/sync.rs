@@ -37,8 +37,8 @@ use crate::chain::proof::{
     check_confirmation, checkpoint_for, height, recheck,
 };
 use crate::chain::{
-    ANOTHER_NETWORK, BEHIND, Fault, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX,
-    drops_a_confirmation, has_proof_of_work, height_limit,
+    ANOTHER_NETWORK, FAR_BEHIND, Fault, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX,
+    follows_far_below, has_proof_of_work, height_limit,
 };
 use crate::network::Network;
 
@@ -269,10 +269,12 @@ impl Chain {
     /// network can have reached ([`height_limit`]); its height is proven
     /// by the coinbase of its block ([`prove_height`]), and the latest
     /// blocks under it are checked ([`checked_suffix`]). The wallet's
-    /// own blocks are read the same way: those far above the server's
-    /// tip, or past that height, came from a server that made them up.
-    /// They are left out of the walk, and dropped, unless one of them
-    /// holds a confirmation ([`drops_a_confirmation`]).
+    /// own blocks are read the same way: those past that height came
+    /// from a server that made them up, and so did those far above the
+    /// server's tip when that tip is fresh. They are left out of the
+    /// walk, and dropped, confirmations and all; a server whose tip is
+    /// old lags, and is refused ([`follows_far_below`]), `now` the
+    /// device's clock.
     ///
     /// A block of the wallet that holds a confirmation, in `confirmed`,
     /// and that the server replaces below its latest blocks, is replaced
@@ -294,8 +296,14 @@ impl Chain {
         height::tip_proven(proof).map_err(super::raised)?;
         let (local, dropped) =
             if local.height() > height.saturating_add(TIP_LAG_MAX) || local.height() > limit {
-                if drops_a_confirmation(network, confirmed.iter().copied(), height, limit) {
-                    return Err(Error::Message(BEHIND.to_owned()));
+                let highest = local
+                    .iter()
+                    .map(|checkpoint| checkpoint.height())
+                    .find(|at| *at <= limit)
+                    .unwrap_or_default();
+                let time = notification.header.time;
+                if !follows_far_below(network, highest, height, time, now) {
+                    return Err(Error::Message(FAR_BEHIND.to_owned()));
                 }
                 let kept = local
                     .iter()

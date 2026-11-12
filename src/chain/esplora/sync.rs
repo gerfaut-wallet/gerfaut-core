@@ -54,8 +54,8 @@ use crate::chain::proof::{
     check_confirmation, esplora_chains, height, recheck,
 };
 use crate::chain::{
-    BEHIND, Fault, Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced, TIP_LAG_MAX,
-    drops_a_confirmation, has_proof_of_work, height_limit,
+    BEHIND, FAR_BEHIND, Fault, Held, IMPOSSIBLE_TIP, Plan, Reading, Scan, ScriptFacts, Synced,
+    TIP_LAG_MAX, follows_far_below, has_proof_of_work, height_limit,
 };
 use crate::network::Network;
 /// Pages read of one script at most: 10,000 confirmed transactions. A
@@ -180,12 +180,13 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
     // Before any history, and so never past it: the tip of the answer
     // is what the wallet counts itself synced up to.
     let limit = height_limit(network, start_time);
-    let latest = latest_blocks(client, network, limit).await?;
+    let (latest, tip_header) = latest_blocks(client, network, limit).await?;
     let server_tip = latest.keys().next_back().copied().unwrap_or_default();
-    // The wallet's blocks far above the server's tip, or past any height
-    // a chain can have reached, came from a server that made them up:
-    // left out of the walk, and dropped (see [`Synced::drop_above`]),
-    // unless one of them holds a confirmation ([`drops_a_confirmation`]).
+    // The wallet's blocks past any height a chain can have reached, or
+    // far above a fresh tip of the server's, came from a server that
+    // made them up: left out of the walk, and dropped, confirmations and
+    // all (see [`Synced::drop_above`]). A server whose tip is old lags,
+    // and is refused ([`follows_far_below`]).
     let confirmed: BTreeSet<u32> = held
         .anchors
         .values()
@@ -193,8 +194,13 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
         .collect();
     let (tip, dropped) =
         if tip.height() > server_tip.saturating_add(TIP_LAG_MAX) || tip.height() > limit {
-            if drops_a_confirmation(network, confirmed.iter().copied(), server_tip, limit) {
-                return Err(Fault::other(BEHIND));
+            let highest = tip
+                .iter()
+                .map(|checkpoint| checkpoint.height())
+                .find(|at| *at <= limit)
+                .unwrap_or_default();
+            if !follows_far_below(network, highest, server_tip, tip_header.time, start_time) {
+                return Err(Fault::other(FAR_BEHIND));
             }
             let kept = tip
                 .iter()
@@ -947,12 +953,12 @@ async fn latest_blocks(
     client: &Client,
     network: Network,
     limit: u32,
-) -> Result<BTreeMap<u32, BlockHash>, Fault> {
+) -> Result<(BTreeMap<u32, BlockHash>, Header), Fault> {
     let (latest, tip) = checked_latest(network, client.get_json("/blocks").await?, limit)?;
     let height = latest.keys().next_back().copied().unwrap_or_default();
     height::tip_proven(prove_height(client, network, height, &tip).await?)?;
     height::remember(network, latest.iter().map(|(at, hash)| (*at, *hash)));
-    Ok(latest)
+    Ok((latest, tip))
 }
 
 /// What the server proves of the height of `header`, its block at
@@ -1012,7 +1018,7 @@ async fn prove_height(
 /// confirmations from. One request, the one that read the height alone.
 pub(crate) async fn proven_tip(client: &Client, network: Network) -> Result<u32, Fault> {
     let limit = height_limit(network, crate::now_secs());
-    let latest = latest_blocks(client, network, limit).await?;
+    let (latest, _) = latest_blocks(client, network, limit).await?;
     latest
         .keys()
         .next_back()
@@ -1291,7 +1297,7 @@ mod tests {
         server.state.lock().unwrap().tip = 500;
         let client =
             super::super::client_for_run(&format!("http://{}/api", server.address), None).unwrap();
-        let latest = latest_blocks(&client, Network::Signet, u32::MAX)
+        let (latest, _) = latest_blocks(&client, Network::Signet, u32::MAX)
             .await
             .unwrap();
         let real = crate::testkit::FakeMempool::header_at_height(&server.state.lock().unwrap(), 80)

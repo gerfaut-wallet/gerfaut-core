@@ -1415,6 +1415,136 @@ mod servers {
         }
     }
 
+    /// What a server that shifts heights left in a vault before it was
+    /// refused for it: its latest blocks [`SHIFT`] blocks too high, and
+    /// the real transaction of block 963,647 confirmed in the last of
+    /// them.
+    fn fooled() -> (CheckPoint, Held) {
+        let genesis = bdk_wallet::bitcoin::constants::genesis_block(Network::Mainnet.to_bitcoin());
+        let real: Transaction = deserialize_hex(REAL_TX).unwrap();
+        let blocks: Vec<Header> = BELOW_LAST
+            .iter()
+            .map(|hex| header(hex))
+            .chain([last_checkpoint()])
+            .collect();
+        let tip = CheckPoint::new(BlockId {
+            height: 0,
+            hash: genesis.block_hash(),
+        })
+        .extend(
+            (963_640 + SHIFT..)
+                .zip(&blocks)
+                .map(|(height, header)| BlockId {
+                    height,
+                    hash: header.block_hash(),
+                }),
+        )
+        .unwrap();
+        let mut held = Held::default();
+        let txid = real.compute_txid();
+        held.anchors.insert(
+            txid,
+            bdk_wallet::chain::ConfirmationBlockTime {
+                block_id: BlockId {
+                    height: 963_647 + SHIFT,
+                    hash: last_checkpoint().block_hash(),
+                },
+                confirmation_time: u64::from(last_checkpoint().time),
+            },
+        );
+        held.txs.insert(txid, std::sync::Arc::new(real));
+        (tip, held)
+    }
+
+    /// A vault a server fooled, its chain and a confirmation two million
+    /// blocks too high, is repaired by the first honest server whose tip
+    /// is fresh, an hour old by the device's clock, over Electrum and
+    /// Esplora: the blocks above its tip go, the confirmation with them,
+    /// and the server proves it again where it is. A server whose tip is
+    /// two days old lags: it is refused, not as a liar, and nothing is
+    /// taken from the vault. Every honest server was refused before, as
+    /// one behind a confirmation, and the vault could only be imported
+    /// again.
+    #[tokio::test]
+    async fn a_fooled_vault_is_repaired_by_a_fresh_server() {
+        let real: Transaction = deserialize_hex(REAL_TX).unwrap();
+        let parent: Transaction = deserialize_hex(REAL_PARENT).unwrap();
+        let txid = real.compute_txid();
+        let mined = u64::from(last_checkpoint().time);
+        let repaired = [(txid, 963_647, last_checkpoint().block_hash())];
+        for (age, fresh) in [(3_600, true), (2 * 24 * 3_600, false)] {
+            let (tip, held) = fooled();
+            let electrum = mainnet().await;
+            electrum.add_tx(&real);
+            electrum.add_tx(&parent);
+            electrum.set_history(&ours(), &[(txid, 963_647)]);
+            electrum.state.lock().unwrap().branches.insert(
+                txid,
+                (
+                    REAL_BRANCH.iter().map(|hash| hash.to_string()).collect(),
+                    REAL_POS,
+                ),
+            );
+            let fooled_plan = Plan {
+                tip,
+                held,
+                start_time: mined + age,
+                ..plan(Network::Mainnet)
+            };
+            let target = Target::new(format!("tcp://{}", electrum.address), None);
+            let synced =
+                crate::chain::electrum::sync(&target, fooled_plan, None, Duration::from_secs(30))
+                    .await;
+            if fresh {
+                let synced = synced.unwrap();
+                assert_eq!(synced.drop_above, Some(963_647));
+                assert_eq!(anchored(&synced), repaired);
+                assert_eq!(synced.update.chain.unwrap().height(), 963_647);
+            } else {
+                let refused = refusal(synced);
+                assert!(
+                    refused.contains(crate::chain::FAR_BEHIND) && !refused.is_false_proof(),
+                    "{refused}"
+                );
+            }
+
+            let (tip, held) = fooled();
+            let esplora = mainnet_mempool(10).await;
+            {
+                let mut state = esplora.state.lock().unwrap();
+                state.scripts.insert(
+                    FakeMempool::rest_key(&ours()),
+                    vec![listed_whole(&real, 963_647)],
+                );
+                state.branches.insert(
+                    REAL_TXID.to_owned(),
+                    (
+                        REAL_BRANCH.iter().map(|hash| hash.to_string()).collect(),
+                        REAL_POS,
+                    ),
+                );
+            }
+            let fooled_plan = Plan {
+                tip,
+                held,
+                start_time: mined + age,
+                ..plan(Network::Mainnet)
+            };
+            let synced = esplora_sync(&esplora, fooled_plan).await;
+            if fresh {
+                let synced = synced.unwrap();
+                assert_eq!(synced.drop_above, Some(963_647));
+                assert_eq!(anchored(&synced), repaired);
+            } else {
+                let refused = refusal(synced);
+                assert!(
+                    refused.contains(crate::chain::FAR_BEHIND) && !refused.is_false_proof(),
+                    "{refused}"
+                );
+            }
+        }
+    }
+
     /// The tests that count what proving block 702,861 costs, one at a
     /// time: what one proves, the session keeps for the others.
     static COINBASE_BLOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
