@@ -959,6 +959,9 @@ pub(crate) struct MempoolState {
     /// The hash `/block-height/:height` names at a height, in place of
     /// the chain's: a server that lies about a block below its latest.
     pub height_hashes: HashMap<u32, String>,
+    /// The block time a history lists a transaction with, by txid, in
+    /// place of the time of its block's header.
+    pub listed_times: HashMap<String, u64>,
 }
 
 /// The headers of the chain the fake mempool serves, by height: see
@@ -1107,6 +1110,12 @@ impl MempoolState {
             };
             tx["status"]["block_hash"] = json!(header.block_hash().to_string());
             tx["status"]["block_time"] = json!(header.time);
+            if let Some(time) = tx["txid"]
+                .as_str()
+                .and_then(|txid| self.listed_times.get(txid))
+            {
+                tx["status"]["block_time"] = json!(time);
+            }
         }
         tx
     }

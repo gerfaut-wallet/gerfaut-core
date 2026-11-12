@@ -599,7 +599,10 @@ impl Found {
 /// Proves the confirmations of `update` the wallet does not hold in the
 /// same block ([`prove_confirmations`]). One proven takes the time of its
 /// block's header; one unsure is taken as unconfirmed, as the server's
-/// word alone is; a false one refuses the server.
+/// word alone is; a false one refuses the server. One the wallet holds in
+/// the same block keeps the time it holds, proven when it was taken: the
+/// time the server lists it with is its word, and the engine keeps the
+/// earliest of two times for one block, for good.
 async fn prove(
     client: &Client,
     network: Network,
@@ -608,6 +611,18 @@ async fn prove(
     start_time: u64,
     update: &mut TxUpdate<ConfirmationBlockTime>,
 ) -> Result<(), Fault> {
+    let retimed: Vec<(ConfirmationBlockTime, Txid, ConfirmationBlockTime)> = update
+        .anchors
+        .iter()
+        .filter_map(|(anchor, txid)| {
+            let kept = held.anchors.get(txid)?;
+            (kept.block_id == anchor.block_id && kept != anchor).then_some((*anchor, *txid, *kept))
+        })
+        .collect();
+    for (listed, txid, kept) in retimed {
+        update.anchors.remove(&(listed, txid));
+        update.anchors.insert((kept, txid));
+    }
     let new: Vec<(ConfirmationBlockTime, Txid)> = update
         .anchors
         .iter()

@@ -2267,6 +2267,51 @@ mod tests {
         assert_eq!(standing(&manager, &wallet).await, [(421, mined)]);
     }
 
+    /// A confirmation the wallet holds, listed again by an Esplora
+    /// instance at another time for its block, as a new payment to the
+    /// same address has its history read again: the wallet keeps the
+    /// time of the block's header, then still after a sync on an honest
+    /// instance. The earlier time the server gave stood for good, the
+    /// engine keeping the earliest of two times for one block.
+    #[tokio::test]
+    async fn an_esplora_confirmation_held_keeps_its_time() {
+        let server = crate::testkit::FakeMempool::start(false, 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, wallet, ours) = esplora_wallet(dir.path(), &server).await;
+        let key = crate::testkit::FakeMempool::rest_key(&ours);
+        let first = paying(&ours, 0x73, 50_000, 80);
+        let txid = first["txid"].as_str().unwrap().to_owned();
+        server
+            .state
+            .lock()
+            .unwrap()
+            .scripts
+            .insert(key.clone(), vec![first.clone()]);
+        manager.sync_wallet(&wallet).await.unwrap();
+        let mined = Some(1_700_000_000);
+        assert_eq!(standing(&manager, &wallet).await, [(421, mined)]);
+
+        // A new payment, and the first one listed at the time 1.
+        {
+            let mut state = server.state.lock().unwrap();
+            state
+                .scripts
+                .insert(key, vec![paying(&ours, 0x74, 20_000, 90), first]);
+            state.listed_times.insert(txid, 1);
+        }
+        manager.sync_wallet(&wallet).await.unwrap();
+        assert_eq!(
+            standing(&manager, &wallet).await,
+            [(411, mined), (421, mined)]
+        );
+        server.state.lock().unwrap().listed_times.clear();
+        manager.sync_wallet(&wallet).await.unwrap();
+        assert_eq!(
+            standing(&manager, &wallet).await,
+            [(411, mined), (421, mined)]
+        );
+    }
+
     /// On mainnet, a server far below the wallet's blocks is followed
     /// only on a tip six hours old at most, by the device's clock, and
     /// one in the device's future counts as fresh; within a day of
