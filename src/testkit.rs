@@ -956,6 +956,9 @@ pub(crate) struct MempoolState {
     /// What `/tx/:txid/merkle-proof` answers for a txid, in place of the
     /// branch its block makes.
     pub proofs: HashMap<String, Value>,
+    /// The hash `/block-height/:height` names at a height, in place of
+    /// the chain's: a server that lies about a block below its latest.
+    pub height_hashes: HashMap<u32, String>,
 }
 
 /// The headers of the chain the fake mempool serves, by height: see
@@ -1406,7 +1409,9 @@ impl FakeMempool {
                 .rsplit_once("/block-height/")
                 .and_then(|(_, height)| height.parse::<u32>().ok())
             {
-                if height <= state.tip {
+                if let Some(hash) = state.height_hashes.get(&height) {
+                    ("200 OK", hash.clone())
+                } else if height <= state.tip {
                     ("200 OK", state.block_id(&chain, height))
                 } else {
                     ("404 Not Found", "Block not found".to_owned())

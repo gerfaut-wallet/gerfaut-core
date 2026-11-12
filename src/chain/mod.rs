@@ -2194,6 +2194,79 @@ mod tests {
         }
     }
 
+    /// A descriptor wallet on signet over the Esplora instance `server`,
+    /// synced once, and the script of its first address.
+    async fn esplora_wallet(
+        dir: &std::path::Path,
+        server: &crate::testkit::FakeMempool,
+    ) -> (crate::WalletManager, String, String) {
+        let (manager, wallet) = synced_wallet(dir, server.backend()).await;
+        let address = &manager.receive_addresses(&wallet, 0).await.unwrap()[0].address;
+        let ours = address
+            .parse::<bdk_wallet::bitcoin::Address<_>>()
+            .unwrap()
+            .assume_checked()
+            .script_pubkey()
+            .to_hex_string();
+        (manager, wallet, ours)
+    }
+
+    /// A payment labelled `label` of `sats` to `ours`, confirmed at
+    /// `height`, as Esplora lists it.
+    fn paying(ours: &str, label: u8, sats: u64, height: u32) -> serde_json::Value {
+        let mut payment = crate::testkit::esplora_payment(label, label, sats, true);
+        payment["vout"][0]["scriptpubkey"] = serde_json::json!(ours);
+        payment["status"]["block_height"] = serde_json::json!(height);
+        payment["txid"] = serde_json::json!(crate::testkit::listed_txid(&payment));
+        payment
+    }
+
+    /// Where each transaction of the wallet stands: its confirmations and
+    /// the time of its block.
+    async fn standing(manager: &crate::WalletManager, wallet: &str) -> Vec<(u32, Option<u64>)> {
+        use crate::wallet::snapshot::TxStatus;
+        let mut txs: Vec<(u32, Option<u64>)> = manager
+            .wallet_snapshot(wallet)
+            .await
+            .unwrap()
+            .txs
+            .iter()
+            .map(|tx| match tx.status {
+                TxStatus::Confirmed { timestamp, .. } => (tx.confirmations, timestamp),
+                TxStatus::Pending => (tx.confirmations, None),
+            })
+            .collect();
+        txs.sort_unstable();
+        txs
+    }
+
+    /// A payment proven in block 80 of an Esplora instance at 500 that
+    /// names another block at 80 when asked for the hash there: the
+    /// wallet's chain takes the block the payment was proven in, and the
+    /// payment is confirmed, then still after a sync on an honest
+    /// instance. The hash the server named went into the chain instead,
+    /// and the payment stayed pending for good.
+    #[tokio::test]
+    async fn an_esplora_confirmation_is_chained_in_its_proven_block() {
+        let server = crate::testkit::FakeMempool::start(false, 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, wallet, ours) = esplora_wallet(dir.path(), &server).await;
+        {
+            let mut state = server.state.lock().unwrap();
+            let key = crate::testkit::FakeMempool::rest_key(&ours);
+            state
+                .scripts
+                .insert(key, vec![paying(&ours, 0x71, 50_000, 80)]);
+            state.height_hashes.insert(80, "ab".repeat(32));
+        }
+        manager.sync_wallet(&wallet).await.unwrap();
+        let mined = Some(1_700_000_000);
+        assert_eq!(standing(&manager, &wallet).await, [(421, mined)]);
+        server.state.lock().unwrap().height_hashes.clear();
+        manager.sync_wallet(&wallet).await.unwrap();
+        assert_eq!(standing(&manager, &wallet).await, [(421, mined)]);
+    }
+
     /// On mainnet, a server far below the wallet's blocks is followed
     /// only on a tip six hours old at most, by the device's clock, and
     /// one in the device's future counts as fresh; within a day of

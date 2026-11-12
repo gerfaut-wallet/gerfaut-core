@@ -292,7 +292,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
     let mut update = found.update;
     check_spent(&held, &update)?;
     prove(client, network, server_tip, &held, start_time, &mut update).await?;
-    let chain = meeting.chain(client, &latest, &update.anchors).await?;
+    let chain = meeting.chain(&latest, &update.anchors)?;
     Ok(Synced {
         update: bdk_wallet::Update {
             last_active_indices: last_active,
@@ -1200,9 +1200,8 @@ impl Meeting {
     /// builds it this way. A server behind the wallet leaves the
     /// wallet's blocks above its tip where they are, which an update
     /// built from the meeting point could not.
-    async fn chain(
+    fn chain(
         self,
-        client: &Client,
         latest: &BTreeMap<u32, BlockHash>,
         anchors: &BTreeSet<(ConfirmationBlockTime, Txid)>,
     ) -> Result<CheckPoint, Fault> {
@@ -1214,11 +1213,16 @@ impl Meeting {
                 .extend(self.conflicts.into_iter().rev())
                 .map_err(|_| "the server's chain never meets the wallet's".to_owned())?,
         };
+        // The block each confirmation was proven in, as over Electrum: the
+        // one the latest blocks hold at its height, or the proven one. The
+        // server's word for the hash at a height below the latest is no
+        // proof, and a block it named there in place of the proven one
+        // kept the confirmation out of the chain for good.
+        let server_tip = latest.keys().next_back().copied().unwrap_or_default();
         for (anchor, _) in anchors {
             let height = anchor.block_id.height;
-            if tip.get(height).is_none()
-                && let Some(hash) = block_at(client, latest, height).await?
-            {
+            if tip.get(height).is_none() && height <= server_tip {
+                let hash = latest.get(&height).copied().unwrap_or(anchor.block_id.hash);
                 tip = tip.insert(BlockId { height, hash });
             }
         }
@@ -1269,20 +1273,12 @@ mod tests {
             conflicts: Vec::new(),
             ahead: None,
         };
-        // Never asked anything: every height it needs is in the latest.
-        let client = super::super::client("http://127.0.0.1:9", None).unwrap();
         let lying = BTreeMap::from([(0, hash(9)), (1, hash(1)), (2, hash(2))]);
-        let refused = meeting()
-            .chain(&client, &lying, &BTreeSet::new())
-            .await
-            .unwrap_err();
+        let refused = meeting().chain(&lying, &BTreeSet::new()).unwrap_err();
         assert!(refused.contains("contradicts"), "{refused}");
 
         let honest = BTreeMap::from([(0, hash(0)), (1, hash(1)), (2, hash(2))]);
-        let tip = meeting()
-            .chain(&client, &honest, &BTreeSet::new())
-            .await
-            .unwrap();
+        let tip = meeting().chain(&honest, &BTreeSet::new()).unwrap();
         assert_eq!(tip.height(), 2);
         assert_eq!(tip.get(0).unwrap().hash(), hash(0));
     }
