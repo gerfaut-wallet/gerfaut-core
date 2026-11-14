@@ -5,7 +5,7 @@
 
 # gerfaut-core
 
-The Rust library behind [Gerfaut](https://gerfaut-wallet.com), a Bitcoin watch-only wallet. The [desktop app](https://github.com/gerfaut-wallet/gerfaut-desktop) and the [Android app](https://github.com/gerfaut-wallet/gerfaut-mobile) both call it for everything but their interface, so they read a descriptor, sync a wallet and word a notification the same way.
+The Rust library behind [Gerfaut](https://gerfaut-wallet.com), a Bitcoin watch-only wallet. The [desktop app](https://github.com/gerfaut-wallet/gerfaut-desktop) and the [mobile app](https://github.com/gerfaut-wallet/gerfaut-mobile), on Android and soon on iPhone, both call it for everything but their interface, so they read a descriptor, sync a wallet and word a notification the same way.
 
 [![CI](https://github.com/gerfaut-wallet/gerfaut-core/actions/workflows/ci.yml/badge.svg)](https://github.com/gerfaut-wallet/gerfaut-core/actions/workflows/ci.yml)
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](LICENSE)
